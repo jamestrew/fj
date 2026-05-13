@@ -162,14 +162,6 @@ impl Client {
         for (k, v) in extra.iter() {
             headers.insert(k.clone(), v.clone());
         }
-        let mut req = self
-            .http
-            .request(method.clone(), url.clone())
-            .headers(headers)
-            .query(query);
-        if let Some(body) = body {
-            req = req.json(body);
-        }
         if debug_enabled() {
             let q = if query.is_empty() {
                 String::new()
@@ -189,11 +181,56 @@ impl Client {
                 }
             }
         }
-        let res = req.send().await.context("sending HTTP request")?;
-        if debug_enabled() {
-            eprintln!("← {} {}", res.status(), res.url());
+
+        let retries = if is_idempotent(&method) { 3 } else { 1 };
+        let mut last_err: Option<anyhow::Error> = None;
+        for attempt in 0..retries {
+            let mut req = self
+                .http
+                .request(method.clone(), url.clone())
+                .headers(headers.clone())
+                .query(query);
+            if let Some(body) = body {
+                req = req.json(body);
+            }
+            match req.send().await {
+                Ok(res) => {
+                    let status = res.status();
+                    if status.is_server_error() && attempt + 1 < retries {
+                        if debug_enabled() {
+                            eprintln!(
+                                "← {status} {} (retrying after backoff, attempt {}/{})",
+                                res.url(),
+                                attempt + 1,
+                                retries
+                            );
+                        }
+                        backoff(attempt).await;
+                        continue;
+                    }
+                    if debug_enabled() {
+                        eprintln!("← {status} {}", res.url());
+                    }
+                    return Ok(res);
+                }
+                Err(e) => {
+                    if attempt + 1 < retries {
+                        if debug_enabled() {
+                            eprintln!(
+                                "transport error: {e}; retrying ({}/{})",
+                                attempt + 1,
+                                retries
+                            );
+                        }
+                        backoff(attempt).await;
+                        last_err = Some(anyhow::Error::new(e));
+                        continue;
+                    }
+                    return Err(anyhow::Error::new(e).context("sending HTTP request"));
+                }
+            }
         }
-        Ok(res)
+        Err(last_err.unwrap_or_else(|| anyhow!("retries exhausted")))
     }
 
     /// Issue a request and decode a JSON body, mapping non-2xx to a typed
@@ -235,6 +272,81 @@ impl Client {
         let items: Vec<T> = res.json().await.context("decoding JSON list response")?;
         Ok(Page::from_headers(items, &headers))
     }
+
+    /// GET that follows `Link: rel=next` until either `total_limit` items have
+    /// been collected or there are no more pages. Use this when the caller's
+    /// requested limit exceeds Forgejo's per-page cap (50).
+    pub async fn get_all<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        base_query: &[(String, String)],
+        total_limit: usize,
+    ) -> Result<Vec<T>> {
+        let mut out: Vec<T> = Vec::new();
+        let mut current_path: String = path.to_string();
+        let mut current_query: Vec<(String, String)> = base_query.to_vec();
+        // Make sure per-page is set to the API's max so we don't make extra
+        // round-trips.
+        if !current_query.iter().any(|(k, _)| k == "limit") {
+            current_query.push(("limit".into(), "50".into()));
+        } else {
+            for (k, v) in current_query.iter_mut() {
+                if k == "limit" {
+                    *v = "50".to_string();
+                }
+            }
+        }
+
+        loop {
+            let res = self
+                .request(Method::GET, &current_path, &current_query, None)
+                .await?;
+            let res = ensure_success(res).await?;
+            let headers = res.headers().clone();
+            let mut items: Vec<T> = res.json().await.context("decoding JSON list response")?;
+            if items.is_empty() {
+                break;
+            }
+            let need = total_limit.saturating_sub(out.len());
+            if items.len() > need {
+                items.truncate(need);
+            }
+            out.append(&mut items);
+            if out.len() >= total_limit {
+                break;
+            }
+            // Find Link: rel=next.
+            let Some(next) = headers
+                .get(reqwest::header::LINK)
+                .and_then(|l| l.to_str().ok())
+                .map(pagination::parse_link_header)
+                .and_then(|links| {
+                    links
+                        .into_iter()
+                        .find_map(|(url, rel)| (rel == "next").then_some(url))
+                })
+            else {
+                break;
+            };
+            let parsed = Url::parse(&next)?;
+            current_path = parsed.path().to_string();
+            current_query = parsed
+                .query_pairs()
+                .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                .collect();
+        }
+        Ok(out)
+    }
+}
+
+fn is_idempotent(m: &Method) -> bool {
+    matches!(m.as_str(), "GET" | "HEAD" | "OPTIONS" | "PUT" | "DELETE")
+}
+
+async fn backoff(attempt: u32) {
+    let base_ms: u64 = 200;
+    let delay = base_ms * (1u64 << attempt);
+    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
 }
 
 fn build_base_url(hostname: &str, host: &Host) -> Result<Url> {

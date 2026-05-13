@@ -45,6 +45,12 @@ pub struct ListOptions<'a> {
 }
 
 pub async fn list_for_user(client: &Client, opts: ListOptions<'_>) -> Result<Page<Repo>> {
+    if opts.limit > 50 {
+        let items = client
+            .get_all::<Repo>("/api/v1/user/repos", &[], opts.limit as usize)
+            .await?;
+        return Ok(Page::single(items));
+    }
     let limit = opts.limit.clamp(1, 50);
     let page = opts.page.max(1);
     let query: Vec<(String, String)> = vec![
@@ -251,6 +257,44 @@ pub async fn set_topics(client: &Client, owner: &str, name: &str, topics: &[Stri
             Some(&serde_json::json!({ "topics": topics })),
         )
         .await?;
+    res.error_for_status()?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Migrate<'a> {
+    pub clone_addr: &'a str,
+    pub repo_name: &'a str,
+    /// User or org login that will own the migrated repo.
+    pub repo_owner: &'a str,
+    #[serde(default)]
+    pub mirror: bool,
+    #[serde(default)]
+    pub private: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_username: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_password: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_token: Option<&'a str>,
+    /// Service: "git", "github", "gitea", "gitlab", "gogs", "onedev", ...
+    pub service: &'a str,
+    /// For pull-mirror: how often to refresh from the source.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mirror_interval: Option<&'a str>,
+}
+
+pub async fn migrate(client: &Client, body: &Migrate<'_>) -> Result<Repo> {
+    client
+        .json(Method::POST, "/api/v1/repos/migrate", &[], Some(body))
+        .await
+}
+
+pub async fn mirror_sync(client: &Client, owner: &str, name: &str) -> Result<()> {
+    let path = format!("/api/v1/repos/{owner}/{name}/mirror-sync");
+    let res = client.request(Method::POST, &path, &[], None).await?;
     res.error_for_status()?;
     Ok(())
 }

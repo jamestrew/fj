@@ -18,6 +18,19 @@ pub struct Page<T> {
 }
 
 impl<T> Page<T> {
+    /// Wrap a fully-collected list (from `get_all`) in a Page with no
+    /// pagination metadata.
+    pub fn single(items: Vec<T>) -> Self {
+        Self {
+            items,
+            next: None,
+            prev: None,
+            last: None,
+            first: None,
+            total: None,
+        }
+    }
+
     pub fn from_headers(items: Vec<T>, headers: &HeaderMap) -> Self {
         let mut next = None;
         let mut prev = None;

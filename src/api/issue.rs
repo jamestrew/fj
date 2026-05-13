@@ -88,8 +88,6 @@ pub async fn list(
     let path = format!("/api/v1/repos/{owner}/{name}/issues");
     let mut query: Vec<(String, String)> = vec![
         ("state".into(), opts.state.as_str().into()),
-        ("limit".into(), opts.limit.clamp(1, 50).to_string()),
-        ("page".into(), opts.page.max(1).to_string()),
         ("type".into(), "issues".into()),
     ];
     if let Some(l) = opts.labels {
@@ -101,6 +99,14 @@ pub async fn list(
     if let Some(q) = opts.query {
         query.push(("q".into(), q.into()));
     }
+    if opts.limit > 50 {
+        let items = client
+            .get_all::<Issue>(&path, &query, opts.limit as usize)
+            .await?;
+        return Ok(Page::single(items));
+    }
+    query.push(("limit".into(), opts.limit.clamp(1, 50).to_string()));
+    query.push(("page".into(), opts.page.max(1).to_string()));
     client.get_page::<Issue>(&path, &query).await
 }
 

@@ -119,6 +119,15 @@ pub async fn list(
     opts: ListOptions,
 ) -> Result<Page<Pull>> {
     let path = format!("/api/v1/repos/{owner}/{name}/pulls");
+    // When the caller wants more than the API's per-page cap, transparently
+    // follow Link rel=next.
+    if opts.limit > 50 {
+        let query: Vec<(String, String)> = vec![("state".into(), opts.state.as_str().into())];
+        let items = client
+            .get_all::<Pull>(&path, &query, opts.limit as usize)
+            .await?;
+        return Ok(Page::single(items));
+    }
     let query: Vec<(String, String)> = vec![
         ("state".into(), opts.state.as_str().into()),
         ("limit".into(), opts.limit.clamp(1, 50).to_string()),
