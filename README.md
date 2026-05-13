@@ -1,8 +1,13 @@
-# fj
+<p align="center">
+  <img src="assets/logo.png" alt="fj logo" width="128">
+</p>
 
-A command-line tool for [Forgejo](https://forgejo.org) instances, in the spirit of GitHub's `gh`.
+<h1 align="center">fj</h1>
 
-Multi-host from day one. Tokens are stored in your OS keychain.
+<p align="center">
+  A command-line tool for <a href="https://forgejo.org">Forgejo</a>, in the spirit of GitHub's <code>gh</code>.<br>
+  Multi-host from day one. Tokens are stored in your OS keychain.
+</p>
 
 <!--
 TODO: replace the line below with an asciinema embed once the v0.1.0
