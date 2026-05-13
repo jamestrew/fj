@@ -2,7 +2,7 @@
 
 ## Reporting a vulnerability
 
-Please report security issues to **stephen@rasterstate.com** rather than
+Please report security issues to **security@rasterstate.com** rather than
 opening a public issue. Encrypt with the GPG key below if the issue is
 sensitive. Expect a response within 72 hours.
 
