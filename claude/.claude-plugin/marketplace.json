@@ -13,11 +13,15 @@
     {
       "name": "fj",
       "description": "Teach Claude Code to use fj, a CLI for Forgejo and Gitea-compatible instances. Activates when the user mentions fj, Forgejo, Gitea, or any forge-side action (issues, PRs, releases, code search, labels, milestones, webhooks).",
-      "source": "./",
-      "strict": false,
-      "skills": [
-        "./skills/fj"
-      ]
+      "source": {
+        "source": "url",
+        "url": "https://github.com/rasterandstate/fj-claude-plugin.git"
+      },
+      "license": "MIT",
+      "category": "developer-tools",
+      "keywords": ["fj", "forgejo", "gitea", "git", "cli"],
+      "homepage": "https://rasterhub.com/rasterstate/fj",
+      "repository": "https://github.com/rasterandstate/fj-claude-plugin"
     }
   ]
 }
