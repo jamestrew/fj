@@ -12,3 +12,5 @@
 
 For build/test workflow see [`../CONTRIBUTING.md`](../CONTRIBUTING.md).
 For project conventions see [`../CLAUDE.md`](../CLAUDE.md).
+For security policy see [`../SECURITY.md`](../SECURITY.md).
+For release notes see [`../CHANGELOG.md`](../CHANGELOG.md).

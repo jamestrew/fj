@@ -32,15 +32,16 @@ fj api /repos/search -X GET -f q=foo   # raw API escape hatch
 | Group      | Common operations                                                                 |
 | ---------- | --------------------------------------------------------------------------------- |
 | `auth`     | login, status, logout, list, switch, token, refresh, setup-git                    |
-| `repo`     | list, view, clone, create, fork, sync, edit, rename, archive, unarchive, delete, branches, topics, mirror, mirror-sync |
-| `issue`    | list, view, create, edit, close, reopen, comment, develop                         |
-| `pr`       | list, view, create, edit, diff, commits, files, checks, ready, review, status, checkout, merge, close, reopen |
+| `repo`     | list, view, clone, create, fork, sync, edit, rename, archive, unarchive, delete, branches, topics, mirror, mirror-sync, watch, unwatch, star, unstar, starred |
+| `issue`    | list, view, create, edit, close, reopen, comment, edit-comment, delete-comment, develop |
+| `pr`       | list, view, create, edit, diff, commits, files, checks, ready, review, request-review, unrequest-review, status, checkout, merge, close, reopen |
 | `release`  | list, view, create, edit, delete, upload, download                                |
 | `label`    | list, create, edit, delete                                                        |
+| `milestone`| list, view, create, edit, close, reopen, delete, assign                           |
 | `run`      | list, view, rerun, cancel (Forgejo Actions workflow runs)                         |
 | `secret`   | list, set, delete (Actions secrets)                                               |
 | `variable` | list, set, delete (Actions variables)                                             |
-| `search`   | repos, issues, prs, users                                                         |
+| `search`   | repos, issues, prs, users, code                                                   |
 | `browse`   | open the current repo (or a path within it) in your browser                       |
 | `status`   | notifications inbox + `--mark-read`                                               |
 | `org`      | list, view, teams                                                                 |
@@ -60,7 +61,11 @@ fj api /repos/search -X GET -f q=foo   # raw API escape hatch
 
 - `--host <hostname>` (or `FJ_HOST`): pick the host explicitly.
 - `--debug` (or `FJ_DEBUG=1`): log every HTTP request to stderr.
-- `--web` on most list/view subcommands: open the relevant page in your default browser.
+- `--no-pager` (or `FJ_NO_PAGER=1`): skip the pager.
+- `--json-fields foo,bar`: gh-style projection on top of any `--json`
+  output. Dotted paths supported (`--json-fields owner.login,id`).
+- `--web` on most list/view subcommands: open the relevant page in
+  your default browser.
 
 ## Config
 

@@ -78,11 +78,14 @@ a clone.
 
 In `client::request_with_headers`:
 
-- The request is built once and stored as `reqwest::Request`.
+- The request is built once and stored as `reqwest::Request`. Each retry
+  uses `Request::try_clone`.
 - Idempotent methods (GET, HEAD, OPTIONS, PUT, DELETE) get 3 attempts.
-- POST and PATCH get 1 attempt — they're never retried.
+- POST and PATCH get 1 attempt; never retried.
 - Backoff is `200ms * 2^attempt` between retries.
-- On 5xx or transport error, we retry. On any other status, we return.
+- On 5xx or transport error, we retry.
+- On 429 we honor the `Retry-After` header (capped at 30 s) and fall
+  back to exponential backoff if the header is absent or non-numeric.
 
 ## Auto-pagination
 
@@ -126,13 +129,31 @@ pager cleanly.
 
 Only if neither pass triggers do we hand off to clap.
 
+## JSON projection
+
+A global `--json-fields foo,bar` flag works on top of any `--json`
+output. `cli::run` reads it once and stores the parsed list in a
+`OnceLock` in `output::mod.rs`. Every `output::print_json` call routes
+through `json_filter::project` before printing, so individual commands
+need no awareness of the filter.
+
+Supports dotted paths (`owner.login`). Missing fields project to `null`
+rather than failing, matching gh.
+
 ## Test strategy
 
 - **Unit tests** stay inline next to the code they cover. Pure
-  functions only (no I/O).
+  functions only (no I/O), with two exceptions marked `#[ignore]`:
+  `editor_command_uses_visual_first` and
+  `edit_text_with_true_returns_initial` mutate `$EDITOR` / `$VISUAL`,
+  which races with the cargo test harness on macOS. Run them with
+  `cargo test -- --ignored --test-threads=1`.
 - **Integration tests** for HTTP behavior live in
   `src/client/integration_tests.rs` and use a wiremock server.
   Construct test clients via `Client::for_base_url`.
 - **Live E2E** lives in `scripts/e2e-smoke.sh`, gated on `FJ_E2E=1`
   in the pre-push hook. It hits the real Forgejo at `rasterhub.com`
   against `stephen/fj-cli-test`.
+- **Remote CI** at `.forgejo/workflows/ci.yml` runs the same gate
+  (fmt, clippy `-D warnings`, test, release build) on every push and
+  PR. The local hook is no longer the only gate.
