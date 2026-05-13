@@ -15,7 +15,6 @@
       "description": "Teach Claude Code to use fj, a CLI for Forgejo and Gitea-compatible instances. Activates when the user mentions fj, Forgejo, Gitea, or any forge-side action (issues, PRs, releases, code search, labels, milestones, webhooks).",
       "version": "0.1.0",
       "source": "./plugins/fj",
-      "strict": false,
       "author": {
         "name": "Raster & State",
         "email": "hello@rasterstate.com"
