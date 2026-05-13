@@ -74,7 +74,6 @@ pub async fn search(client: &Client, opts: ListOptions<'_>) -> Result<Page<Searc
 
 #[derive(Debug, Deserialize)]
 struct SearchResponse {
-    #[serde(default)]
     data: Vec<SearchHit>,
     #[serde(default)]
     #[allow(dead_code)]
@@ -126,12 +125,7 @@ pub struct EditRepo<'a> {
     pub archived: Option<bool>,
 }
 
-pub async fn edit(
-    client: &Client,
-    owner: &str,
-    name: &str,
-    body: &EditRepo<'_>,
-) -> Result<Repo> {
+pub async fn edit(client: &Client, owner: &str, name: &str, body: &EditRepo<'_>) -> Result<Repo> {
     let path = format!("/api/v1/repos/{owner}/{name}");
     client.json(Method::PATCH, &path, &[], Some(body)).await
 }
@@ -230,11 +224,7 @@ pub struct BranchCommit {
     pub message: String,
 }
 
-pub async fn list_branches(
-    client: &Client,
-    owner: &str,
-    name: &str,
-) -> Result<Vec<Branch>> {
+pub async fn list_branches(client: &Client, owner: &str, name: &str) -> Result<Vec<Branch>> {
     let path = format!("/api/v1/repos/{owner}/{name}/branches");
     client.json(Method::GET, &path, &[], None::<&()>).await
 }
@@ -245,22 +235,13 @@ pub struct Topic {
     pub topics: Vec<String>,
 }
 
-pub async fn list_topics(
-    client: &Client,
-    owner: &str,
-    name: &str,
-) -> Result<Vec<String>> {
+pub async fn list_topics(client: &Client, owner: &str, name: &str) -> Result<Vec<String>> {
     let path = format!("/api/v1/repos/{owner}/{name}/topics");
     let t: Topic = client.json(Method::GET, &path, &[], None::<&()>).await?;
     Ok(t.topics)
 }
 
-pub async fn set_topics(
-    client: &Client,
-    owner: &str,
-    name: &str,
-    topics: &[String],
-) -> Result<()> {
+pub async fn set_topics(client: &Client, owner: &str, name: &str, topics: &[String]) -> Result<()> {
     let path = format!("/api/v1/repos/{owner}/{name}/topics");
     let res = client
         .request(

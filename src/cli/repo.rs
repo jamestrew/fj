@@ -348,7 +348,11 @@ async fn fork(args: ForkArgs, host: Option<&str>) -> Result<()> {
             .get(hostname)
             .map(|h| h.git_protocol.clone())
             .unwrap_or_else(|| "https".into());
-        let url = if proto == "ssh" { r.ssh_url } else { r.clone_url };
+        let url = if proto == "ssh" {
+            r.ssh_url
+        } else {
+            r.clone_url
+        };
         git::clone(&url, None)?;
     }
     Ok(())
@@ -365,7 +369,10 @@ async fn sync(args: SyncArgs, host: Option<&str>) -> Result<()> {
         }
     };
     api::repo::sync_with_upstream(&ctx.client, &ctx.owner, &ctx.name, &branch).await?;
-    println!("✓ Synced {}/{} branch {} with upstream", ctx.owner, ctx.name, branch);
+    println!(
+        "✓ Synced {}/{} branch {} with upstream",
+        ctx.owner, ctx.name, branch
+    );
     Ok(())
 }
 
@@ -420,9 +427,7 @@ async fn delete(args: DeleteArgs, host: Option<&str>) -> Result<()> {
     let (owner, name) = api::split_repo(&args.repo)?;
     let client = Client::connect(host)?;
     if !args.yes {
-        let prompt = format!(
-            "Delete {owner}/{name}? Type the slug to confirm"
-        );
+        let prompt = format!("Delete {owner}/{name}? Type the slug to confirm");
         let answer = editor::prompt_line(&prompt)?;
         if answer != args.repo {
             return Err(anyhow!("aborted: slug did not match"));

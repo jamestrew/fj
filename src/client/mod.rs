@@ -83,6 +83,17 @@ impl Client {
         &self.base
     }
 
+    /// Underlying `reqwest::Client` for code paths that need to bypass our
+    /// JSON-shaped helpers (e.g. multipart uploads for release assets).
+    pub fn http(&self) -> &reqwest::Client {
+        &self.http
+    }
+
+    /// Raw token. Use only when constructing custom request headers.
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
     fn auth_headers(&self) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(

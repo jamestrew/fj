@@ -1,7 +1,13 @@
 pub mod issue;
+pub mod label;
+pub mod notification;
+pub mod org;
 pub mod pull;
+pub mod release;
 pub mod repo;
+pub mod search;
 pub mod user;
+pub mod workflow;
 
 use anyhow::{anyhow, Result};
 

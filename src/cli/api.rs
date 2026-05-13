@@ -234,7 +234,10 @@ async fn collect_paginated(
         // client (which adds auth + headers).
         let parsed = Url::parse(&next_url).context("parsing next-page URL")?;
         current_endpoint = parsed.path().to_string();
-        current_query = parsed.query_pairs().map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
+        current_query = parsed
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
     }
     Ok(Value::Array(all_items))
 }
@@ -279,11 +282,7 @@ fn apply_stage(value: &Value, stage: &str) -> Result<Value> {
             let Some(arr) = target.as_array() else {
                 return Err(anyhow!("not an array; can't index with '{raw_str}'"));
             };
-            let real = if idx < 0 {
-                arr.len() as i64 + idx
-            } else {
-                idx
-            };
+            let real = if idx < 0 { arr.len() as i64 + idx } else { idx };
             let v = arr
                 .get(real as usize)
                 .ok_or_else(|| anyhow!("index {idx} out of range"))?
