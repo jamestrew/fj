@@ -25,14 +25,21 @@ After install, the skill activates automatically when relevant.
 ```
 claude/
 ├── .claude-plugin/
-│   ├── plugin.json         plugin manifest (name, version, keywords)
-│   └── marketplace.json    makes this directory a single-plugin
-│                           marketplace; required for `/plugin install`
+│   └── marketplace.json    marketplace manifest — declares plugins[]
 ├── README.md               this file
-└── skills/
+└── plugins/
     └── fj/
-        └── SKILL.md        the skill body — what Claude reads
+        ├── .claude-plugin/
+        │   └── plugin.json plugin manifest (name, version, keywords)
+        └── skills/
+            └── fj/
+                └── SKILL.md  the skill body — what Claude reads
 ```
+
+The marketplace lives at the root; each plugin lives in `plugins/<name>/`.
+`marketplace.json` references plugins via `"source": "./plugins/<name>"`.
+This is the working pattern used by `anthropics/claude-plugins-official`
+and other shipping marketplaces.
 
 ## Updating
 
