@@ -1,5 +1,6 @@
 pub mod hook;
 pub mod issue;
+pub(crate) mod serde_util;
 pub mod label;
 pub mod notification;
 pub mod org;

@@ -17,7 +17,7 @@ pub struct Pull {
     pub body: String,
     pub state: String,
     pub user: User,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::serde_util::deserialize_null_to_default")]
     pub labels: Vec<Label>,
     pub html_url: String,
     pub head: Branch,

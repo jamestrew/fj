@@ -269,7 +269,13 @@ impl Client {
         let res = self.request(Method::GET, path, query, None).await?;
         let res = ensure_success(res).await?;
         let headers = res.headers().clone();
-        let items: Vec<T> = res.json().await.context("decoding JSON list response")?;
+        let text = res.text().await.context("reading list response body")?;
+        // Forgejo returns `null` for some empty list endpoints. Normalize.
+        let items: Vec<T> = if text.trim().is_empty() || text.trim() == "null" {
+            Vec::new()
+        } else {
+            serde_json::from_str(&text).context("decoding JSON list response")?
+        };
         Ok(Page::from_headers(items, &headers))
     }
 

@@ -69,11 +69,20 @@ pub struct ListArgs {
 pub struct ViewArgs {
     /// `owner/name` slug. Inferred from the git remote when omitted.
     pub repo: Option<String>,
+    /// Alias for the positional repo arg.
+    #[arg(short = 'R', long = "repo")]
+    pub repo_flag: Option<String>,
     #[arg(long)]
     pub json: bool,
     /// Open the repo's web page.
     #[arg(long)]
     pub web: bool,
+}
+
+/// Choose between a positional repo arg and the `-R` flag.
+fn pick_repo<'a>(pos: Option<&'a String>, flag: Option<&'a String>) -> Option<&'a str> {
+    flag.map(|s| s.as_str())
+        .or(pos.map(|s| s.as_str()))
 }
 
 #[derive(Debug, Args)]
@@ -106,6 +115,8 @@ pub struct CreateArgs {
 pub struct ForkArgs {
     /// Source repo `owner/name`. Inferred when omitted.
     pub repo: Option<String>,
+    #[arg(short = 'R', long = "repo")]
+    pub repo_flag: Option<String>,
     /// Place the fork under this organization instead of your user account.
     #[arg(long)]
     pub org: Option<String>,
@@ -120,6 +131,8 @@ pub struct ForkArgs {
 #[derive(Debug, Args)]
 pub struct SyncArgs {
     pub repo: Option<String>,
+    #[arg(short = 'R', long = "repo")]
+    pub repo_flag: Option<String>,
     /// Branch to sync. Defaults to the repo's default branch.
     #[arg(long)]
     pub branch: Option<String>,
@@ -128,6 +141,8 @@ pub struct SyncArgs {
 #[derive(Debug, Args)]
 pub struct EditArgs {
     pub repo: Option<String>,
+    #[arg(short = 'R', long = "repo")]
+    pub repo_flag: Option<String>,
     #[arg(long)]
     pub description: Option<String>,
     #[arg(long)]
@@ -151,6 +166,8 @@ pub struct RenameArgs {
 #[derive(Debug, Args)]
 pub struct ArchiveArgs {
     pub repo: Option<String>,
+    #[arg(short = 'R', long = "repo")]
+    pub repo_flag: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -164,6 +181,8 @@ pub struct DeleteArgs {
 #[derive(Debug, Args)]
 pub struct BranchesArgs {
     pub repo: Option<String>,
+    #[arg(short = 'R', long = "repo")]
+    pub repo_flag: Option<String>,
     #[arg(long)]
     pub json: bool,
 }
@@ -171,6 +190,8 @@ pub struct BranchesArgs {
 #[derive(Debug, Args)]
 pub struct TopicsArgs {
     pub repo: Option<String>,
+    #[arg(short = 'R', long = "repo")]
+    pub repo_flag: Option<String>,
     /// Set the topic list (comma-separated). Omit to just print.
     #[arg(long)]
     pub set: Option<String>,
@@ -210,6 +231,8 @@ pub struct MirrorArgs {
 #[derive(Debug, Args)]
 pub struct MirrorSyncArgs {
     pub repo: Option<String>,
+    #[arg(short = 'R', long = "repo")]
+    pub repo_flag: Option<String>,
 }
 
 pub async fn run(cmd: RepoCmd, host: Option<&str>) -> Result<()> {
@@ -272,7 +295,7 @@ async fn mirror(args: MirrorArgs, host: Option<&str>) -> Result<()> {
 }
 
 async fn mirror_sync(args: MirrorSyncArgs, host: Option<&str>) -> Result<()> {
-    let ctx = resolve_repo(args.repo.as_deref(), host)?;
+    let ctx = resolve_repo(pick_repo(args.repo.as_ref(), args.repo_flag.as_ref()), host)?;
     api::repo::mirror_sync(&ctx.client, &ctx.owner, &ctx.name).await?;
     println!("✓ Triggered mirror sync for {}/{}", ctx.owner, ctx.name);
     Ok(())
@@ -319,7 +342,7 @@ async fn list(args: ListArgs, host: Option<&str>) -> Result<()> {
 }
 
 async fn view(args: ViewArgs, host: Option<&str>) -> Result<()> {
-    let ctx = resolve_repo(args.repo.as_deref(), host)?;
+    let ctx = resolve_repo(pick_repo(args.repo.as_ref(), args.repo_flag.as_ref()), host)?;
     let repo = api::repo::get(&ctx.client, &ctx.owner, &ctx.name).await?;
     if args.web {
         return web::open(&repo.html_url);
@@ -417,7 +440,7 @@ async fn create(args: CreateArgs, host: Option<&str>) -> Result<()> {
 }
 
 async fn fork(args: ForkArgs, host: Option<&str>) -> Result<()> {
-    let ctx = resolve_repo(args.repo.as_deref(), host)?;
+    let ctx = resolve_repo(pick_repo(args.repo.as_ref(), args.repo_flag.as_ref()), host)?;
     let r = api::repo::fork(
         &ctx.client,
         &ctx.owner,
@@ -447,7 +470,7 @@ async fn fork(args: ForkArgs, host: Option<&str>) -> Result<()> {
 }
 
 async fn sync(args: SyncArgs, host: Option<&str>) -> Result<()> {
-    let ctx = resolve_repo(args.repo.as_deref(), host)?;
+    let ctx = resolve_repo(pick_repo(args.repo.as_ref(), args.repo_flag.as_ref()), host)?;
     let branch = match args.branch {
         Some(b) => b,
         None => {
@@ -465,7 +488,7 @@ async fn sync(args: SyncArgs, host: Option<&str>) -> Result<()> {
 }
 
 async fn edit(args: EditArgs, host: Option<&str>) -> Result<()> {
-    let ctx = resolve_repo(args.repo.as_deref(), host)?;
+    let ctx = resolve_repo(pick_repo(args.repo.as_ref(), args.repo_flag.as_ref()), host)?;
     let description = if args.description_editor {
         let existing = api::repo::get(&ctx.client, &ctx.owner, &ctx.name).await?;
         Some(editor::edit_text(
@@ -496,7 +519,7 @@ async fn rename(args: RenameArgs, host: Option<&str>) -> Result<()> {
 }
 
 async fn set_archived(args: ArchiveArgs, host: Option<&str>, archived: bool) -> Result<()> {
-    let ctx = resolve_repo(args.repo.as_deref(), host)?;
+    let ctx = resolve_repo(pick_repo(args.repo.as_ref(), args.repo_flag.as_ref()), host)?;
     let body = api::repo::EditRepo {
         archived: Some(archived),
         ..Default::default()
@@ -527,7 +550,7 @@ async fn delete(args: DeleteArgs, host: Option<&str>) -> Result<()> {
 }
 
 async fn branches(args: BranchesArgs, host: Option<&str>) -> Result<()> {
-    let ctx = resolve_repo(args.repo.as_deref(), host)?;
+    let ctx = resolve_repo(pick_repo(args.repo.as_ref(), args.repo_flag.as_ref()), host)?;
     let bs = api::repo::list_branches(&ctx.client, &ctx.owner, &ctx.name).await?;
     if args.json {
         return output::print_json(&serde_json::to_value(&bs)?);
@@ -559,7 +582,7 @@ async fn branches(args: BranchesArgs, host: Option<&str>) -> Result<()> {
 }
 
 async fn topics(args: TopicsArgs, host: Option<&str>) -> Result<()> {
-    let ctx = resolve_repo(args.repo.as_deref(), host)?;
+    let ctx = resolve_repo(pick_repo(args.repo.as_ref(), args.repo_flag.as_ref()), host)?;
     if let Some(set) = args.set {
         let list: Vec<String> = set
             .split(',')

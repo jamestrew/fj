@@ -16,9 +16,9 @@ pub struct Issue {
     pub body: String,
     pub state: String,
     pub user: User,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::serde_util::deserialize_null_to_default")]
     pub labels: Vec<Label>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::api::serde_util::deserialize_null_to_default")]
     pub assignees: Vec<User>,
     pub html_url: String,
     pub created_at: DateTime<Utc>,
