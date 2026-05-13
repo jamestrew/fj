@@ -6,3 +6,9 @@ Cargo.lock.bak
 .vscode/
 *.swp
 *.swo
+
+# Release build outputs (uploaded to Forgejo releases, never tracked)
+/dist/v*/
+
+# Local Claude / agent state
+.claude/settings.local.json
