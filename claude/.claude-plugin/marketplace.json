@@ -5,12 +5,19 @@
     "email": "hello@rasterstate.com",
     "url": "https://rasterstate.com"
   },
+  "metadata": {
+    "description": "Raster & State plugins for Claude Code.",
+    "version": "0.1.0"
+  },
   "plugins": [
     {
       "name": "fj",
-      "source": ".",
       "description": "Teach Claude Code to use fj, a CLI for Forgejo and Gitea-compatible instances. Activates when the user mentions fj, Forgejo, Gitea, or any forge-side action (issues, PRs, releases, code search, labels, milestones, webhooks).",
-      "keywords": ["fj", "forgejo", "gitea", "git", "cli"]
+      "source": "./",
+      "strict": false,
+      "skills": [
+        "./skills/fj"
+      ]
     }
   ]
 }
