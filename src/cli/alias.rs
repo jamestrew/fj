@@ -53,20 +53,28 @@ pub fn path() -> Result<std::path::PathBuf> {
 }
 
 pub fn load() -> Result<AliasFile> {
-    let p = path()?;
-    if !p.exists() {
-        return Ok(AliasFile::default());
-    }
-    let text = fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?;
-    toml::from_str(&text).with_context(|| format!("parsing {}", p.display()))
+    load_from(&path()?)
 }
 
 pub fn save(a: &AliasFile) -> Result<()> {
-    let p = path()?;
+    save_to(&path()?, a)
+}
+
+/// Load aliases from an explicit path. Returns the default (empty) file when
+/// the path doesn't exist. Used by tests; production callers use `load`.
+pub fn load_from(p: &std::path::Path) -> Result<AliasFile> {
+    if !p.exists() {
+        return Ok(AliasFile::default());
+    }
+    let text = fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?;
+    toml::from_str(&text).with_context(|| format!("parsing {}", p.display()))
+}
+
+pub fn save_to(p: &std::path::Path, a: &AliasFile) -> Result<()> {
     if let Some(parent) = p.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&p, toml::to_string_pretty(a)?)?;
+    fs::write(p, toml::to_string_pretty(a)?)?;
     Ok(())
 }
 
@@ -131,6 +139,7 @@ pub fn expand_argv(argv: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn expand_no_alias_passthrough() {
@@ -141,5 +150,35 @@ mod tests {
     #[test]
     fn expand_empty_argv() {
         assert_eq!(expand_argv(vec!["fj".into()]), vec!["fj".to_string()]);
+    }
+
+    #[test]
+    fn save_then_load_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("aliases.toml");
+        let mut a = AliasFile::default();
+        a.aliases.insert("co".into(), "pr checkout".into());
+        a.aliases.insert("st".into(), "pr status".into());
+        save_to(&path, &a).unwrap();
+        let loaded = load_from(&path).unwrap();
+        assert_eq!(loaded.aliases.len(), 2);
+        assert_eq!(loaded.aliases.get("co"), Some(&"pr checkout".to_string()));
+        assert_eq!(loaded.aliases.get("st"), Some(&"pr status".to_string()));
+    }
+
+    #[test]
+    fn load_missing_file_is_empty() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("does-not-exist.toml");
+        let loaded = load_from(&path).unwrap();
+        assert!(loaded.aliases.is_empty());
+    }
+
+    #[test]
+    fn save_creates_parent_dirs() {
+        let dir = TempDir::new().unwrap();
+        let nested = dir.path().join("a/b/c/aliases.toml");
+        save_to(&nested, &AliasFile::default()).unwrap();
+        assert!(nested.exists());
     }
 }

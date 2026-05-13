@@ -267,6 +267,53 @@ pub async fn submit_review(
         .await
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct ReviewerBody {
+    reviewers: Vec<String>,
+}
+
+/// Request reviews from specific users on a PR. Distinct from
+/// `submit_review`, which is your own approval/changes/comment.
+pub async fn request_reviewers(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    number: u64,
+    reviewers: Vec<String>,
+) -> Result<()> {
+    let path = format!("/api/v1/repos/{owner}/{name}/pulls/{number}/requested_reviewers");
+    let res = client
+        .request(
+            Method::POST,
+            &path,
+            &[],
+            Some(&serde_json::to_value(ReviewerBody { reviewers })?),
+        )
+        .await?;
+    res.error_for_status()?;
+    Ok(())
+}
+
+pub async fn unrequest_reviewers(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    number: u64,
+    reviewers: Vec<String>,
+) -> Result<()> {
+    let path = format!("/api/v1/repos/{owner}/{name}/pulls/{number}/requested_reviewers");
+    let res = client
+        .request(
+            Method::DELETE,
+            &path,
+            &[],
+            Some(&serde_json::to_value(ReviewerBody { reviewers })?),
+        )
+        .await?;
+    res.error_for_status()?;
+    Ok(())
+}
+
 pub async fn list_reviews(
     client: &Client,
     owner: &str,

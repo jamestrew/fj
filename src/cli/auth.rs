@@ -38,6 +38,10 @@ pub enum AuthSub {
 pub struct TokenArgs {
     #[arg(long)]
     pub host: Option<String>,
+    /// Print the token even if stdout is a terminal (default refuses to, to
+    /// avoid accidental shoulder-surfing in shell history).
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Debug, Args)]
@@ -111,10 +115,16 @@ pub async fn run(cmd: AuthCmd) -> Result<()> {
 }
 
 fn token(args: TokenArgs) -> Result<()> {
+    use std::io::IsTerminal;
     let hosts = Hosts::load()?;
     let host = hosts.resolve_host(args.host.as_deref())?.to_string();
     let token = token_store::load_token(&host)?
         .ok_or_else(|| anyhow!("no token stored for {host}; run `fj auth login`"))?;
+    if std::io::stdout().is_terminal() && !args.force {
+        return Err(anyhow!(
+            "refusing to print a plaintext token to a terminal; pipe to a file/command, or pass --force"
+        ));
+    }
     println!("{token}");
     Ok(())
 }
@@ -162,45 +172,88 @@ async fn refresh(args: RefreshArgs) -> Result<()> {
 fn setup_git(args: SetupGitArgs) -> Result<()> {
     let hosts = Hosts::load()?;
     let host = hosts.resolve_host(args.host.as_deref())?.to_string();
+    validate_hostname(&host)?;
     let cfg = hosts
         .hosts
         .get(&host)
         .cloned()
         .ok_or_else(|| anyhow!("host '{host}' not configured"))?;
-    // Use git's credential.helper indirection: fj prints the token on demand.
-    // We register an `https://<host>` scoped helper that invokes
-    // `fj auth git-credential` (a synthetic subcommand exposed via stdin).
-    let helper = format!("!fj auth token --host {host} | sed 's/^/password=/'");
-    let cmd_set_helper = format!("git config --global credential.https://{host}.helper '{helper}'");
-    let cmd_set_user = match cfg.user.as_deref() {
-        Some(u) => format!("git config --global credential.https://{host}.username {u}"),
-        None => String::new(),
-    };
+    if let Some(u) = cfg.user.as_deref() {
+        validate_username(u)?;
+    }
+
+    // The credential helper value is `!`-prefixed, which means git will run it
+    // through sh when the helper is invoked. We've validated the hostname is
+    // shell-safe above (DNS-style only, no metacharacters), so the
+    // interpolation here is safe even inside that sh context.
+    let key = format!("credential.https://{host}.helper");
+    let value = format!("!fj auth token --host {host} | sed 's/^/password=/'");
+
+    let user_key = format!("credential.https://{host}.username");
+    let user_val = cfg.user.as_deref().unwrap_or("");
 
     if args.dry_run {
         println!("# Run these commands to install the fj git credential helper:");
-        println!("{cmd_set_helper}");
-        if !cmd_set_user.is_empty() {
-            println!("{cmd_set_user}");
+        println!("git config --global {key} {value:?}");
+        if !user_val.is_empty() {
+            println!("git config --global {user_key} {user_val:?}");
         }
         return Ok(());
     }
 
-    // Apply.
-    let parts: Vec<String> = vec![cmd_set_helper.clone(), cmd_set_user.clone()]
-        .into_iter()
-        .filter(|s| !s.is_empty())
-        .collect();
-    for c in parts {
-        let status = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(&c)
-            .status()?;
-        if !status.success() {
-            return Err(anyhow!("`{c}` failed with status {status}"));
-        }
+    // Call `git config` directly with separate args — no shell layer between
+    // us and git, so there's nothing to escape.
+    run_git_config(&key, &value)?;
+    if !user_val.is_empty() {
+        run_git_config(&user_key, user_val)?;
     }
     println!("✓ Installed git credential helper for {host}");
+    Ok(())
+}
+
+fn run_git_config(key: &str, value: &str) -> Result<()> {
+    let status = std::process::Command::new("git")
+        .args(["config", "--global", key, value])
+        .status()
+        .context("running `git config`")?;
+    if !status.success() {
+        return Err(anyhow!(
+            "`git config --global {key} ...` failed with status {status}"
+        ));
+    }
+    Ok(())
+}
+
+/// A hostname must look like a DNS name (optionally with a port). This is the
+/// keystone of `setup-git`'s safety: if the host is shell-safe, the
+/// credential-helper interpolation below is too. Reject anything else.
+fn validate_hostname(host: &str) -> Result<()> {
+    if host.is_empty() || host.len() > 253 {
+        return Err(anyhow!("invalid hostname '{host}'"));
+    }
+    let ok = host
+        .chars()
+        .all(|c| matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '-' | ':'));
+    if !ok {
+        return Err(anyhow!(
+            "hostname '{host}' contains characters that are not allowed in a DNS name"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_username(user: &str) -> Result<()> {
+    if user.is_empty() || user.len() > 64 {
+        return Err(anyhow!("invalid username '{user}'"));
+    }
+    let ok = user
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if !ok {
+        return Err(anyhow!(
+            "username '{user}' contains characters that are not allowed in a Forgejo login"
+        ));
+    }
     Ok(())
 }
 
@@ -314,7 +367,13 @@ async fn status(args: StatusArgs) -> Result<()> {
             }
         );
         if args.show_token {
-            if let Some(t) = token_store::load_token(name)? {
+            use std::io::IsTerminal;
+            if std::io::stdout().is_terminal() {
+                println!(
+                    "  Token value: {}",
+                    output::dim("(hidden; pipe to a file or use `fj auth token --force`)")
+                );
+            } else if let Some(t) = token_store::load_token(name)? {
                 println!("  Token value: {t}");
             }
         }
@@ -379,4 +438,39 @@ fn switch(args: SwitchArgs) -> Result<()> {
     hosts.save()?;
     println!("✓ Default host is now {}", args.host);
     Ok(())
+}
+
+#[cfg(test)]
+mod setup_git_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_shell_metacharacters_in_hostname() {
+        assert!(validate_hostname("rasterhub.com; rm -rf /").is_err());
+        assert!(validate_hostname("foo`whoami`").is_err());
+        assert!(validate_hostname("foo $(whoami)").is_err());
+        assert!(validate_hostname("foo|bar").is_err());
+        assert!(validate_hostname("foo&bar").is_err());
+        assert!(validate_hostname("foo\"bar").is_err());
+        assert!(validate_hostname("foo'bar").is_err());
+    }
+
+    #[test]
+    fn accepts_normal_hostnames() {
+        assert!(validate_hostname("rasterhub.com").is_ok());
+        assert!(validate_hostname("git.example.org:2222").is_ok());
+        assert!(validate_hostname("forgejo-1.internal").is_ok());
+    }
+
+    #[test]
+    fn rejects_shell_metacharacters_in_username() {
+        assert!(validate_username("alice; rm").is_err());
+        assert!(validate_username("alice$user").is_err());
+    }
+
+    #[test]
+    fn accepts_normal_usernames() {
+        assert!(validate_username("alice").is_ok());
+        assert!(validate_username("alice.bob_123").is_ok());
+    }
 }

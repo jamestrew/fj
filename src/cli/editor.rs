@@ -114,3 +114,71 @@ pub fn prompt_line(label: &str) -> Result<String> {
     stdin().read_line(&mut buf).context("reading line")?;
     Ok(buf.trim().to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Mutates process-global env so it's serial-only and ignored by default.
+    // Run with `cargo test -- --ignored --test-threads=1`.
+    #[test]
+    #[ignore]
+    fn editor_command_uses_visual_first() {
+        let saved_visual = env::var("VISUAL").ok();
+        let saved_editor = env::var("EDITOR").ok();
+        // SAFETY: tests modifying env are intrinsically racy. The fj test suite
+        // doesn't run them in parallel against editor_command, and we restore
+        // on exit. Acceptable for a hermetic CI environment.
+        unsafe {
+            env::set_var("VISUAL", "code -w");
+            env::set_var("EDITOR", "nano");
+        }
+        assert_eq!(editor_command(), "code -w");
+        unsafe {
+            env::remove_var("VISUAL");
+        }
+        assert_eq!(editor_command(), "nano");
+        unsafe {
+            env::remove_var("EDITOR");
+        }
+        assert_eq!(editor_command(), "vi");
+        unsafe {
+            if let Some(v) = saved_visual {
+                env::set_var("VISUAL", v);
+            }
+            if let Some(v) = saved_editor {
+                env::set_var("EDITOR", v);
+            }
+        }
+    }
+
+    // Marked #[ignore] because spawning a real subprocess from the test
+    // harness occasionally hangs on macOS depending on how cargo wired up
+    // stdin/stdout. Run with `cargo test -- --ignored` to exercise it.
+    #[test]
+    #[ignore]
+    #[cfg(unix)]
+    fn edit_text_with_true_returns_initial() {
+        // `/usr/bin/true` is a no-op command that always exits 0. Using it as
+        // the "editor" means we get the initial contents back unchanged.
+        // We use the absolute path to avoid hangs when test runners have an
+        // odd PATH that resolves `true` to something else.
+        let saved = env::var("EDITOR").ok();
+        unsafe { env::set_var("EDITOR", "/usr/bin/true") };
+        let out = edit_text("FJ_TEST.md", "hello world\n").unwrap();
+        assert_eq!(out, "hello world");
+        unsafe {
+            match saved {
+                Some(v) => env::set_var("EDITOR", v),
+                None => env::remove_var("EDITOR"),
+            }
+        }
+    }
+
+    #[test]
+    fn read_body_passes_string_through() {
+        let r = read_body(Some("hello")).unwrap();
+        assert_eq!(r.as_deref(), Some("hello"));
+        assert!(read_body(None).unwrap().is_none());
+    }
+}

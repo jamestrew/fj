@@ -21,6 +21,20 @@ pub enum SearchSub {
     Prs(QueryArgs),
     /// Search users.
     Users(QueryArgs),
+    /// Search code across visible repos (or a single repo with `-R`).
+    Code(CodeArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct CodeArgs {
+    pub query: String,
+    /// Restrict to one repo. Omit to search everything visible.
+    #[arg(short = 'R', long = "repo")]
+    pub repo: Option<String>,
+    #[arg(short = 'L', long, default_value_t = 20)]
+    pub limit: u32,
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -39,7 +53,49 @@ pub async fn run(cmd: SearchCmd, host: Option<&str>) -> Result<()> {
         SearchSub::Issues(args) => search_issues(&client, args, "issues").await,
         SearchSub::Prs(args) => search_issues(&client, args, "pulls").await,
         SearchSub::Users(args) => search_users(&client, args).await,
+        SearchSub::Code(args) => search_code(&client, args).await,
     }
+}
+
+async fn search_code(client: &Client, args: CodeArgs) -> Result<()> {
+    let hits = match args.repo.as_deref() {
+        Some(slug) => {
+            let (owner, name) = crate::api::split_repo(slug)?;
+            crate::api::search::code_in_repo(client, owner, name, &args.query, args.limit).await?
+        }
+        None => crate::api::search::code(client, &args.query, args.limit).await?,
+    };
+    if args.json {
+        return output::print_json(&serde_json::to_value(&hits)?);
+    }
+    if hits.is_empty() {
+        println!("(no matches)");
+        return Ok(());
+    }
+    for h in hits {
+        println!(
+            "{}  {}",
+            output::bold(&h.path),
+            output::dim(&format!(
+                "{} match{}",
+                h.matches,
+                if h.matches == 1 { "" } else { "es" }
+            )),
+        );
+        let snippet = if h.raw_lines.is_empty() {
+            &h.formatted_lines
+        } else {
+            &h.raw_lines
+        };
+        for line in snippet.lines().take(5) {
+            println!("  {line}");
+        }
+        if !h.html_url.is_empty() {
+            println!("  {}", output::dim(&h.html_url));
+        }
+        println!();
+    }
+    Ok(())
 }
 
 async fn search_repos(client: &Client, args: QueryArgs) -> Result<()> {

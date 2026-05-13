@@ -224,6 +224,18 @@ impl Client {
             match self.http.execute(req).await {
                 Ok(res) => {
                     let status = res.status();
+                    // 429 (rate limit): always honor Retry-After when retryable.
+                    if status == StatusCode::TOO_MANY_REQUESTS && attempt + 1 < retries {
+                        let wait = parse_retry_after(&res).unwrap_or_else(|| {
+                            std::time::Duration::from_millis(200 * (1u64 << attempt))
+                        });
+                        let wait = wait.min(std::time::Duration::from_secs(30));
+                        if debug_enabled() {
+                            eprintln!("← 429 {} (rate-limited, sleeping {:?})", res.url(), wait);
+                        }
+                        tokio::time::sleep(wait).await;
+                        continue;
+                    }
                     if status.is_server_error() && attempt + 1 < retries {
                         if debug_enabled() {
                             eprintln!(
@@ -375,6 +387,16 @@ impl Client {
 
 fn is_idempotent(m: &Method) -> bool {
     matches!(m.as_str(), "GET" | "HEAD" | "OPTIONS" | "PUT" | "DELETE")
+}
+
+/// Parse a Retry-After response header. Supports both delta-seconds (the
+/// common case) and HTTP-date (which we don't bother parsing — we just bail
+/// out and let the caller use exponential backoff instead).
+fn parse_retry_after(res: &Response) -> Option<std::time::Duration> {
+    let v = res.headers().get(reqwest::header::RETRY_AFTER)?;
+    let s = v.to_str().ok()?.trim();
+    let secs: u64 = s.parse().ok()?;
+    Some(std::time::Duration::from_secs(secs))
 }
 
 async fn backoff(attempt: u32) {

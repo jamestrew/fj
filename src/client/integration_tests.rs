@@ -195,6 +195,34 @@ async fn get_all_respects_total_limit() {
 }
 
 #[tokio::test]
+async fn honors_retry_after_on_429() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/rate"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("Retry-After", "0")
+                .set_body_json(json!({"message": "slow down"})),
+        )
+        .up_to_n_times(2)
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/rate"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let res: serde_json::Value = c
+        .json(Method::GET, "/api/v1/rate", &[], None::<&()>)
+        .await
+        .expect("eventually ok");
+    assert_eq!(res["ok"], true);
+}
+
+#[tokio::test]
 async fn header_value_rejects_bad_token() {
     let server = MockServer::start().await;
     let base = Url::parse(&format!("{}/api/v1/", server.uri())).unwrap();

@@ -11,6 +11,7 @@ pub mod hook;
 pub mod issue;
 pub mod key;
 pub mod label;
+pub mod milestone;
 pub mod org;
 pub mod pr;
 pub mod protect;
@@ -48,6 +49,11 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_pager: bool,
 
+    /// Comma-separated list of fields to keep in `--json` output (gh-style
+    /// projection). Supports dotted paths like `owner.login`.
+    #[arg(long, global = true, value_name = "FIELDS")]
+    pub json_fields: Option<String>,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -66,6 +72,8 @@ pub enum Command {
     Release(release::ReleaseCmd),
     /// Work with labels.
     Label(label::LabelCmd),
+    /// Work with milestones.
+    Milestone(milestone::MilestoneCmd),
     /// Manage workflow runs (Forgejo Actions).
     Run(workflow::RunCmd),
     /// Manage Actions secrets.
@@ -120,6 +128,7 @@ pub struct CompletionArgs {
 
 pub async fn run(cli: Cli) -> Result<()> {
     crate::client::set_debug(cli.debug);
+    crate::output::set_json_fields(cli.json_fields.as_deref());
     // Page commands whose output can run long. Pass `cli.no_pager` through
     // explicitly so we don't have to mutate the process environment to opt
     // out, which would be a process-wide side effect and an unsafe set_var.
@@ -131,6 +140,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         | Command::Search(_)
         | Command::Status(_)
         | Command::Label(_)
+        | Command::Milestone(_)
         | Command::Run(_)
         | Command::Api(_) => crate::output::pager::maybe_start(cli.no_pager),
         _ => None,
@@ -159,6 +169,7 @@ async fn dispatch(command: Command, host: Option<&str>) -> Result<()> {
         Command::Pr(cmd) => pr::run(cmd, host).await,
         Command::Release(cmd) => release::run(cmd, host).await,
         Command::Label(cmd) => label::run(cmd, host).await,
+        Command::Milestone(cmd) => milestone::run(cmd, host).await,
         Command::Run(cmd) => workflow::run(cmd, host).await,
         Command::Secret(cmd) => workflow::run_secret(cmd, host).await,
         Command::Variable(cmd) => workflow::run_variable(cmd, host).await,

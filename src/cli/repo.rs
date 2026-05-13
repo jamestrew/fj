@@ -49,6 +49,31 @@ pub enum RepoSub {
     Mirror(MirrorArgs),
     /// Manually trigger a sync on a pull-mirror.
     MirrorSync(MirrorSyncArgs),
+    /// Watch a repo (subscribe to its notifications).
+    Watch(SimpleRepoArgs),
+    /// Stop watching a repo.
+    Unwatch(SimpleRepoArgs),
+    /// Star a repo.
+    Star(SimpleRepoArgs),
+    /// Unstar a repo.
+    Unstar(SimpleRepoArgs),
+    /// List your starred repos.
+    Starred(StarredArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct SimpleRepoArgs {
+    pub repo: Option<String>,
+    #[arg(short = 'R', long = "repo")]
+    pub repo_flag: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct StarredArgs {
+    #[arg(short = 'L', long, default_value_t = 30)]
+    pub limit: u32,
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -251,7 +276,64 @@ pub async fn run(cmd: RepoCmd, host: Option<&str>) -> Result<()> {
         RepoSub::Topics(args) => topics(args, host).await,
         RepoSub::Mirror(args) => mirror(args, host).await,
         RepoSub::MirrorSync(args) => mirror_sync(args, host).await,
+        RepoSub::Watch(args) => watch(args, host, true).await,
+        RepoSub::Unwatch(args) => watch(args, host, false).await,
+        RepoSub::Star(args) => star(args, host, true).await,
+        RepoSub::Unstar(args) => star(args, host, false).await,
+        RepoSub::Starred(args) => starred(args, host).await,
     }
+}
+
+async fn watch(args: SimpleRepoArgs, host: Option<&str>, on: bool) -> Result<()> {
+    let ctx = resolve_repo(pick_repo(args.repo.as_ref(), args.repo_flag.as_ref()), host)?;
+    if on {
+        api::repo::watch(&ctx.client, &ctx.owner, &ctx.name).await?;
+        println!("✓ Watching {}/{}", ctx.owner, ctx.name);
+    } else {
+        api::repo::unwatch(&ctx.client, &ctx.owner, &ctx.name).await?;
+        println!("✓ Unwatched {}/{}", ctx.owner, ctx.name);
+    }
+    Ok(())
+}
+
+async fn star(args: SimpleRepoArgs, host: Option<&str>, on: bool) -> Result<()> {
+    let ctx = resolve_repo(pick_repo(args.repo.as_ref(), args.repo_flag.as_ref()), host)?;
+    if on {
+        api::repo::star(&ctx.client, &ctx.owner, &ctx.name).await?;
+        println!("★ Starred {}/{}", ctx.owner, ctx.name);
+    } else {
+        api::repo::unstar(&ctx.client, &ctx.owner, &ctx.name).await?;
+        println!("☆ Unstarred {}/{}", ctx.owner, ctx.name);
+    }
+    Ok(())
+}
+
+async fn starred(args: StarredArgs, host: Option<&str>) -> Result<()> {
+    let client = Client::connect(host)?;
+    let repos = api::repo::list_starred(&client, args.limit).await?;
+    if args.json {
+        return output::print_json(&serde_json::to_value(&repos)?);
+    }
+    if repos.is_empty() {
+        println!("(no starred repos)");
+        return Ok(());
+    }
+    let rows: Vec<Vec<String>> = repos
+        .iter()
+        .map(|r| {
+            let vis = if r.private { "private" } else { "public" };
+            vec![
+                r.full_name.clone(),
+                truncate(&r.description, 60),
+                vis.into(),
+            ]
+        })
+        .collect();
+    print!(
+        "{}",
+        output::render_table(&["NAME", "DESCRIPTION", "VIS"], &rows)
+    );
+    Ok(())
 }
 
 async fn mirror(args: MirrorArgs, host: Option<&str>) -> Result<()> {

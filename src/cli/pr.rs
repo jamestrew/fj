@@ -42,6 +42,10 @@ pub enum PrSub {
     Ready(SimpleArgs),
     /// Submit a review (approve / request changes / comment).
     Review(ReviewArgs),
+    /// Request reviews from specific users.
+    RequestReview(ReviewerArgs),
+    /// Remove pending reviewer requests.
+    UnrequestReview(ReviewerArgs),
     /// Cross-repo dashboard of your PRs: created, review-requested, mentions.
     Status(StatusArgs),
     /// Check out a pull request locally.
@@ -187,6 +191,16 @@ pub struct ReviewArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct ReviewerArgs {
+    #[command(flatten)]
+    pub r: RepoFlag,
+    pub number: u64,
+    /// Reviewer usernames (repeatable, comma-separated also allowed).
+    #[arg(value_name = "USERNAME")]
+    pub reviewers: Vec<String>,
+}
+
+#[derive(Debug, Args)]
 pub struct StatusArgs {
     #[arg(short = 'L', long, default_value_t = 20)]
     pub limit: u32,
@@ -237,6 +251,8 @@ pub async fn run(cmd: PrCmd, host: Option<&str>) -> Result<()> {
         PrSub::Checks(args) => checks(args, host).await,
         PrSub::Ready(args) => ready(args, host).await,
         PrSub::Review(args) => review(args, host).await,
+        PrSub::RequestReview(args) => request_reviewers(args, host).await,
+        PrSub::UnrequestReview(args) => unrequest_reviewers(args, host).await,
         PrSub::Status(args) => status(args, host).await,
         PrSub::Checkout(args) => checkout(args, host).await,
         PrSub::Merge(args) => merge(args, host).await,
@@ -572,6 +588,64 @@ async fn review(args: ReviewArgs, host: Option<&str>) -> Result<()> {
     println!("✓ Submitted {} review on #{}", r.state, args.number);
     println!("{}", r.html_url);
     Ok(())
+}
+
+async fn request_reviewers(args: ReviewerArgs, host: Option<&str>) -> Result<()> {
+    let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
+    let reviewers = expand_reviewers(args.reviewers)?;
+    api::pull::request_reviewers(
+        &ctx.client,
+        &ctx.owner,
+        &ctx.name,
+        args.number,
+        reviewers.clone(),
+    )
+    .await?;
+    println!(
+        "✓ Requested review from {} on #{}",
+        reviewers.join(", "),
+        args.number
+    );
+    Ok(())
+}
+
+async fn unrequest_reviewers(args: ReviewerArgs, host: Option<&str>) -> Result<()> {
+    let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
+    let reviewers = expand_reviewers(args.reviewers)?;
+    api::pull::unrequest_reviewers(
+        &ctx.client,
+        &ctx.owner,
+        &ctx.name,
+        args.number,
+        reviewers.clone(),
+    )
+    .await?;
+    println!(
+        "✓ Removed review request from {} on #{}",
+        reviewers.join(", "),
+        args.number
+    );
+    Ok(())
+}
+
+/// Accept reviewers as either repeated args or comma-separated within one
+/// arg, since both forms come up naturally in shell invocations.
+fn expand_reviewers(raw: Vec<String>) -> Result<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    for r in raw {
+        for piece in r.split(',') {
+            let p = piece.trim();
+            if !p.is_empty() {
+                out.push(p.to_string());
+            }
+        }
+    }
+    if out.is_empty() {
+        return Err(anyhow!(
+            "no reviewers provided (pass one or more usernames)"
+        ));
+    }
+    Ok(out)
 }
 
 async fn status(args: StatusArgs, host: Option<&str>) -> Result<()> {

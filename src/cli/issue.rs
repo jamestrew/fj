@@ -33,6 +33,10 @@ pub enum IssueSub {
     Reopen(NumberOnly),
     /// Add a comment.
     Comment(CommentArgs),
+    /// Edit a comment by id (comment ids come from `issue view --comments`).
+    EditComment(EditCommentArgs),
+    /// Delete a comment by id.
+    DeleteComment(DeleteCommentArgs),
     /// Create a branch tied to the issue.
     Develop(DevelopArgs),
 }
@@ -138,6 +142,26 @@ pub struct CommentArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct EditCommentArgs {
+    #[command(flatten)]
+    pub r: RepoFlag,
+    /// Comment id (NOT the issue number). Find it via `issue view --comments --json`.
+    pub comment_id: u64,
+    /// New body. Use `-` to read from stdin. Omit to open `$EDITOR`.
+    #[arg(short = 'b', long)]
+    pub body: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct DeleteCommentArgs {
+    #[command(flatten)]
+    pub r: RepoFlag,
+    pub comment_id: u64,
+    #[arg(short = 'y', long)]
+    pub yes: bool,
+}
+
+#[derive(Debug, Args)]
 pub struct DevelopArgs {
     #[command(flatten)]
     pub r: RepoFlag,
@@ -162,8 +186,46 @@ pub async fn run(cmd: IssueCmd, host: Option<&str>) -> Result<()> {
         IssueSub::Close(args) => set_state(args, host, "closed").await,
         IssueSub::Reopen(args) => set_state(args, host, "open").await,
         IssueSub::Comment(args) => comment(args, host).await,
+        IssueSub::EditComment(args) => edit_comment(args, host).await,
+        IssueSub::DeleteComment(args) => delete_comment(args, host).await,
         IssueSub::Develop(args) => develop(args, host).await,
     }
+}
+
+async fn edit_comment(args: EditCommentArgs, host: Option<&str>) -> Result<()> {
+    let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
+    let body = match args.body.as_deref() {
+        Some("-") => {
+            let mut buf = String::new();
+            std::io::stdin().read_to_string(&mut buf)?;
+            buf
+        }
+        Some(s) => s.to_string(),
+        None => editor::edit_text("COMMENT_BODY.md", "")?,
+    };
+    if body.trim().is_empty() {
+        return Err(anyhow!("comment body is empty"));
+    }
+    let c = api::issue::edit_comment(&ctx.client, &ctx.owner, &ctx.name, args.comment_id, &body)
+        .await?;
+    println!("✓ Updated comment #{} ({})", c.id, c.html_url);
+    Ok(())
+}
+
+async fn delete_comment(args: DeleteCommentArgs, host: Option<&str>) -> Result<()> {
+    let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
+    if !args.yes {
+        let ans = editor::prompt_line(&format!(
+            "Delete comment {}? Type the id to confirm",
+            args.comment_id
+        ))?;
+        if ans != args.comment_id.to_string() {
+            return Err(anyhow!("aborted"));
+        }
+    }
+    api::issue::delete_comment(&ctx.client, &ctx.owner, &ctx.name, args.comment_id).await?;
+    println!("✓ Deleted comment {}", args.comment_id);
+    Ok(())
 }
 
 async fn list(args: ListArgs, host: Option<&str>) -> Result<()> {

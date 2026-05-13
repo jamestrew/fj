@@ -1,8 +1,29 @@
+pub mod json_filter;
 pub mod pager;
 
 use std::io::IsTerminal;
+use std::sync::OnceLock;
 
 use anyhow::Result;
+
+static JSON_FIELDS: OnceLock<Vec<String>> = OnceLock::new();
+
+/// Set the global `--json-fields` selector. Called once at startup from
+/// `cli::run`. After this, every `print_json` call routes through the filter.
+pub fn set_json_fields(spec: Option<&str>) {
+    let parsed: Vec<String> = match spec {
+        Some(s) => json_filter::parse_fields(s),
+        None => Vec::new(),
+    };
+    let _ = JSON_FIELDS.set(parsed);
+}
+
+fn json_fields() -> Option<&'static [String]> {
+    JSON_FIELDS
+        .get()
+        .filter(|v| !v.is_empty())
+        .map(|v| v.as_slice())
+}
 use owo_colors::{OwoColorize, Style};
 use tabled::settings::{object::Columns, Alignment, Modify, Padding, Style as TStyle};
 use tabled::{builder::Builder, Table};
@@ -40,9 +61,14 @@ pub fn render_table(headers: &[&str], rows: &[Vec<String>]) -> String {
     table.to_string()
 }
 
-/// Print JSON pretty-formatted to stdout.
+/// Print JSON pretty-formatted to stdout. If `--json-fields foo,bar` was
+/// set globally, the value is projected through that filter first.
 pub fn print_json(value: &serde_json::Value) -> Result<()> {
-    let text = serde_json::to_string_pretty(value)?;
+    let projected = match json_fields() {
+        Some(fs) => json_filter::project(value, fs),
+        None => value.clone(),
+    };
+    let text = serde_json::to_string_pretty(&projected)?;
     println!("{text}");
     Ok(())
 }

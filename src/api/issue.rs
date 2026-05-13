@@ -198,3 +198,36 @@ pub async fn list_comments(
     let path = format!("/api/v1/repos/{owner}/{name}/issues/{number}/comments");
     client.json(Method::GET, &path, &[], None::<&()>).await
 }
+
+#[derive(Debug, Clone, Serialize)]
+struct EditComment<'a> {
+    body: &'a str,
+}
+
+/// Edit an issue or PR comment by its id (NOT by the issue number).
+/// Comment ids come from `list_comments` or from the URL of a comment
+/// (e.g. `#issuecomment-7`).
+pub async fn edit_comment(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    comment_id: u64,
+    body: &str,
+) -> Result<Comment> {
+    let path = format!("/api/v1/repos/{owner}/{name}/issues/comments/{comment_id}");
+    client
+        .json(Method::PATCH, &path, &[], Some(&EditComment { body }))
+        .await
+}
+
+pub async fn delete_comment(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    comment_id: u64,
+) -> Result<()> {
+    let path = format!("/api/v1/repos/{owner}/{name}/issues/comments/{comment_id}");
+    let res = client.request(Method::DELETE, &path, &[], None).await?;
+    res.error_for_status()?;
+    Ok(())
+}

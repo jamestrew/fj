@@ -85,6 +85,7 @@ const KNOWN_SUBCOMMANDS: &[&str] = &[
     "pr",
     "release",
     "label",
+    "milestone",
     "run",
     "secret",
     "variable",

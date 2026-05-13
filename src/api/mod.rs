@@ -1,6 +1,7 @@
 pub mod hook;
 pub mod issue;
 pub mod label;
+pub mod milestone;
 pub mod notification;
 pub mod org;
 pub mod protect;
