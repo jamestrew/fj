@@ -81,8 +81,7 @@ pub struct ViewArgs {
 
 /// Choose between a positional repo arg and the `-R` flag.
 fn pick_repo<'a>(pos: Option<&'a String>, flag: Option<&'a String>) -> Option<&'a str> {
-    flag.map(|s| s.as_str())
-        .or(pos.map(|s| s.as_str()))
+    flag.map(|s| s.as_str()).or(pos.map(|s| s.as_str()))
 }
 
 #[derive(Debug, Args)]

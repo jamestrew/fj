@@ -1,6 +1,5 @@
 pub mod hook;
 pub mod issue;
-pub(crate) mod serde_util;
 pub mod label;
 pub mod notification;
 pub mod org;
@@ -9,6 +8,7 @@ pub mod pull;
 pub mod release;
 pub mod repo;
 pub mod search;
+pub(crate) mod serde_util;
 pub mod user;
 pub mod workflow;
 
