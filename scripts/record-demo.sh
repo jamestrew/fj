@@ -1,51 +1,68 @@
 #!/usr/bin/env bash
-# Record an asciinema demo of fj. The result is a .cast file you can:
-#   - Upload to asciinema.org via `asciinema upload dist/demo.cast`
-#   - Embed as a static SVG/GIF via `agg` (https://github.com/asciinema/agg)
-#   - Link from README.md
+# Record the fj README demo from scripts/demo.tape using vhs.
 #
-# Requires: asciinema, fj (installed and authenticated), `jq` for nicer output.
+# vhs is from Charmbracelet (https://github.com/charmbracelet/vhs):
+# a declarative tape format that drives a headless terminal and writes
+# GIF/MP4/WebM directly. Reproducible, scriptable, no manual typing.
+#
+# Pre-flight:
+#   * `brew install vhs` (or download from the vhs releases page)
+#   * `cargo build --release && ln -sf $PWD/target/release/fj ~/.local/bin/fj`
+#   * `fj auth login --host rasterhub.com`
+#
+# Outputs:
+#   assets/demo.gif    embed in README
+#   assets/demo.mp4    optional, higher-fidelity for social cards
 #
 # Usage:
-#   ./scripts/record-demo.sh           # records dist/demo.cast
-#   ./scripts/record-demo.sh foo.cast  # records to foo.cast
-#
-# The session below is deliberately short (~30 seconds) and covers what
-# someone reading the README in their first 10 seconds cares about.
+#   ./scripts/record-demo.sh                 # records both outputs
+#   ./scripts/record-demo.sh --gif-only      # GIF only (faster)
 
 set -euo pipefail
 
-OUT="${1:-dist/demo.cast}"
-mkdir -p "$(dirname "$OUT")"
+cd "$(git rev-parse --show-toplevel)"
 
-if ! command -v asciinema >/dev/null 2>&1; then
-  cat >&2 <<EOF
-asciinema not found.
-  macOS:  brew install asciinema
-  Linux:  pipx install asciinema
-EOF
+GIF_ONLY=0
+case "${1:-}" in
+  --gif-only) GIF_ONLY=1 ;;
+  "") ;;
+  --help|-h)
+    sed -n '/^# /{s/^# \{0,1\}//;p;}' "$0" | head -25
+    exit 0
+    ;;
+  *)
+    echo "unknown arg: $1 (try --help)" >&2
+    exit 2
+    ;;
+esac
+
+require() {
+  local cmd=$1 hint=$2
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "missing $cmd. $hint" >&2
+    exit 1
+  fi
+}
+
+require vhs "Install with: brew install vhs"
+require fj  "Build with: cargo build --release && ln -sf \$PWD/target/release/fj ~/.local/bin/fj"
+
+if ! fj auth status >/dev/null 2>&1; then
+  echo "fj is not authenticated. Run: fj auth login --host rasterhub.com" >&2
   exit 1
 fi
 
-if ! command -v fj >/dev/null 2>&1; then
-  echo "fj not found on PATH; build it first (cargo build --release)" >&2
-  exit 1
+mkdir -p assets
+
+if [ "$GIF_ONLY" = 1 ]; then
+  TAPE=$(mktemp -t fj-demo.XXXXXX.tape)
+  trap 'rm -f "$TAPE"' EXIT
+  grep -v '^Output assets/demo\.mp4' scripts/demo.tape > "$TAPE"
+  vhs "$TAPE"
+else
+  vhs scripts/demo.tape
 fi
 
-# Drive a representative session through asciinema.
-# Idle pauses keep readability up; trim them in post if you want a snappier
-# embedded GIF.
-asciinema rec \
-  --overwrite \
-  --idle-time-limit 2 \
-  --title "fj: a CLI for Forgejo" \
-  --command "bash $(dirname "$0")/_demo-session.sh" \
-  "$OUT"
-
 echo ""
-echo "✓ Recorded $OUT"
-echo ""
-echo "Next:"
-echo "  asciinema play $OUT          # preview"
-echo "  asciinema upload $OUT        # publish (returns a URL)"
-echo "  agg $OUT $OUT.gif            # render to GIF"
+echo "✓ wrote assets/demo.gif"
+[ "$GIF_ONLY" = 1 ] || echo "✓ wrote assets/demo.mp4"
