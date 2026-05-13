@@ -7,11 +7,13 @@ pub mod context;
 pub mod editor;
 pub mod extension;
 pub mod gist;
+pub mod hook;
 pub mod issue;
 pub mod key;
 pub mod label;
 pub mod org;
 pub mod pr;
+pub mod protect;
 pub mod release;
 pub mod repo;
 pub mod search;
@@ -37,6 +39,10 @@ pub struct Cli {
     /// `fj auth login` is used).
     #[arg(long, global = true, env = "FJ_HOST")]
     pub host: Option<String>,
+
+    /// Log every HTTP request fj makes to stderr.
+    #[arg(long, global = true, env = "FJ_DEBUG")]
+    pub debug: bool,
 
     #[command(subcommand)]
     pub command: Command,
@@ -78,6 +84,10 @@ pub enum Command {
     Alias(alias::AliasCmd),
     /// Manage local fj configuration (editor, pager, browser, etc.).
     Config(config::ConfigCmd),
+    /// Manage branch protection rules.
+    Protect(protect::ProtectCmd),
+    /// Manage repository webhooks.
+    Hook(hook::HookCmd),
     /// Run a discovered `fj-<name>` plugin from PATH.
     Extension(extension::ExtensionCmd),
     /// Forgejo gists.
@@ -86,6 +96,15 @@ pub enum Command {
     Api(api::ApiArgs),
     /// Print shell completions to stdout.
     Completion(CompletionArgs),
+    /// Generate man pages for `fj` and all subcommands into a directory.
+    Man(ManArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub struct ManArgs {
+    /// Output directory. Defaults to `./man`.
+    #[arg(short = 'o', long, default_value = "./man")]
+    pub output_dir: std::path::PathBuf,
 }
 
 #[derive(Debug, clap::Args)]
@@ -96,10 +115,7 @@ pub struct CompletionArgs {
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
-    // Alias resolution: if the first positional looks like a user-defined
-    // alias and the user typed `fj <alias>`, expand it before dispatching.
-    // clap already parsed; aliases are handled inside the dedicated `alias`
-    // subcommand or by re-execing ourselves. See cli::alias::dispatch.
+    crate::client::set_debug(cli.debug);
     match cli.command {
         Command::Auth(cmd) => auth::run(cmd).await,
         Command::Repo(cmd) => repo::run(cmd, cli.host.as_deref()).await,
@@ -118,6 +134,8 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::GpgKey(cmd) => key::run_gpg(cmd, cli.host.as_deref()).await,
         Command::Alias(cmd) => alias::run(cmd).await,
         Command::Config(cmd) => config::run(cmd).await,
+        Command::Protect(cmd) => protect::run(cmd, cli.host.as_deref()).await,
+        Command::Hook(cmd) => hook::run(cmd, cli.host.as_deref()).await,
         Command::Extension(cmd) => extension::run(cmd).await,
         Command::Gist(cmd) => gist::run(cmd, cli.host.as_deref()).await,
         Command::Api(args) => api::run(args, cli.host.as_deref()).await,
@@ -127,5 +145,28 @@ pub async fn run(cli: Cli) -> Result<()> {
             clap_complete::generate(args.shell, &mut cmd, "fj", &mut std::io::stdout());
             Ok(())
         }
+        Command::Man(args) => generate_man_pages(args).await,
     }
+}
+
+async fn generate_man_pages(args: ManArgs) -> Result<()> {
+    use clap::CommandFactory;
+    let dir = &args.output_dir;
+    std::fs::create_dir_all(dir)?;
+    let cmd = Cli::command();
+    write_man_for(&cmd, "fj", dir)?;
+    for sub in cmd.get_subcommands() {
+        let name = format!("fj-{}", sub.get_name());
+        write_man_for(sub, &name, dir)?;
+    }
+    println!("✓ Wrote man pages to {}", dir.display());
+    Ok(())
+}
+
+fn write_man_for(cmd: &clap::Command, file_name: &str, dir: &std::path::Path) -> Result<()> {
+    let path = dir.join(format!("{file_name}.1"));
+    let mut out = std::fs::File::create(&path)?;
+    let man = clap_mangen::Man::new(cmd.clone());
+    man.render(&mut out)?;
+    Ok(())
 }

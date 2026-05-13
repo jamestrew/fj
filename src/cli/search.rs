@@ -13,9 +13,13 @@ pub struct SearchCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum SearchSub {
+    /// Search repositories.
     Repos(QueryArgs),
+    /// Search issues across all repos you can see.
     Issues(QueryArgs),
+    /// Search pull requests across all repos you can see.
     Prs(QueryArgs),
+    /// Search users.
     Users(QueryArgs),
 }
 

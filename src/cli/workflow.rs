@@ -144,8 +144,11 @@ pub struct SecretCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum SecretSub {
+    /// List secret names (values are write-only).
     List(SecretListArgs),
+    /// Set or replace a secret.
     Set(SecretSetArgs),
+    /// Delete a secret.
     Delete(SecretDeleteArgs),
 }
 
@@ -239,8 +242,11 @@ pub struct VariableCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum VariableSub {
+    /// List Actions variables.
     List(SecretListArgs),
+    /// Set or replace a variable.
     Set(SecretSetArgs),
+    /// Delete a variable.
     Delete(SecretDeleteArgs),
 }
 

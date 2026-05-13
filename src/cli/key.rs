@@ -34,8 +34,11 @@ pub struct SshKeyCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum SshKeySub {
+    /// List SSH keys on your account.
     List(ListArgs),
+    /// Add an SSH key.
     Add(AddArgs),
+    /// Remove an SSH key by id.
     Delete(DeleteArgs),
 }
 
@@ -47,8 +50,11 @@ pub struct GpgKeyCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum GpgKeySub {
+    /// List GPG keys on your account.
     List(ListArgs),
+    /// Add a GPG key.
     Add(GpgAddArgs),
+    /// Remove a GPG key by id.
     Delete(DeleteArgs),
 }
 

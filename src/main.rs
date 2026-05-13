@@ -98,6 +98,8 @@ const KNOWN_SUBCOMMANDS: &[&str] = &[
     "config",
     "extension",
     "gist",
+    "protect",
+    "hook",
     "api",
     "completion",
     "help",

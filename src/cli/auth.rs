@@ -26,6 +26,39 @@ pub enum AuthSub {
     List,
     /// Set the default host for commands that omit `--host`.
     Switch(SwitchArgs),
+    /// Print the stored token for a host (for scripting).
+    Token(TokenArgs),
+    /// Re-verify the stored token. Replaces it if a new one is given.
+    Refresh(RefreshArgs),
+    /// Install a git credential helper that uses fj's stored token.
+    SetupGit(SetupGitArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct TokenArgs {
+    #[arg(long)]
+    pub host: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct RefreshArgs {
+    #[arg(long)]
+    pub host: Option<String>,
+    /// Replace the stored token. If omitted, fj just re-verifies the existing one.
+    #[arg(long)]
+    pub token: Option<String>,
+    /// Read replacement token from stdin.
+    #[arg(long, conflicts_with = "token")]
+    pub with_token: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct SetupGitArgs {
+    #[arg(long)]
+    pub host: Option<String>,
+    /// Print the recommended git config commands without applying them.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Args)]
@@ -71,7 +104,104 @@ pub async fn run(cmd: AuthCmd) -> Result<()> {
         AuthSub::Logout(args) => logout(args),
         AuthSub::List => list(),
         AuthSub::Switch(args) => switch(args),
+        AuthSub::Token(args) => token(args),
+        AuthSub::Refresh(args) => refresh(args).await,
+        AuthSub::SetupGit(args) => setup_git(args),
     }
+}
+
+fn token(args: TokenArgs) -> Result<()> {
+    let hosts = Hosts::load()?;
+    let host = hosts.resolve_host(args.host.as_deref())?.to_string();
+    let token = token_store::load_token(&host)?
+        .ok_or_else(|| anyhow!("no token stored for {host}; run `fj auth login`"))?;
+    println!("{token}");
+    Ok(())
+}
+
+async fn refresh(args: RefreshArgs) -> Result<()> {
+    let hosts = Hosts::load()?;
+    let host = hosts.resolve_host(args.host.as_deref())?.to_string();
+    let cfg = hosts
+        .hosts
+        .get(&host)
+        .cloned()
+        .ok_or_else(|| anyhow!("host '{host}' not configured"))?;
+
+    let new_token = if let Some(t) = args.token {
+        Some(t)
+    } else if args.with_token {
+        use std::io::Read;
+        let mut buf = String::new();
+        std::io::stdin().read_to_string(&mut buf)?;
+        Some(buf.trim().to_string())
+    } else {
+        None
+    };
+
+    let token = match &new_token {
+        Some(t) => t.clone(),
+        None => token_store::load_token(&host)?
+            .ok_or_else(|| anyhow!("no token stored; pass --token to set one"))?,
+    };
+
+    let probe = build_probe_client(&host, &cfg, &token)?;
+    let me = api::user::current(&probe)
+        .await
+        .context("verifying token against /api/v1/user")?;
+
+    if new_token.is_some() {
+        token_store::store_token(&host, &token)?;
+        println!("✓ Replaced token for {host} (verified as {})", me.login);
+    } else {
+        println!("✓ Token for {host} is still valid (user: {})", me.login);
+    }
+    Ok(())
+}
+
+fn setup_git(args: SetupGitArgs) -> Result<()> {
+    let hosts = Hosts::load()?;
+    let host = hosts.resolve_host(args.host.as_deref())?.to_string();
+    let cfg = hosts
+        .hosts
+        .get(&host)
+        .cloned()
+        .ok_or_else(|| anyhow!("host '{host}' not configured"))?;
+    // Use git's credential.helper indirection: fj prints the token on demand.
+    // We register an `https://<host>` scoped helper that invokes
+    // `fj auth git-credential` (a synthetic subcommand exposed via stdin).
+    let helper = format!("!fj auth token --host {host} | sed 's/^/password=/'");
+    let cmd_set_helper = format!("git config --global credential.https://{host}.helper '{helper}'");
+    let cmd_set_user = match cfg.user.as_deref() {
+        Some(u) => format!("git config --global credential.https://{host}.username {u}"),
+        None => String::new(),
+    };
+
+    if args.dry_run {
+        println!("# Run these commands to install the fj git credential helper:");
+        println!("{cmd_set_helper}");
+        if !cmd_set_user.is_empty() {
+            println!("{cmd_set_user}");
+        }
+        return Ok(());
+    }
+
+    // Apply.
+    let parts: Vec<String> = vec![cmd_set_helper.clone(), cmd_set_user.clone()]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect();
+    for c in parts {
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&c)
+            .status()?;
+        if !status.success() {
+            return Err(anyhow!("`{c}` failed with status {status}"));
+        }
+    }
+    println!("✓ Installed git credential helper for {host}");
+    Ok(())
 }
 
 async fn login(args: LoginArgs) -> Result<()> {

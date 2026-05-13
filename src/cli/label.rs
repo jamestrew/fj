@@ -13,9 +13,13 @@ pub struct LabelCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum LabelSub {
+    /// List labels in a repo.
     List(ListArgs),
+    /// Create a new label.
     Create(CreateArgs),
+    /// Edit a label's name, color, or description.
     Edit(EditArgs),
+    /// Delete a label.
     Delete(DeleteArgs),
 }
 

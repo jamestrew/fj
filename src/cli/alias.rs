@@ -24,7 +24,7 @@ pub struct AliasCmd {
 pub enum AliasSub {
     /// List configured aliases.
     List,
-    /// Set an alias: `fj alias set co "pr checkout"`.
+    /// Set an alias (e.g. `fj alias set co "pr checkout"`).
     Set(SetArgs),
     /// Delete an alias.
     Delete(DeleteArgs),

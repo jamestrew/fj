@@ -1,7 +1,19 @@
 pub mod error;
 pub mod pagination;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+static DEBUG: AtomicBool = AtomicBool::new(false);
+
+/// Toggle request logging at runtime. Set by `--debug` / `FJ_DEBUG`.
+pub fn set_debug(on: bool) {
+    DEBUG.store(on, Ordering::Relaxed);
+}
+
+fn debug_enabled() -> bool {
+    DEBUG.load(Ordering::Relaxed)
+}
 
 use anyhow::{anyhow, Context, Result};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
@@ -150,11 +162,37 @@ impl Client {
         for (k, v) in extra.iter() {
             headers.insert(k.clone(), v.clone());
         }
-        let mut req = self.http.request(method, url).headers(headers).query(query);
+        let mut req = self
+            .http
+            .request(method.clone(), url.clone())
+            .headers(headers)
+            .query(query);
         if let Some(body) = body {
             req = req.json(body);
         }
+        if debug_enabled() {
+            let q = if query.is_empty() {
+                String::new()
+            } else {
+                let pairs: Vec<String> = query.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                format!("?{}", pairs.join("&"))
+            };
+            eprintln!("→ {method} {url}{q}");
+            if let Some(b) = body {
+                if let Ok(text) = serde_json::to_string(b) {
+                    let preview = if text.len() > 200 {
+                        format!("{}…", &text[..200])
+                    } else {
+                        text
+                    };
+                    eprintln!("  body: {preview}");
+                }
+            }
+        }
         let res = req.send().await.context("sending HTTP request")?;
+        if debug_enabled() {
+            eprintln!("← {} {}", res.status(), res.url());
+        }
         Ok(res)
     }
 
