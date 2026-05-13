@@ -9,12 +9,18 @@
   Multi-host from day one. Tokens are stored in your OS keychain.
 </p>
 
+<p align="center">
+  <img src="assets/demo.gif" alt="fj demo" width="800">
+</p>
+
 <!--
-TODO: replace the line below with an asciinema embed once the v0.1.0
-release is tagged. Run `./scripts/record-demo.sh` then
-`asciinema upload dist/demo.cast` and paste the returned URL.
+The GIF above is generated from scripts/demo.tape via charmbracelet/vhs.
+To refresh it after a feature change:
+  brew install vhs
+  ./scripts/record-demo.sh
+  git commit -am 'docs: refresh demo recording'
 -->
-<!-- [![asciicast](https://asciinema.org/a/REPLACE.svg)](https://asciinema.org/a/REPLACE) -->
+
 
 ## Install
 
