@@ -1,3 +1,5 @@
+pub mod pager;
+
 use std::io::IsTerminal;
 
 use anyhow::Result;

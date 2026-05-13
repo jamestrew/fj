@@ -447,6 +447,7 @@ dependencies = [
  "indicatif",
  "is-terminal",
  "keyring",
+ "libc",
  "owo-colors",
  "reqwest",
  "serde",

@@ -44,6 +44,10 @@ pub struct Cli {
     #[arg(long, global = true, env = "FJ_DEBUG")]
     pub debug: bool,
 
+    /// Skip piping long output through `$FJ_PAGER` / `$PAGER` (default: less).
+    #[arg(long, global = true)]
+    pub no_pager: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -116,6 +120,27 @@ pub struct CompletionArgs {
 
 pub async fn run(cli: Cli) -> Result<()> {
     crate::client::set_debug(cli.debug);
+    if cli.no_pager {
+        // SAFETY: setting an env var is safe; child processes inherit it.
+        unsafe { std::env::set_var("FJ_NO_PAGER", "1") };
+    }
+    // Page commands whose output can run long: any list, view, diff, or
+    // commits. Each call site re-enters this helper if it wants pager support.
+    // We start it conditionally here too so most `--help` invocations stay
+    // unpaged.
+    let _pager = match &cli.command {
+        Command::Repo(_)
+        | Command::Issue(_)
+        | Command::Pr(_)
+        | Command::Release(_)
+        | Command::Search(_)
+        | Command::Status(_)
+        | Command::Label(_)
+        | Command::Run(_)
+        | Command::Api(_) => crate::output::pager::maybe_start(),
+        _ => None,
+    };
+
     match cli.command {
         Command::Auth(cmd) => auth::run(cmd).await,
         Command::Repo(cmd) => repo::run(cmd, cli.host.as_deref()).await,

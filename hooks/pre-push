@@ -2,6 +2,10 @@
 # fj pre-push hook — local CI gate.
 # Runs fmt-check, clippy, tests, and a release build. With FJ_E2E=1 also
 # runs the live-API smoke suite against the currently signed-in host.
+#
+# This script is invoked by git push with the list of refs being pushed on
+# stdin. We close stdin ourselves and run every step with stdin redirected
+# from /dev/null so cargo / tests can't accidentally block waiting for input.
 
 set -euo pipefail
 
@@ -13,25 +17,40 @@ if [[ "${FJ_SKIP_PREPUSH:-0}" = "1" ]]; then
   exit 0
 fi
 
+# Drain whatever git fed us on stdin so we don't deadlock if a child inherits
+# our stdin and blocks. Then close it for the rest of the hook.
+cat >/dev/null || true
+exec 0</dev/null
+
+# Compact output even when stderr is a TTY (the hook usually isn't run
+# interactively).
+export CARGO_TERM_COLOR=auto
+export CARGO_TERM_PROGRESS_WHEN=never
+
 step() {
-  printf '\n\033[1;34m== %s ==\033[0m\n' "$*"
+  printf '\n\033[1;34m== %s ==\033[0m\n' "$*" >&2
+}
+
+run() {
+  # Run with stdin closed and stdout/stderr passed through.
+  "$@" </dev/null
 }
 
 step "cargo fmt --check"
-cargo fmt --all -- --check
+run cargo fmt --all -- --check
 
 step "cargo clippy (deny warnings)"
-cargo clippy --all-targets --all-features -- -D warnings
+run cargo clippy --all-targets --all-features -- -D warnings
 
 step "cargo test"
-cargo test --all --locked
+run cargo test --all --locked --no-fail-fast
 
 step "cargo build --release"
-cargo build --release --locked
+run cargo build --release --locked
 
 if [[ "${FJ_E2E:-0}" = "1" ]]; then
   step "E2E smoke (live API)"
-  ./scripts/e2e-smoke.sh
+  run ./scripts/e2e-smoke.sh
 fi
 
-printf '\n\033[1;32m✓ pre-push checks passed\033[0m\n'
+printf '\n\033[1;32m✓ pre-push checks passed\033[0m\n' >&2
