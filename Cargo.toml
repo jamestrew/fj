@@ -1,0 +1,47 @@
+[package]
+name = "fj"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Command-line tool for Forgejo, in the spirit of gh"
+authors = ["Stephen Way <stephen@rasterstate.com>"]
+license = "MIT"
+repository = "https://rasterhub.com/rasterstate/fj"
+readme = "README.md"
+
+[[bin]]
+name = "fj"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+thiserror = "2"
+clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
+clap_complete = "4.5"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "process", "io-util", "io-std", "signal"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "gzip", "brotli"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+directories = "5"
+keyring = { version = "3", features = ["apple-native", "linux-native", "windows-native"] }
+url = "2"
+chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
+tabled = { version = "0.16", features = ["ansi"] }
+owo-colors = { version = "4", features = ["supports-colors"] }
+supports-color = "3"
+indicatif = "0.17"
+dialoguer = { version = "0.11", default-features = false, features = ["password"] }
+is-terminal = "0.4"
+textwrap = "0.16"
+futures-util = "0.3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+opt-level = 3
+
+[profile.dist]
+inherits = "release"
+lto = "fat"
