@@ -1,4 +1,6 @@
 pub mod error;
+#[cfg(test)]
+mod integration_tests;
 pub mod pagination;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -85,6 +87,25 @@ impl Client {
         Self::new(resolve(host_flag)?)
     }
 
+    /// Construct a client pointing at an arbitrary base URL. Used for tests
+    /// against a local mock server. `base_url` must end with `/`.
+    #[allow(dead_code)]
+    pub fn for_base_url(base_url: Url, token: String) -> Result<Self> {
+        let host = base_url.host_str().map(str::to_string).unwrap_or_default();
+        let http = reqwest::Client::builder()
+            .user_agent(default_user_agent())
+            .connect_timeout(Duration::from_secs(15))
+            .timeout(Duration::from_secs(60))
+            .build()
+            .context("building HTTP client")?;
+        Ok(Self {
+            http,
+            host,
+            base: base_url,
+            token,
+        })
+    }
+
     #[allow(dead_code)]
     pub fn host(&self) -> &str {
         &self.host
@@ -106,19 +127,22 @@ impl Client {
         &self.token
     }
 
-    fn auth_headers(&self) -> HeaderMap {
+    fn auth_headers(&self) -> Result<HeaderMap> {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("token {}", self.token))
-                .expect("token contains invalid header chars"),
-        );
+        let value = HeaderValue::from_str(&format!("token {}", self.token)).map_err(|_| {
+            anyhow!(
+                "stored token for host '{}' contains characters that can't appear in an HTTP header. Re-run `fj auth login --host {}` with a clean token.",
+                self.host,
+                self.host
+            )
+        })?;
+        headers.insert(AUTHORIZATION, value);
         headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
         headers.insert(
             USER_AGENT,
             HeaderValue::from_static(default_user_agent_static()),
         );
-        headers
+        Ok(headers)
     }
 
     /// Build an absolute URL for an API path. Accepts any of: a full URL
@@ -149,6 +173,10 @@ impl Client {
     }
 
     /// Like `request` but merges `extra` headers in (they override defaults).
+    ///
+    /// The request is constructed once and cloned per retry attempt via
+    /// `reqwest::Request::try_clone`, which avoids re-allocating headers and
+    /// re-parsing the URL on each attempt.
     pub async fn request_with_headers(
         &self,
         method: Method,
@@ -158,42 +186,42 @@ impl Client {
         extra: &HeaderMap,
     ) -> Result<Response> {
         let url = self.url(path)?;
-        let mut headers = self.auth_headers();
+        let mut headers = self.auth_headers()?;
         for (k, v) in extra.iter() {
             headers.insert(k.clone(), v.clone());
         }
+
         if debug_enabled() {
-            let q = if query.is_empty() {
-                String::new()
-            } else {
-                let pairs: Vec<String> = query.iter().map(|(k, v)| format!("{k}={v}")).collect();
-                format!("?{}", pairs.join("&"))
-            };
-            eprintln!("→ {method} {url}{q}");
-            if let Some(b) = body {
-                if let Ok(text) = serde_json::to_string(b) {
-                    let preview = if text.len() > 200 {
-                        format!("{}…", &text[..200])
-                    } else {
-                        text
-                    };
-                    eprintln!("  body: {preview}");
-                }
-            }
+            log_request(&method, &url, query, body);
         }
 
         let retries = if is_idempotent(&method) { 3 } else { 1 };
+
+        // Build the request once. `Request::try_clone` (used per retry below)
+        // succeeds for any request whose body is `None`, `Bytes`, or `Text`.
+        // We only ever set a JSON body, which lives in memory as bytes, so the
+        // clone is always successful.
+        let mut builder = self
+            .http
+            .request(method.clone(), url.clone())
+            .headers(headers)
+            .query(query);
+        if let Some(body) = body {
+            builder = builder.json(body);
+        }
+        let prepared = builder.build().context("building request")?;
+
         let mut last_err: Option<anyhow::Error> = None;
         for attempt in 0..retries {
-            let mut req = self
-                .http
-                .request(method.clone(), url.clone())
-                .headers(headers.clone())
-                .query(query);
-            if let Some(body) = body {
-                req = req.json(body);
-            }
-            match req.send().await {
+            let req = match prepared.try_clone() {
+                Some(c) => c,
+                None => {
+                    return Err(anyhow!(
+                        "internal: request body could not be cloned for retry"
+                    ));
+                }
+            };
+            match self.http.execute(req).await {
                 Ok(res) => {
                     let status = res.status();
                     if status.is_server_error() && attempt + 1 < retries {
@@ -353,6 +381,34 @@ async fn backoff(attempt: u32) {
     let base_ms: u64 = 200;
     let delay = base_ms * (1u64 << attempt);
     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+}
+
+/// Emit a `--debug` log line for an outgoing request. Pulled out of the hot
+/// path so the formatting code is gated behind the cold `debug_enabled` check.
+#[cold]
+fn log_request(
+    method: &Method,
+    url: &Url,
+    query: &[(String, String)],
+    body: Option<&serde_json::Value>,
+) {
+    let q = if query.is_empty() {
+        String::new()
+    } else {
+        let pairs: Vec<String> = query.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        format!("?{}", pairs.join("&"))
+    };
+    eprintln!("→ {method} {url}{q}");
+    if let Some(b) = body {
+        if let Ok(text) = serde_json::to_string(b) {
+            let preview = if text.len() > 200 {
+                format!("{}…", &text[..200])
+            } else {
+                text
+            };
+            eprintln!("  body: {preview}");
+        }
+    }
 }
 
 fn build_base_url(hostname: &str, host: &Host) -> Result<Url> {

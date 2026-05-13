@@ -44,9 +44,9 @@ impl Drop for PagerGuard {
 /// failed.
 ///
 /// The returned guard must outlive all `println!`/`print!` calls produced by
-/// the current command.
-pub fn maybe_start() -> Option<PagerGuard> {
-    if std::env::var_os("FJ_NO_PAGER").is_some() {
+/// the current command. Pass `force_disabled=true` to honor `--no-pager`.
+pub fn maybe_start(force_disabled: bool) -> Option<PagerGuard> {
+    if force_disabled || std::env::var_os("FJ_NO_PAGER").is_some() {
         return None;
     }
     if !std::io::stdout().is_terminal() {

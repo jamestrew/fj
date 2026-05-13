@@ -21,7 +21,7 @@ pub mod status;
 pub mod web;
 pub mod workflow;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 /// `fj` — command-line tool for Forgejo.
@@ -120,14 +120,9 @@ pub struct CompletionArgs {
 
 pub async fn run(cli: Cli) -> Result<()> {
     crate::client::set_debug(cli.debug);
-    if cli.no_pager {
-        // SAFETY: setting an env var is safe; child processes inherit it.
-        unsafe { std::env::set_var("FJ_NO_PAGER", "1") };
-    }
-    // Page commands whose output can run long: any list, view, diff, or
-    // commits. Each call site re-enters this helper if it wants pager support.
-    // We start it conditionally here too so most `--help` invocations stay
-    // unpaged.
+    // Page commands whose output can run long. Pass `cli.no_pager` through
+    // explicitly so we don't have to mutate the process environment to opt
+    // out, which would be a process-wide side effect and an unsafe set_var.
     let _pager = match &cli.command {
         Command::Repo(_)
         | Command::Issue(_)
@@ -137,33 +132,49 @@ pub async fn run(cli: Cli) -> Result<()> {
         | Command::Status(_)
         | Command::Label(_)
         | Command::Run(_)
-        | Command::Api(_) => crate::output::pager::maybe_start(),
+        | Command::Api(_) => crate::output::pager::maybe_start(cli.no_pager),
         _ => None,
     };
 
-    match cli.command {
+    // Run the command, racing it against Ctrl+C. On SIGINT we return an error
+    // and let `_pager` drop naturally — its Drop impl restores stdout and
+    // waits on the pager child, leaving the terminal in a clean state.
+    let cli_host = cli.host.clone();
+    let cmd_future = dispatch(cli.command, cli_host.as_deref());
+    tokio::select! {
+        biased;
+        sig = tokio::signal::ctrl_c() => {
+            sig.context("installing SIGINT handler")?;
+            Err(anyhow::anyhow!("interrupted"))
+        }
+        res = cmd_future => res,
+    }
+}
+
+async fn dispatch(command: Command, host: Option<&str>) -> Result<()> {
+    match command {
         Command::Auth(cmd) => auth::run(cmd).await,
-        Command::Repo(cmd) => repo::run(cmd, cli.host.as_deref()).await,
-        Command::Issue(cmd) => issue::run(cmd, cli.host.as_deref()).await,
-        Command::Pr(cmd) => pr::run(cmd, cli.host.as_deref()).await,
-        Command::Release(cmd) => release::run(cmd, cli.host.as_deref()).await,
-        Command::Label(cmd) => label::run(cmd, cli.host.as_deref()).await,
-        Command::Run(cmd) => workflow::run(cmd, cli.host.as_deref()).await,
-        Command::Secret(cmd) => workflow::run_secret(cmd, cli.host.as_deref()).await,
-        Command::Variable(cmd) => workflow::run_variable(cmd, cli.host.as_deref()).await,
-        Command::Search(cmd) => search::run(cmd, cli.host.as_deref()).await,
-        Command::Browse(args) => browse::run(args, cli.host.as_deref()).await,
-        Command::Status(args) => status::run(args, cli.host.as_deref()).await,
-        Command::Org(cmd) => org::run(cmd, cli.host.as_deref()).await,
-        Command::SshKey(cmd) => key::run_ssh(cmd, cli.host.as_deref()).await,
-        Command::GpgKey(cmd) => key::run_gpg(cmd, cli.host.as_deref()).await,
+        Command::Repo(cmd) => repo::run(cmd, host).await,
+        Command::Issue(cmd) => issue::run(cmd, host).await,
+        Command::Pr(cmd) => pr::run(cmd, host).await,
+        Command::Release(cmd) => release::run(cmd, host).await,
+        Command::Label(cmd) => label::run(cmd, host).await,
+        Command::Run(cmd) => workflow::run(cmd, host).await,
+        Command::Secret(cmd) => workflow::run_secret(cmd, host).await,
+        Command::Variable(cmd) => workflow::run_variable(cmd, host).await,
+        Command::Search(cmd) => search::run(cmd, host).await,
+        Command::Browse(args) => browse::run(args, host).await,
+        Command::Status(args) => status::run(args, host).await,
+        Command::Org(cmd) => org::run(cmd, host).await,
+        Command::SshKey(cmd) => key::run_ssh(cmd, host).await,
+        Command::GpgKey(cmd) => key::run_gpg(cmd, host).await,
         Command::Alias(cmd) => alias::run(cmd).await,
         Command::Config(cmd) => config::run(cmd).await,
-        Command::Protect(cmd) => protect::run(cmd, cli.host.as_deref()).await,
-        Command::Hook(cmd) => hook::run(cmd, cli.host.as_deref()).await,
+        Command::Protect(cmd) => protect::run(cmd, host).await,
+        Command::Hook(cmd) => hook::run(cmd, host).await,
         Command::Extension(cmd) => extension::run(cmd).await,
-        Command::Gist(cmd) => gist::run(cmd, cli.host.as_deref()).await,
-        Command::Api(args) => api::run(args, cli.host.as_deref()).await,
+        Command::Gist(cmd) => gist::run(cmd, host).await,
+        Command::Api(args) => api::run(args, host).await,
         Command::Completion(args) => {
             use clap::CommandFactory;
             let mut cmd = Cli::command();
