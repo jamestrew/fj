@@ -10,16 +10,12 @@ issues, cut a release, request a review, etc.) on a non-GitHub host.
 
 ## Install
 
-This directory is itself a complete Claude Code plugin. Two ways to
-install:
+This directory is both a Claude Code plugin AND a single-plugin
+marketplace. Add the marketplace once, then install:
 
-```sh
-# From a local clone of the upstream fj repo:
-/plugin install /path/to/fj/claude
-
-# From the canonical mirror repo (preferred for users who aren't
-# already cloning fj for development):
-/plugin install rasterandstate/fj-claude-plugin
+```text
+/plugin marketplace add rasterandstate/fj-claude-plugin
+/plugin install fj@rasterandstate
 ```
 
 After install, the skill activates automatically when relevant.
@@ -29,11 +25,13 @@ After install, the skill activates automatically when relevant.
 ```
 claude/
 ├── .claude-plugin/
-│   └── plugin.json       plugin manifest (name, version, keywords)
-├── README.md             this file
+│   ├── plugin.json         plugin manifest (name, version, keywords)
+│   └── marketplace.json    makes this directory a single-plugin
+│                           marketplace; required for `/plugin install`
+├── README.md               this file
 └── skills/
     └── fj/
-        └── SKILL.md      the skill body — what Claude reads
+        └── SKILL.md        the skill body — what Claude reads
 ```
 
 ## Updating

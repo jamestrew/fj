@@ -151,8 +151,9 @@ cargo build --release            # ~4 MB stripped binary at target/release/fj
 plugin so AI agents and developers using Claude Code can drive fj
 directly from natural-language requests.
 
-```sh
-/plugin install rasterandstate/fj-claude-plugin
+```text
+/plugin marketplace add rasterandstate/fj-claude-plugin
+/plugin install fj@rasterandstate
 ```
 
 The source of truth for the plugin lives in [`claude/`](claude/) inside
