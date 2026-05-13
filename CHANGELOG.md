@@ -6,6 +6,25 @@ All notable changes will be recorded here. The format follows
 
 ## [Unreleased]
 
+### Added (distribution + open-source ready)
+
+- `LICENSE` (MIT) at the repo root. Cargo.toml had always declared MIT;
+  the file was just missing.
+- `.forgejo/workflows/release.yml`: on `v*` tags, builds for
+  `darwin-aarch64`, `darwin-x86_64`, `linux-x86_64`; uploads tarballs,
+  `SHA256SUMS`, and a pre-rendered `fj.rb` to the Forgejo release.
+- Homebrew formula template at `dist/homebrew/fj.rb.tmpl` and
+  `scripts/render-homebrew-formula.sh` to fill SHA256s post-release.
+  Publishes into the existing `rasterandstate/homebrew-tap`.
+- `.forgejo/issue_template/{bug,feature,api-gap}.md` and
+  `.forgejo/pull_request_template.md` to keep triage cheap.
+- `scripts/record-demo.sh` + `scripts/_demo-session.sh` to record an
+  asciinema demo; README has a placeholder embed for the v0.1.0 cast.
+- `docs/compatibility.md`: tested Forgejo versions, caveats for older
+  Gitea, and Forgejo-only endpoints.
+- One-shot version probe during `fj auth login` that warns when the
+  server reports a pre-7.x version (with tests for the parser).
+
 ### Added (agent-focused Forgejo gaps)
 
 - `fj issue edit-comment` / `delete-comment`. Lets an agent (or you)

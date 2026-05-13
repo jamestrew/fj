@@ -1,0 +1,193 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: darwin-aarch64
+            runs-on: macos
+            target: aarch64-apple-darwin
+          - name: darwin-x86_64
+            runs-on: macos
+            target: x86_64-apple-darwin
+          - name: linux-x86_64
+            runs-on: docker
+            container: rust:1.95-bookworm
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.runs-on }}
+    container: ${{ matrix.container }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: install rust target
+        run: |
+          rustup target add ${{ matrix.target }} || true
+
+      - name: cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: build
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: package
+        run: |
+          mkdir -p dist
+          BIN=target/${{ matrix.target }}/release/fj
+          test -x "$BIN" || (echo "binary missing"; exit 1)
+          STAGE=fj-${{ github.ref_name }}-${{ matrix.name }}
+          mkdir -p "$STAGE"
+          cp "$BIN" "$STAGE/"
+          cp README.md LICENSE CHANGELOG.md "$STAGE/"
+          tar czf "dist/$STAGE.tar.gz" "$STAGE"
+          (cd dist && shasum -a 256 "$STAGE.tar.gz" > "$STAGE.tar.gz.sha256")
+
+      - name: upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: fj-${{ matrix.name }}
+          path: dist/*
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: docker
+    container: alpine:3.20
+    steps:
+      - name: install tools
+        run: apk add --no-cache curl jq coreutils bash
+
+      - name: fetch artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: combined SHA256SUMS
+        run: |
+          cd dist
+          ls -la
+          # Concatenate per-artifact sha256 files into a single SHA256SUMS.
+          cat *.sha256 | sort > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: create or update release
+        env:
+          FORGEJO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          API: ${{ github.server_url }}/api/v1
+        run: |
+          set -euo pipefail
+
+          # Look up the release by tag (Forgejo auto-creates one on tag push,
+          # but the API call above may run first); create if missing.
+          RELEASE_JSON=$(curl -sf \
+            -H "Authorization: token $FORGEJO_TOKEN" \
+            "$API/repos/$REPO/releases/tags/$TAG" || echo "")
+
+          if [ -z "$RELEASE_JSON" ]; then
+            RELEASE_JSON=$(curl -sf \
+              -X POST \
+              -H "Authorization: token $FORGEJO_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{\"tag_name\":\"$TAG\",\"name\":\"$TAG\",\"draft\":false,\"prerelease\":false}" \
+              "$API/repos/$REPO/releases")
+          fi
+
+          RELEASE_ID=$(echo "$RELEASE_JSON" | jq -r .id)
+          echo "Release id: $RELEASE_ID"
+
+          cd dist
+          for f in fj-*.tar.gz SHA256SUMS; do
+            [ -f "$f" ] || continue
+            echo "Uploading $f"
+            curl -sf \
+              -X POST \
+              -H "Authorization: token $FORGEJO_TOKEN" \
+              -F "attachment=@$f" \
+              "$API/repos/$REPO/releases/$RELEASE_ID/assets?name=$f"
+          done
+
+      - name: render homebrew formula
+        env:
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          HOST: ${{ github.server_url }}
+        run: |
+          set -euo pipefail
+          VERSION=${TAG#v}
+          ARM_SHA=$(awk '/darwin-aarch64\.tar\.gz$/{print $1}' dist/SHA256SUMS)
+          X64_SHA=$(awk '/darwin-x86_64\.tar\.gz$/{print $1}' dist/SHA256SUMS)
+          LIN_SHA=$(awk '/linux-x86_64\.tar\.gz$/{print $1}' dist/SHA256SUMS)
+          BASE="$HOST/$REPO/releases/download/$TAG"
+          mkdir -p homebrew-out
+          cat > homebrew-out/fj.rb <<RUBY
+          class Fj < Formula
+            desc "Command-line tool for Forgejo, in the spirit of gh"
+            homepage "$HOST/$REPO"
+            version "$VERSION"
+            license "MIT"
+
+            on_macos do
+              on_arm do
+                url "$BASE/fj-$TAG-darwin-aarch64.tar.gz"
+                sha256 "$ARM_SHA"
+              end
+              on_intel do
+                url "$BASE/fj-$TAG-darwin-x86_64.tar.gz"
+                sha256 "$X64_SHA"
+              end
+            end
+
+            on_linux do
+              url "$BASE/fj-$TAG-linux-x86_64.tar.gz"
+              sha256 "$LIN_SHA"
+            end
+
+            def install
+              cd "fj-$TAG-#{if OS.mac? then (Hardware::CPU.arm? ? "darwin-aarch64" : "darwin-x86_64") else "linux-x86_64" end}"
+              bin.install "fj"
+            end
+
+            test do
+              assert_match "fj #{version}", shell_output("#{bin}/fj --version")
+            end
+          end
+          RUBY
+          echo "Rendered formula:"
+          cat homebrew-out/fj.rb
+
+      - name: upload rendered formula as release asset
+        env:
+          FORGEJO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          API: ${{ github.server_url }}/api/v1
+        run: |
+          set -euo pipefail
+          RELEASE_ID=$(curl -sf \
+            -H "Authorization: token $FORGEJO_TOKEN" \
+            "$API/repos/$REPO/releases/tags/$TAG" | jq -r .id)
+          curl -sf \
+            -X POST \
+            -H "Authorization: token $FORGEJO_TOKEN" \
+            -F "attachment=@homebrew-out/fj.rb" \
+            "$API/repos/$REPO/releases/$RELEASE_ID/assets?name=fj.rb"

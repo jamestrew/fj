@@ -4,9 +4,21 @@ A command-line tool for [Forgejo](https://forgejo.org) instances, in the spirit 
 
 Multi-host from day one. Tokens are stored in your OS keychain.
 
+<!--
+TODO: replace the line below with an asciinema embed once the v0.1.0
+release is tagged. Run `./scripts/record-demo.sh` then
+`asciinema upload dist/demo.cast` and paste the returned URL.
+-->
+<!-- [![asciicast](https://asciinema.org/a/REPLACE.svg)](https://asciinema.org/a/REPLACE) -->
+
 ## Install
 
 ```sh
+# Homebrew (macOS + Linux):
+brew tap rasterandstate/tap
+brew install fj
+
+# From source:
 cargo install --path .
 # or
 cargo build --release && cp target/release/fj ~/.local/bin/fj

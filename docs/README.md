@@ -5,6 +5,8 @@
 - [`jq.md`](jq.md) — the `fj api --jq` syntax. Dot paths, brackets,
   negative indices, pipes.
 - [`gh-to-fj.md`](gh-to-fj.md) — command-by-command mapping from gh.
+- [`compatibility.md`](compatibility.md) — Forgejo version matrix and
+  known caveats on older Gitea.
 - [`faq.md`](faq.md) — common questions about tokens, hosts, debug,
   scripting, plugins.
 - [`troubleshooting.md`](troubleshooting.md) — keychain prompts, hangs,

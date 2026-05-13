@@ -1,0 +1,42 @@
+class Fj < Formula
+  desc "Command-line tool for Forgejo, in the spirit of gh"
+  homepage "https://rasterhub.com/rasterstate/fj"
+  version "@@VERSION@@"
+  license "MIT"
+
+  on_macos do
+    on_arm do
+      url "https://rasterhub.com/rasterstate/fj/releases/download/v@@VERSION@@/fj-v@@VERSION@@-darwin-aarch64.tar.gz"
+      sha256 "@@SHA_DARWIN_AARCH64@@"
+    end
+    on_intel do
+      url "https://rasterhub.com/rasterstate/fj/releases/download/v@@VERSION@@/fj-v@@VERSION@@-darwin-x86_64.tar.gz"
+      sha256 "@@SHA_DARWIN_X86_64@@"
+    end
+  end
+
+  on_linux do
+    url "https://rasterhub.com/rasterstate/fj/releases/download/v@@VERSION@@/fj-v@@VERSION@@-linux-x86_64.tar.gz"
+    sha256 "@@SHA_LINUX_X86_64@@"
+  end
+
+  def install
+    target = if OS.mac?
+      Hardware::CPU.arm? ? "darwin-aarch64" : "darwin-x86_64"
+    else
+      "linux-x86_64"
+    end
+    cd "fj-v@@VERSION@@-#{target}"
+    bin.install "fj"
+    # Optional: completions and man pages if present.
+    bash_completion.install "completions/fj.bash" if File.exist?("completions/fj.bash")
+    zsh_completion.install "completions/_fj" if File.exist?("completions/_fj")
+    fish_completion.install "completions/fj.fish" if File.exist?("completions/fj.fish")
+    man1.install Dir["man/*.1"] if Dir.exist?("man")
+  end
+
+  test do
+    assert_match "fj @@VERSION@@", shell_output("#{bin}/fj --version")
+    assert_match "Command-line tool for Forgejo", shell_output("#{bin}/fj --help")
+  end
+end
