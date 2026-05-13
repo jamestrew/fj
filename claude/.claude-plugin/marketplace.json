@@ -2,28 +2,19 @@
   "name": "rasterandstate",
   "owner": {
     "name": "Raster & State",
-    "email": "hello@rasterstate.com",
-    "url": "https://rasterstate.com"
-  },
-  "metadata": {
-    "description": "Raster & State plugins for Claude Code.",
-    "version": "0.1.0"
+    "email": "hello@rasterstate.com"
   },
   "plugins": [
     {
       "name": "fj",
       "description": "Teach Claude Code to use fj, a CLI for Forgejo and Gitea-compatible instances. Activates when the user mentions fj, Forgejo, Gitea, or any forge-side action (issues, PRs, releases, code search, labels, milestones, webhooks).",
-      "version": "0.1.0",
-      "source": "./plugins/fj",
       "author": {
         "name": "Raster & State",
         "email": "hello@rasterstate.com"
       },
-      "license": "MIT",
+      "source": "./plugins/fj",
       "category": "developer-tools",
-      "keywords": ["fj", "forgejo", "gitea", "git", "cli"],
-      "homepage": "https://rasterhub.com/rasterstate/fj",
-      "repository": "https://github.com/rasterandstate/fj-claude-plugin"
+      "homepage": "https://rasterhub.com/rasterstate/fj"
     }
   ]
 }
