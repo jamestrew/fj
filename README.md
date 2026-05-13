@@ -112,10 +112,20 @@ fj api /repos/migrate --input '{"clone_addr":"...","repo_name":"x","repo_owner":
 ## Building
 
 ```sh
-cargo build --release            # 5-6 MB stripped binary at target/release/fj
+cargo build --release            # ~4 MB stripped binary at target/release/fj
 ./target/release/fj completion zsh > ~/.zfunc/_fj
 ./target/release/fj man -o ~/man/man1
 ```
+
+## Documentation
+
+- [`docs/architecture.md`](docs/architecture.md) — module graph, HTTP
+  funnel, pager + SIGINT, repo resolution
+- [`docs/jq.md`](docs/jq.md) — `fj api --jq` projection syntax
+- [`docs/troubleshooting.md`](docs/troubleshooting.md) — keychain
+  prompts, 401s, hook bypass, pager opt-out, alias precedence
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — build / test / release workflow
+- [`CHANGELOG.md`](CHANGELOG.md) — release notes
 
 ## License
 
