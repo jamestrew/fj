@@ -145,6 +145,20 @@ cargo build --release            # ~4 MB stripped binary at target/release/fj
 ./target/release/fj man -o ~/man/man1
 ```
 
+## Claude Code plugin
+
+`fj` ships a [Claude Code](https://docs.claude.com/en/docs/claude-code)
+plugin so AI agents and developers using Claude Code can drive fj
+directly from natural-language requests.
+
+```sh
+/plugin install rasterandstate/fj-claude-plugin
+```
+
+The source of truth for the plugin lives in [`claude/`](claude/) inside
+this repo; the canonical install URL points at the mirror at
+[`rasterandstate/fj-claude-plugin`](https://github.com/rasterandstate/fj-claude-plugin).
+
 ## Documentation
 
 - [`docs/architecture.md`](docs/architecture.md) — module graph, HTTP
