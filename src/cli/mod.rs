@@ -1,8 +1,11 @@
 pub mod api;
 pub mod auth;
+pub mod context;
+pub mod editor;
 pub mod issue;
 pub mod pr;
 pub mod repo;
+pub mod web;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -60,12 +63,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Completion(args) => {
             use clap::CommandFactory;
             let mut cmd = Cli::command();
-            clap_complete::generate(
-                args.shell,
-                &mut cmd,
-                "fj",
-                &mut std::io::stdout(),
-            );
+            clap_complete::generate(args.shell, &mut cmd, "fj", &mut std::io::stdout());
             Ok(())
         }
     }

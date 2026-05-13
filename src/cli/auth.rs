@@ -177,7 +177,11 @@ async fn status(args: StatusArgs) -> Result<()> {
         }
         println!(
             "  ✓ Token: {}",
-            if token_present { "present in keychain" } else { "missing" }
+            if token_present {
+                "present in keychain"
+            } else {
+                "missing"
+            }
         );
         if args.show_token {
             if let Some(t) = token_store::load_token(name)? {

@@ -1,6 +1,12 @@
+pub mod remote;
+
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
+
+pub use remote::discover;
+#[allow(unused_imports)]
+pub use remote::{parse_remote, RemoteRepo};
 
 /// Spawn `git` synchronously and surface the exit status as an error.
 pub fn run(args: &[&str]) -> Result<()> {

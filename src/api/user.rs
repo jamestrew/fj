@@ -19,5 +19,7 @@ pub struct User {
 }
 
 pub async fn current(client: &Client) -> Result<User> {
-    client.json(Method::GET, "/api/v1/user", &[], None::<&()>).await
+    client
+        .json(Method::GET, "/api/v1/user", &[], None::<&()>)
+        .await
 }

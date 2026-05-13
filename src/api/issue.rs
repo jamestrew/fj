@@ -174,9 +174,7 @@ pub async fn comment(
 ) -> Result<Comment> {
     let path = format!("/api/v1/repos/{owner}/{name}/issues/{number}/comments");
     let payload = CreateComment { body };
-    client
-        .json(Method::POST, &path, &[], Some(&payload))
-        .await
+    client.json(Method::POST, &path, &[], Some(&payload)).await
 }
 
 pub async fn list_comments(

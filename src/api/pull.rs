@@ -44,6 +44,57 @@ pub struct Branch {
     pub sha: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PullFile {
+    pub filename: String,
+    pub status: String,
+    #[serde(default)]
+    pub additions: u64,
+    #[serde(default)]
+    pub deletions: u64,
+    #[serde(default)]
+    pub changes: u64,
+    #[serde(default)]
+    pub previous_filename: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Commit {
+    pub sha: String,
+    #[serde(default)]
+    pub commit: CommitMeta,
+    #[serde(default)]
+    pub html_url: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CommitMeta {
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub author: Option<CommitAuthor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitAuthor {
+    pub name: String,
+    #[serde(default)]
+    pub email: String,
+    #[serde(default)]
+    pub date: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Review {
+    pub id: u64,
+    pub state: String,
+    #[serde(default)]
+    pub body: String,
+    pub user: User,
+    pub submitted_at: Option<DateTime<Utc>>,
+    pub html_url: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct ListOptions {
     pub state: State,
@@ -88,6 +139,8 @@ pub struct CreatePull<'a> {
     pub base: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body: Option<&'a str>,
+    #[serde(default)]
+    pub draft: bool,
 }
 
 pub async fn create(
@@ -119,6 +172,97 @@ pub async fn edit(
 ) -> Result<Pull> {
     let path = format!("/api/v1/repos/{owner}/{name}/pulls/{number}");
     client.json(Method::PATCH, &path, &[], Some(body)).await
+}
+
+/// Convert a draft PR to ready-for-review.
+pub async fn ready(client: &Client, owner: &str, name: &str, number: u64) -> Result<()> {
+    let path = format!("/api/v1/repos/{owner}/{name}/pulls/{number}");
+    // Forgejo accepts `allow_maintainer_edit` and the toggle for `draft` via
+    // PATCH; the more reliable form is the dedicated endpoint when present,
+    // but PATCH with `{ "draft": false }` works on 7.x.
+    #[derive(serde::Serialize)]
+    struct ReadyBody {
+        draft: bool,
+    }
+    let body = ReadyBody { draft: false };
+    client
+        .json::<Pull, _>(Method::PATCH, &path, &[], Some(&body))
+        .await
+        .map(|_| ())
+}
+
+pub async fn files(client: &Client, owner: &str, name: &str, number: u64) -> Result<Vec<PullFile>> {
+    let path = format!("/api/v1/repos/{owner}/{name}/pulls/{number}/files");
+    client.json(Method::GET, &path, &[], None::<&()>).await
+}
+
+pub async fn commits(client: &Client, owner: &str, name: &str, number: u64) -> Result<Vec<Commit>> {
+    let path = format!("/api/v1/repos/{owner}/{name}/pulls/{number}/commits");
+    client.json(Method::GET, &path, &[], None::<&()>).await
+}
+
+/// Raw unified diff for a PR.
+pub async fn diff_text(client: &Client, owner: &str, name: &str, number: u64) -> Result<String> {
+    let path = format!("/api/v1/repos/{owner}/{name}/pulls/{number}.diff");
+    let res = client.request(Method::GET, &path, &[], None).await?;
+    let res = res.error_for_status()?;
+    Ok(res.text().await?)
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ReviewEvent {
+    Approve,
+    RequestChanges,
+    Comment,
+}
+
+impl ReviewEvent {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReviewEvent::Approve => "APPROVED",
+            ReviewEvent::RequestChanges => "REQUEST_CHANGES",
+            ReviewEvent::Comment => "COMMENT",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CreateReviewBody<'a> {
+    event: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    body: Option<&'a str>,
+}
+
+pub async fn submit_review(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    number: u64,
+    event: ReviewEvent,
+    body: Option<&str>,
+) -> Result<Review> {
+    let path = format!("/api/v1/repos/{owner}/{name}/pulls/{number}/reviews");
+    client
+        .json(
+            Method::POST,
+            &path,
+            &[],
+            Some(&CreateReviewBody {
+                event: event.as_str(),
+                body,
+            }),
+        )
+        .await
+}
+
+pub async fn list_reviews(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    number: u64,
+) -> Result<Vec<Review>> {
+    let path = format!("/api/v1/repos/{owner}/{name}/pulls/{number}/reviews");
+    client.json(Method::GET, &path, &[], None::<&()>).await
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -166,8 +310,48 @@ pub async fn merge(
         message,
     };
     let res = client
-        .request(Method::POST, &path, &[], Some(&serde_json::to_value(&body)?))
+        .request(
+            Method::POST,
+            &path,
+            &[],
+            Some(&serde_json::to_value(&body)?),
+        )
         .await?;
     res.error_for_status()?;
     Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CombinedStatus {
+    #[serde(default)]
+    pub state: String,
+    pub sha: String,
+    #[serde(default)]
+    pub statuses: Vec<CommitStatus>,
+    #[serde(default)]
+    pub total_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitStatus {
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub context: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub target_url: String,
+    #[serde(default)]
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+pub async fn combined_status(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    sha: &str,
+) -> Result<CombinedStatus> {
+    let path = format!("/api/v1/repos/{owner}/{name}/commits/{sha}/status");
+    client.json(Method::GET, &path, &[], None::<&()>).await
 }

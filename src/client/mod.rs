@@ -121,12 +121,25 @@ impl Client {
         query: &[(String, String)],
         body: Option<&serde_json::Value>,
     ) -> Result<Response> {
+        self.request_with_headers(method, path, query, body, &HeaderMap::new())
+            .await
+    }
+
+    /// Like `request` but merges `extra` headers in (they override defaults).
+    pub async fn request_with_headers(
+        &self,
+        method: Method,
+        path: &str,
+        query: &[(String, String)],
+        body: Option<&serde_json::Value>,
+        extra: &HeaderMap,
+    ) -> Result<Response> {
         let url = self.url(path)?;
-        let mut req = self
-            .http
-            .request(method, url)
-            .headers(self.auth_headers())
-            .query(query);
+        let mut headers = self.auth_headers();
+        for (k, v) in extra.iter() {
+            headers.insert(k.clone(), v.clone());
+        }
+        let mut req = self.http.request(method, url).headers(headers).query(query);
         if let Some(body) = body {
             req = req.json(body);
         }
@@ -154,7 +167,11 @@ impl Client {
         let res = self
             .request(method, path, query, body_value.as_ref())
             .await?;
-        ensure_success(res).await?.json().await.context("decoding JSON response")
+        ensure_success(res)
+            .await?
+            .json()
+            .await
+            .context("decoding JSON response")
     }
 
     /// GET that returns a single page along with pagination metadata.
@@ -195,7 +212,8 @@ async fn ensure_success(res: Response) -> Result<Response> {
         body: text,
     };
     if status == StatusCode::UNAUTHORIZED {
-        Err(anyhow::Error::new(err).context("authentication failed (HTTP 401). Token may be invalid or revoked"))
+        Err(anyhow::Error::new(err)
+            .context("authentication failed (HTTP 401). Token may be invalid or revoked"))
     } else {
         Err(anyhow::Error::new(err))
     }

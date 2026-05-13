@@ -11,3 +11,30 @@ pub fn split_repo(repo: &str) -> Result<(&str, &str)> {
         .filter(|(o, n)| !o.is_empty() && !n.is_empty())
         .ok_or_else(|| anyhow!("expected '<owner>/<name>', got '{repo}'"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_normal_slug() {
+        let (o, n) = split_repo("rasterstate/fj").unwrap();
+        assert_eq!(o, "rasterstate");
+        assert_eq!(n, "fj");
+    }
+
+    #[test]
+    fn rejects_missing_slash() {
+        assert!(split_repo("fj").is_err());
+    }
+
+    #[test]
+    fn rejects_empty_owner() {
+        assert!(split_repo("/fj").is_err());
+    }
+
+    #[test]
+    fn rejects_empty_name() {
+        assert!(split_repo("rasterstate/").is_err());
+    }
+}

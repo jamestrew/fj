@@ -1,11 +1,15 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use clap::{Args, Subcommand};
 
 use crate::api;
+use crate::cli::context::{resolve_repo, RepoFlag};
 use crate::client::Client;
 use crate::config::hosts::Hosts;
 use crate::git;
 use crate::output;
+
+use super::editor;
+use super::web;
 
 #[derive(Debug, Args)]
 pub struct RepoCmd {
@@ -23,6 +27,24 @@ pub enum RepoSub {
     Clone(CloneArgs),
     /// Create a new repository.
     Create(CreateArgs),
+    /// Fork a repository.
+    Fork(ForkArgs),
+    /// Sync a fork with its upstream default branch.
+    Sync(SyncArgs),
+    /// Edit a repository's description, visibility, default branch.
+    Edit(EditArgs),
+    /// Rename a repository (in-place).
+    Rename(RenameArgs),
+    /// Archive a repository (read-only).
+    Archive(ArchiveArgs),
+    /// Unarchive a repository.
+    Unarchive(ArchiveArgs),
+    /// Delete a repository. Destructive.
+    Delete(DeleteArgs),
+    /// List branches.
+    Branches(BranchesArgs),
+    /// Manage repo topics (tags).
+    Topics(TopicsArgs),
 }
 
 #[derive(Debug, Args)]
@@ -41,10 +63,13 @@ pub struct ListArgs {
 
 #[derive(Debug, Args)]
 pub struct ViewArgs {
-    /// `owner/name` slug.
-    pub repo: String,
+    /// `owner/name` slug. Inferred from the git remote when omitted.
+    pub repo: Option<String>,
     #[arg(long)]
     pub json: bool,
+    /// Open the repo's web page.
+    #[arg(long)]
+    pub web: bool,
 }
 
 #[derive(Debug, Args)]
@@ -65,28 +90,117 @@ pub struct CreateArgs {
     pub private: bool,
     #[arg(long, default_value_t = false)]
     pub init: bool,
+    /// Clone the new repo into the current directory.
+    #[arg(long)]
+    pub clone: bool,
+    /// Open the new repo in your browser.
+    #[arg(long)]
+    pub web: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ForkArgs {
+    /// Source repo `owner/name`. Inferred when omitted.
+    pub repo: Option<String>,
+    /// Place the fork under this organization instead of your user account.
+    #[arg(long)]
+    pub org: Option<String>,
+    /// New repository name.
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Clone the fork after creation.
+    #[arg(long)]
+    pub clone: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct SyncArgs {
+    pub repo: Option<String>,
+    /// Branch to sync. Defaults to the repo's default branch.
+    #[arg(long)]
+    pub branch: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct EditArgs {
+    pub repo: Option<String>,
+    #[arg(long)]
+    pub description: Option<String>,
+    #[arg(long)]
+    pub website: Option<String>,
+    #[arg(long)]
+    pub default_branch: Option<String>,
+    /// Force private/public. Accepts `true` or `false`.
+    #[arg(long)]
+    pub private: Option<bool>,
+    /// Open `$EDITOR` for the description.
+    #[arg(long)]
+    pub description_editor: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct RenameArgs {
+    pub repo: String,
+    pub new_name: String,
+}
+
+#[derive(Debug, Args)]
+pub struct ArchiveArgs {
+    pub repo: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct DeleteArgs {
+    pub repo: String,
+    /// Skip the confirmation prompt.
+    #[arg(short = 'y', long)]
+    pub yes: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct BranchesArgs {
+    pub repo: Option<String>,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct TopicsArgs {
+    pub repo: Option<String>,
+    /// Set the topic list (comma-separated). Omit to just print.
+    #[arg(long)]
+    pub set: Option<String>,
 }
 
 pub async fn run(cmd: RepoCmd, host: Option<&str>) -> Result<()> {
-    let client = Client::connect(host)?;
     match cmd.command {
-        RepoSub::List(args) => list(&client, args).await,
-        RepoSub::View(args) => view(&client, args).await,
-        RepoSub::Clone(args) => clone(&client, host, args).await,
-        RepoSub::Create(args) => create(&client, args).await,
+        RepoSub::List(args) => list(args, host).await,
+        RepoSub::View(args) => view(args, host).await,
+        RepoSub::Clone(args) => clone(args, host).await,
+        RepoSub::Create(args) => create(args, host).await,
+        RepoSub::Fork(args) => fork(args, host).await,
+        RepoSub::Sync(args) => sync(args, host).await,
+        RepoSub::Edit(args) => edit(args, host).await,
+        RepoSub::Rename(args) => rename(args, host).await,
+        RepoSub::Archive(args) => set_archived(args, host, true).await,
+        RepoSub::Unarchive(args) => set_archived(args, host, false).await,
+        RepoSub::Delete(args) => delete(args, host).await,
+        RepoSub::Branches(args) => branches(args, host).await,
+        RepoSub::Topics(args) => topics(args, host).await,
     }
 }
 
-async fn list(client: &Client, args: ListArgs) -> Result<()> {
+async fn list(args: ListArgs, host: Option<&str>) -> Result<()> {
+    let client = Client::connect(host)?;
     let opts = api::repo::ListOptions {
         limit: args.limit,
         page: args.page,
         query: args.search.as_deref(),
     };
     let page = if args.search.is_some() {
-        api::repo::search(client, opts).await?
+        api::repo::search(&client, opts).await?
     } else {
-        api::repo::list_for_user(client, opts).await?
+        api::repo::list_for_user(&client, opts).await?
     };
     if args.json {
         let v = serde_json::to_value(&page.items)?;
@@ -116,15 +230,23 @@ async fn list(client: &Client, args: ListArgs) -> Result<()> {
     Ok(())
 }
 
-async fn view(client: &Client, args: ViewArgs) -> Result<()> {
-    let (owner, name) = api::split_repo(&args.repo)?;
-    let repo = api::repo::get(client, owner, name).await?;
+async fn view(args: ViewArgs, host: Option<&str>) -> Result<()> {
+    let ctx = resolve_repo(args.repo.as_deref(), host)?;
+    let repo = api::repo::get(&ctx.client, &ctx.owner, &ctx.name).await?;
+    if args.web {
+        return web::open(&repo.html_url);
+    }
     if args.json {
         return output::print_json(&serde_json::to_value(&repo)?);
     }
     let header = output::bold(&repo.full_name);
     let vis = if repo.private { "private" } else { "public" };
-    println!("{header}  {}", output::dim(vis));
+    let extra = if repo.archived {
+        format!(" {}", output::dim("(archived)"))
+    } else {
+        String::new()
+    };
+    println!("{header}  {}{extra}", output::dim(vis));
     if !repo.description.is_empty() {
         println!("{}", repo.description);
     }
@@ -133,7 +255,10 @@ async fn view(client: &Client, args: ViewArgs) -> Result<()> {
     println!("Stars:           {}", repo.stars_count);
     println!("Forks:           {}", repo.forks_count);
     println!("Open issues:     {}", repo.open_issues_count);
-    println!("Updated:         {}", output::relative_time(repo.updated_at));
+    println!(
+        "Updated:         {}",
+        output::relative_time(repo.updated_at)
+    );
     println!();
     println!("URL:        {}", repo.html_url);
     println!("Clone URL:  {}", repo.clone_url);
@@ -141,11 +266,12 @@ async fn view(client: &Client, args: ViewArgs) -> Result<()> {
     Ok(())
 }
 
-async fn clone(client: &Client, host_flag: Option<&str>, args: CloneArgs) -> Result<()> {
+async fn clone(args: CloneArgs, host: Option<&str>) -> Result<()> {
     let (owner, name) = api::split_repo(&args.repo)?;
-    let repo = api::repo::get(client, owner, name).await?;
+    let client = Client::connect(host)?;
+    let repo = api::repo::get(&client, owner, name).await?;
     let hosts = Hosts::load()?;
-    let hostname = hosts.resolve_host(host_flag)?;
+    let hostname = hosts.resolve_host(host)?;
     let proto = hosts
         .hosts
         .get(hostname)
@@ -159,7 +285,8 @@ async fn clone(client: &Client, host_flag: Option<&str>, args: CloneArgs) -> Res
     git::clone(&url, args.dir.as_deref())
 }
 
-async fn create(client: &Client, args: CreateArgs) -> Result<()> {
+async fn create(args: CreateArgs, host: Option<&str>) -> Result<()> {
+    let client = Client::connect(host)?;
     let (owner, name) = match args.repo.split_once('/') {
         Some((o, n)) => (Some(o.to_string()), n.to_string()),
         None => (None, args.repo.clone()),
@@ -172,19 +299,198 @@ async fn create(client: &Client, args: CreateArgs) -> Result<()> {
         auto_init: args.init,
     };
     let repo = match owner {
-        Some(o) => {
-            // Try as org first; if 404, fall through to user-namespaced.
-            match api::repo::create_for_org(client, &o, &body).await {
-                Ok(r) => r,
-                Err(_) => api::repo::create_for_current_user(client, &body).await?,
-            }
-        }
-        None => api::repo::create_for_current_user(client, &body).await?,
+        Some(o) => match api::repo::create_for_org(&client, &o, &body).await {
+            Ok(r) => r,
+            Err(_) => api::repo::create_for_current_user(&client, &body).await?,
+        },
+        None => api::repo::create_for_current_user(&client, &body).await?,
     };
     println!("✓ Created {}", repo.full_name);
     println!("{}", repo.html_url);
+    if args.clone {
+        let hosts = Hosts::load()?;
+        let hostname = hosts.resolve_host(host)?;
+        let proto = hosts
+            .hosts
+            .get(hostname)
+            .map(|h| h.git_protocol.clone())
+            .unwrap_or_else(|| "https".into());
+        let url = if proto == "ssh" {
+            repo.ssh_url.clone()
+        } else {
+            repo.clone_url.clone()
+        };
+        git::clone(&url, None)?;
+    }
+    if args.web {
+        web::open(&repo.html_url)?;
+    }
     Ok(())
 }
+
+async fn fork(args: ForkArgs, host: Option<&str>) -> Result<()> {
+    let ctx = resolve_repo(args.repo.as_deref(), host)?;
+    let r = api::repo::fork(
+        &ctx.client,
+        &ctx.owner,
+        &ctx.name,
+        args.org.as_deref(),
+        args.name.as_deref(),
+    )
+    .await?;
+    println!("✓ Forked to {}", r.full_name);
+    println!("{}", r.html_url);
+    if args.clone {
+        let hosts = Hosts::load()?;
+        let hostname = hosts.resolve_host(host)?;
+        let proto = hosts
+            .hosts
+            .get(hostname)
+            .map(|h| h.git_protocol.clone())
+            .unwrap_or_else(|| "https".into());
+        let url = if proto == "ssh" { r.ssh_url } else { r.clone_url };
+        git::clone(&url, None)?;
+    }
+    Ok(())
+}
+
+async fn sync(args: SyncArgs, host: Option<&str>) -> Result<()> {
+    let ctx = resolve_repo(args.repo.as_deref(), host)?;
+    let branch = match args.branch {
+        Some(b) => b,
+        None => {
+            api::repo::get(&ctx.client, &ctx.owner, &ctx.name)
+                .await?
+                .default_branch
+        }
+    };
+    api::repo::sync_with_upstream(&ctx.client, &ctx.owner, &ctx.name, &branch).await?;
+    println!("✓ Synced {}/{} branch {} with upstream", ctx.owner, ctx.name, branch);
+    Ok(())
+}
+
+async fn edit(args: EditArgs, host: Option<&str>) -> Result<()> {
+    let ctx = resolve_repo(args.repo.as_deref(), host)?;
+    let description = if args.description_editor {
+        let existing = api::repo::get(&ctx.client, &ctx.owner, &ctx.name).await?;
+        Some(editor::edit_text(
+            "REPO_DESCRIPTION.md",
+            &existing.description,
+        )?)
+    } else {
+        args.description
+    };
+    let body = api::repo::EditRepo {
+        description: description.as_deref(),
+        website: args.website.as_deref(),
+        private: args.private,
+        default_branch: args.default_branch.as_deref(),
+        archived: None,
+    };
+    let r = api::repo::edit(&ctx.client, &ctx.owner, &ctx.name, &body).await?;
+    println!("✓ Updated {}", r.full_name);
+    Ok(())
+}
+
+async fn rename(args: RenameArgs, host: Option<&str>) -> Result<()> {
+    let (owner, name) = api::split_repo(&args.repo)?;
+    let client = Client::connect(host)?;
+    api::repo::rename(&client, owner, name, &args.new_name).await?;
+    println!("✓ Renamed {}/{} → {}/{}", owner, name, owner, args.new_name);
+    Ok(())
+}
+
+async fn set_archived(args: ArchiveArgs, host: Option<&str>, archived: bool) -> Result<()> {
+    let ctx = resolve_repo(args.repo.as_deref(), host)?;
+    let body = api::repo::EditRepo {
+        archived: Some(archived),
+        ..Default::default()
+    };
+    api::repo::edit(&ctx.client, &ctx.owner, &ctx.name, &body).await?;
+    println!(
+        "✓ {} {}/{}",
+        if archived { "Archived" } else { "Unarchived" },
+        ctx.owner,
+        ctx.name
+    );
+    Ok(())
+}
+
+async fn delete(args: DeleteArgs, host: Option<&str>) -> Result<()> {
+    let (owner, name) = api::split_repo(&args.repo)?;
+    let client = Client::connect(host)?;
+    if !args.yes {
+        let prompt = format!(
+            "Delete {owner}/{name}? Type the slug to confirm"
+        );
+        let answer = editor::prompt_line(&prompt)?;
+        if answer != args.repo {
+            return Err(anyhow!("aborted: slug did not match"));
+        }
+    }
+    api::repo::delete(&client, owner, name).await?;
+    println!("✓ Deleted {owner}/{name}");
+    Ok(())
+}
+
+async fn branches(args: BranchesArgs, host: Option<&str>) -> Result<()> {
+    let ctx = resolve_repo(args.repo.as_deref(), host)?;
+    let bs = api::repo::list_branches(&ctx.client, &ctx.owner, &ctx.name).await?;
+    if args.json {
+        return output::print_json(&serde_json::to_value(&bs)?);
+    }
+    if bs.is_empty() {
+        println!("(no branches)");
+        return Ok(());
+    }
+    let rows: Vec<Vec<String>> = bs
+        .iter()
+        .map(|b| {
+            vec![
+                b.name.clone(),
+                output::dim(&b.commit.id[..7.min(b.commit.id.len())]),
+                truncate(b.commit.message.lines().next().unwrap_or(""), 60),
+                if b.protected {
+                    output::bold("protected")
+                } else {
+                    String::new()
+                },
+            ]
+        })
+        .collect();
+    print!(
+        "{}",
+        output::render_table(&["BRANCH", "SHA", "SUBJECT", ""], &rows)
+    );
+    Ok(())
+}
+
+async fn topics(args: TopicsArgs, host: Option<&str>) -> Result<()> {
+    let ctx = resolve_repo(args.repo.as_deref(), host)?;
+    if let Some(set) = args.set {
+        let list: Vec<String> = set
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        api::repo::set_topics(&ctx.client, &ctx.owner, &ctx.name, &list).await?;
+        println!("✓ Topics set to: {}", list.join(", "));
+        return Ok(());
+    }
+    let topics = api::repo::list_topics(&ctx.client, &ctx.owner, &ctx.name).await?;
+    if topics.is_empty() {
+        println!("(no topics)");
+    } else {
+        for t in topics {
+            println!("{t}");
+        }
+    }
+    Ok(())
+}
+
+// Silence the unused `RepoFlag` import for now — kept for symmetry with other
+// subcommands and exported through `cli::context`.
+const _: fn() -> Option<RepoFlag> = || None;
 
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {

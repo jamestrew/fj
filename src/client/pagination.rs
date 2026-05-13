@@ -51,7 +51,7 @@ impl<T> Page<T> {
     }
 }
 
-fn parse_link_header(value: &str) -> Vec<(String, String)> {
+pub(crate) fn parse_link_header(value: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for part in value.split(',') {
         let part = part.trim();
@@ -59,21 +59,58 @@ fn parse_link_header(value: &str) -> Vec<(String, String)> {
         let Some((url_part, params)) = part.split_once(';') else {
             continue;
         };
-        let url = url_part.trim().trim_start_matches('<').trim_end_matches('>');
-        let rel = params
-            .split(';')
-            .map(str::trim)
-            .find_map(|p| {
-                let (k, v) = p.split_once('=')?;
-                if k.trim().eq_ignore_ascii_case("rel") {
-                    Some(v.trim().trim_matches('"').to_string())
-                } else {
-                    None
-                }
-            });
+        let url = url_part
+            .trim()
+            .trim_start_matches('<')
+            .trim_end_matches('>');
+        let rel = params.split(';').map(str::trim).find_map(|p| {
+            let (k, v) = p.split_once('=')?;
+            if k.trim().eq_ignore_ascii_case("rel") {
+                Some(v.trim().trim_matches('"').to_string())
+            } else {
+                None
+            }
+        });
         if let Some(rel) = rel {
             out.push((url.to_string(), rel));
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_single_link() {
+        let input = r#"<https://example.com/api/v1/repos?page=2>; rel="next""#;
+        let parsed = parse_link_header(input);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].0, "https://example.com/api/v1/repos?page=2");
+        assert_eq!(parsed[0].1, "next");
+    }
+
+    #[test]
+    fn parses_multiple_rels() {
+        let input = r#"<https://x/p?page=2>; rel="next", <https://x/p?page=5>; rel="last", <https://x/p?page=1>; rel="first""#;
+        let parsed = parse_link_header(input);
+        let rels: Vec<&str> = parsed.iter().map(|(_, r)| r.as_str()).collect();
+        assert!(rels.contains(&"next"));
+        assert!(rels.contains(&"last"));
+        assert!(rels.contains(&"first"));
+    }
+
+    #[test]
+    fn ignores_unparsable_segments() {
+        let input = "garbage";
+        assert!(parse_link_header(input).is_empty());
+    }
+
+    #[test]
+    fn rel_case_insensitive() {
+        let input = r#"<https://x/p>; REL="next""#;
+        let parsed = parse_link_header(input);
+        assert_eq!(parsed[0].1, "next");
+    }
 }

@@ -2,7 +2,7 @@
 name = "fj"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.82"
 description = "Command-line tool for Forgejo, in the spirit of gh"
 authors = ["Stephen Way <stephen@rasterstate.com>"]
 license = "MIT"

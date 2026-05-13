@@ -21,6 +21,8 @@ pub struct Repo {
     pub fork: bool,
     #[serde(default)]
     pub archived: bool,
+    #[serde(default)]
+    pub mirror: bool,
     pub html_url: String,
     pub clone_url: String,
     pub ssh_url: String,
@@ -63,16 +65,11 @@ pub async fn search(client: &Client, opts: ListOptions<'_>) -> Result<Page<Searc
         query.push(("q".into(), q.into()));
     }
     let res = client
-        .request(
-            Method::GET,
-            "/api/v1/repos/search",
-            &query,
-            None,
-        )
+        .request(Method::GET, "/api/v1/repos/search", &query, None)
         .await?;
     let headers = res.headers().clone();
     let body: SearchResponse = res.error_for_status()?.json().await?;
-    Ok(Page::from_headers(body.data, &headers).also_total(body.ok))
+    Ok(Page::from_headers(body.data, &headers))
 }
 
 #[derive(Debug, Deserialize)]
@@ -80,13 +77,8 @@ struct SearchResponse {
     #[serde(default)]
     data: Vec<SearchHit>,
     #[serde(default)]
+    #[allow(dead_code)]
     ok: bool,
-}
-
-impl<T> Page<T> {
-    fn also_total(self, _ok: bool) -> Self {
-        self
-    }
 }
 
 pub type SearchHit = Repo;
@@ -115,11 +107,169 @@ pub async fn create_for_current_user(client: &Client, body: &CreateRepo<'_>) -> 
         .await
 }
 
-pub async fn create_for_org(
-    client: &Client,
-    org: &str,
-    body: &CreateRepo<'_>,
-) -> Result<Repo> {
+pub async fn create_for_org(client: &Client, org: &str, body: &CreateRepo<'_>) -> Result<Repo> {
     let path = format!("/api/v1/orgs/{org}/repos");
     client.json(Method::POST, &path, &[], Some(body)).await
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct EditRepo<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub website: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub private: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_branch: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archived: Option<bool>,
+}
+
+pub async fn edit(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    body: &EditRepo<'_>,
+) -> Result<Repo> {
+    let path = format!("/api/v1/repos/{owner}/{name}");
+    client.json(Method::PATCH, &path, &[], Some(body)).await
+}
+
+pub async fn delete(client: &Client, owner: &str, name: &str) -> Result<()> {
+    let path = format!("/api/v1/repos/{owner}/{name}");
+    let res = client.request(Method::DELETE, &path, &[], None).await?;
+    res.error_for_status()?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ForkBody<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    organization: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<&'a str>,
+}
+
+pub async fn fork(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    organization: Option<&str>,
+    new_name: Option<&str>,
+) -> Result<Repo> {
+    let path = format!("/api/v1/repos/{owner}/{name}/forks");
+    client
+        .json(
+            Method::POST,
+            &path,
+            &[],
+            Some(&ForkBody {
+                organization,
+                name: new_name,
+            }),
+        )
+        .await
+}
+
+pub async fn rename(client: &Client, owner: &str, name: &str, new_name: &str) -> Result<()> {
+    // Forgejo: PATCH /repos/{owner}/{name} with `name` field.
+    let path = format!("/api/v1/repos/{owner}/{name}");
+    #[derive(Serialize)]
+    struct Body<'a> {
+        name: &'a str,
+    }
+    let res = client
+        .request(
+            Method::PATCH,
+            &path,
+            &[],
+            Some(&serde_json::to_value(Body { name: new_name })?),
+        )
+        .await?;
+    res.error_for_status()?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MergeUpstream<'a> {
+    pub branch: &'a str,
+}
+
+pub async fn sync_with_upstream(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    branch: &str,
+) -> Result<()> {
+    let path = format!("/api/v1/repos/{owner}/{name}/merge-upstream");
+    let res = client
+        .request(
+            Method::POST,
+            &path,
+            &[],
+            Some(&serde_json::to_value(MergeUpstream { branch })?),
+        )
+        .await?;
+    res.error_for_status()?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Branch {
+    pub name: String,
+    #[serde(default)]
+    pub protected: bool,
+    pub commit: BranchCommit,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchCommit {
+    pub id: String,
+    #[serde(default)]
+    pub message: String,
+}
+
+pub async fn list_branches(
+    client: &Client,
+    owner: &str,
+    name: &str,
+) -> Result<Vec<Branch>> {
+    let path = format!("/api/v1/repos/{owner}/{name}/branches");
+    client.json(Method::GET, &path, &[], None::<&()>).await
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Topic {
+    #[serde(default)]
+    pub topics: Vec<String>,
+}
+
+pub async fn list_topics(
+    client: &Client,
+    owner: &str,
+    name: &str,
+) -> Result<Vec<String>> {
+    let path = format!("/api/v1/repos/{owner}/{name}/topics");
+    let t: Topic = client.json(Method::GET, &path, &[], None::<&()>).await?;
+    Ok(t.topics)
+}
+
+pub async fn set_topics(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    topics: &[String],
+) -> Result<()> {
+    let path = format!("/api/v1/repos/{owner}/{name}/topics");
+    let res = client
+        .request(
+            Method::PUT,
+            &path,
+            &[],
+            Some(&serde_json::json!({ "topics": topics })),
+        )
+        .await?;
+    res.error_for_status()?;
+    Ok(())
 }
