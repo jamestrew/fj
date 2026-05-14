@@ -86,8 +86,9 @@ docs/                  architecture, jq, gh-to-fj, faq, troubleshooting
 - `fj auth token` and `auth status --show-token` refuse to write a
   plaintext token to a TTY by default (use `--force`).
 - The repo URL in `Cargo.toml` is `https://rasterhub.com/rasterstate/fj`.
-- Commit author is `Stephen Way <stephen@rasterstate.com>`. The user has
-  a CLAUDE.md preference: no em-dashes, terse responses, no preamble.
+- The user's CLAUDE.md preferences: no em-dashes, terse responses, no
+  preamble. They handle their own git author identity locally; don't
+  hardcode or assume any specific author in scripts.
 - MSRV is 1.82 (we use `Option::is_none_or`).
 
 ## Where to look first

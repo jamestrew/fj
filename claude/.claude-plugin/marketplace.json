@@ -2,7 +2,7 @@
   "name": "rasterandstate",
   "owner": {
     "name": "Raster & State",
-    "email": "hello@rasterstate.com"
+    "email": "support@rasterstate.com"
   },
   "plugins": [
     {
@@ -10,7 +10,7 @@
       "description": "Teach Claude Code to use fj, a CLI for Forgejo and Gitea-compatible instances. Activates when the user mentions fj, Forgejo, Gitea, or any forge-side action (issues, PRs, releases, code search, labels, milestones, webhooks).",
       "author": {
         "name": "Raster & State",
-        "email": "hello@rasterstate.com"
+        "email": "support@rasterstate.com"
       },
       "source": "./plugins/fj",
       "category": "developer-tools",

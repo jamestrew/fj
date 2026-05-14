@@ -12,3 +12,11 @@ Cargo.lock.bak
 
 # Local Claude / agent state
 .claude/settings.local.json
+
+# Local env files. `.env.example` (checked in) documents the variables;
+# real values stay out of the repo. Notarization passwords belong in the
+# OS keychain via `xcrun notarytool store-credentials`, not here.
+.env
+.env.local
+.env.*
+!.env.example
