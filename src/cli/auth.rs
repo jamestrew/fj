@@ -586,6 +586,68 @@ mod setup_git_tests {
         }
     }
 
+    /// Behavioral test for issue #1. Builds a tempdir containing a stub
+    /// `fj` script, then invokes the helper string through `sh -c '… "$@"' sh
+    /// <verb>` — the exact pattern git uses when invoking a `!`-prefixed
+    /// credential.helper. Asserts stdout is `password=<expected>` and that
+    /// no error leaks through for any of the three credential verbs.
+    #[test]
+    #[cfg(unix)]
+    fn credential_helper_runs_through_sh_with_each_git_verb() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().expect("tempdir");
+
+        // Stub fj that prints a known token, used as the `fj auth token`
+        // call inside the helper. We don't need it to parse args; the
+        // helper pipes its stdout into sed.
+        let stub = dir.path().join("fj");
+        fs::write(
+            &stub,
+            "#!/bin/sh\n# stub fj: print a fixed token regardless of args\necho 'TOKEN-XXX'\n",
+        )
+        .expect("write stub");
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        // Strip the leading `!` (that's the git-credential-helper sigil,
+        // not part of the shell command).
+        let raw = credential_helper_value("rasterhub.com");
+        let cmd = raw.strip_prefix('!').expect("`!` prefix").to_string();
+
+        // Mirror git's exact invocation: `sh -c '<cmd> "$@"' sh <verb>`.
+        let path = format!(
+            "{}:{}",
+            dir.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+
+        for verb in ["get", "store", "erase"] {
+            let out = Command::new("sh")
+                .args(["-c", &format!("{cmd} \"$@\""), "sh", verb])
+                .env("PATH", &path)
+                .output()
+                .expect("spawn sh");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                out.status.success(),
+                "helper failed for verb {verb}: stdout={stdout:?} stderr={stderr:?}"
+            );
+            assert_eq!(
+                stdout.trim_end(),
+                "password=TOKEN-XXX",
+                "unexpected stdout for verb {verb}: {stdout:?} (stderr: {stderr:?})"
+            );
+            assert!(
+                !stderr.contains("No such file or directory"),
+                "verb leaked to sed for {verb}: stderr={stderr:?}"
+            );
+        }
+    }
+
     #[test]
     fn version_warning_fires_on_old() {
         assert!(version_warning("1.21.11").is_some());
