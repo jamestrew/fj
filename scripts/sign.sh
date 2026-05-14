@@ -78,3 +78,15 @@ printf '\n' >&2
 codesign -dv "$BIN" 2>&1 | grep -E "Identifier|Authority|Signed Time|TeamIdentifier|Timestamp" || true
 
 printf '\n\033[1;32m✓ signed %s\033[0m\n' "$BIN" >&2
+
+# Optional notarization. Triggered by --notarize or FJ_NOTARIZE=1.
+# Notarization needs a tarball (notarytool doesn't take bare Mach-O),
+# so we package up the binary on the fly, submit, and clean up.
+if [ "${FJ_NOTARIZE:-0}" = "1" ] || [ "${2:-}" = "--notarize" ]; then
+  printf '\n\033[1;34m== notarize\033[0m\n' >&2
+  tmp=$(mktemp -d)
+  trap 'rm -rf "$tmp"' EXIT
+  cp "$BIN" "$tmp/fj"
+  (cd "$tmp" && tar czf fj-notary.tar.gz fj)
+  ./scripts/notarize.sh "$tmp/fj-notary.tar.gz"
+fi

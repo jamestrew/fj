@@ -6,6 +6,30 @@ All notable changes will be recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.1.3] — 2026-05-14
+
+### Added
+
+- **Linux x86_64 release binary.** `fj-v0.1.3-linux-x86_64.tar.gz`
+  ships alongside the two macOS tarballs. Built via Docker
+  cross-compile (rust:1.95-bookworm under linux/amd64 emulation on
+  Apple Silicon). Statically linked against glibc 3.2+, ELF stripped.
+- `scripts/build-linux.sh`: one-shot Docker-backed cross-build that
+  drops `target/fj-linux-x86_64` into the host. Uses persistent
+  named volumes for the cargo registry so incremental builds stay
+  cheap.
+- `scripts/notarize.sh`: submits a signed darwin tarball to Apple's
+  notary service, polls, and surfaces the failure log if rejected.
+  Requires a keychain profile created via `xcrun notarytool
+  store-credentials fj-notary`.
+- `scripts/sign.sh --notarize` (or `FJ_NOTARIZE=1`): chains signing
+  → notarization in one step.
+
+### Changed
+
+- `docs/faq.md` Windows entry is now honest: "nobody's tried."
+  Drops the implied claim of cross-platform support.
+
 ## [0.1.2] — 2026-05-14
 
 ### Added

@@ -100,8 +100,14 @@ fj --no-pager repo list               # per-command opt out
 
 ## Will `fj` work on Windows?
 
-Compilation works (the pager is a no-op there; everything else is
-cross-platform). Not actively tested. Reports welcome.
+Honest answer: nobody's tried. The code compiles for Windows
+(`#[cfg(windows)]` stubs in `output::pager` and `cli::web`), but no
+release binary is built or tested for it and the keychain code path
+(via the `keyring` crate's `windows-native` feature) has never been
+exercised by a real user. If you want to be the first, build from
+source with a current Rust toolchain and report back at
+[issue #2](https://rasterhub.com/rasterstate/fj/issues/new) with what
+broke.
 
 ## Where does `fj` store its config?
 
