@@ -36,6 +36,9 @@ run() {
   "$@" </dev/null
 }
 
+step "preflight (.env + denylist)"
+run ./scripts/preflight.sh
+
 step "cargo fmt --check"
 run cargo fmt --all -- --check
 
