@@ -182,12 +182,8 @@ fn setup_git(args: SetupGitArgs) -> Result<()> {
         validate_username(u)?;
     }
 
-    // The credential helper value is `!`-prefixed, which means git will run it
-    // through sh when the helper is invoked. We've validated the hostname is
-    // shell-safe above (DNS-style only, no metacharacters), so the
-    // interpolation here is safe even inside that sh context.
     let key = format!("credential.https://{host}.helper");
-    let value = format!("!fj auth token --host {host} | sed 's/^/password=/'");
+    let value = credential_helper_value(&host);
 
     let user_key = format!("credential.https://{host}.username");
     let user_val = cfg.user.as_deref().unwrap_or("");
@@ -222,6 +218,22 @@ fn run_git_config(key: &str, value: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Build the `credential.https://<host>.helper` value installed by
+/// `setup-git`. Two invariants this function exists to preserve:
+///
+/// 1. **No positional-arg leakage.** Git appends the operation (`get`,
+///    `store`, `erase`) as a positional arg to the helper string. The
+///    obvious shape `!fj auth token --host <h> | sed 's/^/password=/'`
+///    is broken because `sed` consumes `get` as a filename and bails.
+///    Wrapping the pipeline in a shell function `f() { … }; f` makes
+///    the trailing positional an arg to `f`, which ignores it.
+///
+/// 2. **No shell metacharacters in the host.** `validate_hostname`
+///    upstream is the keystone here; this function trusts its input.
+fn credential_helper_value(host: &str) -> String {
+    format!("!f() {{ fj auth token --host {host} | sed 's/^/password=/'; }}; f")
 }
 
 /// A hostname must look like a DNS name (optionally with a port). This is the
@@ -528,6 +540,50 @@ mod setup_git_tests {
     fn accepts_normal_usernames() {
         assert!(validate_username("alice").is_ok());
         assert!(validate_username("alice.bob_123").is_ok());
+    }
+
+    /// Regression test for issue #1: git appends the operation name
+    /// (`get` / `store` / `erase`) as a positional arg to the helper
+    /// string. Without a function wrapper, `sed` interprets `get` as a
+    /// filename and the entire credential dance breaks.
+    #[test]
+    fn credential_helper_wraps_in_shell_function() {
+        let v = credential_helper_value("rasterhub.com");
+        // Begins with the `!`-prefix git uses to invoke via sh.
+        assert!(v.starts_with('!'), "got: {v}");
+        // Defines a function before invoking it.
+        assert!(v.contains("f() {"), "got: {v}");
+        assert!(v.ends_with("}; f"), "got: {v}");
+        // sed call is inside the function body, not at the tail.
+        let after_sed = v.split("sed").nth(1).unwrap_or("");
+        assert!(
+            after_sed.contains("}; f"),
+            "sed must be inside the function so trailing `get` is ignored; got: {v}"
+        );
+        // Host is interpolated correctly.
+        assert!(v.contains("--host rasterhub.com"), "got: {v}");
+    }
+
+    /// Simulate git's invocation: pretend a shell evaluates the helper
+    /// with `get` as $1 and check that the pipeline structure isolates
+    /// it. (We don't actually exec a shell here; we inspect the string
+    /// to assert that the trailing token after the closing brace is the
+    /// function call, not a sed-consumable positional.)
+    #[test]
+    fn credential_helper_isolates_git_verb() {
+        for op in ["get", "store", "erase"] {
+            // The function call `f` is the only thing after the closing
+            // brace, so `f $op` becomes the invocation. `f` ignores its
+            // args, so the verb is swallowed harmlessly.
+            let v = credential_helper_value("h.example");
+            let simulated = format!("{v} {op}");
+            // The simulated shell line still ends with `f <op>`, never
+            // with `sed ... <op>`.
+            assert!(
+                simulated.ends_with(&format!("f {op}")),
+                "verb must trail `f`, not sed; got: {simulated}"
+            );
+        }
     }
 
     #[test]
