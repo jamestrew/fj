@@ -6,6 +6,41 @@ All notable changes will be recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.1.2] — 2026-05-14
+
+### Added
+
+- **Code-signed macOS binaries.** Both `darwin-aarch64` and
+  `darwin-x86_64` release tarballs now ship binaries signed with the
+  Raster & State Developer ID (`62Y3FRM8PD`), hardened-runtime
+  enabled. macOS keychain ACLs persist across version bumps, so a
+  user who clicks "Always Allow" once doesn't get re-prompted for
+  every release. (Notarization is a follow-up; signing alone solves
+  the prompt-storm.)
+- `scripts/sign.sh`: signs `target/release/fj` (or any path you pass)
+  with the Developer ID. Reads the identity from `.env` /
+  `.env.local`, falling back to the value in `.env.example`. Use
+  this after every local `cargo build --release` so your symlinked
+  dev binary keeps the same code identity across rebuilds.
+- `scripts/preflight.sh` + integration into the pre-push hook. Two
+  checks: (1) refuses to proceed if any `.env*` file (other than the
+  example) contains non-empty values for sensitive keys or
+  keystore-path-shaped values; (2) git-greps the working tree for
+  PEM markers, AWS/GitHub/Slack tokens, and Apple app-specific
+  password format (anchored to value position so dashed identifiers
+  in `Cargo.lock` don't false-positive).
+- `.env.example` documenting the variables release/signing scripts
+  read (`FJ_APPLE_TEAM_ID`, `FJ_APPLE_DEVELOPER_ID`,
+  `FJ_NOTARY_PROFILE`, `FJ_RELEASE_HOST`, `FJ_E2E_REPO`).
+  Notarization passwords stay in the OS keychain, never in `.env`.
+
+### Changed
+
+- `Cargo.toml` `authors` is now `"Raster & State <support@rasterstate.com>"`.
+- All in-tree references to `hello@rasterstate.com` switched to
+  `support@rasterstate.com` (marketplace.json, plugin.json,
+  CLAUDE.md). Personal-email references removed from tracked files.
+
 ## [0.1.1] — 2026-05-14
 
 ### Fixed
