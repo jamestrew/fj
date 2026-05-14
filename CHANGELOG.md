@@ -6,6 +6,26 @@ All notable changes will be recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-05-14
+
+### Fixed
+
+- **`fj auth setup-git` installed a broken credential helper.** Git
+  invokes the helper via `sh -c '<helper> "$@"' sh <verb>`, which
+  meant `sed 's/^/password=/'` would see `get` / `store` / `erase` as
+  a filename and bail with `sed: get: No such file or directory`. Every
+  `git push` and `git pull` against the configured host failed
+  ([#1](https://rasterhub.com/rasterstate/fj/issues/1)). The helper is
+  now wrapped in a shell function `f() { … }; f` that ignores its
+  positional args. Three regression tests cover the structural shape,
+  the verb-positional simulation, and a real `sh -c` invocation with a
+  stub `fj` on PATH.
+
+  **Recovery on already-affected machines:** re-run `fj auth setup-git
+  --host <hostname>`.
+
+## [0.1.0] — 2026-05-13 — distribution & open-source ready
+
 ### Added (distribution + open-source ready)
 
 - `LICENSE` (MIT) at the repo root. Cargo.toml had always declared MIT;
