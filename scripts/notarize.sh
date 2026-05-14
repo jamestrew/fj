@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
-# Submit a signed darwin tarball to Apple's notary service, poll for the
-# result, and (if accepted) staple the ticket onto the binary inside the
-# tarball.
+# Submit a signed darwin Mach-O binary to Apple's notary service.
 #
 # Pre-requisites:
-#   * The binary inside the tarball must already be signed with a
-#     Developer ID Application identity AND have hardened runtime
-#     enabled. `scripts/sign.sh` does both.
+#   * The binary is already signed with a Developer ID Application
+#     identity AND has hardened runtime enabled. `scripts/sign.sh`
+#     does both.
 #   * Notarization credentials stored in the keychain via:
 #
 #       xcrun notarytool store-credentials "$FJ_NOTARY_PROFILE" \
@@ -18,14 +16,19 @@
 #     name defaults to `fj-notary`; override via FJ_NOTARY_PROFILE.
 #
 # Usage:
-#   ./scripts/notarize.sh path/to/tarball.tar.gz
+#   ./scripts/notarize.sh path/to/tarball.tar.gz   # extracts the binary, zips, submits
+#   ./scripts/notarize.sh path/to/binary            # zips, submits
 #
 # What it does:
-#   1. notarytool submit --wait → blocks until Apple returns accepted/
-#      rejected
-#   2. On accepted: extract the binary, staple the ticket, re-tar the
-#      directory IN PLACE (same SHA256 will change — re-compute upstream).
-#   3. On rejected: dump the failure log and exit non-zero.
+#   1. If the input is a .tar.gz, extract the Mach-O binary from inside.
+#   2. Zip the binary (notary requires .zip / .pkg / .dmg).
+#   3. notarytool submit --wait → blocks until Apple returns accepted /
+#      rejected.
+#   4. On rejected: dump the failure log and exit non-zero.
+#
+# The tarball / source binary is NOT modified. Apple's notary records
+# the binary hash; the tarball on disk stays bit-identical and the
+# Homebrew SHA256 doesn't need to be updated.
 
 set -euo pipefail
 
@@ -38,19 +41,24 @@ done
 PROFILE="${FJ_NOTARY_PROFILE:-fj-notary}"
 
 if [ "$#" -lt 1 ]; then
-  echo "usage: $0 path/to/tarball.tar.gz" >&2
+  echo "usage: $0 path/to/{tarball.tar.gz,binary}" >&2
   exit 2
 fi
 
-TARBALL="$1"
-if [ ! -f "$TARBALL" ]; then
-  echo "tarball not found: $TARBALL" >&2
+INPUT="$1"
+if [ ! -f "$INPUT" ]; then
+  echo "not found: $INPUT" >&2
   exit 1
 fi
 
-if ! xcrun notarytool history --keychain-profile "$PROFILE" >/dev/null 2>&1; then
-  cat >&2 <<EOF
-notarytool can't find a keychain profile named '$PROFILE'.
+# notarytool's `info` subcommand exits 0 with no args when the profile
+# exists, errors with a clear message otherwise. Use that as the probe.
+if ! xcrun notarytool info --keychain-profile "$PROFILE" >/dev/null 2>&1; then
+  # That's expected — info needs a submission id. We just want to know
+  # the profile resolves. Try a no-op that DOES exist.
+  if ! xcrun notarytool history --keychain-profile "$PROFILE" 2>&1 | head -1 | grep -qiE "successfully|history|created"; then
+    cat >&2 <<EOF
+notarytool can't find or auth a keychain profile named '$PROFILE'.
 Store it once:
 
   xcrun notarytool store-credentials "$PROFILE" \\
@@ -60,24 +68,51 @@ Store it once:
 
 Then re-run this script.
 EOF
-  exit 1
+    exit 1
+  fi
 fi
 
-printf '\033[1;34m== notarytool submit %s\033[0m\n' "$TARBALL" >&2
+# ── Prepare the zip notary expects ───────────────────────────────────────────
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
 
-# Submit + wait. Output captures the request UUID and the final status.
-out=$(xcrun notarytool submit "$TARBALL" \
+case "$INPUT" in
+  *.tar.gz|*.tgz)
+    tar xzf "$INPUT" -C "$tmp"
+    # Find the Mach-O binary inside (handles both bare-binary and
+    # staged-directory tarballs).
+    bin=$(find "$tmp" -type f -name 'fj' | head -1)
+    if [ -z "$bin" ]; then
+      echo "no fj binary found inside $INPUT" >&2
+      exit 1
+    fi
+    ;;
+  *)
+    bin="$INPUT"
+    ;;
+esac
+
+zip_name=$(basename "$INPUT" .tar.gz).zip
+[ "$zip_name" = "$(basename "$INPUT")" ] && zip_name="$(basename "$bin").zip"
+zip_path="$tmp/$zip_name"
+
+(cd "$(dirname "$bin")" && zip -q "$zip_path" "$(basename "$bin")")
+
+printf '\033[1;34m== notarytool submit %s\033[0m\n' "$zip_name" >&2
+
+# ── Submit + wait ─────────────────────────────────────────────────────────────
+out=$(xcrun notarytool submit "$zip_path" \
   --keychain-profile "$PROFILE" \
   --wait \
   --output-format json)
 
 echo "$out" | python3 -m json.tool >&2
 
-status=$(echo "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("status",""))')
+n_status=$(echo "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("status",""))')
 req_id=$(echo "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))')
 
-if [ "$status" != "Accepted" ]; then
-  printf '\033[1;31m✗ notarization status: %s (request %s)\033[0m\n' "$status" "$req_id" >&2
+if [ "$n_status" != "Accepted" ]; then
+  printf '\033[1;31m✗ notarization status: %s (request %s)\033[0m\n' "$n_status" "$req_id" >&2
   echo "" >&2
   echo "Fetching detailed log:" >&2
   xcrun notarytool log "$req_id" --keychain-profile "$PROFILE" >&2 || true
@@ -86,29 +121,13 @@ fi
 
 printf '\033[1;32m✓ accepted (request %s)\033[0m\n' "$req_id" >&2
 
-# Staple the ticket onto the binary inside the tarball.
-#
-# notarytool doesn't staple gzipped tarballs directly; `xcrun stapler`
-# works on .app bundles, .dmg, .pkg, and (with -v) some other formats,
-# but not on bare Mach-O binaries or .tar.gz.
-#
-# Practice: stapling matters for offline Gatekeeper checks. For a
-# Homebrew install, the user is online, so Gatekeeper does a live
-# notary check and the staple is optional. We skip stapling here and
-# rely on the live check; if needed later, we can change the artifact
-# format to .dmg or .pkg which does support stapling.
-#
-# For documentation: this binary IS notarized — Apple's notary service
-# has its hash on file. macOS will silently accept it on first run
-# whenever the machine is online.
-
 cat >&2 <<EOF
 
-The tarball ($TARBALL) is unchanged on disk.
-The binary inside it is notarized (Apple has its hash on file).
-Gatekeeper will accept it on first run for online machines.
+Apple's notary service now has this binary's hash on file. The
+tarball on disk is unchanged; Gatekeeper will silently accept the
+binary on first run for any online macOS machine.
 
-For offline Gatekeeper acceptance, repackage as a .dmg or .pkg and
-re-run with the stapler (\`xcrun stapler staple\`). Not needed for the
-Homebrew install path.
+(Stapling would let Gatekeeper accept offline machines too, but that
+requires a .dmg or .pkg artifact format. We ship .tar.gz to keep parity
+with the Linux release, and Homebrew users are online anyway.)
 EOF
