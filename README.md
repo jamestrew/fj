@@ -5,171 +5,228 @@
 <h1 align="center">fj</h1>
 
 <p align="center">
-  A command-line tool for <a href="https://forgejo.org">Forgejo</a>, in the spirit of GitHub's <code>gh</code>.<br>
-  Multi-host from day one. Tokens are stored in your OS keychain.
+  <strong>A native CLI for <a href="https://forgejo.org">Forgejo</a> and Gitea-compatible forges.</strong><br>
+  <code>fj</code> does for Forgejo what <code>gh</code> does for GitHub: open PRs, triage issues,<br>
+  ship releases, search code, drive Actions, all from a single binary.<br>
+  Tokens stay in your OS keychain. Multi-host from day one.
+</p>
+
+<p align="center">
+  <a href="https://rasterhub.com/rasterstate/fj/actions"><img src="https://rasterhub.com/rasterstate/fj/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
+  <a href="https://rasterhub.com/rasterstate/fj/releases/latest"><img src="https://img.shields.io/badge/release-v0.1.3-blue" alt="version"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="license"></a>
+  <a href="https://rasterhub.com/rasterstate/fj/src/branch/main/CHANGELOG.md"><img src="https://img.shields.io/badge/changelog-keep--a--changelog-orange" alt="changelog"></a>
 </p>
 
 <p align="center">
   <img src="assets/demo.gif" alt="fj demo" width="800">
 </p>
 
-<!--
-The GIF above is generated from scripts/demo.tape via charmbracelet/vhs.
-To refresh it after a feature change:
-  brew install vhs
-  ./scripts/record-demo.sh
-  git commit -am 'docs: refresh demo recording'
--->
+## Why fj
 
+If you self-host a Forgejo or Gitea instance, your options for scripting it
+have been: paste curl commands, juggle a `~/.netrc`, or wrap your own scripts
+around `git` and the web UI. `tea` exists but lags Forgejo features and has
+no signed release. `gh` works on GitHub only.
+
+`fj` is the thing in the middle. It tracks the Forgejo `/api/v1` surface,
+ships **signed and notarized** macOS binaries (no Gatekeeper warnings, no
+re-prompting keychain), one Linux binary, and a Homebrew tap. Tokens never
+touch disk: they live in the macOS Keychain, Linux Secret Service, or
+Windows Credential Manager.
+
+Three concrete wins over hand-rolled curl scripts:
+
+- **Repo auto-detection** from your git remote. Inside any Forgejo clone,
+  `fj pr list` knows which repo and which host. No `-R` plumbing.
+- **Retry, pagination, and a jq-ish projector** baked into every call. `fj
+  api /repos/foo/bar/issues --paginate -q '.[].title'` Just Works.
+- **Agent-friendly.** Ships a [Claude Code](#claude-code-plugin) plugin so
+  AI agents can drive fj from natural-language requests, and a `--json
+  --json-fields name,number` projection mode for scripts.
+
+If you came from `gh`, the [gh → fj mapping table](docs/gh-to-fj.md) covers
+every command you reach for.
 
 ## Install
 
+**Homebrew** (macOS + Linux x86_64), signed and notarized binaries:
+
 ```sh
-# Homebrew (macOS + Linux):
 brew tap rasterandstate/tap
 brew install fj
-
-# From source:
-cargo install --path .
-# or
-cargo build --release && cp target/release/fj ~/.local/bin/fj
 ```
+
+**Linux tarball:**
+
+```sh
+curl -fsSL https://rasterhub.com/rasterstate/fj/releases/download/v0.1.3/fj-v0.1.3-linux-x86_64.tar.gz | tar -xz
+sudo mv fj-v0.1.3-linux-x86_64/fj /usr/local/bin/fj
+```
+
+**From source** (any platform with a current Rust toolchain):
+
+```sh
+cargo install --git https://rasterhub.com/rasterstate/fj --tag v0.1.3
+```
+
+Windows compiles but is untested. [File an issue](https://rasterhub.com/rasterstate/fj/issues/new) if you try it.
 
 ## Quick start
 
 ```sh
-fj auth login                          # add a host and token
-fj auth status                         # show signed-in hosts
-fj repo list                           # repos you own
-fj repo view owner/name                # repo overview
-fj issue list -R owner/name            # issues
-fj pr list -R owner/name --state open  # pull requests
-fj api /repos/search -X GET -f q=foo   # raw API escape hatch
+fj auth login                            # paste a Forgejo token; stored in your OS keychain
+fj repo view                             # auto-detects the repo from your git remote
+fj pr list --state all -L 10             # latest 10 PRs
+fj issue create --title "..." --body "..."
+fj api /version                          # raw API escape hatch
 ```
 
-`-R/--repo` is optional inside a git clone. fj detects the upstream from
-`upstream`, then `origin`, then any other remote.
+`-R/--repo` is always optional inside a clone (fj reads `origin` / `upstream`
+to figure out the slug). Outside a clone, pass it explicitly.
 
-## Commands
+## Common workflows
 
-| Group      | Common operations                                                                 |
-| ---------- | --------------------------------------------------------------------------------- |
-| `auth`     | login, status, logout, list, switch, token, refresh, setup-git                    |
-| `repo`     | list, view, clone, create, fork, sync, edit, rename, archive, unarchive, delete, branches, topics, mirror, mirror-sync, watch, unwatch, star, unstar, starred |
-| `issue`    | list, view, create, edit, close, reopen, comment, edit-comment, delete-comment, develop |
-| `pr`       | list, view, create, edit, diff, commits, files, checks, ready, review, request-review, unrequest-review, status, checkout, merge, close, reopen |
-| `release`  | list, view, create, edit, delete, upload, download                                |
-| `label`    | list, create, edit, delete                                                        |
-| `milestone`| list, view, create, edit, close, reopen, delete, assign                           |
-| `run`      | list, view, rerun, cancel (Forgejo Actions workflow runs)                         |
-| `secret`   | list, set, delete (Actions secrets)                                               |
-| `variable` | list, set, delete (Actions variables)                                             |
-| `search`   | repos, issues, prs, users, code                                                   |
-| `browse`   | open the current repo (or a path within it) in your browser                       |
-| `status`   | notifications inbox + `--mark-read`                                               |
-| `org`      | list, view, teams                                                                 |
-| `ssh-key`  | list, add, delete                                                                 |
-| `gpg-key`  | list, add, delete                                                                 |
-| `alias`    | list, set, delete                                                                 |
-| `config`   | get, set, list, path                                                              |
-| `protect`  | list, view, set, delete branch protection rules                                   |
-| `hook`     | list, create, delete, test webhooks                                               |
-| `gist`     | list, create (thin wrapper over `gist-*` repos)                                   |
-| `extension`| list, run discovered `fj-<name>` plugins on PATH                                  |
-| `api`      | raw HTTP with `-X`, `-f`, `-F`, `-H`, `-q` (jq-ish), `--paginate`, `--include`    |
-| `completion`| Print shell completions (bash, zsh, fish, powershell, elvish)                    |
-| `man`      | Generate man pages into a directory                                               |
+**Review a PR (inside a clone):**
+
+```sh
+fj pr checkout 42                        # fetch + checkout PR branch
+fj pr diff 42 | less                     # or `fj pr files 42` for a file summary
+fj pr review 42 --event approve --body "LGTM"
+fj pr review 42 --event request-changes --body "see comments"
+fj pr request-review 42 alice bob        # tag specific reviewers
+```
+
+**Triage your inbox:**
+
+```sh
+fj pr status                             # cross-repo dashboard of PRs you care about
+fj status                                # notifications inbox
+fj status --mark-read                    # clear it
+```
+
+**Cut a release:**
+
+```sh
+fj release create v1.2.3 \
+  --title "1.2.3" \
+  --body "$(cat RELEASE_NOTES.md)" \
+  --asset dist/foo-x86_64.tar.gz \
+  --asset dist/foo-aarch64.tar.gz
+```
+
+**Search code, scripting-friendly:**
+
+```sh
+fj search code "use crate::foo" -R owner/name --json --json-fields path,html_url
+```
+
+**Drop into raw API when you need it:**
+
+```sh
+fj api /repos/foo/bar/pulls --paginate -q '[].number'
+fj api -X POST /repos/foo/bar/labels --input '{"name":"bug","color":"d73a4a"}'
+fj api /version --include                # response headers + body
+```
+
+## Command surface
+
+Twenty-five top-level groups. Run `fj --help` for the live list; each group
+has its own `--help`. Highlights:
+
+| Group       | What it covers                                                                  |
+| ----------- | ------------------------------------------------------------------------------- |
+| `auth`      | login, status, logout, switch, token, refresh, setup-git                        |
+| `repo`      | list, view, clone, create, fork, sync, edit, rename, archive, delete, branches, topics, mirror, watch, star |
+| `issue`     | list, view, create, edit, close, reopen, comment, edit-comment, delete-comment, develop |
+| `pr`        | list, view, create, edit, diff, commits, files, checks, ready, review, request-review, status, checkout, merge, close, reopen |
+| `release`   | list, view, create, edit, delete, upload, download                              |
+| `label`     | CRUD                                                                            |
+| `milestone` | CRUD + assign                                                                   |
+| `run`       | workflow runs (Forgejo Actions)                                                 |
+| `secret`    | Actions secrets                                                                 |
+| `variable`  | Actions variables                                                               |
+| `search`    | repos, issues, prs, users, **code**                                             |
+| `browse`    | open the current repo (or a path within it) in `$BROWSER`                       |
+| `status`    | notifications inbox + `--mark-read`                                             |
+| `org`       | list, view, teams                                                               |
+| `ssh-key`   | account keys                                                                    |
+| `gpg-key`   | account keys                                                                    |
+| `alias`     | user-defined command shortcuts                                                  |
+| `config`    | local preferences (editor, pager, browser)                                      |
+| `protect`   | branch protection rules                                                         |
+| `hook`      | webhook CRUD + test delivery                                                    |
+| `gist`      | thin wrapper over `gist-*` repos                                                |
+| `extension` | discover and run `fj-<name>` plugins on PATH                                    |
+| `api`       | raw HTTP with `-X`, `-f`, `-F`, `-H`, `-q`, `--paginate`, `--include`           |
+| `completion`| shell completions (bash, zsh, fish, powershell, elvish)                         |
+| `man`       | generate man pages                                                              |
+
+Full [gh → fj mapping table](docs/gh-to-fj.md) for migrating from GitHub workflows.
 
 ## Global flags
 
-- `--host <hostname>` (or `FJ_HOST`): pick the host explicitly.
-- `--debug` (or `FJ_DEBUG=1`): log every HTTP request to stderr.
-- `--no-pager` (or `FJ_NO_PAGER=1`): skip the pager.
-- `--json-fields foo,bar`: gh-style projection on top of any `--json`
-  output. Dotted paths supported (`--json-fields owner.login,id`).
-- `--web` on most list/view subcommands: open the relevant page in
-  your default browser.
-
-## Config
-
-- Hosts and the current host live in `$XDG_CONFIG_HOME/fj/hosts.toml`
-  (`~/Library/Application Support/fj/hosts.toml` on macOS).
-- Aliases in `aliases.toml`. Preferences in `config.toml`.
-- Tokens live in the OS keychain under service `fj`, keyed by hostname.
-
-## Aliases
-
-```sh
-fj alias set co "pr checkout"
-fj co 42                   # equivalent to: fj pr checkout 42
-```
-
-## Extensions
-
-Any executable on `$PATH` named `fj-<name>` is invokable as `fj <name> [args]`.
-
-```sh
-fj extension list          # show discovered plugins
-fj my-plugin some-arg      # invokes `fj-my-plugin some-arg`
-```
-
-## Plugin-style usage of `fj api`
-
-```sh
-# Auto-paginate a list endpoint into a single JSON array:
-fj api /repos/search -f q=fj --paginate -q .
-
-# Pass a custom request header:
-fj api /user -H "X-Trace-Id: foo"
-
-# Show response headers along with the body:
-fj api /version --include
-
-# Send a literal JSON body:
-fj api /repos/migrate --input '{"clone_addr":"...","repo_name":"x","repo_owner":"y"}'
-```
-
-## Hooks
-
-- `hooks/pre-push` runs `cargo fmt --check`, `cargo clippy -D warnings`,
-  `cargo test`, and a release build before any push.
-- With `FJ_E2E=1`, the hook also runs `scripts/e2e-smoke.sh` against the
-  configured host.
-- Install via `./scripts/install-hooks.sh`.
-
-## Building
-
-```sh
-cargo build --release            # ~4 MB stripped binary at target/release/fj
-./target/release/fj completion zsh > ~/.zfunc/_fj
-./target/release/fj man -o ~/man/man1
-```
+- `--host <name>` or `FJ_HOST`: explicit host, otherwise inferred from git
+  remote, otherwise the configured default.
+- `--debug` or `FJ_DEBUG=1`: log every HTTP request to stderr.
+- `--json`: switch list/view output to JSON.
+- `--json-fields field1,field2,owner.login`: gh-style projection on top of
+  `--json`. Dotted paths supported.
+- `--no-pager` or `FJ_NO_PAGER=1`: skip the pager.
+- `--web` on list/view: open the relevant page in `$BROWSER`.
 
 ## Claude Code plugin
 
 `fj` ships a [Claude Code](https://docs.claude.com/en/docs/claude-code)
-plugin so AI agents and developers using Claude Code can drive fj
-directly from natural-language requests.
+plugin so AI agents (and developers using Claude Code) can drive fj from
+natural-language requests:
 
 ```text
 /plugin marketplace add rasterandstate/fj-claude-plugin
 /plugin install fj@rasterandstate
 ```
 
-The source of truth for the plugin lives in [`claude/`](claude/) inside
-this repo; the canonical install URL points at the mirror at
+The skill activates whenever the user mentions fj, Forgejo, Gitea, or any
+forge-side action. Source lives in [`claude/`](claude/); canonical install
+URL points at the mirror at
 [`rasterandstate/fj-claude-plugin`](https://github.com/rasterandstate/fj-claude-plugin).
+
+## Configuration
+
+| Location | What |
+| -------- | ---- |
+| `$XDG_CONFIG_HOME/fj/hosts.toml` (`~/Library/Application Support/fj/hosts.toml` on macOS) | host registry + current default |
+| `$XDG_CONFIG_HOME/fj/aliases.toml` | user-defined command shortcuts |
+| `$XDG_CONFIG_HOME/fj/config.toml` | editor / pager / browser preferences |
+| OS keychain, service `fj`, key = hostname | API tokens (never on disk) |
+
+## Build it yourself
+
+```sh
+git clone https://rasterhub.com/rasterstate/fj
+cd fj
+cargo build --release            # ~4 MB stripped binary at target/release/fj
+./target/release/fj completion zsh > ~/.zfunc/_fj
+./target/release/fj man -o ~/man/man1
+```
+
+The pre-push hook (`hooks/pre-push`) gates every push on `cargo fmt`,
+`cargo clippy -D warnings`, the test suite, and a release build. Install
+once via `./scripts/install-hooks.sh`. Set `FJ_E2E=1` to also run the live-API
+smoke against your configured host.
 
 ## Documentation
 
-- [`docs/architecture.md`](docs/architecture.md) — module graph, HTTP
-  funnel, pager + SIGINT, repo resolution
-- [`docs/jq.md`](docs/jq.md) — `fj api --jq` projection syntax
-- [`docs/troubleshooting.md`](docs/troubleshooting.md) — keychain
-  prompts, 401s, hook bypass, pager opt-out, alias precedence
-- [`CONTRIBUTING.md`](CONTRIBUTING.md) — build / test / release workflow
-- [`CHANGELOG.md`](CHANGELOG.md) — release notes
+- [`docs/architecture.md`](docs/architecture.md): module graph, HTTP funnel, repo resolution, test strategy
+- [`docs/gh-to-fj.md`](docs/gh-to-fj.md): command-by-command mapping from gh
+- [`docs/jq.md`](docs/jq.md): `fj api --jq` projection syntax
+- [`docs/compatibility.md`](docs/compatibility.md): Forgejo version matrix and known caveats
+- [`docs/faq.md`](docs/faq.md): tokens, hosts, debug, scripting, plugins
+- [`docs/troubleshooting.md`](docs/troubleshooting.md): keychain prompts, 401s, hook bypass, pager opt-out
+- [`CONTRIBUTING.md`](CONTRIBUTING.md): build / test / release workflow
+- [`CHANGELOG.md`](CHANGELOG.md): release notes
+- [`SECURITY.md`](SECURITY.md): security policy + threat model
 
 ## License
 
-MIT
+MIT.
