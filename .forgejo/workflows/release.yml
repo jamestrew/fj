@@ -26,6 +26,8 @@ jobs:
             target: x86_64-unknown-linux-gnu
     runs-on: ${{ matrix.runs-on }}
     container: ${{ matrix.container }}
+    env:
+      FJ_APPLE_DEVELOPER_ID: 'Developer ID Application: Raster & State LLC (62Y3FRM8PD)'
     steps:
       - name: checkout
         uses: actions/checkout@v4
@@ -47,6 +49,45 @@ jobs:
         run: |
           cargo build --release --locked --target ${{ matrix.target }}
 
+      # ── macOS: import cert into a temporary keychain ────────────────────────
+      # Pattern from Apple's own docs: build a throwaway keychain per job, drop
+      # the .p12 into it, allow codesign access without a password prompt, and
+      # delete the whole thing at the end. The job-scoped keychain never
+      # leaks the cert beyond this run.
+      - name: setup signing keychain
+        if: contains(matrix.name, 'darwin')
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          MACOS_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN_PATH="$RUNNER_TEMP/fj-build.keychain-db"
+          CERT_PATH="$RUNNER_TEMP/cert.p12"
+          echo "$MACOS_CERT_P12_BASE64" | base64 --decode > "$CERT_PATH"
+          security create-keychain -p "$MACOS_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$MACOS_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$MACOS_CERT_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$MACOS_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" > /dev/null
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+          rm -f "$CERT_PATH"
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+
+      - name: sign binary
+        if: contains(matrix.name, 'darwin')
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release/fj"
+          codesign --force \
+            --sign "$FJ_APPLE_DEVELOPER_ID" \
+            --timestamp \
+            --options=runtime \
+            "$BIN"
+          codesign --verify --verbose=2 "$BIN"
+
       - name: package
         run: |
           mkdir -p dist
@@ -58,6 +99,55 @@ jobs:
           cp README.md LICENSE CHANGELOG.md "$STAGE/"
           tar czf "dist/$STAGE.tar.gz" "$STAGE"
           (cd dist && shasum -a 256 "$STAGE.tar.gz" > "$STAGE.tar.gz.sha256")
+
+      # ── macOS: notarize the signed binary ───────────────────────────────────
+      # Apple's notary records the binary hash, not the tarball hash, so the
+      # .tar.gz on disk (and its SHA256SUMS entry) stays bit-identical after
+      # this step. We submit a zip of the signed binary and block until Apple
+      # responds. Failures dump the rejection log and fail the job.
+      - name: notarize binary
+        if: contains(matrix.name, 'darwin')
+        env:
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          set -euo pipefail
+          KEY_PATH="$RUNNER_TEMP/api-key.p8"
+          echo "$APPLE_API_KEY_BASE64" | base64 --decode > "$KEY_PATH"
+          chmod 600 "$KEY_PATH"
+
+          BIN="target/${{ matrix.target }}/release/fj"
+          ZIP="$RUNNER_TEMP/fj-notary.zip"
+          (cd "$(dirname "$BIN")" && zip -q "$ZIP" "$(basename "$BIN")")
+
+          out=$(xcrun notarytool submit "$ZIP" \
+            --key "$KEY_PATH" \
+            --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER" \
+            --wait \
+            --output-format json)
+          echo "$out"
+          n_status=$(echo "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("status",""))')
+          req_id=$(echo "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))')
+
+          rm -f "$KEY_PATH" "$ZIP"
+
+          if [ "$n_status" != "Accepted" ]; then
+            echo "::error::notarization failed: $n_status (request $req_id)"
+            xcrun notarytool log "$req_id" \
+              --key "$RUNNER_TEMP/api-key.p8" \
+              --key-id "$APPLE_API_KEY_ID" \
+              --issuer "$APPLE_API_ISSUER" || true
+            exit 1
+          fi
+
+      - name: cleanup keychain
+        if: always() && contains(matrix.name, 'darwin')
+        run: |
+          if [ -n "${KEYCHAIN_PATH:-}" ] && [ -f "$KEYCHAIN_PATH" ]; then
+            security delete-keychain "$KEYCHAIN_PATH" || true
+          fi
 
       - name: upload artifacts
         uses: actions/upload-artifact@v4
@@ -158,17 +248,20 @@ jobs:
             end
 
             on_linux do
-              url "$BASE/fj-$TAG-linux-x86_64.tar.gz"
-              sha256 "$LIN_SHA"
+              on_intel do
+                url "$BASE/fj-$TAG-linux-x86_64.tar.gz"
+                sha256 "$LIN_SHA"
+              end
             end
 
             def install
-              cd "fj-$TAG-#{if OS.mac? then (Hardware::CPU.arm? ? "darwin-aarch64" : "darwin-x86_64") else "linux-x86_64" end}"
               bin.install "fj"
+              pkgshare.install "README.md", "LICENSE", "CHANGELOG.md"
             end
 
             test do
               assert_match "fj #{version}", shell_output("#{bin}/fj --version")
+              assert_match "Command-line tool for Forgejo", shell_output("#{bin}/fj --help")
             end
           end
           RUBY
