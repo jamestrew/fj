@@ -22,7 +22,7 @@ jobs:
             target: x86_64-apple-darwin
           - name: linux-x86_64
             runs-on: docker
-            container: rust:1.95-bookworm
+            container: catthehacker/ubuntu:act-22.04
             target: x86_64-unknown-linux-gnu
     runs-on: ${{ matrix.runs-on }}
     container: ${{ matrix.container }}
@@ -31,6 +31,16 @@ jobs:
     steps:
       - name: checkout
         uses: actions/checkout@v4
+
+      # On linux-x86_64 the container is catthehacker/ubuntu:act-22.04
+      # which has node bundled but no rustup. Install rustup at job
+      # start. On macOS the runners come with rustup preinstalled.
+      - name: install rust toolchain (linux only)
+        if: matrix.name == 'linux-x86_64'
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain 1.95.0
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
       - name: install rust target
         run: |

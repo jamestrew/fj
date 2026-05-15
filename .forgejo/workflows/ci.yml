@@ -9,11 +9,20 @@ on:
 jobs:
   check:
     runs-on: docker
+    # catthehacker/ubuntu:act-22.04 is the de-facto standard for Forgejo
+    # Actions: it has node preinstalled (required by actions/checkout@v4
+    # and most JS actions). Rust ships from rustup.rs at job start.
     container:
-      image: rust:1.95-bookworm
+      image: catthehacker/ubuntu:act-22.04
     steps:
       - name: checkout
         uses: actions/checkout@v4
+
+      - name: install rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain 1.95.0
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
       - name: cache cargo
         uses: actions/cache@v4
@@ -26,9 +35,8 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: install components
-        run: |
-          rustup component add rustfmt clippy
+      - name: install rustfmt + clippy
+        run: rustup component add rustfmt clippy
 
       - name: cargo fmt
         run: cargo fmt --all -- --check
