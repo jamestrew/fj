@@ -59,6 +59,9 @@ pub struct SetArgs {
     /// Disable direct pushes.
     #[arg(long)]
     pub no_push: bool,
+    /// Required status check context (repeatable). Enables status checks.
+    #[arg(long = "status-check", value_name = "CONTEXT")]
+    pub status_check: Vec<String>,
 }
 
 pub async fn run(cmd: ProtectCmd, host: Option<&str>) -> Result<()> {
@@ -89,13 +92,29 @@ async fn list(args: ListArgs, host: Option<&str>) -> Result<()> {
                 p.require_signed_commits.to_string(),
                 p.block_on_outdated_branch.to_string(),
                 p.enable_push.to_string(),
+                if p.enable_status_check {
+                    if p.status_check_contexts.is_empty() {
+                        "true".to_string()
+                    } else {
+                        p.status_check_contexts.join(",")
+                    }
+                } else {
+                    "false".to_string()
+                },
             ]
         })
         .collect();
     print!(
         "{}",
         output::render_table(
-            &["BRANCH", "APPROVALS", "SIGNED", "BLOCK_OUTDATED", "PUSH"],
+            &[
+                "BRANCH",
+                "APPROVALS",
+                "SIGNED",
+                "BLOCK_OUTDATED",
+                "PUSH",
+                "STATUS_CHECK"
+            ],
             &rows
         )
     );
@@ -113,6 +132,13 @@ async fn view(args: BranchArgs, host: Option<&str>) -> Result<()> {
     println!("Require signed:        {}", p.require_signed_commits);
     println!("Block outdated branch: {}", p.block_on_outdated_branch);
     println!("Direct push allowed:   {}", p.enable_push);
+    println!("Status checks:         {}", p.enable_status_check);
+    if !p.status_check_contexts.is_empty() {
+        println!(
+            "  Contexts:            {}",
+            p.status_check_contexts.join(", ")
+        );
+    }
     Ok(())
 }
 
@@ -124,6 +150,8 @@ async fn set(args: SetArgs, host: Option<&str>) -> Result<()> {
         require_signed_commits: args.require_signed,
         block_on_outdated_branch: args.block_outdated,
         required_approvals: args.required_approvals,
+        enable_status_check: !args.status_check.is_empty(),
+        status_check_contexts: &args.status_check,
     };
     let p = protect::create(&ctx.client, &ctx.owner, &ctx.name, &body).await?;
     println!("✓ Protected {}", p.branch_name);

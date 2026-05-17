@@ -13,7 +13,10 @@ pub struct BranchProtection {
     pub enable_push: bool,
     #[serde(default)]
     pub enable_push_whitelist: bool,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::api::serde_util::deserialize_null_to_default"
+    )]
     pub push_whitelist_usernames: Vec<String>,
     #[serde(default)]
     pub require_signed_commits: bool,
@@ -21,6 +24,13 @@ pub struct BranchProtection {
     pub block_on_outdated_branch: bool,
     #[serde(default)]
     pub required_approvals: i64,
+    #[serde(default)]
+    pub enable_status_check: bool,
+    #[serde(
+        default,
+        deserialize_with = "crate::api::serde_util::deserialize_null_to_default"
+    )]
+    pub status_check_contexts: Vec<String>,
 }
 
 pub async fn list(client: &Client, owner: &str, name: &str) -> Result<Vec<BranchProtection>> {
@@ -49,6 +59,10 @@ pub struct CreateBranchProtection<'a> {
     pub block_on_outdated_branch: bool,
     #[serde(default)]
     pub required_approvals: i64,
+    #[serde(default)]
+    pub enable_status_check: bool,
+    #[serde(default)]
+    pub status_check_contexts: &'a [String],
 }
 
 pub async fn create(

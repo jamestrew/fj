@@ -234,3 +234,27 @@ async fn header_value_rejects_bad_token() {
     let text = format!("{err:#}");
     assert!(text.contains("clean token"), "got: {text}");
 }
+
+#[tokio::test]
+async fn protect_get_tolerates_null_arrays() {
+    // Forgejo returns `null` (not `[]`) for status_check_contexts and
+    // push_whitelist_usernames when unset; deserialization must not fail.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/branch_protections/main"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "branch_name": "main",
+            "enable_status_check": false,
+            "status_check_contexts": null,
+            "push_whitelist_usernames": null
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let p = crate::api::protect::get(&c, "o", "r", "main")
+        .await
+        .expect("null arrays tolerated");
+    assert!(p.status_check_contexts.is_empty());
+    assert!(p.push_whitelist_usernames.is_empty());
+}
