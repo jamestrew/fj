@@ -384,6 +384,15 @@ fn build_probe_client(host: &str, cfg: &Host, token: &str) -> Result<Client> {
 
 fn read_token(args: &LoginArgs) -> Result<String> {
     if let Some(t) = &args.token {
+        // `--token` also binds FJ_TOKEN. If the value didn't come from the
+        // environment it was passed on the command line, where it lands in
+        // `ps` output and shell history. Nudge toward the safe inputs.
+        let from_env = std::env::var("FJ_TOKEN").ok().as_deref() == Some(t.as_str());
+        if !from_env {
+            eprintln!(
+                "warning: passing --token on the command line exposes it in shell history and `ps`; prefer `--with-token` (stdin) or the interactive prompt"
+            );
+        }
         return Ok(t.clone());
     }
     if args.with_token {

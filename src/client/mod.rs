@@ -127,6 +127,22 @@ impl Client {
         &self.token
     }
 
+    /// Whether `url` is the same origin (scheme + host + port) as the
+    /// configured API base. The auth token is only ever attached to requests
+    /// that pass this check, so an absolute URL handed to `fj api` (or any
+    /// redirected target) can't exfiltrate the bearer token to another host
+    /// or downgrade it onto cleartext. Real bases are always `https` (see
+    /// `build_base_url`), so requiring the scheme to match the base also
+    /// rejects `fj api http://<same-host>/…`.
+    fn is_trusted_url(&self, url: &Url) -> bool {
+        url.scheme() == self.base.scheme()
+            && url
+                .host_str()
+                .zip(self.base.host_str())
+                .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
+            && url.port_or_known_default() == self.base.port_or_known_default()
+    }
+
     fn auth_headers(&self) -> Result<HeaderMap> {
         let mut headers = HeaderMap::new();
         let value = HeaderValue::from_str(&format!("token {}", self.token)).map_err(|_| {
@@ -187,6 +203,16 @@ impl Client {
     ) -> Result<Response> {
         let url = self.url(path)?;
         let mut headers = self.auth_headers()?;
+        if !self.is_trusted_url(&url) {
+            // Absolute URL pointing off-host or not over TLS (only reachable
+            // via `fj api <url>`): never leak the token there.
+            headers.remove(AUTHORIZATION);
+            eprintln!(
+                "warning: not sending your {} token to {} (only same-host HTTPS requests are authenticated)",
+                self.host,
+                url.host_str().unwrap_or("?")
+            );
+        }
         for (k, v) in extra.iter() {
             headers.insert(k.clone(), v.clone());
         }
@@ -422,7 +448,9 @@ fn log_request(
     };
     eprintln!("→ {method} {url}{q}");
     if let Some(b) = body {
-        if let Ok(text) = serde_json::to_string(b) {
+        if is_sensitive_path(url.path()) {
+            eprintln!("  body: [redacted: sensitive endpoint]");
+        } else if let Ok(text) = serde_json::to_string(b) {
             let preview = if text.len() > 200 {
                 format!("{}…", &text[..200])
             } else {
@@ -431,6 +459,15 @@ fn log_request(
             eprintln!("  body: {preview}");
         }
     }
+}
+
+/// Endpoints whose request bodies carry credentials we must never echo to the
+/// debug log (`fj secret set`, `variable set`, token/key management, …).
+fn is_sensitive_path(path: &str) -> bool {
+    let p = path.to_ascii_lowercase();
+    ["secret", "variable", "token", "password", "/keys"]
+        .iter()
+        .any(|needle| p.contains(needle))
 }
 
 fn build_base_url(hostname: &str, host: &Host) -> Result<Url> {
@@ -442,8 +479,26 @@ fn build_base_url(hostname: &str, host: &Host) -> Result<Url> {
     Ok(url)
 }
 
+/// Upper bound on a single response body we'll buffer into memory. A
+/// misbehaving or hostile server otherwise gets to drive us to OOM, since the
+/// JSON/text helpers read the whole body. 256 MiB is far above any real
+/// Forgejo API payload.
+const MAX_RESPONSE_BYTES: u64 = 256 * 1024 * 1024;
+
+pub(crate) fn check_body_size(res: &Response) -> Result<()> {
+    if let Some(len) = res.content_length() {
+        if len > MAX_RESPONSE_BYTES {
+            return Err(anyhow!(
+                "response body is {len} bytes, over the {MAX_RESPONSE_BYTES}-byte cap; refusing to buffer it"
+            ));
+        }
+    }
+    Ok(())
+}
+
 async fn ensure_success(res: Response) -> Result<Response> {
     let status = res.status();
+    check_body_size(&res)?;
     if status.is_success() {
         return Ok(res);
     }
@@ -482,4 +537,28 @@ fn default_user_agent() -> String {
 
 const fn default_user_agent_static() -> &'static str {
     concat!("fj/", env!("CARGO_PKG_VERSION"))
+}
+
+#[cfg(test)]
+mod trust_tests {
+    use super::*;
+
+    fn client(base: &str) -> Client {
+        Client::for_base_url(Url::parse(base).unwrap(), "tok".into()).unwrap()
+    }
+
+    #[test]
+    fn trusts_same_host_https() {
+        let c = client("https://rasterhub.com/api/v1/");
+        assert!(c.is_trusted_url(&Url::parse("https://rasterhub.com/api/v1/user").unwrap()));
+        assert!(c.is_trusted_url(&Url::parse("https://RasterHub.com/repos/x/y").unwrap()));
+    }
+
+    #[test]
+    fn rejects_other_host_or_cleartext() {
+        let c = client("https://rasterhub.com/api/v1/");
+        assert!(!c.is_trusted_url(&Url::parse("https://attacker.example/x").unwrap()));
+        assert!(!c.is_trusted_url(&Url::parse("http://rasterhub.com/api/v1/user").unwrap()));
+        assert!(!c.is_trusted_url(&Url::parse("https://rasterhub.com:8443/x").unwrap()));
+    }
 }

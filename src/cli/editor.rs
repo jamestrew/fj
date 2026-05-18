@@ -7,6 +7,7 @@ use std::io::{Read, Write};
 use std::process::Command;
 
 use anyhow::{anyhow, Context, Result};
+use tempfile::Builder;
 
 /// Default editor binary, in order: $VISUAL, $EDITOR, then `vi`.
 fn editor_command() -> String {
@@ -21,13 +22,18 @@ fn editor_command() -> String {
 /// trailing whitespace trimmed. `template_name` is just the suffix of the
 /// temp file (helps editors pick syntax: `ISSUE_BODY.md`, etc.).
 pub fn edit_text(template_name: &str, initial_contents: &str) -> Result<String> {
-    let mut tmp = env::temp_dir();
-    tmp.push(format!("fj-{}-{}", std::process::id(), template_name));
-    {
-        let mut file = fs::File::create(&tmp)
-            .with_context(|| format!("creating temp file at {}", tmp.display()))?;
-        file.write_all(initial_contents.as_bytes())?;
-    }
+    // Create the scratch file with O_EXCL + mode 0600 (via tempfile) and a
+    // random name, instead of a predictable `/tmp/fj-<pid>-<name>` path that a
+    // local attacker could pre-create as a symlink. The handle is held until
+    // we've read the buffer back, then dropped (which unlinks it).
+    let mut tmp = Builder::new()
+        .prefix("fj-")
+        .suffix(&format!("-{template_name}"))
+        .tempfile()
+        .context("creating secure temp file")?;
+    tmp.write_all(initial_contents.as_bytes())?;
+    tmp.flush()?;
+    let tmp_path = tmp.path().to_path_buf();
 
     let editor = editor_command();
     // Split on whitespace so users can set `EDITOR="code -w"`.
@@ -38,18 +44,20 @@ pub fn edit_text(template_name: &str, initial_contents: &str) -> Result<String> 
     let extra_args: Vec<&str> = parts.collect();
     let status = Command::new(program)
         .args(&extra_args)
-        .arg(&tmp)
+        .arg(&tmp_path)
         .status()
         .with_context(|| format!("launching editor `{editor}`"))?;
     if !status.success() {
         return Err(anyhow!("editor `{editor}` exited with status {status}"));
     }
 
+    // Re-open by path: some editors replace the file (write new + rename)
+    // rather than editing in place, so the original handle may be stale.
     let mut buf = String::new();
-    fs::File::open(&tmp)?
+    fs::File::open(&tmp_path)?
         .read_to_string(&mut buf)
         .context("reading edited buffer back from temp file")?;
-    let _ = fs::remove_file(&tmp);
+    drop(tmp);
     Ok(buf.trim_end().to_string())
 }
 

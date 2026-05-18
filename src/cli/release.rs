@@ -1,4 +1,6 @@
-use anyhow::Result;
+use std::path::{Path, PathBuf};
+
+use anyhow::{anyhow, Result};
 use clap::{Args, Subcommand};
 
 use crate::api;
@@ -323,16 +325,16 @@ async fn download(args: DownloadArgs, host: Option<&str>) -> Result<()> {
                 continue;
             }
         }
-        let dest = std::path::Path::new(&out).join(&a.name);
-        let bytes = ctx
+        let dest = safe_asset_dest(Path::new(&out), &a.name)?;
+        let resp = ctx
             .client
             .http()
             .get(&a.browser_download_url)
             .send()
             .await?
-            .error_for_status()?
-            .bytes()
-            .await?;
+            .error_for_status()?;
+        crate::client::check_body_size(&resp)?;
+        let bytes = resp.bytes().await?;
         std::fs::write(&dest, &bytes)?;
         println!("✓ Downloaded {} → {}", a.name, dest.display());
         downloaded += 1;
@@ -341,6 +343,35 @@ async fn download(args: DownloadArgs, host: Option<&str>) -> Result<()> {
         println!("(no assets matched)");
     }
     Ok(())
+}
+
+/// Resolve the on-disk destination for a release asset. The asset name is
+/// returned by the server and is therefore untrusted: it must be a single
+/// normal path component (no separators, no `.`/`..`, not absolute). We then
+/// re-check that the joined path stays directly inside `out`. Without this a
+/// malicious repo could ship an asset named `../../../../etc/whatever` and
+/// `Path::join` would happily write outside the download directory.
+fn safe_asset_dest(out: &Path, asset_name: &str) -> Result<PathBuf> {
+    let mut comps = Path::new(asset_name).components();
+    let only = match (comps.next(), comps.next()) {
+        (Some(std::path::Component::Normal(c)), None) => c,
+        _ => {
+            return Err(anyhow!(
+                "refusing to write release asset with unsafe name {asset_name:?}"
+            ))
+        }
+    };
+    if only.is_empty() {
+        return Err(anyhow!("release asset has an empty name"));
+    }
+    let dest = out.join(only);
+    if dest.parent() != Some(out) {
+        return Err(anyhow!(
+            "refusing to write release asset outside {}: {asset_name:?}",
+            out.display()
+        ));
+    }
+    Ok(dest)
 }
 
 fn human_size(bytes: u64) -> String {
@@ -369,7 +400,25 @@ fn truncate(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::human_size;
+    use super::{human_size, safe_asset_dest};
+    use std::path::Path;
+
+    #[test]
+    fn safe_asset_dest_accepts_plain_name() {
+        let dest = safe_asset_dest(Path::new("/tmp/out"), "fj-linux.tar.gz").unwrap();
+        assert_eq!(dest, Path::new("/tmp/out/fj-linux.tar.gz"));
+    }
+
+    #[test]
+    fn safe_asset_dest_rejects_traversal() {
+        assert!(safe_asset_dest(Path::new("/tmp/out"), "../evil").is_err());
+        assert!(safe_asset_dest(Path::new("/tmp/out"), "../../etc/passwd").is_err());
+        assert!(safe_asset_dest(Path::new("/tmp/out"), "a/b").is_err());
+        assert!(safe_asset_dest(Path::new("/tmp/out"), "/etc/passwd").is_err());
+        assert!(safe_asset_dest(Path::new("/tmp/out"), "..").is_err());
+        assert!(safe_asset_dest(Path::new("/tmp/out"), "").is_err());
+        assert!(safe_asset_dest(Path::new("/tmp/out"), ".").is_err());
+    }
 
     #[test]
     fn formats_bytes() {

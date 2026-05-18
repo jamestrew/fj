@@ -5,7 +5,7 @@ use reqwest::Method;
 use serde_json::Value;
 use url::Url;
 
-use crate::client::{pagination::parse_link_header, Client};
+use crate::client::{check_body_size, pagination::parse_link_header, Client};
 use crate::output;
 
 #[derive(Debug, Args)]
@@ -85,6 +85,7 @@ pub async fn run(args: ApiArgs, host: Option<&str>) -> Result<()> {
         )
         .await?;
     let status = res.status();
+    check_body_size(&res)?;
     let resp_headers = res.headers().clone();
     let text = res.text().await.context("reading response body")?;
 
@@ -186,10 +187,19 @@ async fn collect_paginated(
     query: &[(String, String)],
     extra_headers: &HeaderMap,
 ) -> Result<Value> {
+    // A hostile or buggy server can serve an endless `Link: rel=next` chain.
+    // Cap the number of pages so `--paginate` can't be turned into an
+    // unbounded loop / memory sink.
+    const MAX_PAGES: usize = 1000;
     let mut all_items = Vec::<Value>::new();
     let mut current_endpoint: String = endpoint.to_string();
     let mut current_query: Vec<(String, String)> = query.to_vec();
-    loop {
+    for page in 0.. {
+        if page >= MAX_PAGES {
+            return Err(anyhow!(
+                "--paginate exceeded {MAX_PAGES} pages; aborting (server may be returning an endless `next` link)"
+            ));
+        }
         let res = client
             .request_with_headers(
                 Method::GET,
@@ -199,6 +209,7 @@ async fn collect_paginated(
                 extra_headers,
             )
             .await?;
+        check_body_size(&res)?;
         let headers = res.headers().clone();
         let status = res.status();
         let text = res.text().await?;
