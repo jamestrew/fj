@@ -80,7 +80,11 @@ async fn list(args: ListArgs, host: Option<&str>) -> Result<()> {
                 r.status.clone(),
                 conclusion,
                 truncate(&r.head_branch, 30),
-                output::dim(&output::relative_time(r.updated_at)),
+                output::dim(
+                    &r.updated_at
+                        .map(output::relative_time)
+                        .unwrap_or_else(|| "-".into()),
+                ),
             ]
         })
         .collect();

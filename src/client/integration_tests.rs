@@ -258,3 +258,51 @@ async fn protect_get_tolerates_null_arrays() {
     assert!(p.status_check_contexts.is_empty());
     assert!(p.push_whitelist_usernames.is_empty());
 }
+
+#[tokio::test]
+async fn run_list_tolerates_inconsistent_forgejo_rows() {
+    // This Forgejo emits inconsistent run rows: workflow_id as a file
+    // path or an int, and queued/odd rows missing name, html_url, and
+    // timestamps. The whole list must still deserialize.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/runs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "total_count": 3,
+            "workflow_runs": [
+                {
+                    "id": 1, "name": "ci", "status": "failure",
+                    "conclusion": null, "workflow_id": "cache-smoke.yml",
+                    "html_url": "https://x/1",
+                    "created_at": "2026-05-18T00:00:00Z",
+                    "updated_at": "2026-05-18T00:01:00Z", "run_number": 788
+                },
+                {
+                    "id": 2, "name": "ci", "status": "success",
+                    "conclusion": "success", "workflow_id": 42,
+                    "html_url": "https://x/2",
+                    "created_at": "2026-05-18T00:00:00Z",
+                    "updated_at": "2026-05-18T00:01:00Z", "run_number": 789
+                },
+                {
+                    "id": 3, "status": "waiting", "run_number": 790
+                }
+            ]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let runs = crate::api::workflow::list_runs(&c, "o", "r", 50)
+        .await
+        .expect("inconsistent rows must not fail the whole list");
+    assert_eq!(runs.len(), 3);
+    assert_eq!(runs[0].workflow_id, "cache-smoke.yml");
+    assert_eq!(runs[1].workflow_id, "42");
+    // Row 3 omits name/html_url/workflow_id/timestamps entirely.
+    assert_eq!(runs[2].workflow_id, "");
+    assert_eq!(runs[2].name, "");
+    assert_eq!(runs[2].status, "waiting");
+    assert!(runs[2].updated_at.is_none());
+    assert_eq!(runs[2].run_number, 790);
+}

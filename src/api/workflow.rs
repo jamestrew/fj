@@ -7,20 +7,41 @@ use serde::{Deserialize, Serialize};
 
 use crate::client::Client;
 
+// Forgejo's actions/runs payload is inconsistent across versions and
+// even across rows in one response (queued runs omit timestamps, some
+// builds drop `name`/`html_url`, `workflow_id` is an int or a filename).
+// Every field is defaulted so `fj run list` degrades gracefully instead
+// of failing the whole list on one odd row.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowRun {
+    #[serde(default)]
     pub id: u64,
+    // Newer Forgejo names the run `title`; older builds use `name`.
+    #[serde(default, alias = "title")]
     pub name: String,
-    #[serde(default)]
+    // Newer: `prettyref`; older: `head_branch`.
+    #[serde(default, alias = "prettyref")]
     pub head_branch: String,
-    #[serde(default)]
+    // Newer: `commit_sha`; older: `head_sha`.
+    #[serde(default, alias = "commit_sha")]
     pub head_sha: String,
+    #[serde(default)]
     pub status: String,
+    // Newer schema folds the outcome into `status` (no separate field).
+    #[serde(default)]
     pub conclusion: Option<String>,
-    pub workflow_id: u64,
+    // Int row id on older builds, workflow file path ("ci.yml") on newer.
+    #[serde(default, deserialize_with = "crate::api::serde_util::string_or_number")]
+    pub workflow_id: String,
+    #[serde(default)]
     pub html_url: String,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    // Newer: `created`/`updated`; older: `created_at`/`updated_at`.
+    #[serde(default, alias = "created")]
+    pub created_at: Option<DateTime<Utc>>,
+    #[serde(default, alias = "updated")]
+    pub updated_at: Option<DateTime<Utc>>,
+    // Newer: `index_in_repo` (per-repo run number); older: `run_number`.
+    #[serde(default, alias = "index_in_repo")]
     pub run_number: u64,
 }
 
