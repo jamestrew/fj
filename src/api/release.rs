@@ -123,10 +123,10 @@ pub async fn upload_asset(
         .mime_str("application/octet-stream")?;
     let form = reqwest::multipart::Form::new().part("attachment", part);
     let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert(
-        reqwest::header::AUTHORIZATION,
-        reqwest::header::HeaderValue::from_str(&format!("token {}", client.token()))?,
-    );
+    // Pull the Authorization header straight from the client so it picks
+    // up the right scheme (PAT vs Fjord bearer) without this call site
+    // needing to know which one is active.
+    headers.insert(reqwest::header::AUTHORIZATION, client.auth_header_value()?);
     let res = client
         .http()
         .post(url)

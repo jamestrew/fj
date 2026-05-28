@@ -67,7 +67,8 @@ pub struct SetupGitArgs {
 
 #[derive(Debug, Args)]
 pub struct LoginArgs {
-    /// Hostname to log in to (e.g. `rasterhub.com`).
+    /// Hostname to log in to (e.g. `rasterhub.com`). Ignored in --fjord
+    /// mode; the platform URL is used as the host identity instead.
     #[arg(long)]
     pub host: Option<String>,
     /// Pass the token as a flag instead of through stdin / interactive prompt.
@@ -79,6 +80,18 @@ pub struct LoginArgs {
     /// Git protocol to use when cloning from this host.
     #[arg(long, value_parser = ["https", "ssh"], default_value = "https")]
     pub git_protocol: String,
+    /// Sign in with Fjord Account credentials (email + password + optional
+    /// TOTP) rather than a Forgejo personal access token. The resulting
+    /// session bearer is used to talk to every Forgejo instance owned by
+    /// this account, via the fjord-platform gateway. Use `fj instances`
+    /// after signing in to list and pick an instance.
+    #[arg(long, conflicts_with_all = ["token", "with_token"])]
+    pub fjord: bool,
+    /// fjord-platform deployment URL to sign in against. Defaults to the
+    /// production deployment. Use this for local dev (`http://localhost:5180`)
+    /// or to point at a staging environment.
+    #[arg(long, requires = "fjord", value_name = "URL")]
+    pub platform_url: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -117,9 +130,27 @@ pub async fn run(cmd: AuthCmd) -> Result<()> {
 fn token(args: TokenArgs) -> Result<()> {
     use std::io::IsTerminal;
     let hosts = Hosts::load()?;
-    let host = hosts.resolve_host(args.host.as_deref())?.to_string();
-    let token = token_store::load_token(&host)?
-        .ok_or_else(|| anyhow!("no token stored for {host}; run `fj auth login`"))?;
+    let host_name = hosts.resolve_host(args.host.as_deref())?.to_string();
+    let cfg = hosts
+        .hosts
+        .get(&host_name)
+        .cloned()
+        .ok_or_else(|| anyhow!("host '{host_name}' not configured"))?;
+    let token = match cfg.auth_kind {
+        crate::config::hosts::AuthKind::Pat => token_store::load_token(&host_name)?
+            .ok_or_else(|| anyhow!("no token stored for {host_name}; run `fj auth login`"))?,
+        crate::config::hosts::AuthKind::FjordAccount => {
+            let fa = cfg.fjord_account.as_ref().ok_or_else(|| {
+                anyhow!("host '{host_name}' is fjord_account but missing fjord_account config")
+            })?;
+            token_store::load_fjord_bearer(&fa.platform_url)?.ok_or_else(|| {
+                anyhow!(
+                    "no Fjord Account session stored for {}; run `fj auth login --fjord`",
+                    fa.platform_url
+                )
+            })?
+        }
+    };
     if std::io::stdout().is_terminal() && !args.force {
         return Err(anyhow!(
             "refusing to print a plaintext token to a terminal; pipe to a file/command, or pass --force"
@@ -137,6 +168,15 @@ async fn refresh(args: RefreshArgs) -> Result<()> {
         .get(&host)
         .cloned()
         .ok_or_else(|| anyhow!("host '{host}' not configured"))?;
+
+    // `fj auth refresh` is a PAT-mode workflow ("paste me a fresh PAT").
+    // Fjord-Account sessions are refreshed by re-running `fj auth login --fjord`.
+    if matches!(cfg.auth_kind, crate::config::hosts::AuthKind::FjordAccount) {
+        return Err(anyhow!(
+            "`fj auth refresh` is for Forgejo PAT hosts. For a Fjord Account session, \
+             re-run `fj auth login --fjord` instead."
+        ));
+    }
 
     let new_token = if let Some(t) = args.token {
         Some(t)
@@ -178,6 +218,12 @@ fn setup_git(args: SetupGitArgs) -> Result<()> {
         .get(&host)
         .cloned()
         .ok_or_else(|| anyhow!("host '{host}' not configured"))?;
+    if matches!(cfg.auth_kind, crate::config::hosts::AuthKind::FjordAccount) {
+        return Err(anyhow!(
+            "`fj auth setup-git` is for Forgejo PAT hosts. Fjord Account git credential \
+             helpers are not yet implemented (git pushes don't currently flow through the gateway)."
+        ));
+    }
     if let Some(u) = cfg.user.as_deref() {
         validate_username(u)?;
     }
@@ -270,6 +316,9 @@ fn validate_username(user: &str) -> Result<()> {
 }
 
 async fn login(args: LoginArgs) -> Result<()> {
+    if args.fjord {
+        return login_fjord(args).await;
+    }
     let hostname = match args.host.clone() {
         Some(h) => h,
         None => prompt_hostname()?,
@@ -291,6 +340,8 @@ async fn login(args: LoginArgs) -> Result<()> {
         user: None,
         git_protocol: git_protocol.clone(),
         api_base_path: None,
+        auth_kind: crate::config::hosts::AuthKind::Pat,
+        fjord_account: None,
     };
     let probe_client = build_probe_client(&hostname, &provisional, &token)?;
     let me = api::user::current(&probe_client)
@@ -310,6 +361,8 @@ async fn login(args: LoginArgs) -> Result<()> {
         user: Some(me.login.clone()),
         git_protocol,
         api_base_path: None,
+        auth_kind: crate::config::hosts::AuthKind::Pat,
+        fjord_account: None,
     };
     hosts.upsert(&hostname, host);
     hosts.save()?;
@@ -327,6 +380,180 @@ async fn login(args: LoginArgs) -> Result<()> {
         }
     );
     Ok(())
+}
+
+/// Fjord Account sign-in: email + password (+ TOTP if Paragon asks). The
+/// resulting bearer is stored under the platform URL's keychain slot so it
+/// doesn't collide with any PAT for the same DNS host (which can't happen
+/// in practice, but the keychain key is namespaced anyway).
+async fn login_fjord(args: LoginArgs) -> Result<()> {
+    use crate::config::hosts::{AuthKind, FjordAccount};
+    use crate::fjord::{
+        normalize_platform_url, sign_in, SignInRequest, SignInResponse, DEFAULT_PLATFORM_URL,
+    };
+
+    let platform_url = match args.platform_url.as_deref() {
+        Some(p) => normalize_platform_url(p)?,
+        None => DEFAULT_PLATFORM_URL.to_string(),
+    };
+
+    let email = prompt_email()?;
+    let password = Password::new()
+        .with_prompt(format!("Password for {email}"))
+        .interact()
+        .context("reading password")?;
+
+    // Up to one TOTP / recovery round-trip on top of the password call.
+    // We re-submit password + code together; the server chains
+    // /auth/2fa/totp/login internally so we don't need to track the
+    // challenge token client-side.
+    let first = sign_in(
+        &platform_url,
+        &SignInRequest {
+            email: &email,
+            password: &password,
+            totp_code: None,
+            recovery_code: None,
+        },
+    )
+    .await?;
+    let success = match first {
+        SignInResponse::Success { .. } => first,
+        SignInResponse::TotpRequired { message, .. } => {
+            if let Some(m) = message.as_deref() {
+                if !m.is_empty() {
+                    eprintln!("{m}");
+                }
+            }
+            let (totp, recovery) = match prompt_totp_or_recovery()? {
+                TotpInput::Totp(c) => (Some(c), None),
+                TotpInput::Recovery(c) => (None, Some(c)),
+            };
+            let second = sign_in(
+                &platform_url,
+                &SignInRequest {
+                    email: &email,
+                    password: &password,
+                    totp_code: totp.as_deref(),
+                    recovery_code: recovery.as_deref(),
+                },
+            )
+            .await?;
+            settle_outcome(second)?
+        }
+        other => settle_outcome(other)?,
+    };
+
+    let (access_token, user_email) = match success {
+        SignInResponse::Success {
+            access_token, user, ..
+        } => (access_token, user.email.unwrap_or_else(|| email.clone())),
+        _ => unreachable!("settle_outcome only returns Success or errors"),
+    };
+
+    // Persist: host entry keyed by platform URL, auth_kind=fjord_account,
+    // bearer under the namespaced keychain slot.
+    let mut hosts = Hosts::load()?;
+    let host_entry = Host {
+        user: Some(user_email.clone()),
+        git_protocol: args.git_protocol.clone(),
+        api_base_path: None,
+        auth_kind: AuthKind::FjordAccount,
+        fjord_account: Some(FjordAccount {
+            platform_url: platform_url.clone(),
+            default_instance_id: None,
+            default_instance_display_name: None,
+            default_instance_slug: None,
+        }),
+    };
+    hosts.upsert(&platform_url, host_entry);
+    hosts.save()?;
+    token_store::store_fjord_bearer(&platform_url, &access_token)?;
+
+    println!(
+        "{} Signed in to {} as {}",
+        output::bold("✓"),
+        output::bold(&platform_url),
+        output::bold(&user_email),
+    );
+    println!(
+        "  {}",
+        output::dim("Next: `fj instances list` to see your Forgejo instances, then `fj instances use <id>`.")
+    );
+    Ok(())
+}
+
+enum TotpInput {
+    Totp(String),
+    Recovery(String),
+}
+
+fn prompt_totp_or_recovery() -> Result<TotpInput> {
+    use std::io::{stderr, stdin, Write};
+    eprint!("TOTP code (or `r` to use a recovery code): ");
+    stderr().flush().ok();
+    let mut buf = String::new();
+    stdin().read_line(&mut buf).context("reading TOTP code")?;
+    let trimmed = buf.trim();
+    if trimmed.eq_ignore_ascii_case("r") {
+        let r = Password::new()
+            .with_prompt("Recovery code")
+            .interact()
+            .context("reading recovery code")?;
+        Ok(TotpInput::Recovery(r))
+    } else if trimmed.is_empty() {
+        Err(anyhow!("TOTP code is required"))
+    } else {
+        Ok(TotpInput::Totp(trimmed.to_string()))
+    }
+}
+
+fn prompt_email() -> Result<String> {
+    use std::io::{stderr, stdin, Write};
+    eprint!("Fjord Account email: ");
+    stderr().flush().ok();
+    let mut buf = String::new();
+    stdin().read_line(&mut buf).context("reading email")?;
+    let trimmed = buf.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("email is required"));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Map a non-Success outcome to an `Err` with a user-readable explanation.
+/// Success passes through verbatim so the caller can keep unwrapping fields.
+fn settle_outcome(o: crate::fjord::SignInResponse) -> Result<crate::fjord::SignInResponse> {
+    use crate::fjord::SignInResponse as R;
+    match o {
+        R::Success { .. } => Ok(o),
+        R::TotpRequired { .. } => Err(anyhow!(
+            "Fjord Account still needs a TOTP code; re-run `fj auth login --fjord`."
+        )),
+        R::WebauthnRequired { .. } => Err(anyhow!(
+            "this account uses a security key; sign-in via key is not yet supported in fj. \
+             Use TOTP or a recovery code."
+        )),
+        R::MfaSetupRequired { message, .. } => Err(anyhow!(
+            "MFA enrollment is required before this account can sign in via fj. \
+             Enroll a TOTP factor through the web UI first. ({})",
+            message.unwrap_or_default()
+        )),
+        R::Locked {
+            retry_after_seconds,
+            message,
+        } => Err(anyhow!(
+            "Fjord Account is rate-limited (retry in {retry_after_seconds}s): {message}"
+        )),
+        R::InvalidCredentials { message } => Err(anyhow!("sign-in failed: {message}")),
+        R::Misconfigured { message } => Err(anyhow!("fjord-platform is misconfigured: {message}")),
+        R::UpstreamError { message, .. } => {
+            Err(anyhow!("fjord-platform upstream error: {message}"))
+        }
+        R::StrategyMismatch { message } => Err(anyhow!(
+            "this fjord-platform deployment is not configured for credential sign-in: {message}"
+        )),
+    }
 }
 
 async fn probe_version(client: &Client) -> Result<String> {
@@ -430,10 +657,44 @@ async fn status(args: StatusArgs) -> Result<()> {
             String::new()
         };
         println!("{}{current_marker}", output::bold(name));
-        let token_present = token_store::load_token(name)?.is_some();
+        let token_present = match host.auth_kind {
+            crate::config::hosts::AuthKind::Pat => token_store::load_token(name)?.is_some(),
+            crate::config::hosts::AuthKind::FjordAccount => host
+                .fjord_account
+                .as_ref()
+                .map(|fa| token_store::load_fjord_bearer(&fa.platform_url))
+                .transpose()?
+                .flatten()
+                .is_some(),
+        };
+        let scheme_label = match host.auth_kind {
+            crate::config::hosts::AuthKind::Pat => "Forgejo PAT",
+            crate::config::hosts::AuthKind::FjordAccount => "Fjord Account",
+        };
+        println!("  Auth: {scheme_label}");
         match host.user.as_deref() {
             Some(u) => println!("  ✓ Logged in as {u}"),
             None => println!("  ✓ Host configured"),
+        }
+        if let Some(fa) = host.fjord_account.as_ref() {
+            println!("  Platform URL: {}", fa.platform_url);
+            match fa.default_instance_id.as_deref() {
+                Some(id) => {
+                    let display = fa.default_instance_display_name.as_deref().unwrap_or("");
+                    println!(
+                        "  Default instance: {id}{}",
+                        if display.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" ({display})")
+                        }
+                    );
+                }
+                None => println!(
+                    "  Default instance: {}",
+                    output::dim("none (run `fj instances list` then `fj instances use <id>`)")
+                ),
+            }
         }
         println!(
             "  ✓ Token: {}",
@@ -450,8 +711,18 @@ async fn status(args: StatusArgs) -> Result<()> {
                     "  Token value: {}",
                     output::dim("(hidden; pipe to a file or use `fj auth token --force`)")
                 );
-            } else if let Some(t) = token_store::load_token(name)? {
-                println!("  Token value: {t}");
+            } else {
+                let t = match host.auth_kind {
+                    crate::config::hosts::AuthKind::Pat => token_store::load_token(name)?,
+                    crate::config::hosts::AuthKind::FjordAccount => host
+                        .fjord_account
+                        .as_ref()
+                        .and_then(|fa| token_store::load_fjord_bearer(&fa.platform_url).transpose())
+                        .transpose()?,
+                };
+                if let Some(t) = t {
+                    println!("  Token value: {t}");
+                }
             }
         }
         println!("  Git protocol: {}", host.git_protocol);
@@ -472,11 +743,22 @@ fn logout(args: LogoutArgs) -> Result<()> {
             hosts.hosts.keys().next().cloned().unwrap()
         }
     };
-    if hosts.remove(&target).is_none() {
-        return Err(anyhow!("no entry for host '{target}'"));
-    }
+    let removed = match hosts.remove(&target) {
+        Some(h) => h,
+        None => return Err(anyhow!("no entry for host '{target}'")),
+    };
     hosts.save()?;
-    token_store::delete_token(&target)?;
+    // Clear the right keychain slot for the auth scheme we just removed.
+    match removed.auth_kind {
+        crate::config::hosts::AuthKind::Pat => {
+            token_store::delete_token(&target)?;
+        }
+        crate::config::hosts::AuthKind::FjordAccount => {
+            if let Some(fa) = removed.fjord_account.as_ref() {
+                token_store::delete_fjord_bearer(&fa.platform_url)?;
+            }
+        }
+    }
     println!("✓ Logged out of {target}");
     Ok(())
 }
@@ -496,15 +778,20 @@ fn list() -> Result<()> {
             } else {
                 ""
             };
+            let scheme = match h.auth_kind {
+                crate::config::hosts::AuthKind::Pat => "pat",
+                crate::config::hosts::AuthKind::FjordAccount => "fjord-account",
+            };
             vec![
                 current.into(),
                 name.clone(),
                 h.user.clone().unwrap_or_default(),
+                scheme.into(),
                 h.git_protocol.clone(),
             ]
         })
         .collect();
-    let table = output::render_table(&["", "HOST", "USER", "PROTOCOL"], &rows);
+    let table = output::render_table(&["", "HOST", "USER", "AUTH", "PROTOCOL"], &rows);
     print!("{table}");
     Ok(())
 }

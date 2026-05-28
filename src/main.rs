@@ -3,6 +3,7 @@ mod auth;
 mod cli;
 mod client;
 mod config;
+mod fjord;
 mod git;
 mod output;
 
@@ -80,6 +81,7 @@ fn detect_plugin(argv: &[String]) -> Option<String> {
 /// hijacking real subcommands as plugin candidates.
 const KNOWN_SUBCOMMANDS: &[&str] = &[
     "auth",
+    "instances",
     "repo",
     "issue",
     "pr",

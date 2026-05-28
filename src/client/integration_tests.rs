@@ -259,6 +259,226 @@ async fn protect_get_tolerates_null_arrays() {
     assert!(p.push_whitelist_usernames.is_empty());
 }
 
+// --- Fjord Account (Phase 6) flows ---
+
+/// `POST /api/v1/sign-in` happy path: the platform returns `kind:success`
+/// with an access token + user info. We assert the request shape and the
+/// decoded enum variant.
+#[tokio::test]
+async fn fjord_sign_in_success() {
+    use crate::fjord::{sign_in, SignInRequest, SignInResponse};
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/sign-in"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "kind": "success",
+            "accessToken": "tok-abc",
+            "refreshToken": "rtok-def",
+            "accessTokenExp": 1_900_000_000,
+            "user": {
+                "userId": "usr_1",
+                "email": "alice@example.com",
+                "role": "owner"
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let res = sign_in(
+        &server.uri(),
+        &SignInRequest {
+            email: "alice@example.com",
+            password: "hunter2",
+            totp_code: None,
+            recovery_code: None,
+        },
+    )
+    .await
+    .expect("sign-in ok");
+    match res {
+        SignInResponse::Success {
+            access_token, user, ..
+        } => {
+            assert_eq!(access_token, "tok-abc");
+            assert_eq!(user.email.as_deref(), Some("alice@example.com"));
+        }
+        other => panic!("expected Success, got {other:?}"),
+    }
+}
+
+/// `POST /api/v1/sign-in` returns `kind:totp-required` when the password
+/// is correct but the account has TOTP enrolled. The CLI must NOT treat
+/// this as success.
+#[tokio::test]
+async fn fjord_sign_in_totp_required() {
+    use crate::fjord::{sign_in, SignInRequest, SignInResponse};
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/sign-in"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "kind": "totp-required",
+            "challengeToken": "chal_xyz",
+            "message": "Enter your 6-digit TOTP."
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let res = sign_in(
+        &server.uri(),
+        &SignInRequest {
+            email: "alice@example.com",
+            password: "hunter2",
+            totp_code: None,
+            recovery_code: None,
+        },
+    )
+    .await
+    .expect("sign-in ok");
+    assert!(matches!(res, SignInResponse::TotpRequired { .. }));
+}
+
+/// `POST /api/v1/sign-in` returns `kind:invalid-credentials` with HTTP 401
+/// when the email or password is wrong. The decoder must still produce the
+/// typed variant rather than failing.
+#[tokio::test]
+async fn fjord_sign_in_invalid_credentials() {
+    use crate::fjord::{sign_in, SignInRequest, SignInResponse};
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/sign-in"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+            "kind": "invalid-credentials",
+            "message": "Email or password is incorrect."
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let res = sign_in(
+        &server.uri(),
+        &SignInRequest {
+            email: "alice@example.com",
+            password: "nope",
+            totp_code: None,
+            recovery_code: None,
+        },
+    )
+    .await
+    .expect("body must still decode despite 401");
+    match res {
+        SignInResponse::InvalidCredentials { message } => {
+            assert!(message.contains("incorrect"));
+        }
+        other => panic!("expected InvalidCredentials, got {other:?}"),
+    }
+}
+
+/// `GET /api/v1/me/forge-instances` happy path: two instances returned,
+/// bearer header forwarded verbatim.
+#[tokio::test]
+async fn fjord_list_instances_happy_path() {
+    use crate::fjord::list_instances;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/me/forge-instances"))
+        .and(header("authorization", "Bearer alice-bearer"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "instances": [
+                {
+                    "id": "inst_1",
+                    "displayName": "Primary",
+                    "slug": "primary",
+                    "region": "us-east-1",
+                    "plan": "pro",
+                    "state": "ready",
+                    "createdAt": "2026-05-01T00:00:00Z",
+                    "publicUrl": "https://primary.forgejo.example"
+                },
+                {
+                    "id": "inst_2",
+                    "displayName": "Sandbox",
+                    "slug": "sandbox",
+                    "region": "us-west-2",
+                    "plan": "free",
+                    "state": "provisioning",
+                    "createdAt": "2026-05-12T00:00:00Z",
+                    "publicUrl": "https://sandbox.forgejo.example"
+                }
+            ]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let instances = list_instances(&server.uri(), "alice-bearer")
+        .await
+        .expect("ok");
+    assert_eq!(instances.len(), 2);
+    assert_eq!(instances[0].id, "inst_1");
+    assert_eq!(instances[0].slug, "primary");
+    assert_eq!(instances[1].state.as_deref(), Some("provisioning"));
+}
+
+/// Paragon's 404 (no instances provisioned yet) maps to an empty list
+/// rather than an error, so the CLI can print a friendly "no instances yet"
+/// message rather than an exception trace.
+#[tokio::test]
+async fn fjord_list_instances_404_is_empty() {
+    use crate::fjord::list_instances;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/me/forge-instances"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let instances = list_instances(&server.uri(), "alice-bearer")
+        .await
+        .expect("404 should map to empty list");
+    assert!(instances.is_empty());
+}
+
+/// When a `Client` is constructed with FjordBearer auth and the gateway
+/// base URL, every Forgejo API call lands at the gateway path (not the
+/// raw Forgejo origin) and carries `Authorization: Bearer …`.
+#[tokio::test]
+async fn fjord_client_routes_through_gateway_with_bearer() {
+    use crate::client::AuthScheme;
+    let server = MockServer::start().await;
+    // The gateway base for instance "inst_x" against this mock platform.
+    let base = Url::parse(&format!(
+        "{}/api/v1/forge-gateway/inst_x/api/v1/",
+        server.uri()
+    ))
+    .expect("base url");
+
+    // The mock only matches if the request hits the gateway path AND
+    // carries the Fjord bearer in Authorization. A PAT-style request
+    // wouldn't satisfy either matcher.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/forge-gateway/inst_x/api/v1/user"))
+        .and(header("authorization", "Bearer jwt-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 7, "login": "alice"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let c = Client::for_base_url_with_scheme(base, "jwt-token".into(), AuthScheme::FjordBearer)
+        .expect("client");
+    // Existing call sites use `/api/v1/<path>`; verify that survives the
+    // gateway re-base. The Client's `url()` strips the `/api/v1/` prefix
+    // before joining against the base, so the result is the gateway-routed
+    // URL `…/forge-gateway/inst_x/api/v1/user`.
+    let res: serde_json::Value = c
+        .json(Method::GET, "/api/v1/user", &[], None::<&()>)
+        .await
+        .expect("ok");
+    assert_eq!(res["login"], "alice");
+}
+
 #[tokio::test]
 async fn run_list_tolerates_inconsistent_forgejo_rows() {
     // This Forgejo emits inconsistent run rows: workflow_id as a file

@@ -10,13 +10,58 @@ use super::hosts_path;
 /// here: tokens live in the OS keychain via the `auth` module.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Host {
-    /// Username (login) of the authenticated user on this host.
+    /// Username (login) of the authenticated user on this host. For Fjord
+    /// Account hosts this is the Fjord email.
     pub user: Option<String>,
     /// Protocol used for git operations (`https` or `ssh`).
     #[serde(default = "default_git_protocol")]
     pub git_protocol: String,
     /// Optional API base path. Defaults to `/api/v1` when absent.
     pub api_base_path: Option<String>,
+    /// How this host authenticates. `pat` (default) means the keychain
+    /// holds a Forgejo personal access token and requests go direct to
+    /// the host. `fjord_account` means the keychain holds a Fjord
+    /// Account bearer and requests are routed through the
+    /// fjord-platform gateway.
+    #[serde(default, skip_serializing_if = "AuthKind::is_default")]
+    pub auth_kind: AuthKind,
+    /// Fjord-Account-specific config. Present only when
+    /// `auth_kind == FjordAccount`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fjord_account: Option<FjordAccount>,
+}
+
+/// How a host authenticates fj's requests.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthKind {
+    #[default]
+    Pat,
+    FjordAccount,
+}
+
+impl AuthKind {
+    fn is_default(&self) -> bool {
+        matches!(self, AuthKind::Pat)
+    }
+}
+
+/// Per-host Fjord Account configuration. The `platform_url` is the
+/// fjord-platform base URL the bearer was minted against; the default
+/// instance id is the Forgejo instance routed to when the user doesn't
+/// pass an explicit `--instance`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FjordAccount {
+    /// Base URL of the fjord-platform deployment, e.g.
+    /// `https://forgejo-site.pages.dev`. No trailing slash.
+    pub platform_url: String,
+    /// Currently-selected Forgejo instance id. `None` means the user
+    /// has signed in but not yet picked one.
+    pub default_instance_id: Option<String>,
+    /// Cached display name + slug for the default instance, so commands
+    /// can print it without re-fetching.
+    pub default_instance_display_name: Option<String>,
+    pub default_instance_slug: Option<String>,
 }
 
 fn default_git_protocol() -> String {
@@ -118,6 +163,8 @@ mod tests {
             user: Some(user.into()),
             git_protocol: "https".into(),
             api_base_path: None,
+            auth_kind: AuthKind::Pat,
+            fjord_account: None,
         }
     }
 

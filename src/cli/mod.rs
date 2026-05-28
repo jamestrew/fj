@@ -8,6 +8,7 @@ pub mod editor;
 pub mod extension;
 pub mod gist;
 pub mod hook;
+pub mod instances;
 pub mod issue;
 pub mod key;
 pub mod label;
@@ -62,6 +63,8 @@ pub struct Cli {
 pub enum Command {
     /// Manage authentication against Forgejo hosts.
     Auth(auth::AuthCmd),
+    /// List and select the Forgejo instances owned by your Fjord Account.
+    Instances(instances::InstancesCmd),
     /// Work with repositories.
     Repo(repo::RepoCmd),
     /// Work with issues.
@@ -164,6 +167,7 @@ pub async fn run(cli: Cli) -> Result<()> {
 async fn dispatch(command: Command, host: Option<&str>) -> Result<()> {
     match command {
         Command::Auth(cmd) => auth::run(cmd).await,
+        Command::Instances(cmd) => instances::run(cmd, host).await,
         Command::Repo(cmd) => repo::run(cmd, host).await,
         Command::Issue(cmd) => issue::run(cmd, host).await,
         Command::Pr(cmd) => pr::run(cmd, host).await,

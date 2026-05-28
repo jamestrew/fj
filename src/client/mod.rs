@@ -25,12 +25,24 @@ use serde::Serialize;
 use url::Url;
 
 use crate::auth;
-use crate::config::hosts::{api_base_path, Host, Hosts};
+use crate::config::hosts::{api_base_path, AuthKind, Host, Hosts};
+use crate::fjord;
 
 pub use error::ApiError;
 pub use pagination::Page;
 
-/// Convenience handle for talking to a single Forgejo host.
+/// Which HTTP `Authorization` shape a `Client` uses on outgoing requests.
+/// `Pat` is the historical Forgejo PAT scheme (`Authorization: token <pat>`).
+/// `FjordBearer` is the OAuth-style bearer fjord-platform mints from
+/// `/api/v1/sign-in` and the gateway then translates per-instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthScheme {
+    Pat,
+    FjordBearer,
+}
+
+/// Convenience handle for talking to a single Forgejo host (or, in
+/// Fjord-Account mode, to a per-instance gateway endpoint that fronts one).
 #[derive(Clone)]
 pub struct Client {
     http: reqwest::Client,
@@ -38,6 +50,7 @@ pub struct Client {
     host: String,
     base: Url,
     token: String,
+    auth_scheme: AuthScheme,
 }
 
 pub struct ResolvedHost {
@@ -55,9 +68,25 @@ pub fn resolve(host_flag: Option<&str>) -> Result<ResolvedHost> {
         .get(&name)
         .cloned()
         .ok_or_else(|| anyhow!("host '{name}' not configured"))?;
-    let token = auth::load_token(&name)?.ok_or_else(|| {
-        anyhow!("no token stored for host '{name}'. Run `fj auth login --host {name}`.")
-    })?;
+    let token = match host_cfg.auth_kind {
+        AuthKind::Pat => auth::load_token(&name)?.ok_or_else(|| {
+            anyhow!("no token stored for host '{name}'. Run `fj auth login --host {name}`.")
+        })?,
+        AuthKind::FjordAccount => {
+            let fa = host_cfg.fjord_account.as_ref().ok_or_else(|| {
+                anyhow!(
+                    "host '{name}' is Fjord-Account but has no fjord_account config; \
+                     remove and re-run `fj auth login --fjord`"
+                )
+            })?;
+            auth::load_fjord_bearer(&fa.platform_url)?.ok_or_else(|| {
+                anyhow!(
+                    "no Fjord Account session stored for '{}'. Run `fj auth login --fjord` again.",
+                    fa.platform_url
+                )
+            })?
+        }
+    };
     Ok(ResolvedHost {
         name,
         host: host_cfg,
@@ -67,7 +96,30 @@ pub fn resolve(host_flag: Option<&str>) -> Result<ResolvedHost> {
 
 impl Client {
     pub fn new(resolved: ResolvedHost) -> Result<Self> {
-        let base = build_base_url(&resolved.name, &resolved.host)?;
+        let (base, auth_scheme) = match resolved.host.auth_kind {
+            AuthKind::Pat => (
+                build_base_url(&resolved.name, &resolved.host)?,
+                AuthScheme::Pat,
+            ),
+            AuthKind::FjordAccount => {
+                let fa = resolved.host.fjord_account.as_ref().ok_or_else(|| {
+                    anyhow!(
+                        "host '{}' is Fjord-Account but missing fjord_account config",
+                        resolved.name
+                    )
+                })?;
+                let instance_id = fa.default_instance_id.as_deref().ok_or_else(|| {
+                    anyhow!(
+                        "no default Fjord instance selected. \
+                         Run `fj instances list` and then `fj instances use <id>`."
+                    )
+                })?;
+                (
+                    fjord::gateway_base_url(&fa.platform_url, instance_id)?,
+                    AuthScheme::FjordBearer,
+                )
+            }
+        };
         let http = reqwest::Client::builder()
             .user_agent(default_user_agent())
             .connect_timeout(Duration::from_secs(15))
@@ -79,6 +131,7 @@ impl Client {
             host: resolved.name,
             base,
             token: resolved.token,
+            auth_scheme,
         })
     }
 
@@ -88,9 +141,20 @@ impl Client {
     }
 
     /// Construct a client pointing at an arbitrary base URL. Used for tests
-    /// against a local mock server. `base_url` must end with `/`.
+    /// against a local mock server. `base_url` must end with `/`. Defaults to
+    /// PAT-style auth; use `for_base_url_with_scheme` to override.
     #[allow(dead_code)]
     pub fn for_base_url(base_url: Url, token: String) -> Result<Self> {
+        Self::for_base_url_with_scheme(base_url, token, AuthScheme::Pat)
+    }
+
+    /// Like `for_base_url` but lets tests pick the auth scheme.
+    #[allow(dead_code)]
+    pub fn for_base_url_with_scheme(
+        base_url: Url,
+        token: String,
+        auth_scheme: AuthScheme,
+    ) -> Result<Self> {
         let host = base_url.host_str().map(str::to_string).unwrap_or_default();
         let http = reqwest::Client::builder()
             .user_agent(default_user_agent())
@@ -103,6 +167,7 @@ impl Client {
             host,
             base: base_url,
             token,
+            auth_scheme,
         })
     }
 
@@ -123,8 +188,34 @@ impl Client {
     }
 
     /// Raw token. Use only when constructing custom request headers.
+    #[allow(dead_code)]
     pub fn token(&self) -> &str {
         &self.token
+    }
+
+    /// Which `Authorization` shape this client emits. Used by call sites
+    /// (e.g. release asset upload) that bypass `request_with_headers` and
+    /// need to build their own header set.
+    #[allow(dead_code)]
+    pub fn auth_scheme(&self) -> AuthScheme {
+        self.auth_scheme
+    }
+
+    /// Build the `Authorization` header value matching the client's auth
+    /// scheme: `token <pat>` for PAT-mode hosts, `Bearer <jwt>` for
+    /// Fjord-Account-mode hosts. Returns an `HeaderValue` so the caller
+    /// can plug it into any `HeaderMap` directly.
+    pub fn auth_header_value(&self) -> Result<HeaderValue> {
+        let raw = match self.auth_scheme {
+            AuthScheme::Pat => format!("token {}", self.token),
+            AuthScheme::FjordBearer => format!("Bearer {}", self.token),
+        };
+        HeaderValue::from_str(&raw).map_err(|_| {
+            anyhow!(
+                "stored credential for host '{}' contains characters that can't appear in an HTTP header. Re-run `fj auth login` with a clean token.",
+                self.host
+            )
+        })
     }
 
     /// Whether `url` is the same origin (scheme + host + port) as the
@@ -145,14 +236,7 @@ impl Client {
 
     fn auth_headers(&self) -> Result<HeaderMap> {
         let mut headers = HeaderMap::new();
-        let value = HeaderValue::from_str(&format!("token {}", self.token)).map_err(|_| {
-            anyhow!(
-                "stored token for host '{}' contains characters that can't appear in an HTTP header. Re-run `fj auth login --host {}` with a clean token.",
-                self.host,
-                self.host
-            )
-        })?;
-        headers.insert(AUTHORIZATION, value);
+        headers.insert(AUTHORIZATION, self.auth_header_value()?);
         headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
         headers.insert(
             USER_AGENT,
