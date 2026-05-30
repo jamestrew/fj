@@ -116,3 +116,29 @@ broke.
 - Windows: `%APPDATA%\rasterstate\fj\`
 
 Files: `hosts.toml`, `aliases.toml`, `config.toml`.
+
+## How do I read Actions run logs?
+
+```sh
+fj run list                 # find the run number in the `#` column
+fj run view 56 --log        # full job log
+fj run view 56 --log-failed # only the steps that failed
+fj run watch 56             # stream the log live until the job ends
+```
+
+Multi-job runs: pass `--job <index>` (0-based). After a rerun, the
+latest attempt is shown by default; pin one with `--attempt <n>`.
+
+Two things to know, because they look like bugs but aren't:
+
+- Forgejo's REST API has no log endpoint. `fj` reads logs from the same
+  web routes the browser Actions UI uses (see `docs/architecture.md` →
+  "Actions run logs"). This is why log commands work even though
+  `fj api /repos/.../actions/runs/N/logs` returns 404.
+- "logs are no longer available for this run" means Forgejo pruned them
+  after its retention period. They're gone server-side; there's nothing
+  `fj` can fetch.
+
+Logs are not available for hosts logged in with a Fjord Account: the
+gateway only proxies `/api/v1`, not the web routes. Use a host with a
+personal access token.

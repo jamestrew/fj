@@ -203,6 +203,22 @@ pub async fn ready(client: &Client, owner: &str, name: &str, number: u64) -> Res
         .map(|_| ())
 }
 
+/// Merge the pull request's base branch into its head (the "update branch"
+/// button). `style` is `merge` (default) or `rebase`.
+pub async fn update_branch(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    number: u64,
+    style: &str,
+) -> Result<()> {
+    let path = format!("/api/v1/repos/{owner}/{name}/pulls/{number}/update");
+    let q = vec![("style".to_string(), style.to_string())];
+    let res = client.request(Method::POST, &path, &q, None).await?;
+    res.error_for_status()?;
+    Ok(())
+}
+
 pub async fn files(client: &Client, owner: &str, name: &str, number: u64) -> Result<Vec<PullFile>> {
     let path = format!("/api/v1/repos/{owner}/{name}/pulls/{number}/files");
     client.json(Method::GET, &path, &[], None::<&()>).await

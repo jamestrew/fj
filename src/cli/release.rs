@@ -33,6 +33,8 @@ pub enum ReleaseSub {
     Upload(UploadArgs),
     /// Download a release asset by name.
     Download(DownloadArgs),
+    /// Delete a single asset from a release by name.
+    DeleteAsset(DeleteAssetArgs),
 }
 
 #[derive(Debug, Args)]
@@ -127,6 +129,17 @@ pub struct DownloadArgs {
     pub output_dir: Option<String>,
 }
 
+#[derive(Debug, Args)]
+pub struct DeleteAssetArgs {
+    #[command(flatten)]
+    pub r: RepoFlag,
+    pub tag: String,
+    /// Name of the asset to delete.
+    pub asset: String,
+    #[arg(short = 'y', long)]
+    pub yes: bool,
+}
+
 pub async fn run(cmd: ReleaseCmd, host: Option<&str>) -> Result<()> {
     match cmd.command {
         ReleaseSub::List(args) => list(args, host).await,
@@ -136,6 +149,7 @@ pub async fn run(cmd: ReleaseCmd, host: Option<&str>) -> Result<()> {
         ReleaseSub::Delete(args) => delete(args, host).await,
         ReleaseSub::Upload(args) => upload(args, host).await,
         ReleaseSub::Download(args) => download(args, host).await,
+        ReleaseSub::DeleteAsset(args) => delete_asset(args, host).await,
     }
 }
 
@@ -283,6 +297,30 @@ async fn delete(args: DeleteArgs, host: Option<&str>) -> Result<()> {
     }
     api::release::delete(&ctx.client, &ctx.owner, &ctx.name, existing.id).await?;
     println!("✓ Deleted release {}", args.tag);
+    Ok(())
+}
+
+async fn delete_asset(args: DeleteAssetArgs, host: Option<&str>) -> Result<()> {
+    let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
+    let release = api::release::get_by_tag(&ctx.client, &ctx.owner, &ctx.name, &args.tag).await?;
+    let asset = release
+        .assets
+        .iter()
+        .find(|a| a.name == args.asset)
+        .ok_or_else(|| {
+            anyhow::anyhow!("release {} has no asset named '{}'", args.tag, args.asset)
+        })?;
+    if !args.yes {
+        let answer = editor::prompt_line(&format!(
+            "Delete asset '{}' from release {}? Type the asset name to confirm",
+            args.asset, args.tag
+        ))?;
+        if answer != args.asset {
+            return Err(anyhow::anyhow!("aborted"));
+        }
+    }
+    api::release::delete_asset(&ctx.client, &ctx.owner, &ctx.name, release.id, asset.id).await?;
+    println!("✓ Deleted asset {} from {}", args.asset, args.tag);
     Ok(())
 }
 

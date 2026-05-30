@@ -31,6 +31,8 @@ pub enum IssueSub {
     Close(NumberOnly),
     /// Reopen a closed issue.
     Reopen(NumberOnly),
+    /// Delete an issue permanently (requires repo admin).
+    Delete(DeleteArgs),
     /// Add a comment.
     Comment(CommentArgs),
     /// Edit a comment by id (comment ids come from `issue view --comments`).
@@ -132,6 +134,15 @@ pub struct NumberOnly {
 }
 
 #[derive(Debug, Args)]
+pub struct DeleteArgs {
+    #[command(flatten)]
+    pub r: RepoFlag,
+    pub number: u64,
+    #[arg(short = 'y', long)]
+    pub yes: bool,
+}
+
+#[derive(Debug, Args)]
 pub struct CommentArgs {
     #[command(flatten)]
     pub r: RepoFlag,
@@ -185,6 +196,7 @@ pub async fn run(cmd: IssueCmd, host: Option<&str>) -> Result<()> {
         IssueSub::Edit(args) => edit(args, host).await,
         IssueSub::Close(args) => set_state(args, host, "closed").await,
         IssueSub::Reopen(args) => set_state(args, host, "open").await,
+        IssueSub::Delete(args) => delete(args, host).await,
         IssueSub::Comment(args) => comment(args, host).await,
         IssueSub::EditComment(args) => edit_comment(args, host).await,
         IssueSub::DeleteComment(args) => delete_comment(args, host).await,
@@ -388,6 +400,22 @@ async fn set_state(args: NumberOnly, host: Option<&str>, state: &str) -> Result<
         issue.number,
         output::state_pill(&issue.state, false)
     );
+    Ok(())
+}
+
+async fn delete(args: DeleteArgs, host: Option<&str>) -> Result<()> {
+    let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
+    if !args.yes {
+        let ans = editor::prompt_line(&format!(
+            "Delete issue #{}? This cannot be undone. Type the number to confirm",
+            args.number
+        ))?;
+        if ans != args.number.to_string() {
+            return Err(anyhow!("aborted"));
+        }
+    }
+    api::issue::delete(&ctx.client, &ctx.owner, &ctx.name, args.number).await?;
+    println!("✓ Deleted issue #{}", args.number);
     Ok(())
 }
 

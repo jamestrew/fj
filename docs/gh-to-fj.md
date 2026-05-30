@@ -25,7 +25,7 @@ called out.
 | `gh repo clone OWNER/NAME`        | `fj repo clone OWNER/NAME`        |                                                 |
 | `gh repo create NAME`             | `fj repo create NAME`             | `--clone` to clone after creating.              |
 | `gh repo fork`                    | `fj repo fork`                    |                                                 |
-| `gh repo sync`                    | `fj repo sync`                    | Calls Forgejo's `merge-upstream` endpoint.      |
+| `gh repo sync`                    | `fj repo sync`                    | Needs `merge-upstream`; absent on some builds (clear error if so). |
 | `gh repo edit`                    | `fj repo edit`                    |                                                 |
 | `gh repo rename`                  | `fj repo rename`                  |                                                 |
 | `gh repo archive`                 | `fj repo archive`                 |                                                 |
@@ -45,6 +45,7 @@ called out.
 | `gh issue edit N`                 | `fj issue edit N`                 |                                                 |
 | `gh issue close N`                | `fj issue close N`                |                                                 |
 | `gh issue reopen N`               | `fj issue reopen N`               |                                                 |
+| `gh issue delete N`               | `fj issue delete N`               | Requires repo admin. Confirm with `-y`.         |
 | `gh issue comment N --body B`     | `fj issue comment N --body B`     | New: also `fj issue edit-comment ID`.           |
 | `gh issue develop N`              | `fj issue develop N`              | Branches off the default branch.                |
 
@@ -59,6 +60,8 @@ called out.
 | `gh pr diff N`                    | `fj pr diff N`                    | Raw unified diff.                               |
 | `gh pr checks N`                  | `fj pr checks N`                  |                                                 |
 | `gh pr ready N`                   | `fj pr ready N`                   |                                                 |
+| `gh pr comment N --body B`        | `fj pr comment N --body B`        | PRs are issues; uses the issue comment endpoint. |
+| `gh pr update-branch N`           | `fj pr update-branch N`           | `--style merge` (default) or `rebase`.          |
 | `gh pr review N --approve`        | `fj pr review N --event approve`  |                                                 |
 | `gh pr review N --request-changes`| `fj pr review N --event request-changes` |                                          |
 | `gh pr status`                    | `fj pr status`                    |                                                 |
@@ -79,6 +82,7 @@ called out.
 | `gh release upload TAG file`      | `fj release upload TAG file`      |                                                 |
 | `gh release download TAG`         | `fj release download TAG`         |                                                 |
 | `gh release delete TAG`           | `fj release delete TAG`           |                                                 |
+| `gh release delete-asset TAG A`   | `fj release delete-asset TAG A`   | `A` is the asset name. Confirm with `-y`.       |
 
 ## Labels & milestones
 
@@ -97,9 +101,13 @@ called out.
 | `gh`                              | `fj`                              | Notes                                           |
 | --------------------------------- | --------------------------------- | ----------------------------------------------- |
 | `gh run list`                     | `fj run list`                     | Forgejo Actions.                                |
-| `gh run view N`                   | `fj run view N`                   |                                                 |
-| `gh run rerun N`                  | `fj run rerun N`                  |                                                 |
-| `gh run cancel N`                 | `fj run cancel N`                 |                                                 |
+| `gh run view N`                   | `fj run view N`                   | `N` is the run number from `fj run list`.       |
+| `gh run view N --log`             | `fj run view N --log`             | Logs come from Forgejo web routes, not the API. |
+| `gh run view N --log-failed`      | `fj run view N --log-failed`      | Only steps that did not succeed.                |
+| `gh run watch N`                  | `fj run watch N`                  | Streams logs live until the job finishes.       |
+| `gh run rerun N`                  | `fj run rerun N`                  | No API; web action rejects token POST. Prints run URL. |
+| `gh run cancel N`                 | `fj run cancel N`                 | Same: no API, falls back to the run URL.        |
+| `gh workflow run FILE`            | `fj workflow run FILE`            | `--ref` (default branch) and `-f key=value` inputs. |
 | `gh secret list`                  | `fj secret list`                  |                                                 |
 | `gh secret set NAME -b VAL`       | `fj secret set NAME --value VAL`  | Also `--from-file path` (or `-` for stdin).     |
 | `gh variable list`                | `fj variable list`                |                                                 |
@@ -111,7 +119,8 @@ called out.
 | `gh search repos QUERY`           | `fj search repos QUERY`           |                                                 |
 | `gh search issues QUERY`          | `fj search issues QUERY`          |                                                 |
 | `gh search prs QUERY`             | `fj search prs QUERY`             |                                                 |
-| `gh search code QUERY`            | `fj search code QUERY`            | New. Optional `-R owner/name` restricts scope.  |
+| `gh search code QUERY`            | (none)                            | Forgejo has no code-search API. Removed.        |
+| `gh search commits QUERY`         | (none)                            | No commit-search API.                           |
 
 ## Other groups
 

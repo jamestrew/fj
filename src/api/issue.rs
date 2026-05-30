@@ -231,3 +231,11 @@ pub async fn delete_comment(
     res.error_for_status()?;
     Ok(())
 }
+
+/// Permanently delete an issue. Requires admin on the repo.
+pub async fn delete(client: &Client, owner: &str, name: &str, number: u64) -> Result<()> {
+    let path = format!("/api/v1/repos/{owner}/{name}/issues/{number}");
+    let res = client.request(Method::DELETE, &path, &[], None).await?;
+    res.error_for_status()?;
+    Ok(())
+}

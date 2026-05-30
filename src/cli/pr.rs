@@ -40,6 +40,10 @@ pub enum PrSub {
     Checks(SimpleArgs),
     /// Convert a draft pull request to ready-for-review.
     Ready(SimpleArgs),
+    /// Add a comment to a pull request.
+    Comment(CommentArgs),
+    /// Update the PR branch by merging (or rebasing) its base branch in.
+    UpdateBranch(UpdateBranchArgs),
     /// Submit a review (approve / request changes / comment).
     Review(ReviewArgs),
     /// Request reviews from specific users.
@@ -239,6 +243,41 @@ pub struct SimpleArgs {
     pub number: u64,
 }
 
+#[derive(Debug, Args)]
+pub struct CommentArgs {
+    #[command(flatten)]
+    pub r: RepoFlag,
+    pub number: u64,
+    /// Comment body. Use `-` to read from stdin. Omit to open `$EDITOR`.
+    #[arg(short = 'b', long)]
+    pub body: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct UpdateBranchArgs {
+    #[command(flatten)]
+    pub r: RepoFlag,
+    pub number: u64,
+    /// Update strategy: merge (default) or rebase.
+    #[arg(long, value_enum, default_value_t = UpdateStyle::Merge)]
+    pub style: UpdateStyle,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum UpdateStyle {
+    Merge,
+    Rebase,
+}
+
+impl UpdateStyle {
+    fn as_str(self) -> &'static str {
+        match self {
+            UpdateStyle::Merge => "merge",
+            UpdateStyle::Rebase => "rebase",
+        }
+    }
+}
+
 pub async fn run(cmd: PrCmd, host: Option<&str>) -> Result<()> {
     match cmd.command {
         PrSub::List(args) => list(args, host).await,
@@ -250,6 +289,8 @@ pub async fn run(cmd: PrCmd, host: Option<&str>) -> Result<()> {
         PrSub::Files(args) => files(args, host).await,
         PrSub::Checks(args) => checks(args, host).await,
         PrSub::Ready(args) => ready(args, host).await,
+        PrSub::Comment(args) => comment(args, host).await,
+        PrSub::UpdateBranch(args) => update_branch(args, host).await,
         PrSub::Review(args) => review(args, host).await,
         PrSub::RequestReview(args) => request_reviewers(args, host).await,
         PrSub::UnrequestReview(args) => unrequest_reviewers(args, host).await,
@@ -554,6 +595,40 @@ async fn ready(args: SimpleArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     api::pull::ready(&ctx.client, &ctx.owner, &ctx.name, args.number).await?;
     println!("✓ PR #{} is ready for review", args.number);
+    Ok(())
+}
+
+async fn comment(args: CommentArgs, host: Option<&str>) -> Result<()> {
+    let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
+    let body = match args.body.as_deref() {
+        Some("-") => {
+            let mut buf = String::new();
+            std::io::stdin().read_to_string(&mut buf)?;
+            buf
+        }
+        Some(s) => s.to_string(),
+        None => editor::edit_text("PR_COMMENT.md", "")?,
+    };
+    if body.trim().is_empty() {
+        return Err(anyhow!("comment body is empty"));
+    }
+    // PRs are issues in Forgejo, so the comment endpoint is the issue one.
+    let c = api::issue::comment(&ctx.client, &ctx.owner, &ctx.name, args.number, &body).await?;
+    println!("✓ Commented on #{} ({})", args.number, c.html_url);
+    Ok(())
+}
+
+async fn update_branch(args: UpdateBranchArgs, host: Option<&str>) -> Result<()> {
+    let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
+    api::pull::update_branch(
+        &ctx.client,
+        &ctx.owner,
+        &ctx.name,
+        args.number,
+        args.style.as_str(),
+    )
+    .await?;
+    println!("✓ Updated PR #{} from its base branch", args.number);
     Ok(())
 }
 

@@ -94,6 +94,72 @@ until either `total_limit` items have accumulated or there are no more
 pages. List commands switch to this path automatically when the user
 asks for `--limit > 50` (Forgejo's per-page cap).
 
+## Actions run logs (the one web-route exception)
+
+Every other command in `fj` talks to `/api/v1`. The run-log readers in
+`api::workflow` (`fetch_run_view`, `fetch_job_logs`, `latest_attempt`)
+are the deliberate exception, and they are the only code that calls
+Forgejo's human-facing web routes instead.
+
+Why: Forgejo's `/api/v1` exposes almost nothing for Actions runs
+(verified against 15.0.2 / gitea-1.22; the single-run
+`/actions/runs/{id}`, plus `/actions/runs/{id}/jobs`,
+`/actions/jobs/{id}/logs`, and `/actions/runs/{id}/logs`, all 404). The
+only documented run surface is the `/actions/tasks` list plus `rerun` /
+`cancel`. So the entirety of `fj run view` reads the web routes:
+
+- `fj run view N` (the run summary: title, status, branch, commit,
+  jobs) calls `fetch_run_summary`, which POSTs the ViewPost route with an
+  empty `logCursors` body to get run-level state without any log lines.
+  This is why the plain summary works even though
+  `fj api /repos/.../actions/runs/N` returns 404.
+- `fj run view --log`, `fj run view --log-failed`, and `fj run watch`
+  step outside the API the same way, for the lines themselves:
+
+- Whole-job plaintext download (whole log, one GET):
+  `GET /{owner}/{repo}/actions/runs/{run}/jobs/{job}/attempt/{attempt}/logs`
+- Incremental per-step JSON (what `watch` polls):
+  `POST /{owner}/{repo}/actions/runs/{run}/jobs/{job}/attempt/{attempt}`
+  with body `{"logCursors":[{"step":S,"cursor":C,"expanded":true}]}`.
+  An empty `{}` body returns run/job/step state with no lines, which is
+  how we cheaply learn the step count before requesting every step.
+
+How it still respects the layering rules:
+
+- No parallel HTTP path. These go through `Client::request` like
+  everything else. The trick is that `Client::url` passes an absolute
+  URL through untouched, and `api::workflow::web_run_url` builds that URL
+  by joining `/` onto `Client::base()` (which ends in `/api/v1/`) to get
+  back to the host origin. Same client, same token, same retry logic.
+- `is_trusted_url` keeps sending the token because the web origin is the
+  same host as the API base over HTTPS.
+
+Three parameter quirks worth knowing (all documented at the call site):
+
+- `run` is the **per-repo run number** (the `#` column of `fj run list`),
+  not the global id from `/actions/tasks`.
+- `job` is the zero-based job position. Forgejo clamps an out-of-range
+  index to the first job rather than 404ing, so `cli::workflow::validate_job`
+  rejects it against the returned job count.
+- `attempt` is 1-based. Forgejo 15 added the `/attempt/{n}` segment; the
+  attempt-less path silently means "attempt 0" and 500s. `latest_attempt`
+  resolves the current attempt from the server's own attempt list so
+  reruns are followed.
+
+Limitations, surfaced to the user rather than hidden:
+
+- These are unversioned web routes, not API. Stable in practice but they
+  can shift between Forgejo releases.
+- A Fjord-Account gateway only proxies `/api/v1`, so it won't forward
+  these routes. `cli::workflow::guard_web_routes` refuses early with an
+  actionable message instead of a confusing gateway 404.
+- Once a run's logs are pruned, the routes 500 with "resource does not
+  exist"; `log_route_error` translates that to a plain-English notice.
+- `fj run rerun` / `cancel` use the same web layer (there is no `/api/v1`
+  rerun/cancel), but Forgejo rejects a PAT-authenticated POST to those
+  state-changing actions with a handler 404. `post_run_action` translates
+  that into a message pointing at the run URL to act on in the browser.
+
 ## Pager
 
 When `cli::run` dispatches a command whose output can run long (list,

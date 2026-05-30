@@ -6,7 +6,6 @@ pub mod config;
 pub mod context;
 pub mod editor;
 pub mod extension;
-pub mod gist;
 pub mod hook;
 pub mod instances;
 pub mod issue;
@@ -79,6 +78,8 @@ pub enum Command {
     Milestone(milestone::MilestoneCmd),
     /// Manage workflow runs (Forgejo Actions).
     Run(workflow::RunCmd),
+    /// Manage workflow definitions (trigger a `workflow_dispatch`).
+    Workflow(workflow::WorkflowCmd),
     /// Manage Actions secrets.
     Secret(workflow::SecretCmd),
     /// Manage Actions variables.
@@ -105,8 +106,6 @@ pub enum Command {
     Hook(hook::HookCmd),
     /// Run a discovered `fj-<name>` plugin from PATH.
     Extension(extension::ExtensionCmd),
-    /// Forgejo gists.
-    Gist(gist::GistCmd),
     /// Make a raw API request (like `gh api`).
     Api(api::ApiArgs),
     /// Print shell completions to stdout.
@@ -136,6 +135,8 @@ pub async fn run(cli: Cli) -> Result<()> {
     // explicitly so we don't have to mutate the process environment to opt
     // out, which would be a process-wide side effect and an unsafe set_var.
     let _pager = match &cli.command {
+        // `run watch` streams live; paging would buffer it. Never page it.
+        Command::Run(rc) if matches!(rc.command, workflow::RunSub::Watch(_)) => None,
         Command::Repo(_)
         | Command::Issue(_)
         | Command::Pr(_)
@@ -175,6 +176,7 @@ async fn dispatch(command: Command, host: Option<&str>) -> Result<()> {
         Command::Label(cmd) => label::run(cmd, host).await,
         Command::Milestone(cmd) => milestone::run(cmd, host).await,
         Command::Run(cmd) => workflow::run(cmd, host).await,
+        Command::Workflow(cmd) => workflow::run_workflow(cmd, host).await,
         Command::Secret(cmd) => workflow::run_secret(cmd, host).await,
         Command::Variable(cmd) => workflow::run_variable(cmd, host).await,
         Command::Search(cmd) => search::run(cmd, host).await,
@@ -188,7 +190,6 @@ async fn dispatch(command: Command, host: Option<&str>) -> Result<()> {
         Command::Protect(cmd) => protect::run(cmd, host).await,
         Command::Hook(cmd) => hook::run(cmd, host).await,
         Command::Extension(cmd) => extension::run(cmd).await,
-        Command::Gist(cmd) => gist::run(cmd, host).await,
         Command::Api(args) => api::run(args, host).await,
         Command::Completion(args) => {
             use clap::CommandFactory;

@@ -28,10 +28,45 @@ These features rely on endpoints introduced in or after Gitea 1.20.
 - `fj repo mirror-sync` (`POST /repos/.../mirror-sync`).
 - `fj milestone` group on instances that didn't expose
   `/repos/.../milestones/{id}` for editing.
-- `fj search code` (`/repos/search/code` is Forgejo 7+ only).
 
 For older instances, the typed API still works via `fj api <path>` if
 you know the right path.
+
+## What the Forgejo API cannot do (verified against 15.0.2 / gitea-1.22)
+
+These are GitHub/`gh` capabilities that Forgejo's `/api/v1` does not
+expose. `fj` does not fake them; where a command exists it degrades with
+a clear message instead of a bare 404.
+
+- **Code search.** No code-search endpoint exists in the API (the UI
+  code search is a web route gated on the repo indexer). `fj search code`
+  was removed rather than left to 404.
+- **Repo sync.** `POST /repos/.../merge-upstream` is absent on some
+  builds (including 15.0.x). `fj repo sync` detects the 404 and tells you
+  to sync the fork manually. `fj repo mirror-sync` (a different endpoint)
+  is unaffected.
+- **Rerun / cancel a run.** There is no `/api/v1` rerun or cancel
+  endpoint on any Forgejo. The web actions exist but reject a
+  PAT-authenticated POST (they need a browser session), so `fj run rerun`
+  / `fj run cancel` attempt the web route and, on rejection, print the
+  run URL to act on in the browser.
+- **Gist / snippets.** Forgejo has no gist or snippet entity at all
+  (snippets are a GitLab feature). The `gist` command was removed.
+- **Artifacts, Actions cache, workflow list/enable/disable.** No API
+  paths, so `gh run download`, `gh cache`, and `gh workflow
+  list/enable/disable` have no `fj` equivalent. `workflow run` (dispatch)
+  is the one Actions-management endpoint that does exist.
+- **Lock/unlock, issue transfer, pr revert, commit search,
+  attestations.** No endpoints; no `fj` equivalent.
+
+## Actions: read vs write over the API
+
+Reads (`fj run list`, `fj run view`, `--log`, `watch`) work, but most
+go through Forgejo's **web** routes, not `/api/v1`, because the API only
+exposes run list/get plus secrets and variables. See
+`docs/architecture.md` → "Actions run logs". A Fjord-Account gateway
+proxies only `/api/v1`, so the whole `fj run` group needs a
+personal-access-token host.
 
 ## Forgejo-only endpoints
 

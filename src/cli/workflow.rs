@@ -1,10 +1,14 @@
 //! `fj run` and `fj secret` / `fj variable` — Forgejo Actions.
 
-use anyhow::Result;
+use std::io::Write;
+use std::time::Duration;
+
+use anyhow::{anyhow, Result};
 use clap::{Args, Subcommand};
 
 use crate::api;
 use crate::cli::context::{resolve_repo, RepoFlag};
+use crate::client::AuthScheme;
 use crate::output;
 
 #[derive(Debug, Args)]
@@ -17,8 +21,10 @@ pub struct RunCmd {
 pub enum RunSub {
     /// List workflow runs.
     List(ListArgs),
-    /// View a workflow run.
+    /// View a workflow run, or its logs with `--log` / `--log-failed`.
     View(ViewArgs),
+    /// Stream a run's logs live until the job finishes.
+    Watch(WatchArgs),
     /// Rerun a workflow run.
     Rerun(IdArgs),
     /// Cancel an in-progress workflow run.
@@ -39,9 +45,39 @@ pub struct ListArgs {
 pub struct ViewArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Run number, as shown in the `#` column of `fj run list`.
     pub run_id: u64,
+    /// Print the full job log instead of the run summary.
+    #[arg(long)]
+    pub log: bool,
+    /// Print only the log of steps that did not succeed.
+    #[arg(long)]
+    pub log_failed: bool,
+    /// Job index within the run (0-based). Most runs have a single job.
+    #[arg(short = 'j', long, default_value_t = 0)]
+    pub job: usize,
+    /// Attempt number. Defaults to the latest attempt (follows reruns).
+    #[arg(long)]
+    pub attempt: Option<u32>,
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct WatchArgs {
+    #[command(flatten)]
+    pub r: RepoFlag,
+    /// Run number, as shown in the `#` column of `fj run list`.
+    pub run_id: u64,
+    /// Job index within the run (0-based).
+    #[arg(short = 'j', long, default_value_t = 0)]
+    pub job: usize,
+    /// Attempt number. Defaults to the latest attempt.
+    #[arg(long)]
+    pub attempt: Option<u32>,
+    /// Seconds between polls while the job is running.
+    #[arg(short = 'i', long, default_value_t = 3)]
+    pub interval: u64,
 }
 
 #[derive(Debug, Args)]
@@ -55,6 +91,7 @@ pub async fn run(cmd: RunCmd, host: Option<&str>) -> Result<()> {
     match cmd.command {
         RunSub::List(args) => list(args, host).await,
         RunSub::View(args) => view(args, host).await,
+        RunSub::Watch(args) => watch(args, host).await,
         RunSub::Rerun(args) => rerun(args, host).await,
         RunSub::Cancel(args) => cancel(args, host).await,
     }
@@ -100,23 +137,277 @@ async fn list(args: ListArgs, host: Option<&str>) -> Result<()> {
 
 async fn view(args: ViewArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
-    let r = api::workflow::get_run(&ctx.client, &ctx.owner, &ctx.name, args.run_id).await?;
+
+    // Everything `view` shows comes from the Forgejo web routes, not the API:
+    // `/api/v1` has no single-run or log endpoint on current Forgejo (see
+    // api::workflow's run-logs section).
+    guard_web_routes(&ctx.client)?;
+
+    if args.log || args.log_failed {
+        let attempt = match args.attempt {
+            Some(a) => a,
+            None => {
+                api::workflow::latest_attempt(
+                    &ctx.client,
+                    &ctx.owner,
+                    &ctx.name,
+                    args.run_id,
+                    args.job,
+                )
+                .await?
+            }
+        };
+        let view = api::workflow::fetch_job_logs(
+            &ctx.client,
+            &ctx.owner,
+            &ctx.name,
+            args.run_id,
+            args.job,
+            attempt,
+        )
+        .await?;
+        validate_job(&view, args.job)?;
+        print_logs(&view, args.log_failed);
+        return Ok(());
+    }
+
+    let view =
+        api::workflow::fetch_run_summary(&ctx.client, &ctx.owner, &ctx.name, args.run_id).await?;
+    let run = &view.state.run;
+    let url = absolutize(&ctx.client, &run.link);
+
     if args.json {
-        return output::print_json(&serde_json::to_value(&r)?);
+        let jobs: Vec<serde_json::Value> = run
+            .jobs
+            .iter()
+            .map(|j| {
+                serde_json::json!({ "name": j.name, "status": j.status, "duration": j.duration })
+            })
+            .collect();
+        let value = serde_json::json!({
+            "run_number": args.run_id,
+            "title": run.title,
+            "status": run.status,
+            "branch": run.commit.branch.name,
+            "sha": run.commit.short_sha,
+            "pushed_by": run.commit.pusher.display_name,
+            "url": url,
+            "jobs": jobs,
+        });
+        return output::print_json(&value);
     }
-    println!("Run #{}: {}", r.run_number, r.name);
-    println!("Status:     {}", r.status);
-    if let Some(c) = &r.conclusion {
-        println!("Conclusion: {c}");
+
+    println!("Run #{}: {}", args.run_id, run.title);
+    println!("Status:   {}", output::action_status(&run.status));
+    println!("Branch:   {}", run.commit.branch.name);
+    println!("SHA:      {}", run.commit.short_sha);
+    if !run.commit.pusher.display_name.is_empty() {
+        println!("Pushed:   {}", run.commit.pusher.display_name);
     }
-    println!("Branch:     {}", r.head_branch);
-    println!("SHA:        {}", r.head_sha);
-    println!("URL:        {}", r.html_url);
+    println!("URL:      {url}");
+    if !run.jobs.is_empty() {
+        println!();
+        let rows: Vec<Vec<String>> = run
+            .jobs
+            .iter()
+            .map(|j| {
+                vec![
+                    j.name.clone(),
+                    output::action_status(&j.status),
+                    output::dim(&j.duration),
+                ]
+            })
+            .collect();
+        let table = output::render_table(&["JOB", "STATUS", "DURATION"], &rows);
+        println!("{}", table.trim_end());
+        println!("{}", output::dim("Use --log to see step output."));
+    }
     Ok(())
+}
+
+/// Render a fully-fetched job view. With `failed_only`, skip steps that
+/// succeeded or were skipped.
+fn print_logs(view: &api::workflow::RunView, failed_only: bool) {
+    let job = &view.state.current_job;
+    let title = if job.title.is_empty() {
+        "job"
+    } else {
+        &job.title
+    };
+    println!(
+        "{} {}",
+        output::bold(title),
+        output::action_status(&view.state.run.status),
+    );
+    if view.state.run.jobs.len() > 1 {
+        let others: Vec<String> = view
+            .state
+            .run
+            .jobs
+            .iter()
+            .map(|j| format!("{} ({})", j.name, j.duration))
+            .collect();
+        println!(
+            "{}",
+            output::dim(&format!("jobs in run: {}", others.join(", ")))
+        );
+    }
+    let steps = &job.steps;
+    for sl in &view.logs.steps_log {
+        let meta = steps.get(sl.step);
+        let status = meta.map(|s| s.status.as_str()).unwrap_or("");
+        if failed_only && matches!(status, "success" | "skipped" | "") {
+            continue;
+        }
+        let summary = meta.map(|s| s.summary.as_str()).unwrap_or("step");
+        let duration = meta.map(|s| s.duration.as_str()).unwrap_or("");
+        println!(
+            "{} {} {}",
+            output::bold(&format!("==> {summary}")),
+            output::action_status(status),
+            output::dim(duration),
+        );
+        for line in &sl.lines {
+            println!("{}", line.message);
+        }
+    }
+}
+
+async fn watch(args: WatchArgs, host: Option<&str>) -> Result<()> {
+    let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
+    guard_web_routes(&ctx.client)?;
+    let (owner, name) = (ctx.owner.as_str(), ctx.name.as_str());
+    let attempt = match args.attempt {
+        Some(a) => a,
+        None => {
+            api::workflow::latest_attempt(&ctx.client, owner, name, args.run_id, args.job).await?
+        }
+    };
+
+    // Bootstrap: learn the step list (empty cursors return state, no lines).
+    let boot = api::workflow::fetch_run_view(
+        &ctx.client,
+        owner,
+        name,
+        args.run_id,
+        args.job,
+        attempt,
+        &[],
+    )
+    .await?;
+    validate_job(&boot, args.job)?;
+    let mut cursors: Vec<u64> = vec![0; boot.state.current_job.steps.len()];
+    let mut header_shown: Vec<bool> = vec![false; cursors.len()];
+    let mut stdout = std::io::stdout();
+
+    loop {
+        let reqs: Vec<api::workflow::LogCursor> = cursors
+            .iter()
+            .enumerate()
+            .map(|(step, &cursor)| api::workflow::LogCursor {
+                step,
+                cursor,
+                expanded: true,
+            })
+            .collect();
+        let view = api::workflow::fetch_run_view(
+            &ctx.client,
+            owner,
+            name,
+            args.run_id,
+            args.job,
+            attempt,
+            &reqs,
+        )
+        .await?;
+
+        let steps = &view.state.current_job.steps;
+        for sl in &view.logs.steps_log {
+            if sl.lines.is_empty() {
+                if sl.cursor > 0 && sl.step < cursors.len() {
+                    cursors[sl.step] = sl.cursor;
+                }
+                continue;
+            }
+            if sl.step < header_shown.len() && !header_shown[sl.step] {
+                header_shown[sl.step] = true;
+                let summary = steps
+                    .get(sl.step)
+                    .map(|s| s.summary.as_str())
+                    .unwrap_or("step");
+                let _ = writeln!(stdout, "{}", output::bold(&format!("==> {summary}")));
+            }
+            for line in &sl.lines {
+                let _ = writeln!(stdout, "{}", line.message);
+            }
+            if sl.step < cursors.len() {
+                cursors[sl.step] = sl.cursor;
+            }
+        }
+        let _ = stdout.flush();
+
+        // New steps can appear as the job progresses; grow the cursor vectors.
+        let n = view.state.current_job.steps.len();
+        if n > cursors.len() {
+            cursors.resize(n, 0);
+            header_shown.resize(n, false);
+        }
+
+        if view.state.run.done {
+            println!(
+                "\n{} {}",
+                output::bold("run finished:"),
+                output::action_status(&view.state.run.status),
+            );
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_secs(args.interval.max(1))).await;
+    }
+}
+
+/// Forgejo clamps an out-of-range job index to the first job rather than
+/// 404ing, which would silently show the wrong logs. Reject it instead.
+fn validate_job(view: &api::workflow::RunView, job: usize) -> Result<()> {
+    let n = view.state.run.jobs.len();
+    if n > 0 && job >= n {
+        return Err(anyhow!(
+            "job index {job} is out of range: this run has {n} job(s) (0..{})",
+            n - 1
+        ));
+    }
+    Ok(())
+}
+
+/// Most of `fj run` (view/watch/rerun/cancel) reads or POSTs Forgejo web
+/// routes, which a Fjord-Account gateway does not proxy. Refuse early with an
+/// actionable message rather than emitting a confusing 404 from the gateway.
+fn guard_web_routes(client: &crate::client::Client) -> Result<()> {
+    if matches!(client.auth_scheme(), AuthScheme::FjordBearer) {
+        return Err(anyhow!(
+            "`fj run` isn't supported over a Fjord Account gateway yet: it uses \
+             Forgejo's web routes, which the gateway doesn't forward. Use a host \
+             configured with a personal access token instead."
+        ));
+    }
+    Ok(())
+}
+
+/// Turn a relative web path (`/owner/repo/actions/runs/56`) into an absolute
+/// URL against the client's host origin. Returns the input unchanged if it is
+/// empty or already absolute.
+fn absolutize(client: &crate::client::Client, link: &str) -> String {
+    if link.is_empty() || link.starts_with("http://") || link.starts_with("https://") {
+        return link.to_string();
+    }
+    match client.base().join("/") {
+        Ok(origin) => format!("{}{}", origin, link.trim_start_matches('/')),
+        Err(_) => link.to_string(),
+    }
 }
 
 async fn rerun(args: IdArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
+    guard_web_routes(&ctx.client)?;
     api::workflow::rerun(&ctx.client, &ctx.owner, &ctx.name, args.run_id).await?;
     println!("✓ Re-ran workflow run #{}", args.run_id);
     Ok(())
@@ -124,6 +415,7 @@ async fn rerun(args: IdArgs, host: Option<&str>) -> Result<()> {
 
 async fn cancel(args: IdArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
+    guard_web_routes(&ctx.client)?;
     api::workflow::cancel(&ctx.client, &ctx.owner, &ctx.name, args.run_id).await?;
     println!("✓ Cancelled workflow run #{}", args.run_id);
     Ok(())
@@ -136,6 +428,70 @@ fn truncate(s: &str, max: usize) -> String {
     let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
     out.push('…');
     out
+}
+
+// ── Workflows ────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Args)]
+pub struct WorkflowCmd {
+    #[command(subcommand)]
+    pub command: WorkflowSub,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WorkflowSub {
+    /// Trigger a `workflow_dispatch` run of a workflow file.
+    Run(DispatchArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct DispatchArgs {
+    #[command(flatten)]
+    pub r: RepoFlag,
+    /// Workflow file name, e.g. `ci.yml`.
+    pub workflow: String,
+    /// Git ref (branch or tag) to run on. Defaults to the repo's default branch.
+    #[arg(long = "ref")]
+    pub ref_: Option<String>,
+    /// Workflow input as `key=value` (repeatable).
+    #[arg(short = 'f', long = "field")]
+    pub fields: Vec<String>,
+}
+
+pub async fn run_workflow(cmd: WorkflowCmd, host: Option<&str>) -> Result<()> {
+    match cmd.command {
+        WorkflowSub::Run(args) => dispatch(args, host).await,
+    }
+}
+
+async fn dispatch(args: DispatchArgs, host: Option<&str>) -> Result<()> {
+    let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
+    let ref_ = match args.ref_ {
+        Some(r) => r,
+        None => {
+            api::repo::get(&ctx.client, &ctx.owner, &ctx.name)
+                .await?
+                .default_branch
+        }
+    };
+    let mut inputs = std::collections::BTreeMap::new();
+    for f in &args.fields {
+        let (k, v) = f
+            .split_once('=')
+            .ok_or_else(|| anyhow!("invalid --field '{f}', expected key=value"))?;
+        inputs.insert(k.to_string(), v.to_string());
+    }
+    api::workflow::dispatch(
+        &ctx.client,
+        &ctx.owner,
+        &ctx.name,
+        &args.workflow,
+        &ref_,
+        inputs,
+    )
+    .await?;
+    println!("✓ Dispatched {} on {}", args.workflow, ref_);
+    Ok(())
 }
 
 // ── Secrets ─────────────────────────────────────────────────────────────────

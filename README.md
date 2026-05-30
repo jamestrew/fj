@@ -143,7 +143,8 @@ has its own `--help`. Highlights:
 | `release`   | list, view, create, edit, delete, upload, download                              |
 | `label`     | CRUD                                                                            |
 | `milestone` | CRUD + assign                                                                   |
-| `run`       | workflow runs (Forgejo Actions)                                                 |
+| `run`       | workflow runs (Forgejo Actions): list, view, `--log`, watch                     |
+| `workflow`  | trigger a `workflow_dispatch` run                                               |
 | `secret`    | Actions secrets                                                                 |
 | `variable`  | Actions variables                                                               |
 | `search`    | repos, issues, prs, users, **code**                                             |
@@ -156,7 +157,6 @@ has its own `--help`. Highlights:
 | `config`    | local preferences (editor, pager, browser)                                      |
 | `protect`   | branch protection rules                                                         |
 | `hook`      | webhook CRUD + test delivery                                                    |
-| `gist`      | thin wrapper over `gist-*` repos                                                |
 | `extension` | discover and run `fj-<name>` plugins on PATH                                    |
 | `api`       | raw HTTP with `-X`, `-f`, `-F`, `-H`, `-q`, `--paginate`, `--include`           |
 | `completion`| shell completions (bash, zsh, fish, powershell, elvish)                         |
