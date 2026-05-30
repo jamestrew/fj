@@ -551,7 +551,10 @@ fn settle_outcome(o: crate::fjord::SignInResponse) -> Result<crate::fjord::SignI
             Err(anyhow!("fjord-platform upstream error: {message}"))
         }
         R::StrategyMismatch { message } => Err(anyhow!(
-            "this fjord-platform deployment is not configured for credential sign-in: {message}"
+            "this Fjord deployment signs in with single sign-on, which fj can't drive yet.\n\
+             Sign in to your Forgejo directly with a personal access token instead:\n  \
+             fj auth login --host <your-forgejo-host> --token <token>\n\
+             Create the token in your Forgejo settings under Applications. ({message})"
         )),
     }
 }
