@@ -211,6 +211,16 @@ pub async fn sync_with_upstream(
             Some(&serde_json::to_value(MergeUpstream { branch })?),
         )
         .await?;
+    // `merge-upstream` is a Gitea endpoint that some Forgejo builds (e.g.
+    // 15.0.x) don't expose. Translate the 404 into an actionable message
+    // rather than a bare "404 Not Found".
+    if res.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(anyhow::anyhow!(
+            "this Forgejo build has no `merge-upstream` endpoint, so `fj repo sync` \
+             can't run server-side. Pull the upstream branch and push it manually, \
+             or upgrade the server."
+        ));
+    }
     res.error_for_status()?;
     Ok(())
 }

@@ -7,7 +7,7 @@
 use reqwest::Method;
 use serde_json::json;
 use url::Url;
-use wiremock::matchers::{header, method, path, query_param};
+use wiremock::matchers::{body_json, header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::Client;
@@ -525,4 +525,248 @@ async fn run_list_tolerates_inconsistent_forgejo_rows() {
     assert_eq!(runs[2].status, "waiting");
     assert!(runs[2].updated_at.is_none());
     assert_eq!(runs[2].run_number, 790);
+}
+
+// ── Run logs (web routes, not /api/v1) ───────────────────────────────────────
+// These exercise the deliberately-non-API log readers in api::workflow. The
+// key things under test: the web URL is anchored at the host ORIGIN (no
+// `/api/v1/` prefix), the `/attempt/{n}` segment is present, an empty cursor
+// list yields step metadata, and a populated list yields lines.
+
+#[tokio::test]
+async fn run_logs_fetch_job_logs_two_phase() {
+    let server = MockServer::start().await;
+    // Phase 1: empty `logCursors` → state only, two steps, no lines.
+    Mock::given(method("POST"))
+        .and(path("/o/r/actions/runs/12/jobs/0/attempt/1"))
+        .and(body_json(json!({ "logCursors": [] })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "logs": { "stepsLog": [] },
+            "state": {
+                "run": { "done": true, "status": "failure", "jobs": [{"name":"build","status":"failure","duration":"1m"}] },
+                "currentJob": {
+                    "title": "build",
+                    "steps": [
+                        {"summary":"checkout","status":"success","duration":"1s"},
+                        {"summary":"compile","status":"failure","duration":"9s"}
+                    ],
+                    "allAttempts": [{"number":1,"status":"failure"}]
+                }
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // Phase 2: cursors for steps 0..2 → lines per step.
+    Mock::given(method("POST"))
+        .and(path("/o/r/actions/runs/12/jobs/0/attempt/1"))
+        .and(body_json(json!({ "logCursors": [
+            {"step":0,"cursor":0,"expanded":true},
+            {"step":1,"cursor":0,"expanded":true}
+        ]})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "logs": { "stepsLog": [
+                {"step":0,"cursor":2,"lines":[{"index":1,"message":"cloned","timestamp":1.0}]},
+                {"step":1,"cursor":3,"lines":[{"index":1,"message":"error[E0382]","timestamp":2.0}]}
+            ]},
+            "state": {
+                "run": { "done": true, "status": "failure", "jobs": [] },
+                "currentJob": { "title": "build", "steps": [
+                    {"summary":"checkout","status":"success","duration":"1s"},
+                    {"summary":"compile","status":"failure","duration":"9s"}
+                ], "allAttempts": [] }
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let c = client_for(&server).await;
+    let view = crate::api::workflow::fetch_job_logs(&c, "o", "r", 12, 0, 1)
+        .await
+        .expect("logs");
+    assert_eq!(view.logs.steps_log.len(), 2);
+    assert_eq!(view.logs.steps_log[1].lines[0].message, "error[E0382]");
+    assert_eq!(view.state.current_job.steps[1].status, "failure");
+}
+
+#[tokio::test]
+async fn run_logs_latest_attempt_follows_reruns() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/o/r/actions/runs/7/jobs/0/attempt/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "logs": { "stepsLog": [] },
+            "state": {
+                "run": { "done": true, "status": "success", "jobs": [] },
+                "currentJob": { "title": "t", "steps": [],
+                    "allAttempts": [{"number":1,"status":"failure"},{"number":2,"status":"success"}] }
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let n = crate::api::workflow::latest_attempt(&c, "o", "r", 7, 0)
+        .await
+        .expect("attempt");
+    assert_eq!(n, 2);
+}
+
+#[tokio::test]
+async fn run_logs_pruned_run_is_friendly() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/o/r/actions/runs/99/jobs/0/attempt/1"))
+        .respond_with(
+            ResponseTemplate::new(500)
+                .set_body_string("task with job_id 4744 and attempt 0: resource does not exist"),
+        )
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let err = crate::api::workflow::fetch_run_view(&c, "o", "r", 99, 0, 1, &[])
+        .await
+        .expect_err("should error");
+    assert!(
+        err.to_string().contains("no longer available"),
+        "got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn run_summary_reads_run_level_state() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/o/r/actions/runs/56/jobs/0/attempt/1"))
+        .and(body_json(json!({ "logCursors": [] })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "logs": { "stepsLog": [] },
+            "state": {
+                "run": {
+                    "title": "Fix the thing",
+                    "status": "success",
+                    "done": true,
+                    "link": "/o/r/actions/runs/56",
+                    "commit": {
+                        "shortSHA": "abc1234567",
+                        "branch": { "name": "main" },
+                        "pusher": { "displayName": "stephen" }
+                    },
+                    "jobs": [{"name":"check","status":"success","duration":"3m8s"}]
+                },
+                "currentJob": { "title": "check", "steps": [], "allAttempts": [] }
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let view = crate::api::workflow::fetch_run_summary(&c, "o", "r", 56)
+        .await
+        .expect("summary");
+    let run = &view.state.run;
+    assert_eq!(run.title, "Fix the thing");
+    assert_eq!(run.status, "success");
+    assert_eq!(run.link, "/o/r/actions/runs/56");
+    assert_eq!(run.commit.short_sha, "abc1234567");
+    assert_eq!(run.commit.branch.name, "main");
+    assert_eq!(run.commit.pusher.display_name, "stephen");
+    assert_eq!(run.jobs.len(), 1);
+    assert_eq!(run.jobs[0].status, "success");
+}
+
+// ── Parity batch: issue delete, pr update-branch, release delete-asset, workflow dispatch ──
+
+#[tokio::test]
+async fn issue_delete_hits_delete_endpoint() {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/repos/o/r/issues/7"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    crate::api::issue::delete(&c, "o", "r", 7)
+        .await
+        .expect("ok");
+}
+
+#[tokio::test]
+async fn pr_update_branch_posts_update_with_style() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/pulls/12/update"))
+        .and(query_param("style", "rebase"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    crate::api::pull::update_branch(&c, "o", "r", 12, "rebase")
+        .await
+        .expect("ok");
+}
+
+#[tokio::test]
+async fn release_delete_asset_uses_release_scoped_path() {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/repos/o/r/releases/5/assets/9"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    crate::api::release::delete_asset(&c, "o", "r", 5, 9)
+        .await
+        .expect("ok");
+}
+
+#[tokio::test]
+async fn workflow_dispatch_sends_ref_and_inputs() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/api/v1/repos/o/r/actions/workflows/ci.yml/dispatches",
+        ))
+        .and(body_json(
+            json!({ "ref": "main", "inputs": { "env": "prod" } }),
+        ))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let mut inputs = std::collections::BTreeMap::new();
+    inputs.insert("env".to_string(), "prod".to_string());
+    crate::api::workflow::dispatch(&c, "o", "r", "ci.yml", "main", inputs)
+        .await
+        .expect("ok");
+}
+
+#[tokio::test]
+async fn workflow_dispatch_omits_empty_inputs() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/api/v1/repos/o/r/actions/workflows/ci.yml/dispatches",
+        ))
+        .and(body_json(json!({ "ref": "main" })))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    crate::api::workflow::dispatch(
+        &c,
+        "o",
+        "r",
+        "ci.yml",
+        "main",
+        std::collections::BTreeMap::new(),
+    )
+    .await
+    .expect("ok");
 }

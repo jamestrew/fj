@@ -138,9 +138,17 @@ pub async fn upload_asset(
     Ok(res.json().await?)
 }
 
-#[allow(dead_code)]
-pub async fn delete_asset(client: &Client, owner: &str, name: &str, asset_id: u64) -> Result<()> {
-    let path = format!("/api/v1/repos/{owner}/{name}/releases/assets/{asset_id}");
+/// Delete one asset from a release. Forgejo keys the attachment under its
+/// release: `/releases/{release_id}/assets/{asset_id}` (NOT a bare
+/// `/releases/assets/{id}`, which 404s).
+pub async fn delete_asset(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    release_id: u64,
+    asset_id: u64,
+) -> Result<()> {
+    let path = format!("/api/v1/repos/{owner}/{name}/releases/{release_id}/assets/{asset_id}");
     let res = client.request(Method::DELETE, &path, &[], None).await?;
     res.error_for_status()?;
     Ok(())

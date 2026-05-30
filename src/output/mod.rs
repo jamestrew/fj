@@ -91,6 +91,23 @@ pub fn state_pill(state: &str, merged: bool) -> String {
     }
 }
 
+/// Colorize an Actions status/conclusion word (`success`, `failure`,
+/// `running`, …) for the terminal. Unknown words and no-color terminals get
+/// the text back unchanged.
+pub fn action_status(status: &str) -> String {
+    if !supports_color() {
+        return status.to_string();
+    }
+    let style = match status {
+        "success" => Style::new().green().bold(),
+        "failure" | "error" => Style::new().red().bold(),
+        "cancelled" | "skipped" => Style::new().yellow(),
+        "running" | "waiting" | "blocked" => Style::new().cyan(),
+        _ => return status.to_string(),
+    };
+    status.style(style).to_string()
+}
+
 pub fn dim(s: &str) -> String {
     if supports_color() {
         s.dimmed().to_string()
