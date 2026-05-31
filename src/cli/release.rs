@@ -140,6 +140,7 @@ pub struct DeleteAssetArgs {
     pub yes: bool,
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub async fn run(cmd: ReleaseCmd, host: Option<&str>) -> Result<()> {
     match cmd.command {
         ReleaseSub::List(args) => list(args, host).await,
@@ -153,6 +154,7 @@ pub async fn run(cmd: ReleaseCmd, host: Option<&str>) -> Result<()> {
     }
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn list(args: ListArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     if args.web {
@@ -198,6 +200,7 @@ async fn list(args: ListArgs, host: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn view(args: ViewArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     let r = api::release::get_by_tag(&ctx.client, &ctx.owner, &ctx.name, &args.tag).await?;
@@ -244,6 +247,7 @@ async fn view(args: ViewArgs, host: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn create(args: CreateArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     let body = editor::resolve_body(args.body.as_deref(), "RELEASE_BODY.md", "")?;
@@ -265,6 +269,7 @@ async fn create(args: CreateArgs, host: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn edit(args: EditArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     let existing = api::release::get_by_tag(&ctx.client, &ctx.owner, &ctx.name, &args.tag).await?;
@@ -285,6 +290,7 @@ async fn edit(args: EditArgs, host: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn delete(args: DeleteArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     let existing = api::release::get_by_tag(&ctx.client, &ctx.owner, &ctx.name, &args.tag).await?;
@@ -300,6 +306,7 @@ async fn delete(args: DeleteArgs, host: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn delete_asset(args: DeleteAssetArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     let release = api::release::get_by_tag(&ctx.client, &ctx.owner, &ctx.name, &args.tag).await?;
@@ -324,6 +331,7 @@ async fn delete_asset(args: DeleteAssetArgs, host: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn upload(args: UploadArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     let release = api::release::get_by_tag(&ctx.client, &ctx.owner, &ctx.name, &args.tag).await?;
@@ -333,6 +341,7 @@ async fn upload(args: UploadArgs, host: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn upload_one(
     ctx: &crate::cli::context::RepoContext,
     release_id: u64,
@@ -355,6 +364,7 @@ async fn upload_one(
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn download(args: DownloadArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     let release = api::release::get_by_tag(&ctx.client, &ctx.owner, &ctx.name, &args.tag).await?;

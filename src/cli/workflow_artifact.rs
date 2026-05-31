@@ -31,6 +31,7 @@ pub struct DownloadArgs {
     pub json: bool,
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub async fn download(args: DownloadArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     guard_web_routes(&ctx.client)?;

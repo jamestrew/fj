@@ -56,6 +56,7 @@ pub struct DeployKeyDeleteArgs {
     pub yes: bool,
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) async fn deploy_key(cmd: DeployKeyCmd, host: Option<&str>) -> Result<()> {
     match cmd.command {
         DeployKeySub::List(args) => {

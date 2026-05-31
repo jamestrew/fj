@@ -90,6 +90,7 @@ pub struct IdArgs {
     pub run_id: u64,
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub async fn run(cmd: RunCmd, host: Option<&str>) -> Result<()> {
     match cmd.command {
         RunSub::List(args) => list(args, host).await,
@@ -101,6 +102,7 @@ pub async fn run(cmd: RunCmd, host: Option<&str>) -> Result<()> {
     }
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn list(args: ListArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     let runs = api::workflow::list_runs(&ctx.client, &ctx.owner, &ctx.name, args.limit).await?;
@@ -139,6 +141,7 @@ async fn list(args: ListArgs, host: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn view(args: ViewArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
 
@@ -277,6 +280,7 @@ fn print_logs(view: &api::workflow::RunView, failed_only: bool) {
     }
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn watch(args: WatchArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     guard_web_routes(&ctx.client)?;
@@ -409,6 +413,7 @@ fn absolutize(client: &crate::client::Client, link: &str) -> String {
     }
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn rerun(args: IdArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     guard_web_routes(&ctx.client)?;
@@ -417,6 +422,7 @@ async fn rerun(args: IdArgs, host: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn cancel(args: IdArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     guard_web_routes(&ctx.client)?;

@@ -40,6 +40,7 @@ pub struct UseArgs {
     pub id_or_slug: String,
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub async fn run(cmd: InstancesCmd, top_host: Option<&str>) -> Result<()> {
     // `--host` on the subcommand wins over the top-level `--host`.
     let host_flag = cmd.host.as_deref().or(top_host);
@@ -77,6 +78,7 @@ fn resolve_fjord(host_flag: Option<&str>) -> Result<(String, crate::config::host
     Ok((name, cfg, bearer))
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn list(host_flag: Option<&str>, json: bool) -> Result<()> {
     let (_name, cfg, bearer) = resolve_fjord(host_flag)?;
     let fa = cfg
@@ -153,6 +155,7 @@ fn serializable_list(instances: &[ForgeInstance]) -> Vec<serde_json::Value> {
         .collect()
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn use_instance(host_flag: Option<&str>, args: UseArgs) -> Result<()> {
     let (name, cfg, bearer) = resolve_fjord(host_flag)?;
     let fa = cfg

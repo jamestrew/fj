@@ -10,6 +10,7 @@ use crate::cli::editor;
 use crate::cli::pr::{ReviewArgs, ReviewerArgs};
 use crate::cli::pr_args::ReviewEventArg;
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) async fn review(args: ReviewArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     let body_required = matches!(args.event, ReviewEventArg::RequestChanges);
@@ -43,6 +44,7 @@ pub(crate) async fn review(args: ReviewArgs, host: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) async fn request_reviewers(args: ReviewerArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     let reviewers = expand_reviewers(args.reviewers)?;
@@ -62,6 +64,7 @@ pub(crate) async fn request_reviewers(args: ReviewerArgs, host: Option<&str>) ->
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) async fn unrequest_reviewers(args: ReviewerArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     let reviewers = expand_reviewers(args.reviewers)?;

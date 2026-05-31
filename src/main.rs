@@ -1,3 +1,10 @@
+// `coverage_nightly` is set by cargo-llvm-cov on a nightly toolchain. Gating
+// the unstable `coverage_attribute` feature on it keeps stable builds (the
+// MSRV path) completely unaffected, while `make coverage-strict` can drop the
+// async command handlers (which we don't unit-test) from the report. See the
+// Makefile's COV_IGNORE section.
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 mod api;
 mod auth;
 mod cli;

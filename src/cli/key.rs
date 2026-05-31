@@ -90,6 +90,7 @@ pub struct DeleteArgs {
     pub yes: bool,
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub async fn run_ssh(cmd: SshKeyCmd, host: Option<&str>) -> Result<()> {
     let client = Client::connect(host)?;
     match cmd.command {
@@ -99,6 +100,7 @@ pub async fn run_ssh(cmd: SshKeyCmd, host: Option<&str>) -> Result<()> {
     }
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn list_ssh(client: &Client, args: ListArgs) -> Result<()> {
     let keys: Vec<PublicKey> = client
         .json(Method::GET, "/api/v1/user/keys", &[], None::<&()>)
@@ -128,6 +130,7 @@ async fn list_ssh(client: &Client, args: ListArgs) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn add_ssh(client: &Client, args: AddArgs) -> Result<()> {
     let key = read_key(args.key.as_deref(), args.from_file.as_deref())?;
     #[derive(Serialize)]
@@ -146,6 +149,7 @@ async fn add_ssh(client: &Client, args: AddArgs) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn delete_ssh(client: &Client, args: DeleteArgs) -> Result<()> {
     if !args.yes {
         let ans = crate::cli::editor::prompt_line(&format!(
@@ -165,6 +169,7 @@ async fn delete_ssh(client: &Client, args: DeleteArgs) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub async fn run_gpg(cmd: GpgKeyCmd, host: Option<&str>) -> Result<()> {
     let client = Client::connect(host)?;
     match cmd.command {
@@ -174,6 +179,7 @@ pub async fn run_gpg(cmd: GpgKeyCmd, host: Option<&str>) -> Result<()> {
     }
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn list_gpg(client: &Client, args: ListArgs) -> Result<()> {
     let keys: Vec<GpgKey> = client
         .json(Method::GET, "/api/v1/user/gpg_keys", &[], None::<&()>)
@@ -202,6 +208,7 @@ async fn list_gpg(client: &Client, args: ListArgs) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn add_gpg(client: &Client, args: GpgAddArgs) -> Result<()> {
     let key = read_key(args.key.as_deref(), args.from_file.as_deref())?;
     let k: GpgKey = client
@@ -216,6 +223,7 @@ async fn add_gpg(client: &Client, args: GpgAddArgs) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn delete_gpg(client: &Client, args: DeleteArgs) -> Result<()> {
     if !args.yes {
         let ans = crate::cli::editor::prompt_line(&format!(

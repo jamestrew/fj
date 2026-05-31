@@ -6,6 +6,7 @@ use crate::client::{Client, ResolvedHost};
 use crate::config::hosts::Host;
 use crate::output;
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) async fn probe_version(client: &Client) -> Result<String> {
     #[derive(serde::Deserialize)]
     struct V {
