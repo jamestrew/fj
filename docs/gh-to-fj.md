@@ -110,8 +110,10 @@ called out.
 | `gh run view N --log`             | `fj run view N --log`             | Logs come from Forgejo web routes, not the API. |
 | `gh run view N --log-failed`      | `fj run view N --log-failed`      | Only steps that did not succeed.                |
 | `gh run watch N`                  | `fj run watch N`                  | Streams logs live until the job finishes.       |
+| `gh run download N`               | `fj run download N`               | Web route; `--list` to list, `-n` to pick one.  |
 | `gh run rerun N`                  | `fj run rerun N`                  | No API; web action rejects token POST. Prints run URL. |
 | `gh run cancel N`                 | `fj run cancel N`                 | Same: no API, falls back to the run URL.        |
+| `gh workflow list`                | `fj workflow list`                | Reads workflow files via the contents API.      |
 | `gh workflow run FILE`            | `fj workflow run FILE`            | `--ref` (default branch) and `-f key=value` inputs. |
 | `gh secret list`                  | `fj secret list`                  |                                                 |
 | `gh secret set NAME -b VAL`       | `fj secret set NAME --value VAL`  | Also `--from-file path` (or `-` for stdin).     |

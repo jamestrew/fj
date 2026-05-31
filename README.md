@@ -7,7 +7,7 @@
 <p align="center">
   <strong>A native CLI for <a href="https://forgejo.org">Forgejo</a> and Gitea-compatible forges.</strong><br>
   <code>fj</code> does for Forgejo what <code>gh</code> does for GitHub: open PRs, triage issues,<br>
-  ship releases, search code, drive Actions, all from a single binary.<br>
+  ship releases, tail Actions logs, drive workflows, all from a single binary.<br>
   Tokens stay in your OS keychain. Multi-host from day one.
 </p>
 
@@ -115,10 +115,11 @@ fj release create v1.2.3 \
   --asset dist/foo-aarch64.tar.gz
 ```
 
-**Search code, scripting-friendly:**
+**Inspect an Actions run, scripting-friendly:**
 
 ```sh
-fj search code "use crate::foo" -R owner/name --json --json-fields path,html_url
+fj run view 42 --log-failed                 # just the steps that failed
+fj run download 42 --list --json            # artifacts as JSON
 ```
 
 **Drop into raw API when you need it:**
@@ -131,23 +132,24 @@ fj api /version --include                # response headers + body
 
 ## Command surface
 
-Twenty-five top-level groups. Run `fj --help` for the live list; each group
+Twenty-six top-level groups. Run `fj --help` for the live list; each group
 has its own `--help`. Highlights:
 
 | Group       | What it covers                                                                  |
 | ----------- | ------------------------------------------------------------------------------- |
 | `auth`      | login, status, logout, switch, token, refresh, setup-git                        |
-| `repo`      | list, view, clone, create, fork, sync, edit, rename, archive, delete, branches, topics, mirror, watch, star |
-| `issue`     | list, view, create, edit, close, reopen, comment, edit-comment, delete-comment, develop |
-| `pr`        | list, view, create, edit, diff, commits, files, checks, ready, review, request-review, status, checkout, merge, close, reopen |
-| `release`   | list, view, create, edit, delete, upload, download                              |
-| `label`     | CRUD                                                                            |
+| `instances` | list and select Forgejo instances on a Fjord Account                            |
+| `repo`      | list, view, clone, create, fork, sync, edit, rename, archive, delete, branches, topics, mirror, watch, star, set-default, deploy-key |
+| `issue`     | list, view, create, edit, close, reopen, delete, pin, comment, edit-comment, delete-comment, develop |
+| `pr`        | list, view, create, edit, diff, commits, files, checks, ready, comment, update-branch, review, request-review, status, checkout, merge, close, reopen |
+| `release`   | list, view, create, edit, delete, upload, download, delete-asset                |
+| `label`     | CRUD + clone                                                                    |
 | `milestone` | CRUD + assign                                                                   |
-| `run`       | workflow runs (Forgejo Actions): list, view, `--log`, watch                     |
-| `workflow`  | trigger a `workflow_dispatch` run                                               |
+| `run`       | workflow runs (Forgejo Actions): list, view, `--log`, watch, download           |
+| `workflow`  | list workflow files; trigger a `workflow_dispatch` run                          |
 | `secret`    | Actions secrets                                                                 |
 | `variable`  | Actions variables                                                               |
-| `search`    | repos, issues, prs, users, **code**                                             |
+| `search`    | repos, issues, prs, users                                                       |
 | `browse`    | open the current repo (or a path within it) in `$BROWSER`                       |
 | `status`    | notifications inbox + `--mark-read`                                             |
 | `org`       | list, view, teams                                                               |
