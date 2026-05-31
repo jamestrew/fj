@@ -293,4 +293,97 @@ mod tests {
     fn parse_headers_rejects_unfielded() {
         assert!(parse_headers(&["nope".into()]).is_err());
     }
+
+    fn base_args() -> ApiArgs {
+        ApiArgs {
+            endpoint: "/repos/o/n".into(),
+            method: None,
+            fields: Vec::new(),
+            raw_fields: Vec::new(),
+            headers: Vec::new(),
+            jq: None,
+            input: None,
+            paginate: false,
+            include: false,
+            silent: false,
+        }
+    }
+
+    #[test]
+    fn pick_method_defaults_to_get() {
+        assert_eq!(pick_method(&base_args()).unwrap(), Method::GET);
+    }
+
+    #[test]
+    fn pick_method_defaults_to_post_with_input() {
+        let mut a = base_args();
+        a.input = Some("{}".into());
+        assert_eq!(pick_method(&a).unwrap(), Method::POST);
+    }
+
+    #[test]
+    fn pick_method_honors_explicit_method_case_insensitively() {
+        let mut a = base_args();
+        a.method = Some("patch".into());
+        assert_eq!(pick_method(&a).unwrap(), Method::PATCH);
+    }
+
+    #[test]
+    fn pick_method_rejects_garbage() {
+        let mut a = base_args();
+        a.method = Some("not a method".into());
+        assert!(pick_method(&a).is_err());
+    }
+
+    #[test]
+    fn build_query_or_body_puts_fields_in_query_for_get() {
+        let mut a = base_args();
+        a.fields = vec!["state=open".into()];
+        a.raw_fields = vec!["limit=5".into()];
+        let (query, body) = build_query_or_body(&a, &Method::GET).unwrap();
+        assert!(body.is_none());
+        assert_eq!(
+            query,
+            vec![
+                ("state".to_string(), "open".to_string()),
+                ("limit".to_string(), "5".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_query_or_body_builds_json_body_for_post() {
+        let mut a = base_args();
+        a.fields = vec!["title=hi".into()];
+        a.raw_fields = vec!["draft=true".into()];
+        let (query, body) = build_query_or_body(&a, &Method::POST).unwrap();
+        assert!(query.is_empty());
+        let body = body.unwrap();
+        // Plain fields stay strings; raw fields are parsed as JSON.
+        assert_eq!(body["title"], "hi");
+        assert_eq!(body["draft"], true);
+    }
+
+    #[test]
+    fn build_query_or_body_rejects_invalid_raw_field_json() {
+        let mut a = base_args();
+        a.raw_fields = vec!["draft=not-json".into()];
+        assert!(build_query_or_body(&a, &Method::POST).is_err());
+    }
+
+    #[test]
+    fn build_query_or_body_input_overrides_fields() {
+        let mut a = base_args();
+        a.input = Some(r#"{"a":1}"#.into());
+        let (query, body) = build_query_or_body(&a, &Method::POST).unwrap();
+        assert!(query.is_empty());
+        assert_eq!(body.unwrap()["a"], 1);
+    }
+
+    #[test]
+    fn build_query_or_body_rejects_invalid_input_json() {
+        let mut a = base_args();
+        a.input = Some("{bad".into());
+        assert!(build_query_or_body(&a, &Method::POST).is_err());
+    }
 }

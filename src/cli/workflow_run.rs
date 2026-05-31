@@ -564,4 +564,36 @@ mod tests {
         let view = run_view_with_jobs(0);
         assert!(validate_job(&view, 5).is_ok());
     }
+
+    fn test_client() -> crate::client::Client {
+        crate::client::Client::for_base_url(
+            "https://git.example.com".parse().unwrap(),
+            "tok".into(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn absolutize_prefixes_a_relative_path_with_the_host_origin() {
+        let c = test_client();
+        assert_eq!(
+            absolutize(&c, "/owner/repo/actions/runs/56"),
+            "https://git.example.com/owner/repo/actions/runs/56"
+        );
+    }
+
+    #[test]
+    fn absolutize_leaves_absolute_urls_untouched() {
+        let c = test_client();
+        for url in ["https://elsewhere.test/x", "http://elsewhere.test/y", ""] {
+            assert_eq!(absolutize(&c, url), url);
+        }
+    }
+
+    #[test]
+    fn guard_web_routes_allows_token_clients() {
+        // A token-auth client (the default for `for_base_url`) is permitted;
+        // only the Fjord gateway scheme is refused.
+        assert!(guard_web_routes(&test_client()).is_ok());
+    }
 }
