@@ -848,3 +848,69 @@ async fn deploy_key_list_and_delete() {
         .await
         .expect("delete");
 }
+
+// ── Artifacts (web route reads) + workflow listing (contents API) ──
+
+#[tokio::test]
+async fn list_artifacts_parses_web_envelope() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/o/r/actions/runs/5/artifacts"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "artifacts": [
+                {"name": "binary", "size": 1024, "status": "completed"},
+                {"name": "old", "size": 10, "status": "expired"}
+            ]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let arts = crate::api::workflow::list_artifacts(&c, "o", "r", 5)
+        .await
+        .expect("list");
+    assert_eq!(arts.len(), 2);
+    assert_eq!(arts[0].name, "binary");
+    assert_eq!(arts[0].size, 1024);
+    assert_eq!(arts[1].status, "expired");
+}
+
+#[tokio::test]
+async fn download_artifact_returns_bytes() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/o/r/actions/runs/5/artifacts/binary"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"PK\x03\x04zip".to_vec()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let bytes = crate::api::workflow::download_artifact(&c, "o", "r", 5, "binary")
+        .await
+        .expect("download");
+    assert_eq!(&bytes[..2], b"PK");
+}
+
+#[tokio::test]
+async fn list_workflows_reads_both_dirs_and_filters_yaml() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/contents/.forgejo/workflows"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {"name": "ci.yml", "path": ".forgejo/workflows/ci.yml", "type": "file"},
+            {"name": "README.md", "path": ".forgejo/workflows/README.md", "type": "file"}
+        ])))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/contents/.github/workflows"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let files = crate::api::workflow::list_workflows(&c, "o", "r")
+        .await
+        .expect("list");
+    assert_eq!(files.len(), 1, "only the .yml file counts");
+    assert_eq!(files[0].name, "ci.yml");
+}

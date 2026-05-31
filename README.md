@@ -143,8 +143,8 @@ has its own `--help`. Highlights:
 | `release`   | list, view, create, edit, delete, upload, download                              |
 | `label`     | CRUD                                                                            |
 | `milestone` | CRUD + assign                                                                   |
-| `run`       | workflow runs (Forgejo Actions): list, view, `--log`, watch                     |
-| `workflow`  | trigger a `workflow_dispatch` run                                               |
+| `run`       | workflow runs (Forgejo Actions): list, view, `--log`, watch, download           |
+| `workflow`  | list workflow files; trigger a `workflow_dispatch` run                          |
 | `secret`    | Actions secrets                                                                 |
 | `variable`  | Actions variables                                                               |
 | `search`    | repos, issues, prs, users, **code**                                             |

@@ -1,6 +1,7 @@
 //! `fj run` and `fj secret` / `fj variable` — Forgejo Actions.
 
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -25,6 +26,8 @@ pub enum RunSub {
     View(ViewArgs),
     /// Stream a run's logs live until the job finishes.
     Watch(WatchArgs),
+    /// List or download a run's artifacts.
+    Download(DownloadArgs),
     /// Rerun a workflow run.
     Rerun(IdArgs),
     /// Cancel an in-progress workflow run.
@@ -87,11 +90,31 @@ pub struct IdArgs {
     pub run_id: u64,
 }
 
+#[derive(Debug, Args)]
+pub struct DownloadArgs {
+    #[command(flatten)]
+    pub r: RepoFlag,
+    /// Run number, as shown in the `#` column of `fj run list`.
+    pub run_id: u64,
+    /// Download only this artifact (by name). Omit to download all.
+    #[arg(short = 'n', long)]
+    pub name: Option<String>,
+    /// Output directory (default: cwd). Each artifact is written as `<name>.zip`.
+    #[arg(short = 'o', long)]
+    pub output_dir: Option<String>,
+    /// List the run's artifacts instead of downloading.
+    #[arg(long)]
+    pub list: bool,
+    #[arg(long)]
+    pub json: bool,
+}
+
 pub async fn run(cmd: RunCmd, host: Option<&str>) -> Result<()> {
     match cmd.command {
         RunSub::List(args) => list(args, host).await,
         RunSub::View(args) => view(args, host).await,
         RunSub::Watch(args) => watch(args, host).await,
+        RunSub::Download(args) => download(args, host).await,
         RunSub::Rerun(args) => rerun(args, host).await,
         RunSub::Cancel(args) => cancel(args, host).await,
     }
@@ -365,6 +388,91 @@ async fn watch(args: WatchArgs, host: Option<&str>) -> Result<()> {
     }
 }
 
+async fn download(args: DownloadArgs, host: Option<&str>) -> Result<()> {
+    let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
+    guard_web_routes(&ctx.client)?;
+    let arts =
+        api::workflow::list_artifacts(&ctx.client, &ctx.owner, &ctx.name, args.run_id).await?;
+    if args.json {
+        return output::print_json(&serde_json::to_value(&arts)?);
+    }
+    if arts.is_empty() {
+        println!("(no artifacts)");
+        return Ok(());
+    }
+    if args.list {
+        let rows: Vec<Vec<String>> = arts
+            .iter()
+            .map(|a| {
+                vec![
+                    a.name.clone(),
+                    human_size(a.size),
+                    output::action_status(&a.status),
+                ]
+            })
+            .collect();
+        print!(
+            "{}",
+            output::render_table(&["NAME", "SIZE", "STATUS"], &rows)
+        );
+        return Ok(());
+    }
+    let out = args.output_dir.unwrap_or_else(|| ".".into());
+    std::fs::create_dir_all(&out)?;
+    let mut got = 0usize;
+    for a in &arts {
+        if let Some(filter) = &args.name {
+            if &a.name != filter {
+                continue;
+            }
+        }
+        if a.status == "expired" {
+            println!("{}", output::dim(&format!("skipping {} (expired)", a.name)));
+            continue;
+        }
+        let dest = artifact_dest(Path::new(&out), &a.name)?;
+        let bytes = api::workflow::download_artifact(
+            &ctx.client,
+            &ctx.owner,
+            &ctx.name,
+            args.run_id,
+            &a.name,
+        )
+        .await?;
+        std::fs::write(&dest, &bytes)?;
+        println!("✓ Downloaded {} → {}", a.name, dest.display());
+        got += 1;
+    }
+    if got == 0 {
+        println!("(no artifacts matched)");
+    }
+    Ok(())
+}
+
+/// Destination path for an artifact zip, rejecting names that try to escape
+/// the output directory.
+fn artifact_dest(dir: &Path, name: &str) -> Result<PathBuf> {
+    if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
+        return Err(anyhow!("refusing unsafe artifact name {name:?}"));
+    }
+    Ok(dir.join(format!("{name}.zip")))
+}
+
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut v = bytes as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < UNITS.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{v:.1} {}", UNITS[i])
+    }
+}
+
 /// Forgejo clamps an out-of-range job index to the first job rather than
 /// 404ing, which would silently show the wrong logs. Reject it instead.
 fn validate_job(view: &api::workflow::RunView, job: usize) -> Result<()> {
@@ -440,8 +548,18 @@ pub struct WorkflowCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum WorkflowSub {
+    /// List workflow files in the repo.
+    List(WorkflowListArgs),
     /// Trigger a `workflow_dispatch` run of a workflow file.
     Run(DispatchArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct WorkflowListArgs {
+    #[command(flatten)]
+    pub r: RepoFlag,
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -460,8 +578,27 @@ pub struct DispatchArgs {
 
 pub async fn run_workflow(cmd: WorkflowCmd, host: Option<&str>) -> Result<()> {
     match cmd.command {
+        WorkflowSub::List(args) => list_workflows(args, host).await,
         WorkflowSub::Run(args) => dispatch(args, host).await,
     }
+}
+
+async fn list_workflows(args: WorkflowListArgs, host: Option<&str>) -> Result<()> {
+    let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
+    let files = api::workflow::list_workflows(&ctx.client, &ctx.owner, &ctx.name).await?;
+    if args.json {
+        return output::print_json(&serde_json::to_value(&files)?);
+    }
+    if files.is_empty() {
+        println!("(no workflow files found in .forgejo/workflows or .github/workflows)");
+        return Ok(());
+    }
+    let rows: Vec<Vec<String>> = files
+        .iter()
+        .map(|f| vec![f.name.clone(), output::dim(&f.path)])
+        .collect();
+    print!("{}", output::render_table(&["WORKFLOW", "PATH"], &rows));
+    Ok(())
 }
 
 async fn dispatch(args: DispatchArgs, host: Option<&str>) -> Result<()> {

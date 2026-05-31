@@ -32,41 +32,57 @@ These features rely on endpoints introduced in or after Gitea 1.20.
 For older instances, the typed API still works via `fj api <path>` if
 you know the right path.
 
-## What the Forgejo API cannot do (verified against 15.0.2 / gitea-1.22)
+## Web-route capability map (verified against 15.0.2 / gitea-1.22)
 
-These are GitHub/`gh` capabilities that Forgejo's `/api/v1` does not
-expose. `fj` does not fake them; where a command exists it degrades with
-a clear message instead of a bare 404.
+Several GitHub/`gh` capabilities have no `/api/v1` endpoint but ARE served
+by Forgejo's human-facing web routes (the ones the browser UI calls). We
+use those where they work, exactly as `fj run --log` does. The decisive
+rule, learned the hard way:
 
-- **Code search.** No code-search endpoint exists in the API (the UI
-  code search is a web route gated on the repo indexer). `fj search code`
-  was removed rather than left to 404.
-- **Repo sync.** `POST /repos/.../merge-upstream` is absent on some
-  builds (including 15.0.x). `fj repo sync` detects the 404 and tells you
-  to sync the fork manually. `fj repo mirror-sync` (a different endpoint)
-  is unaffected.
-- **Rerun / cancel a run.** There is no `/api/v1` rerun or cancel
-  endpoint on any Forgejo. The web actions exist but reject a
-  PAT-authenticated POST (they need a browser session), so `fj run rerun`
-  / `fj run cancel` attempt the web route and, on rejection, print the
-  run URL to act on in the browser.
-- **Gist / snippets.** Forgejo has no gist or snippet entity at all
-  (snippets are a GitLab feature). The `gist` command was removed.
-- **Artifacts, Actions cache, workflow list/enable/disable.** No API
-  paths, so `gh run download`, `gh cache`, and `gh workflow
-  list/enable/disable` have no `fj` equivalent. `workflow run` (dispatch)
-  is the one Actions-management endpoint that does exist.
-- **Lock/unlock, issue transfer, pr revert, commit search,
-  attestations.** No endpoints; no `fj` equivalent.
+> **Read-only web endpoints accept a personal access token. State-changing
+> web POSTs reject it (they require a browser session).**
+
+So reads can borrow the web-route trick; writes cannot. Status of every
+no-`/api/v1` capability we looked at:
+
+| Capability | Web route? | Reachable with a PAT? | In `fj` |
+| --- | --- | --- | --- |
+| Run logs (`run view --log`, `watch`) | yes (read) | yes | ✅ implemented |
+| Run summary (`run view`) | yes (read) | yes | ✅ implemented |
+| Artifact **list** (`run download --list`) | yes, returns JSON (read) | yes | ✅ implemented |
+| Artifact **download** (`run download`) | documented `.../artifacts/{name}` (read) | likely (unverified) | ⚠️ implemented, see note |
+| Workflow **list** (`workflow list`) | n/a — read the files via the contents API | yes | ✅ implemented |
+| Run rerun / cancel | yes (write) | **no** — 404s a token POST | degrades, prints run URL |
+| Run delete, workflow enable/disable | write | no | not offered |
+| Issue/PR lock/unlock, issue transfer, pr revert | write | no | not offered |
+| Code search / commit search | web route returns **HTML only**, indexer-gated | scrape-only | not offered (fragile) |
+| Actions cache list/delete | **no web route** (404) and no API | n/a | not offered |
+| Gist / snippets | no entity at all (a GitLab feature, not Forgejo) | n/a | removed |
+
+Note on artifact download: the list route (`GET .../runs/{run}/artifacts`)
+is confirmed working and returns `{"artifacts":[{name,size,status}]}`.
+The download route (`GET .../runs/{run}/artifacts/{name}`) is Forgejo's
+documented path, but no run in development had artifacts to download, so
+the exact behavior on a populated run is unverified. `fj run download`
+lists first (always works) and then fetches each artifact; if the
+download route misbehaves it surfaces a clear error rather than failing
+silently.
+
+`fj repo sync` is the one non-Actions case here: `POST
+/repos/.../merge-upstream` is a real Gitea endpoint absent on some Forgejo
+builds (15.0.x included). The command detects the 404 and tells you to
+sync the fork manually; `fj repo mirror-sync` (a different endpoint) is
+unaffected.
 
 ## Actions: read vs write over the API
 
-Reads (`fj run list`, `fj run view`, `--log`, `watch`) work, but most
-go through Forgejo's **web** routes, not `/api/v1`, because the API only
-exposes run list/get plus secrets and variables. See
-`docs/architecture.md` → "Actions run logs". A Fjord-Account gateway
-proxies only `/api/v1`, so the whole `fj run` group needs a
-personal-access-token host.
+Reads (`fj run list`, `fj run view`, `--log`, `watch`, `run download
+--list`, `workflow list`) work, but most go through Forgejo's **web**
+routes (or the contents API), not the Actions `/api/v1` surface, which
+only exposes run list/get plus secrets, variables, and workflow dispatch.
+See `docs/architecture.md` → "Actions run logs". A Fjord-Account gateway
+proxies only `/api/v1`, so the whole `fj run` / `fj workflow` group needs
+a personal-access-token host.
 
 ## Forgejo-only endpoints
 
