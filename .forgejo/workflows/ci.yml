@@ -56,3 +56,43 @@ jobs:
           ./target/release/fj --version
           ./target/release/fj --help >/dev/null
           ./target/release/fj completion zsh >/dev/null
+
+  # Intent-precise coverage (handler regions excluded; see the Makefile's
+  # COV_IGNORE / coverage-strict). Runs after `check` rather than alongside it
+  # so the two heavy compiles don't contend for the runner's memory. The floor
+  # fails the build on a real regression; raise COV_MIN as coverage climbs.
+  coverage:
+    runs-on: docker
+    needs: check
+    container:
+      image: catthehacker/ubuntu:act-22.04
+    env:
+      RASTER_CACHE_S3_BUCKET:            ${{ vars.RASTER_CACHE_S3_BUCKET }}
+      RASTER_CACHE_S3_ENDPOINT:          ${{ vars.RASTER_CACHE_S3_ENDPOINT }}
+      RASTER_CACHE_S3_REGION:            ${{ vars.RASTER_CACHE_S3_REGION }}
+      RASTER_CACHE_S3_FORCE_PATH_STYLE:  "false"
+      RASTER_CACHE_S3_ACCESS_KEY_ID:     ${{ secrets.SCCACHE_AWS_KEY_ID }}
+      RASTER_CACHE_S3_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_AWS_SECRET_KEY }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: install rust toolchains
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain 1.95.0
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          # The coverage(off) regions only take effect on a nightly toolchain
+          # (cargo-llvm-cov sets cfg(coverage_nightly) there). llvm-tools-preview
+          # provides the profdata/cov tooling.
+          rustup toolchain install nightly --profile minimal
+          rustup component add llvm-tools-preview --toolchain nightly
+
+      - name: cache cargo
+        uses: https://rasterhub.com/rasterstate/rust-cache-action@v1
+
+      - name: install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --locked
+
+      - name: coverage-strict (fails under the floor)
+        run: make coverage-strict COV_MIN=73

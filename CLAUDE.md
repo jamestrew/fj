@@ -55,7 +55,9 @@ docs/                  architecture, jq, gh-to-fj, faq, troubleshooting
   command modules, via `#[cfg_attr(coverage_nightly, coverage(off))]` on
   every cli `async fn` (inert on stable). It's the intent-precise number
   (~76% vs ~51% for plain `coverage`). When you add a cli `async fn`
-  handler, keep the attribute on it.
+  handler, keep the attribute on it. CI enforces it: the `coverage` job in
+  `.forgejo/workflows/ci.yml` runs `make coverage-strict COV_MIN=73`
+  (raise the floor as coverage climbs).
 - `./scripts/install-hooks.sh` symlinks `hooks/pre-push` into `.git/hooks`.
 - `FJ_E2E=1` enables the live API smoke against `stephen/fj-cli-test`.
   It read-exercises the command handlers that `COV_IGNORE` excludes from
