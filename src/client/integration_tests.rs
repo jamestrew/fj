@@ -2000,3 +2000,281 @@ async fn repo_mirror_sync_posts_and_succeeds() {
         .await
         .expect("mirror-sync");
 }
+
+// ---- labels ----
+
+#[tokio::test]
+async fn label_list_decodes_rows() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "id": 1, "name": "bug", "color": "ee0000", "description": "defects" },
+            { "id": 2, "name": "docs", "color": "00ee00" }
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let labels = crate::api::label::list(&c, "o", "r").await.expect("list");
+    assert_eq!(labels.len(), 2);
+    assert_eq!(labels[0].name, "bug");
+    // description defaults when omitted.
+    assert_eq!(labels[1].description, "");
+}
+
+#[tokio::test]
+async fn label_create_posts_color_and_skips_none_description() {
+    use crate::api::label::CreateLabel;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/labels"))
+        .and(body_json(json!({ "name": "bug", "color": "ee0000" })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "id": 1, "name": "bug", "color": "ee0000"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let body = CreateLabel {
+        name: "bug",
+        color: "ee0000",
+        description: None,
+    };
+    let l = crate::api::label::create(&c, "o", "r", &body)
+        .await
+        .expect("create");
+    assert_eq!(l.id, 1);
+}
+
+#[tokio::test]
+async fn label_edit_patches_only_set_fields() {
+    use crate::api::label::EditLabel;
+    let server = MockServer::start().await;
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/repos/o/r/labels/1"))
+        .and(body_json(json!({ "color": "0000ee" })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 1, "name": "bug", "color": "0000ee"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let body = EditLabel {
+        color: Some("0000ee"),
+        ..Default::default()
+    };
+    let l = crate::api::label::edit(&c, "o", "r", 1, &body)
+        .await
+        .expect("edit");
+    assert_eq!(l.color, "0000ee");
+}
+
+#[tokio::test]
+async fn label_delete_succeeds_on_204() {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/repos/o/r/labels/1"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    crate::api::label::delete(&c, "o", "r", 1)
+        .await
+        .expect("delete");
+}
+
+// ---- milestones ----
+
+fn milestone_json(id: u64, title: &str, state: &str) -> serde_json::Value {
+    json!({ "id": id, "title": title, "state": state })
+}
+
+#[tokio::test]
+async fn milestone_list_sends_state_filter() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/milestones"))
+        .and(query_param("state", "open"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!([milestone_json(1, "v1", "open")])),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let ms = crate::api::milestone::list(&c, "o", "r", "open")
+        .await
+        .expect("list");
+    assert_eq!(ms.len(), 1);
+    assert_eq!(ms[0].title, "v1");
+}
+
+#[tokio::test]
+async fn milestone_create_skips_none_fields() {
+    use crate::api::milestone::CreateMilestone;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/milestones"))
+        .and(body_json(json!({ "title": "v2" })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(milestone_json(2, "v2", "open")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let body = CreateMilestone {
+        title: "v2",
+        description: None,
+        due_on: None,
+    };
+    let m = crate::api::milestone::create(&c, "o", "r", &body)
+        .await
+        .expect("create");
+    assert_eq!(m.id, 2);
+}
+
+#[tokio::test]
+async fn milestone_edit_can_close() {
+    use crate::api::milestone::EditMilestone;
+    let server = MockServer::start().await;
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/repos/o/r/milestones/2"))
+        .and(body_json(json!({ "state": "closed" })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(milestone_json(2, "v2", "closed")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let body = EditMilestone {
+        state: Some("closed"),
+        ..Default::default()
+    };
+    let m = crate::api::milestone::edit(&c, "o", "r", 2, &body)
+        .await
+        .expect("edit");
+    assert_eq!(m.state, "closed");
+}
+
+#[tokio::test]
+async fn milestone_assign_sets_and_clears_via_patch_issue() {
+    let server = MockServer::start().await;
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/repos/o/r/issues/7"))
+        .and(body_json(json!({ "milestone": 2 })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/repos/o/r/issues/8"))
+        .and(body_json(json!({ "milestone": null })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    crate::api::milestone::assign(&c, "o", "r", 7, Some(2))
+        .await
+        .expect("assign");
+    crate::api::milestone::assign(&c, "o", "r", 8, None)
+        .await
+        .expect("detach");
+}
+
+#[tokio::test]
+async fn milestone_delete_succeeds_on_204() {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/repos/o/r/milestones/2"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    crate::api::milestone::delete(&c, "o", "r", 2)
+        .await
+        .expect("delete");
+}
+
+// ---- webhooks ----
+
+#[tokio::test]
+async fn hook_list_decodes_type_and_config() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/hooks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {
+                "id": 3, "type": "gitea", "events": ["push"], "active": true,
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z",
+                "config": { "url": "https://hook.example" }
+            }
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let hooks = crate::api::hook::list(&c, "o", "r").await.expect("list");
+    assert_eq!(hooks.len(), 1);
+    assert_eq!(hooks[0].type_, "gitea");
+    assert_eq!(hooks[0].config["url"], "https://hook.example");
+}
+
+#[tokio::test]
+async fn hook_create_posts_type_config_events() {
+    use crate::api::hook::CreateHook;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/hooks"))
+        .and(body_json(json!({
+            "type": "gitea",
+            "config": { "url": "https://hook.example", "content_type": "json" },
+            "events": ["push", "pull_request"],
+            "active": true
+        })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "id": 3, "type": "gitea", "events": ["push", "pull_request"], "active": true,
+            "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
+            "config": {}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let body = CreateHook {
+        type_: "gitea",
+        config: json!({ "url": "https://hook.example", "content_type": "json" }),
+        events: vec!["push", "pull_request"],
+        active: true,
+    };
+    let h = crate::api::hook::create(&c, "o", "r", &body)
+        .await
+        .expect("create");
+    assert_eq!(h.id, 3);
+}
+
+#[tokio::test]
+async fn hook_delete_and_test_post_to_their_paths() {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/repos/o/r/hooks/3"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/hooks/3/tests"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    crate::api::hook::delete(&c, "o", "r", 3)
+        .await
+        .expect("delete");
+    crate::api::hook::test(&c, "o", "r", 3).await.expect("test");
+}
