@@ -276,4 +276,65 @@ mod tests {
         }
         walk(&mut Cli::command());
     }
+
+    /// Keep the coverage scope honest: the `COV_IGNORE` list in the Makefile
+    /// must stay in sync with reality. A `cli/*.rs` with no `#[cfg(test)]`
+    /// module is glue we don't unit-test and must be excluded; one that has
+    /// a test module is a unit-test target and must NOT be excluded. Without
+    /// this guard the coverage number silently drifts as files are added.
+    ///
+    /// `mod.rs` is the one documented exception: it stays excluded as
+    /// entry/dispatch even though it carries the structural tests above.
+    #[test]
+    fn cov_ignore_stays_in_sync_with_test_modules() {
+        use std::collections::BTreeSet;
+        use std::fs;
+
+        let root = env!("CARGO_MANIFEST_DIR");
+
+        let makefile = fs::read_to_string(format!("{root}/Makefile")).expect("read Makefile");
+        let cov_line = makefile
+            .lines()
+            .find(|l| l.starts_with("COV_IGNORE"))
+            .expect("COV_IGNORE assignment in Makefile");
+        // Pull the `cli/( ... )` alternation and split it into basenames.
+        let cli_group = cov_line
+            .split_once("cli/(")
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .map(|(group, _)| group)
+            .expect("cli/(...) group in COV_IGNORE");
+        let excluded: BTreeSet<&str> = cli_group.split('|').collect();
+
+        let mut problems = Vec::new();
+        for entry in fs::read_dir(format!("{root}/src/cli")).expect("read src/cli") {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let stem = path.file_stem().unwrap().to_str().unwrap().to_string();
+            if stem == "mod" {
+                continue; // documented exception (see doc comment)
+            }
+            let src = fs::read_to_string(&path).unwrap();
+            let has_tests = src.contains("#[cfg(test)]");
+            let is_excluded = excluded.contains(stem.as_str());
+            if has_tests && is_excluded {
+                problems.push(format!(
+                    "cli/{stem}.rs has a #[cfg(test)] module but is in COV_IGNORE: \
+                     remove it from COV_IGNORE (it is a unit-test target)"
+                ));
+            }
+            if !has_tests && !is_excluded {
+                problems.push(format!(
+                    "cli/{stem}.rs has no #[cfg(test)] module and is not in COV_IGNORE: \
+                     add it to COV_IGNORE (it is untested glue) or give it tests"
+                ));
+            }
+        }
+        assert!(
+            problems.is_empty(),
+            "COV_IGNORE is out of sync with the cli/ test modules:\n  {}",
+            problems.join("\n  ")
+        );
+    }
 }
