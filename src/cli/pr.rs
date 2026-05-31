@@ -1,12 +1,13 @@
 use std::io::Read;
 
 use anyhow::{anyhow, Result};
-use clap::{Args, Subcommand, ValueEnum};
+use clap::{Args, Subcommand};
 
 use crate::api;
-use crate::api::issue::State;
-use crate::api::pull::{CreatePull, EditPull, ListOptions, MergeStyle, ReviewEvent};
+use crate::api::pull::{CreatePull, EditPull, ListOptions};
 use crate::cli::context::{resolve_repo, RepoFlag};
+use crate::cli::pr_args::{MergeStyleArg, ReviewEventArg, StateFilter, UpdateStyle};
+use crate::cli::pr_review;
 use crate::client::Client;
 use crate::git;
 use crate::output;
@@ -60,59 +61,6 @@ pub enum PrSub {
     Close(SimpleArgs),
     /// Reopen a closed pull request.
     Reopen(SimpleArgs),
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum StateFilter {
-    Open,
-    Closed,
-    All,
-}
-
-impl From<StateFilter> for State {
-    fn from(value: StateFilter) -> Self {
-        match value {
-            StateFilter::Open => State::Open,
-            StateFilter::Closed => State::Closed,
-            StateFilter::All => State::All,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum MergeStyleArg {
-    Merge,
-    Rebase,
-    RebaseMerge,
-    Squash,
-}
-
-impl From<MergeStyleArg> for MergeStyle {
-    fn from(value: MergeStyleArg) -> Self {
-        match value {
-            MergeStyleArg::Merge => MergeStyle::Merge,
-            MergeStyleArg::Rebase => MergeStyle::Rebase,
-            MergeStyleArg::RebaseMerge => MergeStyle::RebaseMerge,
-            MergeStyleArg::Squash => MergeStyle::Squash,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum ReviewEventArg {
-    Approve,
-    RequestChanges,
-    Comment,
-}
-
-impl From<ReviewEventArg> for ReviewEvent {
-    fn from(value: ReviewEventArg) -> Self {
-        match value {
-            ReviewEventArg::Approve => ReviewEvent::Approve,
-            ReviewEventArg::RequestChanges => ReviewEvent::RequestChanges,
-            ReviewEventArg::Comment => ReviewEvent::Comment,
-        }
-    }
 }
 
 #[derive(Debug, Args)]
@@ -263,21 +211,6 @@ pub struct UpdateBranchArgs {
     pub style: UpdateStyle,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum UpdateStyle {
-    Merge,
-    Rebase,
-}
-
-impl UpdateStyle {
-    fn as_str(self) -> &'static str {
-        match self {
-            UpdateStyle::Merge => "merge",
-            UpdateStyle::Rebase => "rebase",
-        }
-    }
-}
-
 pub async fn run(cmd: PrCmd, host: Option<&str>) -> Result<()> {
     match cmd.command {
         PrSub::List(args) => list(args, host).await,
@@ -291,9 +224,9 @@ pub async fn run(cmd: PrCmd, host: Option<&str>) -> Result<()> {
         PrSub::Ready(args) => ready(args, host).await,
         PrSub::Comment(args) => comment(args, host).await,
         PrSub::UpdateBranch(args) => update_branch(args, host).await,
-        PrSub::Review(args) => review(args, host).await,
-        PrSub::RequestReview(args) => request_reviewers(args, host).await,
-        PrSub::UnrequestReview(args) => unrequest_reviewers(args, host).await,
+        PrSub::Review(args) => pr_review::review(args, host).await,
+        PrSub::RequestReview(args) => pr_review::request_reviewers(args, host).await,
+        PrSub::UnrequestReview(args) => pr_review::unrequest_reviewers(args, host).await,
         PrSub::Status(args) => status(args, host).await,
         PrSub::Checkout(args) => checkout(args, host).await,
         PrSub::Merge(args) => merge(args, host).await,
@@ -630,97 +563,6 @@ async fn update_branch(args: UpdateBranchArgs, host: Option<&str>) -> Result<()>
     .await?;
     println!("✓ Updated PR #{} from its base branch", args.number);
     Ok(())
-}
-
-async fn review(args: ReviewArgs, host: Option<&str>) -> Result<()> {
-    let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
-    let body_required = matches!(args.event, ReviewEventArg::RequestChanges);
-    let body = match args.body.as_deref() {
-        Some("-") => {
-            let mut buf = String::new();
-            std::io::stdin().read_to_string(&mut buf)?;
-            Some(buf.trim_end().to_string())
-        }
-        Some(s) => Some(s.to_string()),
-        None => {
-            if body_required {
-                Some(editor::edit_text("PR_REVIEW.md", "")?)
-            } else {
-                None
-            }
-        }
-    };
-    let body = body.filter(|s| !s.trim().is_empty());
-    let r = api::pull::submit_review(
-        &ctx.client,
-        &ctx.owner,
-        &ctx.name,
-        args.number,
-        args.event.into(),
-        body.as_deref(),
-    )
-    .await?;
-    println!("✓ Submitted {} review on #{}", r.state, args.number);
-    println!("{}", r.html_url);
-    Ok(())
-}
-
-async fn request_reviewers(args: ReviewerArgs, host: Option<&str>) -> Result<()> {
-    let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
-    let reviewers = expand_reviewers(args.reviewers)?;
-    api::pull::request_reviewers(
-        &ctx.client,
-        &ctx.owner,
-        &ctx.name,
-        args.number,
-        reviewers.clone(),
-    )
-    .await?;
-    println!(
-        "✓ Requested review from {} on #{}",
-        reviewers.join(", "),
-        args.number
-    );
-    Ok(())
-}
-
-async fn unrequest_reviewers(args: ReviewerArgs, host: Option<&str>) -> Result<()> {
-    let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
-    let reviewers = expand_reviewers(args.reviewers)?;
-    api::pull::unrequest_reviewers(
-        &ctx.client,
-        &ctx.owner,
-        &ctx.name,
-        args.number,
-        reviewers.clone(),
-    )
-    .await?;
-    println!(
-        "✓ Removed review request from {} on #{}",
-        reviewers.join(", "),
-        args.number
-    );
-    Ok(())
-}
-
-/// Accept reviewers as either repeated args or comma-separated within one
-/// arg, since both forms come up naturally in shell invocations.
-fn expand_reviewers(raw: Vec<String>) -> Result<Vec<String>> {
-    let mut out: Vec<String> = Vec::new();
-    for r in raw {
-        for piece in r.split(',') {
-            let p = piece.trim();
-            if !p.is_empty() {
-                out.push(p.to_string());
-            }
-        }
-    }
-    if out.is_empty() {
-        return Err(anyhow!(
-            "no reviewers provided (pass one or more usernames)"
-        ));
-    }
-    Ok(out)
 }
 
 async fn status(args: StatusArgs, host: Option<&str>) -> Result<()> {

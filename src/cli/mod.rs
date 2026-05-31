@@ -1,6 +1,10 @@
 pub mod alias;
 pub mod api;
+mod api_jq;
 pub mod auth;
+mod auth_login;
+mod auth_probe;
+mod auth_setup_git;
 pub mod browse;
 pub mod config;
 pub mod context;
@@ -14,13 +18,20 @@ pub mod label;
 pub mod milestone;
 pub mod org;
 pub mod pr;
+mod pr_args;
+mod pr_review;
 pub mod protect;
 pub mod release;
 pub mod repo;
+mod repo_deploy_key;
+mod repo_mirror;
 pub mod search;
 pub mod status;
 pub mod web;
 pub mod workflow;
+mod workflow_run;
+mod workflow_secret;
+mod workflow_variable;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -136,7 +147,7 @@ pub async fn run(cli: Cli) -> Result<()> {
     // out, which would be a process-wide side effect and an unsafe set_var.
     let _pager = match &cli.command {
         // `run watch` streams live; paging would buffer it. Never page it.
-        Command::Run(rc) if matches!(rc.command, workflow::RunSub::Watch(_)) => None,
+        Command::Run(rc) if matches!(rc.command, workflow_run::RunSub::Watch(_)) => None,
         Command::Repo(_)
         | Command::Issue(_)
         | Command::Pr(_)
@@ -175,10 +186,10 @@ async fn dispatch(command: Command, host: Option<&str>) -> Result<()> {
         Command::Release(cmd) => release::run(cmd, host).await,
         Command::Label(cmd) => label::run(cmd, host).await,
         Command::Milestone(cmd) => milestone::run(cmd, host).await,
-        Command::Run(cmd) => workflow::run(cmd, host).await,
+        Command::Run(cmd) => workflow_run::run(cmd, host).await,
         Command::Workflow(cmd) => workflow::run_workflow(cmd, host).await,
-        Command::Secret(cmd) => workflow::run_secret(cmd, host).await,
-        Command::Variable(cmd) => workflow::run_variable(cmd, host).await,
+        Command::Secret(cmd) => workflow_secret::run_secret(cmd, host).await,
+        Command::Variable(cmd) => workflow_variable::run_variable(cmd, host).await,
         Command::Search(cmd) => search::run(cmd, host).await,
         Command::Browse(args) => browse::run(args, host).await,
         Command::Status(args) => status::run(args, host).await,

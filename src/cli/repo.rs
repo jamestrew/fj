@@ -2,7 +2,10 @@ use anyhow::{anyhow, Result};
 use clap::{Args, Subcommand};
 
 use crate::api;
-use crate::cli::context::{resolve_repo, RepoFlag};
+use crate::cli::context::resolve_repo;
+use crate::cli::repo_deploy_key::DeployKeyCmd;
+use crate::cli::repo_mirror::{MirrorArgs, MirrorSyncArgs};
+use crate::cli::{repo_deploy_key, repo_mirror};
 use crate::client::Client;
 use crate::config::hosts::Hosts;
 use crate::git;
@@ -78,54 +81,6 @@ pub struct SetDefaultArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct DeployKeyCmd {
-    #[command(subcommand)]
-    pub command: DeployKeySub,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum DeployKeySub {
-    /// List deploy keys on the repo.
-    List(DeployKeyListArgs),
-    /// Add a deploy key (read-only by default).
-    Add(DeployKeyAddArgs),
-    /// Delete a deploy key by id.
-    Delete(DeployKeyDeleteArgs),
-}
-
-#[derive(Debug, Args)]
-pub struct DeployKeyListArgs {
-    #[command(flatten)]
-    pub r: RepoFlag,
-    #[arg(long)]
-    pub json: bool,
-}
-
-#[derive(Debug, Args)]
-pub struct DeployKeyAddArgs {
-    #[command(flatten)]
-    pub r: RepoFlag,
-    pub title: String,
-    /// Public key string. Use `--from-file path` (or `-` for stdin) instead for files.
-    #[arg(long)]
-    pub key: Option<String>,
-    #[arg(long = "from-file")]
-    pub from_file: Option<String>,
-    /// Allow the key to push (default is read-only).
-    #[arg(long)]
-    pub allow_write: bool,
-}
-
-#[derive(Debug, Args)]
-pub struct DeployKeyDeleteArgs {
-    #[command(flatten)]
-    pub r: RepoFlag,
-    pub id: u64,
-    #[arg(short = 'y', long)]
-    pub yes: bool,
-}
-
-#[derive(Debug, Args)]
 pub struct SimpleRepoArgs {
     pub repo: Option<String>,
     #[arg(short = 'R', long = "repo")]
@@ -169,7 +124,7 @@ pub struct ViewArgs {
 }
 
 /// Choose between a positional repo arg and the `-R` flag.
-fn pick_repo<'a>(pos: Option<&'a String>, flag: Option<&'a String>) -> Option<&'a str> {
+pub(crate) fn pick_repo<'a>(pos: Option<&'a String>, flag: Option<&'a String>) -> Option<&'a str> {
     flag.map(|s| s.as_str()).or(pos.map(|s| s.as_str()))
 }
 
@@ -285,44 +240,6 @@ pub struct TopicsArgs {
     pub set: Option<String>,
 }
 
-#[derive(Debug, Args)]
-pub struct MirrorArgs {
-    /// Source URL (e.g. `https://github.com/foo/bar.git`).
-    pub source_url: String,
-    /// Destination as `[owner/]name`. Defaults to the source's basename
-    /// under your user account.
-    #[arg(long)]
-    pub dest: Option<String>,
-    /// Migrate as a pull-mirror instead of a one-shot import.
-    #[arg(long)]
-    pub mirror: bool,
-    /// Make the destination repo private.
-    #[arg(long)]
-    pub private: bool,
-    /// Description for the new repo.
-    #[arg(long)]
-    pub description: Option<String>,
-    /// Username for HTTP source-auth.
-    #[arg(long)]
-    pub auth_user: Option<String>,
-    /// Password / token for HTTP source-auth.
-    #[arg(long)]
-    pub auth_pass: Option<String>,
-    /// Service hint: git, github, gitea, gitlab, gogs.
-    #[arg(long, default_value = "git")]
-    pub service: String,
-    /// Refresh interval for pull-mirrors (e.g. `8h`, `1d`).
-    #[arg(long)]
-    pub interval: Option<String>,
-}
-
-#[derive(Debug, Args)]
-pub struct MirrorSyncArgs {
-    pub repo: Option<String>,
-    #[arg(short = 'R', long = "repo")]
-    pub repo_flag: Option<String>,
-}
-
 pub async fn run(cmd: RepoCmd, host: Option<&str>) -> Result<()> {
     match cmd.command {
         RepoSub::List(args) => list(args, host).await,
@@ -338,15 +255,15 @@ pub async fn run(cmd: RepoCmd, host: Option<&str>) -> Result<()> {
         RepoSub::Delete(args) => delete(args, host).await,
         RepoSub::Branches(args) => branches(args, host).await,
         RepoSub::Topics(args) => topics(args, host).await,
-        RepoSub::Mirror(args) => mirror(args, host).await,
-        RepoSub::MirrorSync(args) => mirror_sync(args, host).await,
+        RepoSub::Mirror(args) => repo_mirror::mirror(args, host).await,
+        RepoSub::MirrorSync(args) => repo_mirror::mirror_sync(args, host).await,
         RepoSub::Watch(args) => watch(args, host, true).await,
         RepoSub::Unwatch(args) => watch(args, host, false).await,
         RepoSub::Star(args) => star(args, host, true).await,
         RepoSub::Unstar(args) => star(args, host, false).await,
         RepoSub::Starred(args) => starred(args, host).await,
         RepoSub::SetDefault(args) => set_default(args).await,
-        RepoSub::DeployKey(cmd) => deploy_key(cmd, host).await,
+        RepoSub::DeployKey(cmd) => repo_deploy_key::deploy_key(cmd, host).await,
     }
 }
 
@@ -425,144 +342,6 @@ async fn set_default(args: SetDefaultArgs) -> Result<()> {
     let _ = api::split_repo(&slug)?;
     git::config_set_local(KEY, &slug)?;
     println!("✓ Default repo for this directory set to {slug}");
-    Ok(())
-}
-
-async fn deploy_key(cmd: DeployKeyCmd, host: Option<&str>) -> Result<()> {
-    match cmd.command {
-        DeployKeySub::List(args) => {
-            let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
-            let keys = api::repo::list_keys(&ctx.client, &ctx.owner, &ctx.name).await?;
-            if args.json {
-                return output::print_json(&serde_json::to_value(&keys)?);
-            }
-            if keys.is_empty() {
-                println!("(no deploy keys)");
-                return Ok(());
-            }
-            let rows: Vec<Vec<String>> = keys
-                .iter()
-                .map(|k| {
-                    vec![
-                        k.id.to_string(),
-                        k.title.clone(),
-                        if k.read_only {
-                            "read-only"
-                        } else {
-                            "read-write"
-                        }
-                        .into(),
-                        output::dim(&output::relative_time(k.created_at)),
-                    ]
-                })
-                .collect();
-            print!(
-                "{}",
-                output::render_table(&["ID", "TITLE", "ACCESS", "CREATED"], &rows)
-            );
-            Ok(())
-        }
-        DeployKeySub::Add(args) => {
-            let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
-            let key = read_key_value(args.key.as_deref(), args.from_file.as_deref())?;
-            let k = api::repo::add_key(
-                &ctx.client,
-                &ctx.owner,
-                &ctx.name,
-                &args.title,
-                &key,
-                !args.allow_write,
-            )
-            .await?;
-            println!(
-                "✓ Added deploy key '{}' (id {}, {})",
-                k.title,
-                k.id,
-                if k.read_only {
-                    "read-only"
-                } else {
-                    "read-write"
-                }
-            );
-            Ok(())
-        }
-        DeployKeySub::Delete(args) => {
-            let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
-            if !args.yes {
-                let ans = editor::prompt_line(&format!(
-                    "Delete deploy key {}? Type the id to confirm",
-                    args.id
-                ))?;
-                if ans != args.id.to_string() {
-                    return Err(anyhow!("aborted"));
-                }
-            }
-            api::repo::delete_key(&ctx.client, &ctx.owner, &ctx.name, args.id).await?;
-            println!("✓ Deleted deploy key {}", args.id);
-            Ok(())
-        }
-    }
-}
-
-fn read_key_value(value: Option<&str>, from_file: Option<&str>) -> Result<String> {
-    if let Some(v) = value {
-        return Ok(v.trim().to_string());
-    }
-    if let Some(path) = from_file {
-        if path == "-" {
-            use std::io::Read;
-            let mut buf = String::new();
-            std::io::stdin().read_to_string(&mut buf)?;
-            return Ok(buf.trim().to_string());
-        }
-        return Ok(std::fs::read_to_string(path)?.trim().to_string());
-    }
-    Err(anyhow!("pass --key or --from-file (use `-` for stdin)"))
-}
-
-async fn mirror(args: MirrorArgs, host: Option<&str>) -> Result<()> {
-    let client = Client::connect(host)?;
-    let me = api::user::current(&client).await?;
-    let (dest_owner, dest_name) = match args.dest.as_deref() {
-        Some(slug) => match slug.split_once('/') {
-            Some((o, n)) => (o.to_string(), n.to_string()),
-            None => (me.login.clone(), slug.to_string()),
-        },
-        None => {
-            let basename = std::path::Path::new(&args.source_url)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .ok_or_else(|| anyhow!("can't infer destination name from {}", args.source_url))?;
-            (me.login.clone(), basename.to_string())
-        }
-    };
-    let body = api::repo::Migrate {
-        clone_addr: &args.source_url,
-        repo_name: &dest_name,
-        repo_owner: &dest_owner,
-        mirror: args.mirror,
-        private: args.private,
-        description: args.description.as_deref(),
-        auth_username: args.auth_user.as_deref(),
-        auth_password: args.auth_pass.as_deref(),
-        auth_token: None,
-        service: &args.service,
-        mirror_interval: args.interval.as_deref(),
-    };
-    let r = api::repo::migrate(&client, &body).await?;
-    println!(
-        "✓ {} {}",
-        if args.mirror { "Mirrored" } else { "Imported" },
-        r.full_name
-    );
-    println!("{}", r.html_url);
-    Ok(())
-}
-
-async fn mirror_sync(args: MirrorSyncArgs, host: Option<&str>) -> Result<()> {
-    let ctx = resolve_repo(pick_repo(args.repo.as_ref(), args.repo_flag.as_ref()), host)?;
-    api::repo::mirror_sync(&ctx.client, &ctx.owner, &ctx.name).await?;
-    println!("✓ Triggered mirror sync for {}/{}", ctx.owner, ctx.name);
     Ok(())
 }
 
@@ -869,10 +648,6 @@ async fn topics(args: TopicsArgs, host: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-// Silence the unused `RepoFlag` import for now — kept for symmetry with other
-// subcommands and exported through `cli::context`.
-const _: fn() -> Option<RepoFlag> = || None;
-
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
@@ -880,4 +655,27 @@ fn truncate(s: &str, max: usize) -> String {
     let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
     out.push('…');
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pick_repo_prefers_the_flag_over_positional() {
+        let pos = String::from("owner/pos");
+        let flag = String::from("owner/flag");
+        assert_eq!(pick_repo(Some(&pos), Some(&flag)), Some("owner/flag"));
+    }
+
+    #[test]
+    fn pick_repo_falls_back_to_positional() {
+        let pos = String::from("owner/pos");
+        assert_eq!(pick_repo(Some(&pos), None), Some("owner/pos"));
+    }
+
+    #[test]
+    fn pick_repo_none_when_neither() {
+        assert_eq!(pick_repo(None, None), None);
+    }
 }

@@ -22,7 +22,7 @@ src/
     mod.rs             Client, retry-on-5xx, debug logging, headers
     pagination.rs      Page<T> + Link header parser
     error.rs           ApiError
-    integration_tests  wiremock-based tests
+    integration_tests.rs  wiremock-based tests (a single file, not a dir)
   config/              hosts.toml shape + load/save
   auth/                OS keychain wrapper
   git/                 git invocation + remote URL parser
@@ -37,7 +37,7 @@ docs/                  architecture, jq, gh-to-fj, faq, troubleshooting
 ## Build / test / hook
 
 - `cargo build --release` produces a ~4 MB binary at `target/release/fj`.
-- `cargo test --all` runs 75 tests (65 unit + 10 wiremock integration).
+- `cargo test --all` runs ~165 tests (~106 unit + 59 wiremock integration).
   2 tests are `#[ignore]` (env-mutating, racy with cargo's harness).
 - `cargo clippy --all-targets --all-features -- -D warnings` is the lint
   bar. Both the pre-push hook and `.forgejo/workflows/ci.yml` treat
