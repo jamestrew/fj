@@ -1820,3 +1820,183 @@ async fn repo_list_starred_clamps_limit() {
     assert_eq!(repos.len(), 1);
     assert_eq!(repos[0].name, "starred");
 }
+
+#[tokio::test]
+async fn repo_list_for_user_pages_with_limit_and_page() {
+    use crate::api::repo::ListOptions;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/user/repos"))
+        .and(query_param("limit", "10"))
+        .and(query_param("page", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([minimal_repo_json("a")])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let page = crate::api::repo::list_for_user(
+        &c,
+        ListOptions {
+            limit: 10,
+            page: 2,
+            query: None,
+        },
+    )
+    .await
+    .expect("list");
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].name, "a");
+}
+
+#[tokio::test]
+async fn repo_create_for_current_user_skips_none_fields() {
+    use crate::api::repo::CreateRepo;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/user/repos"))
+        // description and default_branch are None -> omitted from the body.
+        .and(body_json(json!({
+            "name": "newrepo",
+            "private": true,
+            "auto_init": false,
+        })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(minimal_repo_json("newrepo")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let body = CreateRepo {
+        name: "newrepo",
+        description: None,
+        private: true,
+        default_branch: None,
+        auto_init: false,
+    };
+    let r = crate::api::repo::create_for_current_user(&c, &body)
+        .await
+        .expect("create");
+    assert_eq!(r.name, "newrepo");
+}
+
+#[tokio::test]
+async fn repo_create_for_org_targets_the_org_path() {
+    use crate::api::repo::CreateRepo;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/orgs/myorg/repos"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(minimal_repo_json("orgrepo")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let body = CreateRepo {
+        name: "orgrepo",
+        description: Some("hi"),
+        private: false,
+        default_branch: None,
+        auto_init: true,
+    };
+    let r = crate::api::repo::create_for_org(&c, "myorg", &body)
+        .await
+        .expect("create");
+    assert_eq!(r.name, "orgrepo");
+}
+
+#[tokio::test]
+async fn repo_edit_patches_only_set_fields() {
+    use crate::api::repo::EditRepo;
+    let server = MockServer::start().await;
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/repos/o/r"))
+        .and(body_json(json!({ "archived": true })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(minimal_repo_json("r")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let body = EditRepo {
+        archived: Some(true),
+        ..Default::default()
+    };
+    crate::api::repo::edit(&c, "o", "r", &body)
+        .await
+        .expect("edit");
+}
+
+#[tokio::test]
+async fn repo_delete_succeeds_on_204() {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/repos/o/r"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    crate::api::repo::delete(&c, "o", "r")
+        .await
+        .expect("delete");
+}
+
+#[tokio::test]
+async fn repo_rename_patches_the_name_field() {
+    let server = MockServer::start().await;
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/repos/o/r"))
+        .and(body_json(json!({ "name": "renamed" })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(minimal_repo_json("renamed")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    crate::api::repo::rename(&c, "o", "r", "renamed")
+        .await
+        .expect("rename");
+}
+
+#[tokio::test]
+async fn repo_sync_with_upstream_posts_the_branch() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/merge-upstream"))
+        .and(body_json(json!({ "branch": "main" })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "merged": true })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    crate::api::repo::sync_with_upstream(&c, "o", "r", "main")
+        .await
+        .expect("sync");
+}
+
+#[tokio::test]
+async fn repo_sync_with_upstream_maps_404_to_actionable_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/merge-upstream"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let err = crate::api::repo::sync_with_upstream(&c, "o", "r", "main")
+        .await
+        .expect_err("should error");
+    assert!(err.to_string().contains("merge-upstream"));
+}
+
+#[tokio::test]
+async fn repo_mirror_sync_posts_and_succeeds() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/mirror-sync"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    crate::api::repo::mirror_sync(&c, "o", "r")
+        .await
+        .expect("mirror-sync");
+}
