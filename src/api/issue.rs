@@ -239,3 +239,19 @@ pub async fn delete(client: &Client, owner: &str, name: &str, number: u64) -> Re
     res.error_for_status()?;
     Ok(())
 }
+
+/// Pin (`pinned = true`) or unpin an issue. Works for PRs too, since they
+/// share the issue index space.
+pub async fn set_pinned(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    number: u64,
+    pinned: bool,
+) -> Result<()> {
+    let path = format!("/api/v1/repos/{owner}/{name}/issues/{number}/pin");
+    let method = if pinned { Method::POST } else { Method::DELETE };
+    let res = client.request(method, &path, &[], None).await?;
+    res.error_for_status()?;
+    Ok(())
+}

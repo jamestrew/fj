@@ -21,6 +21,19 @@ pub enum LabelSub {
     Edit(EditArgs),
     /// Delete a label.
     Delete(DeleteArgs),
+    /// Copy labels from another repo into this one.
+    Clone(CloneArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct CloneArgs {
+    #[command(flatten)]
+    pub r: RepoFlag,
+    /// Source repo as `<owner>/<name>` to copy labels from.
+    pub source: String,
+    /// Overwrite color/description of labels that already exist here.
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Debug, Args)]
@@ -73,7 +86,70 @@ pub async fn run(cmd: LabelCmd, host: Option<&str>) -> Result<()> {
         LabelSub::Create(args) => create(args, host).await,
         LabelSub::Edit(args) => edit(args, host).await,
         LabelSub::Delete(args) => delete(args, host).await,
+        LabelSub::Clone(args) => clone_labels(args, host).await,
     }
+}
+
+async fn clone_labels(args: CloneArgs, host: Option<&str>) -> Result<()> {
+    let dest = resolve_repo(args.r.repo.as_deref(), host)?;
+    let (so, sn) = crate::api::split_repo(&args.source)?;
+    let source = label::list(&dest.client, so, sn).await?;
+    if source.is_empty() {
+        println!("(source repo has no labels)");
+        return Ok(());
+    }
+    // name -> id for labels already in the destination.
+    let existing: std::collections::HashMap<String, u64> =
+        label::list(&dest.client, &dest.owner, &dest.name)
+            .await?
+            .into_iter()
+            .map(|l| (l.name, l.id))
+            .collect();
+    let (mut created, mut updated, mut skipped) = (0u32, 0u32, 0u32);
+    for l in &source {
+        let desc = if l.description.is_empty() {
+            None
+        } else {
+            Some(l.description.as_str())
+        };
+        match existing.get(&l.name) {
+            Some(_) if !args.force => skipped += 1,
+            Some(&id) => {
+                label::edit(
+                    &dest.client,
+                    &dest.owner,
+                    &dest.name,
+                    id,
+                    &EditLabel {
+                        name: None,
+                        color: Some(&l.color),
+                        description: desc,
+                    },
+                )
+                .await?;
+                updated += 1;
+            }
+            None => {
+                label::create(
+                    &dest.client,
+                    &dest.owner,
+                    &dest.name,
+                    &CreateLabel {
+                        name: &l.name,
+                        color: &l.color,
+                        description: desc,
+                    },
+                )
+                .await?;
+                created += 1;
+            }
+        }
+    }
+    println!(
+        "✓ Cloned labels from {}: {created} created, {updated} updated, {skipped} skipped",
+        args.source
+    );
+    Ok(())
 }
 
 async fn list(args: ListArgs, host: Option<&str>) -> Result<()> {

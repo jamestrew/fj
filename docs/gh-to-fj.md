@@ -33,7 +33,10 @@ called out.
 | (n/a)                             | `fj repo branches`                |                                                 |
 | (n/a)                             | `fj repo topics --set a,b,c`      |                                                 |
 | (n/a)                             | `fj repo mirror <source-url>`     | Forgejo migrate/mirror endpoint.                |
-| `gh repo set-default`             | (not yet)                         | Multi-remote default picking.                   |
+| `gh repo set-default`             | `fj repo set-default owner/name`  | Pins `fj.resolved` in local git config; `--view`/`--unset`. |
+| `gh repo deploy-key list`         | `fj repo deploy-key list`         |                                                 |
+| `gh repo deploy-key add KEY`      | `fj repo deploy-key add TITLE --from-file KEY` | Read-only unless `--allow-write`.  |
+| `gh repo deploy-key delete ID`    | `fj repo deploy-key delete ID`    |                                                 |
 
 ## Issues
 
@@ -46,6 +49,7 @@ called out.
 | `gh issue close N`                | `fj issue close N`                |                                                 |
 | `gh issue reopen N`               | `fj issue reopen N`               |                                                 |
 | `gh issue delete N`               | `fj issue delete N`               | Requires repo admin. Confirm with `-y`.         |
+| `gh issue pin N` / `unpin N`      | `fj issue pin N` / `unpin N`      |                                                 |
 | `gh issue comment N --body B`     | `fj issue comment N --body B`     | New: also `fj issue edit-comment ID`.           |
 | `gh issue develop N`              | `fj issue develop N`              | Branches off the default branch.                |
 
@@ -92,6 +96,7 @@ called out.
 | `gh label create NAME`            | `fj label create NAME`            |                                                 |
 | `gh label edit NAME`              | `fj label edit NAME`              |                                                 |
 | `gh label delete NAME`            | `fj label delete NAME`            |                                                 |
+| `gh label clone SRC`              | `fj label clone SRC`              | Copies labels from `SRC`; `--force` overwrites. |
 | (n/a)                             | `fj milestone list`               | New: Forgejo milestones.                        |
 | (n/a)                             | `fj milestone create TITLE`       |                                                 |
 | (n/a)                             | `fj milestone assign N --milestone ID` | Assign an issue/PR to a milestone.         |

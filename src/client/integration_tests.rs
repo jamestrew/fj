@@ -770,3 +770,81 @@ async fn workflow_dispatch_omits_empty_inputs() {
     .await
     .expect("ok");
 }
+
+// ── Parity follow-ups: issue pin/unpin, repo deploy keys ──
+
+#[tokio::test]
+async fn issue_pin_posts_unpin_deletes() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/issues/3/pin"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/repos/o/r/issues/3/pin"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    crate::api::issue::set_pinned(&c, "o", "r", 3, true)
+        .await
+        .expect("pin");
+    crate::api::issue::set_pinned(&c, "o", "r", 3, false)
+        .await
+        .expect("unpin");
+}
+
+#[tokio::test]
+async fn deploy_key_add_sends_read_only_flag() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/keys"))
+        .and(body_json(json!({
+            "title": "ci", "key": "ssh-ed25519 AAAA", "read_only": true
+        })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "id": 8, "key": "ssh-ed25519 AAAA", "title": "ci",
+            "read_only": true, "created_at": "2026-05-30T00:00:00Z"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let k = crate::api::repo::add_key(&c, "o", "r", "ci", "ssh-ed25519 AAAA", true)
+        .await
+        .expect("add");
+    assert_eq!(k.id, 8);
+    assert!(k.read_only);
+}
+
+#[tokio::test]
+async fn deploy_key_list_and_delete() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/keys"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {"id": 1, "key": "ssh-rsa B", "title": "deploy",
+             "read_only": false, "created_at": "2026-05-30T00:00:00Z"}
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/repos/o/r/keys/1"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let keys = crate::api::repo::list_keys(&c, "o", "r")
+        .await
+        .expect("list");
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0].title, "deploy");
+    crate::api::repo::delete_key(&c, "o", "r", 1)
+        .await
+        .expect("delete");
+}
