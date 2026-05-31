@@ -26,8 +26,22 @@ jobs:
             target: x86_64-unknown-linux-gnu
     runs-on: ${{ matrix.runs-on }}
     container: ${{ matrix.container }}
+    # Cargo cache (fsn1) + release artifacts (hel1) on our own S3. Hetzner needs
+    # virtual-hosted addressing, so path-style is off for both namespaces.
     env:
       FJ_APPLE_DEVELOPER_ID: 'Developer ID Application: Raster & State LLC (62Y3FRM8PD)'
+      RASTER_CACHE_S3_BUCKET:                ${{ vars.RASTER_CACHE_S3_BUCKET }}
+      RASTER_CACHE_S3_ENDPOINT:              ${{ vars.RASTER_CACHE_S3_ENDPOINT }}
+      RASTER_CACHE_S3_REGION:                ${{ vars.RASTER_CACHE_S3_REGION }}
+      RASTER_CACHE_S3_FORCE_PATH_STYLE:      "false"
+      RASTER_CACHE_S3_ACCESS_KEY_ID:         ${{ secrets.SCCACHE_AWS_KEY_ID }}
+      RASTER_CACHE_S3_SECRET_ACCESS_KEY:     ${{ secrets.SCCACHE_AWS_SECRET_KEY }}
+      RASTER_ARTIFACTS_S3_BUCKET:            ${{ vars.RASTER_ARTIFACTS_S3_BUCKET }}
+      RASTER_ARTIFACTS_S3_ENDPOINT:          ${{ vars.RASTER_ARTIFACTS_S3_ENDPOINT }}
+      RASTER_ARTIFACTS_S3_REGION:            ${{ vars.RASTER_ARTIFACTS_S3_REGION }}
+      RASTER_ARTIFACTS_S3_FORCE_PATH_STYLE:  "false"
+      RASTER_ARTIFACTS_S3_ACCESS_KEY_ID:     ${{ secrets.SCCACHE_AWS_KEY_ID }}
+      RASTER_ARTIFACTS_S3_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_AWS_SECRET_KEY }}
     steps:
       - name: checkout
         uses: actions/checkout@v4
@@ -47,13 +61,10 @@ jobs:
           rustup target add ${{ matrix.target }} || true
 
       - name: cache cargo
-        uses: actions/cache@v4
+        uses: https://rasterhub.com/rasterstate/rust-cache-action@v1
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: release-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          prefix-key: release
+          key: ${{ matrix.target }}
 
       - name: build
         run: |
@@ -160,7 +171,7 @@ jobs:
           fi
 
       - name: upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: https://rasterhub.com/rasterstate/upload-artifact-action@v1
         with:
           name: fj-${{ matrix.name }}
           path: dist/*
@@ -170,12 +181,22 @@ jobs:
     needs: build
     runs-on: docker
     container: alpine:3.20
+    # Release artifacts live on our own S3 (hel1). download-artifact-action
+    # shells out to tar + zstd/gzip, none of which busybox alpine ships, so
+    # they are installed below alongside the release tooling.
+    env:
+      RASTER_ARTIFACTS_S3_BUCKET:            ${{ vars.RASTER_ARTIFACTS_S3_BUCKET }}
+      RASTER_ARTIFACTS_S3_ENDPOINT:          ${{ vars.RASTER_ARTIFACTS_S3_ENDPOINT }}
+      RASTER_ARTIFACTS_S3_REGION:            ${{ vars.RASTER_ARTIFACTS_S3_REGION }}
+      RASTER_ARTIFACTS_S3_FORCE_PATH_STYLE:  "false"
+      RASTER_ARTIFACTS_S3_ACCESS_KEY_ID:     ${{ secrets.SCCACHE_AWS_KEY_ID }}
+      RASTER_ARTIFACTS_S3_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_AWS_SECRET_KEY }}
     steps:
       - name: install tools
-        run: apk add --no-cache curl jq coreutils bash
+        run: apk add --no-cache curl jq coreutils bash tar zstd gzip
 
       - name: fetch artifacts
-        uses: actions/download-artifact@v4
+        uses: https://rasterhub.com/rasterstate/download-artifact-action@v1
         with:
           path: dist
           merge-multiple: true

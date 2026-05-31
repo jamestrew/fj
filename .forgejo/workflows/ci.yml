@@ -14,6 +14,15 @@ jobs:
     # and most JS actions). Rust ships from rustup.rs at job start.
     container:
       image: catthehacker/ubuntu:act-22.04
+    # Cargo cache lives on our own S3 (Hetzner), via rust-cache-action ->
+    # cache-action. Hetzner needs virtual-hosted addressing, so path-style off.
+    env:
+      RASTER_CACHE_S3_BUCKET:            ${{ vars.RASTER_CACHE_S3_BUCKET }}
+      RASTER_CACHE_S3_ENDPOINT:          ${{ vars.RASTER_CACHE_S3_ENDPOINT }}
+      RASTER_CACHE_S3_REGION:            ${{ vars.RASTER_CACHE_S3_REGION }}
+      RASTER_CACHE_S3_FORCE_PATH_STYLE:  "false"
+      RASTER_CACHE_S3_ACCESS_KEY_ID:     ${{ secrets.SCCACHE_AWS_KEY_ID }}
+      RASTER_CACHE_S3_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_AWS_SECRET_KEY }}
     steps:
       - name: checkout
         uses: actions/checkout@v4
@@ -25,15 +34,7 @@ jobs:
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
       - name: cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+        uses: https://rasterhub.com/rasterstate/rust-cache-action@v1
 
       - name: install rustfmt + clippy
         run: rustup component add rustfmt clippy
