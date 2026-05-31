@@ -50,7 +50,7 @@ pub async fn run(args: StatusArgs, host: Option<&str>) -> Result<()> {
                 output::state_pill(&n.subject.state, false),
                 n.subject.type_.clone(),
                 repo,
-                truncate(&n.subject.title, 60),
+                output::truncate(&n.subject.title, 60),
                 output::dim(&output::relative_time(n.updated_at)),
             ]
         })
@@ -60,13 +60,4 @@ pub async fn run(args: StatusArgs, host: Option<&str>) -> Result<()> {
         output::render_table(&["", "STATE", "TYPE", "REPO", "TITLE", "UPDATED"], &rows)
     );
     Ok(())
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-    out.push('…');
-    out
 }

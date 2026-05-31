@@ -307,7 +307,7 @@ async fn starred(args: StarredArgs, host: Option<&str>) -> Result<()> {
             let vis = if r.private { "private" } else { "public" };
             vec![
                 r.full_name.clone(),
-                truncate(&r.description, 60),
+                output::truncate(&r.description, 60),
                 vis.into(),
             ]
         })
@@ -372,7 +372,7 @@ async fn list(args: ListArgs, host: Option<&str>) -> Result<()> {
             let visibility = if r.private { "private" } else { "public" };
             vec![
                 r.full_name.clone(),
-                truncate(&r.description, 60),
+                output::truncate(&r.description, 60),
                 visibility.into(),
                 output::dim(&output::relative_time(r.updated_at)),
             ]
@@ -609,7 +609,7 @@ async fn branches(args: BranchesArgs, host: Option<&str>) -> Result<()> {
             vec![
                 b.name.clone(),
                 output::dim(&b.commit.id[..7.min(b.commit.id.len())]),
-                truncate(b.commit.message.lines().next().unwrap_or(""), 60),
+                output::truncate(b.commit.message.lines().next().unwrap_or(""), 60),
                 if b.protected {
                     output::bold("protected")
                 } else {
@@ -646,15 +646,6 @@ async fn topics(args: TopicsArgs, host: Option<&str>) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-    out.push('…');
-    out
 }
 
 #[cfg(test)]

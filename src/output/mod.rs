@@ -149,3 +149,72 @@ pub fn relative_time(t: chrono::DateTime<chrono::Utc>) -> String {
         format!("in {label}")
     }
 }
+
+/// Truncate `s` to at most `max` characters, replacing the tail with a
+/// single-character ellipsis when it overflows. Counts by char, not byte,
+/// so multibyte content is clamped safely.
+pub fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+/// Format a byte count as a human-readable size (e.g. `512 B`, `1.0 KB`).
+/// Uses 1024-based units up to TB.
+pub fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{size:.1} {}", UNITS[unit])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_short_string_untouched() {
+        assert_eq!(truncate("hello", 10), "hello");
+        assert_eq!(truncate("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_long_string_gets_ellipsis() {
+        let out = truncate("abcdefghij", 5);
+        assert_eq!(out.chars().count(), 5);
+        assert!(out.ends_with('…'));
+        assert_eq!(out, "abcd…");
+    }
+
+    #[test]
+    fn truncate_counts_chars_not_bytes() {
+        // 6 multibyte chars, clamp to 4 → 3 chars + ellipsis.
+        let out = truncate("αααααα", 4);
+        assert_eq!(out.chars().count(), 4);
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn human_size_formats_units() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(512), "512 B");
+        assert_eq!(human_size(1023), "1023 B");
+        assert_eq!(human_size(1024), "1.0 KB");
+        assert_eq!(human_size(1536), "1.5 KB");
+        assert_eq!(human_size(2048), "2.0 KB");
+        assert_eq!(human_size(1024 * 1024), "1.0 MB");
+        assert_eq!(human_size(5 * 1024 * 1024 * 1024), "5.0 GB");
+        assert_eq!(human_size(2 * 1024_u64.pow(4)), "2.0 TB");
+    }
+}

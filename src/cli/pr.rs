@@ -268,7 +268,7 @@ async fn list(args: ListArgs, host: Option<&str>) -> Result<()> {
             vec![
                 format!("#{}", p.number),
                 output::state_pill(&p.state, p.merged),
-                truncate(&p.title, 55),
+                output::truncate(&p.title, 55),
                 output::dim(&format!(
                     "{} → {}",
                     branch_label(&p.head),
@@ -439,7 +439,7 @@ async fn commits(args: SimpleArgs, host: Option<&str>) -> Result<()> {
                 .as_ref()
                 .map(|a| a.name.clone())
                 .unwrap_or_default();
-            vec![short, truncate(&subject, 70), output::dim(&author)]
+            vec![short, output::truncate(&subject, 70), output::dim(&author)]
         })
         .collect();
     if rows.is_empty() {
@@ -512,7 +512,7 @@ async fn checks(args: SimpleArgs, host: Option<&str>) -> Result<()> {
             vec![
                 output::state_pill(&s.status.to_lowercase(), false),
                 s.context.clone(),
-                truncate(&s.description, 50),
+                output::truncate(&s.description, 50),
                 output::dim(&when),
             ]
         })
@@ -627,7 +627,7 @@ fn print_status_section(label: &str, items: &[api::issue::Issue]) {
         println!(
             "  #{}  {}  {}",
             i.number,
-            truncate(&i.title, 70),
+            output::truncate(&i.title, 70),
             output::dim(&i.html_url)
         );
     }
@@ -713,15 +713,6 @@ fn detect_current_branch() -> Option<String> {
     }
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-    out.push('…');
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -751,17 +742,5 @@ mod tests {
     fn passes_through_synthetic_when_no_label_no_prefix() {
         let b = br("", "refs/pull/7/head");
         assert_eq!(branch_label(&b), "refs/pull/7/head");
-    }
-
-    #[test]
-    fn truncate_short_string_untouched() {
-        assert_eq!(truncate("hello", 10), "hello");
-    }
-
-    #[test]
-    fn truncate_long_string_gets_ellipsis() {
-        let out = truncate("abcdefghij", 5);
-        assert_eq!(out.chars().count(), 5);
-        assert!(out.ends_with('…'));
     }
 }
