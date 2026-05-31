@@ -2,6 +2,10 @@ pub mod error;
 #[cfg(test)]
 mod integration_tests;
 pub mod pagination;
+mod resolve;
+
+use resolve::build_base_url;
+pub use resolve::{resolve, ResolvedHost};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -24,8 +28,7 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use url::Url;
 
-use crate::auth;
-use crate::config::hosts::{api_base_path, AuthKind, Host, Hosts};
+use crate::config::hosts::AuthKind;
 use crate::fjord;
 
 pub use error::ApiError;
@@ -51,47 +54,6 @@ pub struct Client {
     base: Url,
     token: String,
     auth_scheme: AuthScheme,
-}
-
-pub struct ResolvedHost {
-    pub name: String,
-    pub host: Host,
-    pub token: String,
-}
-
-/// Look up the host config and token for the host the user is targeting.
-pub fn resolve(host_flag: Option<&str>) -> Result<ResolvedHost> {
-    let hosts = Hosts::load()?;
-    let name = hosts.resolve_host(host_flag)?.to_string();
-    let host_cfg = hosts
-        .hosts
-        .get(&name)
-        .cloned()
-        .ok_or_else(|| anyhow!("host '{name}' not configured"))?;
-    let token = match host_cfg.auth_kind {
-        AuthKind::Pat => auth::load_token(&name)?.ok_or_else(|| {
-            anyhow!("no token stored for host '{name}'. Run `fj auth login --host {name}`.")
-        })?,
-        AuthKind::FjordAccount => {
-            let fa = host_cfg.fjord_account.as_ref().ok_or_else(|| {
-                anyhow!(
-                    "host '{name}' is Fjord-Account but has no fjord_account config; \
-                     remove and re-run `fj auth login --fjord`"
-                )
-            })?;
-            auth::load_fjord_bearer(&fa.platform_url)?.ok_or_else(|| {
-                anyhow!(
-                    "no Fjord Account session stored for '{}'. Run `fj auth login --fjord` again.",
-                    fa.platform_url
-                )
-            })?
-        }
-    };
-    Ok(ResolvedHost {
-        name,
-        host: host_cfg,
-        token,
-    })
 }
 
 impl Client {
@@ -552,15 +514,6 @@ fn is_sensitive_path(path: &str) -> bool {
     ["secret", "variable", "token", "password", "/keys"]
         .iter()
         .any(|needle| p.contains(needle))
-}
-
-fn build_base_url(hostname: &str, host: &Host) -> Result<Url> {
-    let scheme = "https";
-    let mut url = Url::parse(&format!("{scheme}://{hostname}"))
-        .with_context(|| format!("constructing URL for {hostname}"))?;
-    let path = api_base_path(host).trim_end_matches('/');
-    url.set_path(&format!("{path}/"));
-    Ok(url)
 }
 
 /// Upper bound on a single response body we'll buffer into memory. A
