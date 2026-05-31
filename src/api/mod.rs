@@ -6,12 +6,21 @@ pub mod notification;
 pub mod org;
 pub mod protect;
 pub mod pull;
+mod pull_core;
+mod pull_review;
+mod pull_status;
 pub mod release;
 pub mod repo;
+mod repo_core;
+mod repo_keys;
+mod repo_social;
 pub mod search;
 pub(crate) mod serde_util;
 pub mod user;
 pub mod workflow;
+mod workflow_run;
+mod workflow_secrets;
+mod workflow_view;
 
 use anyhow::{anyhow, Result};
 
