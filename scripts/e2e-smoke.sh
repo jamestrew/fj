@@ -41,4 +41,25 @@ echo "== pr =="
 run "$FJ" pr list -R "$TEST_REPO" --state all
 run "$FJ" pr list -R "$TEST_REPO" --json
 
+# The command modules below are intentionally excluded from unit-test
+# coverage (see COV_IGNORE in the Makefile): they are thin handlers over the
+# api layer. This smoke is the automated check that actually exercises them,
+# so keep a read-only invocation here for every excluded command surface.
+echo "== labels / milestones =="
+run "$FJ" label list -R "$TEST_REPO"
+run "$FJ" milestone list -R "$TEST_REPO"
+
+echo "== branches / topics / protect =="
+run "$FJ" repo branches "$TEST_REPO"
+run "$FJ" repo topics "$TEST_REPO"
+run "$FJ" protect list -R "$TEST_REPO"
+
+echo "== actions =="
+run "$FJ" workflow list -R "$TEST_REPO"
+run "$FJ" run list -R "$TEST_REPO" -L 5
+
+echo "== search =="
+run "$FJ" search repos "$TEST_REPO" -L 3
+run "$FJ" search issues "is:issue" -L 3
+
 echo "✓ e2e smoke passed against $TEST_REPO"

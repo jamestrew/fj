@@ -35,10 +35,11 @@ UNAME      := $(shell uname)
 #   - platform / process glue: output/pager.rs, cli/web.rs, cli/browse.rs,
 #     cli/extension.rs
 #   - thin async command handlers that only orchestrate the (tested) api
-#     layer and are exercised by the e2e smoke instead: cli/auth*.rs,
-#     config, org, status, hook, protect, label, milestone, search,
-#     workflow, workflow_variable, repo_mirror, repo_social, issue_comment,
-#     pr_inspect, pr_status, context
+#     layer: cli/auth*.rs, config, org, status, hook, protect, label,
+#     milestone, search, workflow, workflow_variable, repo_mirror,
+#     repo_social, issue_comment, pr_inspect, pr_status, context.
+#     Their read paths are exercised end-to-end by scripts/e2e-smoke.sh
+#     (FJ_E2E=1); write paths are manually verified.
 #
 # Rule of thumb: a cli command file with no `#[cfg(test)]` module is glue we
 # don't unit-test; add it here when you add such a file (or drop it once it

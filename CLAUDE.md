@@ -51,6 +51,9 @@ docs/                  architecture, jq, gh-to-fj, faq, troubleshooting
   opens a browsable report.
 - `./scripts/install-hooks.sh` symlinks `hooks/pre-push` into `.git/hooks`.
 - `FJ_E2E=1` enables the live API smoke against `stephen/fj-cli-test`.
+  It read-exercises the command handlers that `COV_IGNORE` excludes from
+  unit coverage (label, milestone, protect, workflow, run, search, …), so
+  keep a read-only invocation there for any new excluded command surface.
 - `FJ_SKIP_PREPUSH=1` bypasses the hook for genuine emergencies only.
 
 ## Key conventions
