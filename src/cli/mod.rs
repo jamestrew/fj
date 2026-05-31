@@ -238,3 +238,42 @@ fn write_man_for(cmd: &clap::Command, file_name: &str, dir: &std::path::Path) ->
     man.render(&mut out)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// Walk the whole derived command tree and assert it is internally
+    /// consistent: no duplicate short flags, conflicting args, bad value
+    /// parsers, or malformed subcommands. clap only performs these checks
+    /// behind `debug_assert`, so without this test a broken arg definition
+    /// in any command module ships and only fails the first time a user
+    /// runs that subcommand. This guards every `cli/*.rs` at once, including
+    /// the command modules excluded from coverage.
+    #[test]
+    fn command_tree_is_internally_consistent() {
+        Cli::command().debug_assert();
+    }
+
+    /// Every subcommand (and nested subcommand) must render its help and
+    /// long-help without panicking. `--help` at the top level only touches
+    /// the first layer; this reaches the leaves.
+    #[test]
+    fn every_subcommand_renders_help() {
+        fn walk(cmd: &mut clap::Command) {
+            let _ = cmd.render_help();
+            let _ = cmd.render_long_help();
+            let names: Vec<String> = cmd
+                .get_subcommands()
+                .map(|s| s.get_name().to_string())
+                .collect();
+            for name in names {
+                if let Some(sub) = cmd.find_subcommand_mut(&name) {
+                    walk(sub);
+                }
+            }
+        }
+        walk(&mut Cli::command());
+    }
+}
