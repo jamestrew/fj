@@ -20,6 +20,43 @@ pub fn run(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// Read a value from the current repo's local git config. Returns None if the
+/// key is unset or we're not inside a git repo.
+pub fn config_get_local(key: &str) -> Option<String> {
+    let out = Command::new("git")
+        .args(["config", "--local", "--get", key])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if v.is_empty() {
+        None
+    } else {
+        Some(v)
+    }
+}
+
+/// Set a value in the current repo's local git config.
+pub fn config_set_local(key: &str, value: &str) -> Result<()> {
+    reject_dash_lead("config value", value)?;
+    run(&["config", "--local", key, value])
+}
+
+/// Unset a local git config value. Tolerates the key not being set (git's
+/// exit code 5), so it's idempotent.
+pub fn config_unset_local(key: &str) -> Result<()> {
+    let status = Command::new("git")
+        .args(["config", "--local", "--unset", key])
+        .status()
+        .with_context(|| "spawning git config --unset")?;
+    match status.code() {
+        Some(0) | Some(5) => Ok(()),
+        _ => bail!("git config --unset {key} failed: {status}"),
+    }
+}
+
 pub fn clone(url: &str, dest: Option<&str>) -> Result<()> {
     // `--` stops git from treating a `-`-leading URL/dest as an option.
     let mut args = vec!["clone", "--", url];

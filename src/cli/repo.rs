@@ -59,6 +59,70 @@ pub enum RepoSub {
     Unstar(SimpleRepoArgs),
     /// List your starred repos.
     Starred(StarredArgs),
+    /// Pin which repo `fj` targets in this directory (like `gh repo set-default`).
+    SetDefault(SetDefaultArgs),
+    /// Manage repository deploy keys.
+    DeployKey(DeployKeyCmd),
+}
+
+#[derive(Debug, Args)]
+pub struct SetDefaultArgs {
+    /// Repository as `<owner>/<name>` to pin for this directory.
+    pub repo: Option<String>,
+    /// Print the currently pinned default, if any.
+    #[arg(long)]
+    pub view: bool,
+    /// Remove the pinned default.
+    #[arg(long)]
+    pub unset: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct DeployKeyCmd {
+    #[command(subcommand)]
+    pub command: DeployKeySub,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DeployKeySub {
+    /// List deploy keys on the repo.
+    List(DeployKeyListArgs),
+    /// Add a deploy key (read-only by default).
+    Add(DeployKeyAddArgs),
+    /// Delete a deploy key by id.
+    Delete(DeployKeyDeleteArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct DeployKeyListArgs {
+    #[command(flatten)]
+    pub r: RepoFlag,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct DeployKeyAddArgs {
+    #[command(flatten)]
+    pub r: RepoFlag,
+    pub title: String,
+    /// Public key string. Use `--from-file path` (or `-` for stdin) instead for files.
+    #[arg(long)]
+    pub key: Option<String>,
+    #[arg(long = "from-file")]
+    pub from_file: Option<String>,
+    /// Allow the key to push (default is read-only).
+    #[arg(long)]
+    pub allow_write: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct DeployKeyDeleteArgs {
+    #[command(flatten)]
+    pub r: RepoFlag,
+    pub id: u64,
+    #[arg(short = 'y', long)]
+    pub yes: bool,
 }
 
 #[derive(Debug, Args)]
@@ -281,6 +345,8 @@ pub async fn run(cmd: RepoCmd, host: Option<&str>) -> Result<()> {
         RepoSub::Star(args) => star(args, host, true).await,
         RepoSub::Unstar(args) => star(args, host, false).await,
         RepoSub::Starred(args) => starred(args, host).await,
+        RepoSub::SetDefault(args) => set_default(args).await,
+        RepoSub::DeployKey(cmd) => deploy_key(cmd, host).await,
     }
 }
 
@@ -334,6 +400,124 @@ async fn starred(args: StarredArgs, host: Option<&str>) -> Result<()> {
         output::render_table(&["NAME", "DESCRIPTION", "VIS"], &rows)
     );
     Ok(())
+}
+
+/// `fj repo set-default` pins the repo this directory's commands target,
+/// stored as `fj.resolved` in local git config and read back by `resolve_repo`.
+async fn set_default(args: SetDefaultArgs) -> Result<()> {
+    const KEY: &str = "fj.resolved";
+    if args.view {
+        match git::config_get_local(KEY) {
+            Some(v) => println!("{v}"),
+            None => println!("(no default set for this directory)"),
+        }
+        return Ok(());
+    }
+    if args.unset {
+        git::config_unset_local(KEY)?;
+        println!("✓ Cleared the pinned default repo");
+        return Ok(());
+    }
+    let slug = args
+        .repo
+        .ok_or_else(|| anyhow!("pass a repo as `<owner>/<name>`, or use --view / --unset"))?;
+    // Validate the shape before writing it.
+    let _ = api::split_repo(&slug)?;
+    git::config_set_local(KEY, &slug)?;
+    println!("✓ Default repo for this directory set to {slug}");
+    Ok(())
+}
+
+async fn deploy_key(cmd: DeployKeyCmd, host: Option<&str>) -> Result<()> {
+    match cmd.command {
+        DeployKeySub::List(args) => {
+            let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
+            let keys = api::repo::list_keys(&ctx.client, &ctx.owner, &ctx.name).await?;
+            if args.json {
+                return output::print_json(&serde_json::to_value(&keys)?);
+            }
+            if keys.is_empty() {
+                println!("(no deploy keys)");
+                return Ok(());
+            }
+            let rows: Vec<Vec<String>> = keys
+                .iter()
+                .map(|k| {
+                    vec![
+                        k.id.to_string(),
+                        k.title.clone(),
+                        if k.read_only {
+                            "read-only"
+                        } else {
+                            "read-write"
+                        }
+                        .into(),
+                        output::dim(&output::relative_time(k.created_at)),
+                    ]
+                })
+                .collect();
+            print!(
+                "{}",
+                output::render_table(&["ID", "TITLE", "ACCESS", "CREATED"], &rows)
+            );
+            Ok(())
+        }
+        DeployKeySub::Add(args) => {
+            let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
+            let key = read_key_value(args.key.as_deref(), args.from_file.as_deref())?;
+            let k = api::repo::add_key(
+                &ctx.client,
+                &ctx.owner,
+                &ctx.name,
+                &args.title,
+                &key,
+                !args.allow_write,
+            )
+            .await?;
+            println!(
+                "✓ Added deploy key '{}' (id {}, {})",
+                k.title,
+                k.id,
+                if k.read_only {
+                    "read-only"
+                } else {
+                    "read-write"
+                }
+            );
+            Ok(())
+        }
+        DeployKeySub::Delete(args) => {
+            let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
+            if !args.yes {
+                let ans = editor::prompt_line(&format!(
+                    "Delete deploy key {}? Type the id to confirm",
+                    args.id
+                ))?;
+                if ans != args.id.to_string() {
+                    return Err(anyhow!("aborted"));
+                }
+            }
+            api::repo::delete_key(&ctx.client, &ctx.owner, &ctx.name, args.id).await?;
+            println!("✓ Deleted deploy key {}", args.id);
+            Ok(())
+        }
+    }
+}
+
+fn read_key_value(value: Option<&str>, from_file: Option<&str>) -> Result<String> {
+    if let Some(v) = value {
+        return Ok(v.trim().to_string());
+    }
+    if let Some(path) = from_file {
+        if path == "-" {
+            use std::io::Read;
+            let mut buf = String::new();
+            std::io::stdin().read_to_string(&mut buf)?;
+            return Ok(buf.trim().to_string());
+        }
+        return Ok(std::fs::read_to_string(path)?.trim().to_string());
+    }
+    Err(anyhow!("pass --key or --from-file (use `-` for stdin)"))
 }
 
 async fn mirror(args: MirrorArgs, host: Option<&str>) -> Result<()> {

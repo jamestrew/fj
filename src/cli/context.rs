@@ -44,7 +44,13 @@ pub fn resolve_repo(
     explicit_repo: Option<&str>,
     explicit_host: Option<&str>,
 ) -> Result<RepoContext> {
-    let (host_for_client, owner, name) = match explicit_repo {
+    // `-R` wins; otherwise honor a per-repo default pinned by
+    // `fj repo set-default` (stored in local git config), then fall back to
+    // git-remote detection. The stored default behaves exactly like `-R`.
+    let explicit_repo: Option<String> = explicit_repo
+        .map(str::to_string)
+        .or_else(|| git::config_get_local("fj.resolved"));
+    let (host_for_client, owner, name) = match explicit_repo.as_deref() {
         Some(slug) => {
             let (o, n) = api::split_repo(slug)?;
             (

@@ -33,6 +33,10 @@ pub enum IssueSub {
     Reopen(NumberOnly),
     /// Delete an issue permanently (requires repo admin).
     Delete(DeleteArgs),
+    /// Pin an issue to the top of the issue list.
+    Pin(NumberOnly),
+    /// Unpin a pinned issue.
+    Unpin(NumberOnly),
     /// Add a comment.
     Comment(CommentArgs),
     /// Edit a comment by id (comment ids come from `issue view --comments`).
@@ -197,6 +201,8 @@ pub async fn run(cmd: IssueCmd, host: Option<&str>) -> Result<()> {
         IssueSub::Close(args) => set_state(args, host, "closed").await,
         IssueSub::Reopen(args) => set_state(args, host, "open").await,
         IssueSub::Delete(args) => delete(args, host).await,
+        IssueSub::Pin(args) => set_pinned(args, host, true).await,
+        IssueSub::Unpin(args) => set_pinned(args, host, false).await,
         IssueSub::Comment(args) => comment(args, host).await,
         IssueSub::EditComment(args) => edit_comment(args, host).await,
         IssueSub::DeleteComment(args) => delete_comment(args, host).await,
@@ -416,6 +422,17 @@ async fn delete(args: DeleteArgs, host: Option<&str>) -> Result<()> {
     }
     api::issue::delete(&ctx.client, &ctx.owner, &ctx.name, args.number).await?;
     println!("✓ Deleted issue #{}", args.number);
+    Ok(())
+}
+
+async fn set_pinned(args: NumberOnly, host: Option<&str>, pinned: bool) -> Result<()> {
+    let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
+    api::issue::set_pinned(&ctx.client, &ctx.owner, &ctx.name, args.number, pinned).await?;
+    println!(
+        "✓ Issue #{} {}",
+        args.number,
+        if pinned { "pinned" } else { "unpinned" }
+    );
     Ok(())
 }
 
