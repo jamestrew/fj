@@ -95,8 +95,12 @@ coverage-html:
 	cargo llvm-cov --all --open --ignore-filename-regex '$(COV_IGNORE)'
 
 # Intent-precise coverage: handler regions excluded on top of COV_IGNORE.
+# COV_MIN is the minimum line coverage; 0 locally (pure report), set higher
+# in CI (see .forgejo/workflows/ci.yml) so a regression fails the build.
+COV_MIN ?= 0
 coverage-strict:
-	cargo +nightly llvm-cov --all --summary-only --ignore-filename-regex '$(COV_IGNORE)'
+	cargo +nightly llvm-cov --all --summary-only \
+		--fail-under-lines $(COV_MIN) --ignore-filename-regex '$(COV_IGNORE)'
 
 coverage-strict-html:
 	cargo +nightly llvm-cov --all --open --ignore-filename-regex '$(COV_IGNORE)'
