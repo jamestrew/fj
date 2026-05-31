@@ -13,6 +13,7 @@ pub mod extension;
 pub mod hook;
 pub mod instances;
 pub mod issue;
+mod issue_comment;
 pub mod key;
 pub mod label;
 pub mod milestone;
