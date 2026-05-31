@@ -2278,3 +2278,410 @@ async fn hook_delete_and_test_post_to_their_paths() {
         .expect("delete");
     crate::api::hook::test(&c, "o", "r", 3).await.expect("test");
 }
+
+// ---- notifications ----
+
+#[tokio::test]
+async fn notification_list_sends_all_and_limit() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/notifications"))
+        .and(query_param("all", "true"))
+        .and(query_param("limit", "50"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {
+                "id": 1, "unread": true, "pinned": false,
+                "updated_at": "2026-01-01T00:00:00Z",
+                "url": "https://x/n/1", "html_url": "https://x/n/1",
+                "subject": { "title": "a thing", "type": "Issue", "state": "open" },
+                "repository": { "full_name": "o/r", "html_url": "https://x/o/r" }
+            }
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let ns = crate::api::notification::list(&c, true, 99)
+        .await
+        .expect("list");
+    assert_eq!(ns.len(), 1);
+    assert_eq!(ns[0].subject.title, "a thing");
+}
+
+#[tokio::test]
+async fn notification_mark_all_read_puts() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v1/notifications"))
+        .respond_with(ResponseTemplate::new(205))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    crate::api::notification::mark_all_read(&c)
+        .await
+        .expect("mark read");
+}
+
+// ---- orgs ----
+
+#[tokio::test]
+async fn org_list_for_user_decodes() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/user/orgs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "id": 1, "username": "acme", "avatar_url": "https://x/a" }
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let orgs = crate::api::org::list_for_user(&c).await.expect("orgs");
+    assert_eq!(orgs.len(), 1);
+    assert_eq!(orgs[0].username, "acme");
+}
+
+#[tokio::test]
+async fn org_get_and_list_teams() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/orgs/acme"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 1, "username": "acme", "avatar_url": "https://x/a"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/orgs/acme/teams"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "id": 7, "name": "Owners", "permission": "owner" }
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let org = crate::api::org::get(&c, "acme").await.expect("get");
+    assert_eq!(org.username, "acme");
+    let teams = crate::api::org::list_teams(&c, "acme")
+        .await
+        .expect("teams");
+    assert_eq!(teams[0].name, "Owners");
+}
+
+// ---- branch protection ----
+
+fn protection_json(branch: &str) -> serde_json::Value {
+    json!({ "branch_name": branch, "required_approvals": 2 })
+}
+
+#[tokio::test]
+async fn protect_list_and_get() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/branch_protections"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([protection_json("main")])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/branch_protections/main"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(protection_json("main")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let rules = crate::api::protect::list(&c, "o", "r").await.expect("list");
+    assert_eq!(rules[0].branch_name, "main");
+    let rule = crate::api::protect::get(&c, "o", "r", "main")
+        .await
+        .expect("get");
+    assert_eq!(rule.required_approvals, 2);
+}
+
+#[tokio::test]
+async fn protect_create_posts_branch_name() {
+    use crate::api::protect::CreateBranchProtection;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/branch_protections"))
+        .and(body_json(json!({
+            "branch_name": "main",
+            "enable_push": false,
+            "require_signed_commits": true,
+            "block_on_outdated_branch": false,
+            "required_approvals": 1,
+            "enable_status_check": false,
+            "status_check_contexts": []
+        })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(protection_json("main")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let contexts: Vec<String> = Vec::new();
+    let body = CreateBranchProtection {
+        branch_name: "main",
+        enable_push: false,
+        require_signed_commits: true,
+        block_on_outdated_branch: false,
+        required_approvals: 1,
+        enable_status_check: false,
+        status_check_contexts: &contexts,
+    };
+    crate::api::protect::create(&c, "o", "r", &body)
+        .await
+        .expect("create");
+}
+
+#[tokio::test]
+async fn protect_delete_succeeds_on_204() {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/repos/o/r/branch_protections/main"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    crate::api::protect::delete(&c, "o", "r", "main")
+        .await
+        .expect("delete");
+}
+
+// ---- issues ----
+
+fn issue_json(number: u64, title: &str, state: &str) -> serde_json::Value {
+    json!({
+        "id": number, "number": number, "title": title, "state": state,
+        "user": { "id": 1, "login": "alice" },
+        "html_url": format!("https://x/o/r/issues/{number}"),
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-01T00:00:00Z"
+    })
+}
+
+fn comment_json(id: u64, body: &str) -> serde_json::Value {
+    json!({
+        "id": id, "body": body,
+        "user": { "id": 1, "login": "alice" },
+        "html_url": format!("https://x/c/{id}"),
+        "created_at": "2026-01-01T00:00:00Z"
+    })
+}
+
+#[tokio::test]
+async fn issue_get_decodes() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/issues/3"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issue_json(3, "a bug", "open")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let i = crate::api::issue::get(&c, "o", "r", 3).await.expect("get");
+    assert_eq!(i.title, "a bug");
+}
+
+#[tokio::test]
+async fn issue_create_skips_none_fields() {
+    use crate::api::issue::CreateIssue;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/issues"))
+        .and(body_json(json!({ "title": "new" })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(issue_json(4, "new", "open")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let body = CreateIssue {
+        title: "new",
+        body: None,
+        assignees: None,
+        labels: None,
+    };
+    let i = crate::api::issue::create(&c, "o", "r", &body)
+        .await
+        .expect("create");
+    assert_eq!(i.number, 4);
+}
+
+#[tokio::test]
+async fn issue_edit_can_close() {
+    use crate::api::issue::EditIssue;
+    let server = MockServer::start().await;
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/repos/o/r/issues/3"))
+        .and(body_json(json!({ "state": "closed" })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issue_json(3, "a bug", "closed")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let body = EditIssue {
+        state: Some("closed"),
+        ..Default::default()
+    };
+    let i = crate::api::issue::edit(&c, "o", "r", 3, &body)
+        .await
+        .expect("edit");
+    assert_eq!(i.state, "closed");
+}
+
+#[tokio::test]
+async fn issue_comment_roundtrip() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/issues/3/comments"))
+        .and(body_json(json!({ "body": "hi there" })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(comment_json(11, "hi there")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/issues/3/comments"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!([comment_json(11, "hi there")])),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let made = crate::api::issue::comment(&c, "o", "r", 3, "hi there")
+        .await
+        .expect("comment");
+    assert_eq!(made.id, 11);
+    let listed = crate::api::issue::list_comments(&c, "o", "r", 3)
+        .await
+        .expect("list");
+    assert_eq!(listed.len(), 1);
+}
+
+#[tokio::test]
+async fn issue_edit_and_delete_comment_by_id() {
+    let server = MockServer::start().await;
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/repos/o/r/issues/comments/11"))
+        .and(body_json(json!({ "body": "edited" })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(comment_json(11, "edited")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/repos/o/r/issues/comments/11"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let c2 = crate::api::issue::edit_comment(&c, "o", "r", 11, "edited")
+        .await
+        .expect("edit");
+    assert_eq!(c2.body, "edited");
+    crate::api::issue::delete_comment(&c, "o", "r", 11)
+        .await
+        .expect("delete");
+}
+
+#[tokio::test]
+async fn issue_delete_and_pin_use_right_verbs() {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/repos/o/r/issues/3"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // pin -> POST, unpin -> DELETE on the /pin subpath.
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/issues/3/pin"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/repos/o/r/issues/3/pin"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    crate::api::issue::set_pinned(&c, "o", "r", 3, true)
+        .await
+        .expect("pin");
+    crate::api::issue::set_pinned(&c, "o", "r", 3, false)
+        .await
+        .expect("unpin");
+    crate::api::issue::delete(&c, "o", "r", 3)
+        .await
+        .expect("delete");
+}
+
+// ---- actions: artifacts + workflow files ----
+
+#[tokio::test]
+async fn workflow_list_artifacts_unwraps_envelope() {
+    let server = MockServer::start().await;
+    // list_artifacts hits the web route at the host origin, not /api/v1.
+    Mock::given(method("GET"))
+        .and(path("/o/r/actions/runs/5/artifacts"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "artifacts": [ { "name": "logs", "size": 12, "status": "completed" } ]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let arts = crate::api::workflow::list_artifacts(&c, "o", "r", 5)
+        .await
+        .expect("artifacts");
+    assert_eq!(arts.len(), 1);
+    assert_eq!(arts[0].name, "logs");
+}
+
+#[tokio::test]
+async fn workflow_list_artifacts_maps_404() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/o/r/actions/runs/9/artifacts"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let err = crate::api::workflow::list_artifacts(&c, "o", "r", 9)
+        .await
+        .expect_err("should 404");
+    assert!(err.to_string().contains("not found"));
+}
+
+#[tokio::test]
+async fn workflow_list_workflows_reads_both_dirs() {
+    let server = MockServer::start().await;
+    // .forgejo/workflows has a yaml file; .github/workflows is absent (404).
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/contents/.forgejo/workflows"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "name": "ci.yml", "path": ".forgejo/workflows/ci.yml", "type": "file" },
+            { "name": "README.md", "path": ".forgejo/workflows/README.md", "type": "file" }
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/contents/.github/workflows"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let wfs = crate::api::workflow::list_workflows(&c, "o", "r")
+        .await
+        .expect("workflows");
+    // Only the .yml is kept; README.md is filtered out.
+    assert_eq!(wfs.len(), 1);
+    assert_eq!(wfs[0].name, "ci.yml");
+}
