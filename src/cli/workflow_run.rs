@@ -1,7 +1,6 @@
 //! `fj run` — Forgejo Actions run management (list/view/watch/download/rerun/cancel).
 
 use std::io::Write;
-use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -9,6 +8,7 @@ use clap::{Args, Subcommand};
 
 use crate::api;
 use crate::cli::context::{resolve_repo, RepoFlag};
+use crate::cli::workflow_artifact::{self, DownloadArgs};
 use crate::client::AuthScheme;
 use crate::output;
 
@@ -90,31 +90,12 @@ pub struct IdArgs {
     pub run_id: u64,
 }
 
-#[derive(Debug, Args)]
-pub struct DownloadArgs {
-    #[command(flatten)]
-    pub r: RepoFlag,
-    /// Run number, as shown in the `#` column of `fj run list`.
-    pub run_id: u64,
-    /// Download only this artifact (by name). Omit to download all.
-    #[arg(short = 'n', long)]
-    pub name: Option<String>,
-    /// Output directory (default: cwd). Each artifact is written as `<name>.zip`.
-    #[arg(short = 'o', long)]
-    pub output_dir: Option<String>,
-    /// List the run's artifacts instead of downloading.
-    #[arg(long)]
-    pub list: bool,
-    #[arg(long)]
-    pub json: bool,
-}
-
 pub async fn run(cmd: RunCmd, host: Option<&str>) -> Result<()> {
     match cmd.command {
         RunSub::List(args) => list(args, host).await,
         RunSub::View(args) => view(args, host).await,
         RunSub::Watch(args) => watch(args, host).await,
-        RunSub::Download(args) => download(args, host).await,
+        RunSub::Download(args) => workflow_artifact::download(args, host).await,
         RunSub::Rerun(args) => rerun(args, host).await,
         RunSub::Cancel(args) => cancel(args, host).await,
     }
@@ -388,76 +369,6 @@ async fn watch(args: WatchArgs, host: Option<&str>) -> Result<()> {
     }
 }
 
-async fn download(args: DownloadArgs, host: Option<&str>) -> Result<()> {
-    let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
-    guard_web_routes(&ctx.client)?;
-    let arts =
-        api::workflow::list_artifacts(&ctx.client, &ctx.owner, &ctx.name, args.run_id).await?;
-    if args.json {
-        return output::print_json(&serde_json::to_value(&arts)?);
-    }
-    if arts.is_empty() {
-        println!("(no artifacts)");
-        return Ok(());
-    }
-    if args.list {
-        let rows: Vec<Vec<String>> = arts
-            .iter()
-            .map(|a| {
-                vec![
-                    a.name.clone(),
-                    output::human_size(a.size),
-                    output::action_status(&a.status),
-                ]
-            })
-            .collect();
-        print!(
-            "{}",
-            output::render_table(&["NAME", "SIZE", "STATUS"], &rows)
-        );
-        return Ok(());
-    }
-    let out = args.output_dir.unwrap_or_else(|| ".".into());
-    std::fs::create_dir_all(&out)?;
-    let mut got = 0usize;
-    for a in &arts {
-        if let Some(filter) = &args.name {
-            if &a.name != filter {
-                continue;
-            }
-        }
-        if a.status == "expired" {
-            println!("{}", output::dim(&format!("skipping {} (expired)", a.name)));
-            continue;
-        }
-        let dest = artifact_dest(Path::new(&out), &a.name)?;
-        let bytes = api::workflow::download_artifact(
-            &ctx.client,
-            &ctx.owner,
-            &ctx.name,
-            args.run_id,
-            &a.name,
-        )
-        .await?;
-        std::fs::write(&dest, &bytes)?;
-        println!("✓ Downloaded {} → {}", a.name, dest.display());
-        got += 1;
-    }
-    if got == 0 {
-        println!("(no artifacts matched)");
-    }
-    Ok(())
-}
-
-/// Destination path for an artifact zip, rejecting names that try to escape
-/// the output directory.
-fn artifact_dest(dir: &Path, name: &str) -> Result<PathBuf> {
-    if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
-        return Err(anyhow!("refusing unsafe artifact name {name:?}"));
-    }
-    Ok(dir.join(format!("{name}.zip")))
-}
-
 /// Forgejo clamps an out-of-range job index to the first job rather than
 /// 404ing, which would silently show the wrong logs. Reject it instead.
 fn validate_job(view: &api::workflow::RunView, job: usize) -> Result<()> {
@@ -474,7 +385,7 @@ fn validate_job(view: &api::workflow::RunView, job: usize) -> Result<()> {
 /// Most of `fj run` (view/watch/rerun/cancel) reads or POSTs Forgejo web
 /// routes, which a Fjord-Account gateway does not proxy. Refuse early with an
 /// actionable message rather than emitting a confusing 404 from the gateway.
-fn guard_web_routes(client: &crate::client::Client) -> Result<()> {
+pub(crate) fn guard_web_routes(client: &crate::client::Client) -> Result<()> {
     if matches!(client.auth_scheme(), AuthScheme::FjordBearer) {
         return Err(anyhow!(
             "`fj run` isn't supported over a Fjord Account gateway yet: it uses \
@@ -517,26 +428,6 @@ async fn cancel(args: IdArgs, host: Option<&str>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn artifact_dest_accepts_plain_names() {
-        let dir = Path::new("/tmp/out");
-        assert_eq!(
-            artifact_dest(dir, "build-logs").unwrap(),
-            dir.join("build-logs.zip")
-        );
-    }
-
-    #[test]
-    fn artifact_dest_rejects_unsafe_names() {
-        let dir = Path::new("/tmp/out");
-        for bad in ["", "../escape", "a/b", "a\\b", "..", "x..y"] {
-            assert!(
-                artifact_dest(dir, bad).is_err(),
-                "expected {bad:?} to be rejected"
-            );
-        }
-    }
 
     fn run_view_with_jobs(n: usize) -> api::workflow::RunView {
         let jobs: Vec<serde_json::Value> = (0..n).map(|_| serde_json::json!({})).collect();

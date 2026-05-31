@@ -33,6 +33,7 @@ pub mod search;
 pub mod status;
 pub mod web;
 pub mod workflow;
+mod workflow_artifact;
 mod workflow_run;
 mod workflow_secret;
 mod workflow_variable;
