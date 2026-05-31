@@ -169,3 +169,28 @@ fn urlencode(s: &str) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::urlencode;
+
+    #[test]
+    fn urlencode_passes_unreserved_chars_through() {
+        assert_eq!(
+            urlencode("fj-linux_v1.2.3~rc.tar.gz"),
+            "fj-linux_v1.2.3~rc.tar.gz"
+        );
+    }
+
+    #[test]
+    fn urlencode_percent_encodes_reserved_and_spaces() {
+        assert_eq!(urlencode("a b"), "a%20b");
+        assert_eq!(urlencode("a/b?c=d"), "a%2Fb%3Fc%3Dd");
+    }
+
+    #[test]
+    fn urlencode_handles_multibyte_utf8_per_byte() {
+        // "é" is U+00E9 -> UTF-8 0xC3 0xA9.
+        assert_eq!(urlencode("é"), "%C3%A9");
+    }
+}

@@ -2685,3 +2685,197 @@ async fn workflow_list_workflows_reads_both_dirs() {
     assert_eq!(wfs.len(), 1);
     assert_eq!(wfs[0].name, "ci.yml");
 }
+
+// ---- pull request: edit / ready / diff / unrequest review ----
+
+fn pull_json(number: u64, state: &str) -> serde_json::Value {
+    json!({
+        "id": number, "number": number, "title": "A PR", "state": state,
+        "user": { "id": 1, "login": "alice" },
+        "html_url": format!("https://x/o/r/pulls/{number}"),
+        "head": { "ref": "feature", "sha": "aaa" },
+        "base": { "ref": "main", "sha": "bbb" },
+        "created_at": "2026-05-30T00:00:00Z",
+        "updated_at": "2026-05-30T00:01:00Z"
+    })
+}
+
+#[tokio::test]
+async fn pull_edit_can_close() {
+    use crate::api::pull::EditPull;
+    let server = MockServer::start().await;
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/repos/o/r/pulls/12"))
+        .and(body_json(json!({ "state": "closed" })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(pull_json(12, "closed")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let body = EditPull {
+        state: Some("closed"),
+        ..Default::default()
+    };
+    let pr = crate::api::pull::edit(&c, "o", "r", 12, &body)
+        .await
+        .expect("edit");
+    assert_eq!(pr.state, "closed");
+}
+
+#[tokio::test]
+async fn pull_ready_patches_draft_false() {
+    let server = MockServer::start().await;
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/repos/o/r/pulls/12"))
+        .and(body_json(json!({ "draft": false })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(pull_json(12, "open")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    crate::api::pull::ready(&c, "o", "r", 12)
+        .await
+        .expect("ready");
+}
+
+#[tokio::test]
+async fn pull_diff_text_returns_raw_body() {
+    let server = MockServer::start().await;
+    let diff = "diff --git a/x b/x\n+new line\n";
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/pulls/12.diff"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(diff))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let got = crate::api::pull::diff_text(&c, "o", "r", 12)
+        .await
+        .expect("diff");
+    assert_eq!(got, diff);
+}
+
+#[tokio::test]
+async fn pull_unrequest_reviewers_deletes_with_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/repos/o/r/pulls/12/requested_reviewers"))
+        .and(body_json(json!({ "reviewers": ["bob", "carol"] })))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    crate::api::pull::unrequest_reviewers(&c, "o", "r", 12, vec!["bob".into(), "carol".into()])
+        .await
+        .expect("unrequest");
+}
+
+// ---- release assets ----
+
+#[tokio::test]
+async fn release_upload_asset_posts_multipart_with_name_query() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/releases/9/assets"))
+        .and(query_param("name", "build.zip"))
+        .and(header("authorization", "token test-token"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "id": 5, "name": "build.zip", "size": 4,
+            "browser_download_url": "https://x/a/build.zip",
+            "created_at": "2026-01-01T00:00:00Z"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let asset = crate::api::release::upload_asset(&c, "o", "r", 9, "build.zip", vec![1, 2, 3, 4])
+        .await
+        .expect("upload");
+    assert_eq!(asset.name, "build.zip");
+    assert_eq!(asset.size, 4);
+}
+
+#[tokio::test]
+async fn release_delete_asset_keys_under_release() {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/repos/o/r/releases/9/assets/5"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    crate::api::release::delete_asset(&c, "o", "r", 9, 5)
+        .await
+        .expect("delete asset");
+}
+
+// ---- repo migrate / search ----
+
+#[tokio::test]
+async fn repo_migrate_posts_to_migrate_endpoint() {
+    use crate::api::repo::Migrate;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/migrate"))
+        .and(body_json(json!({
+            "clone_addr": "https://github.com/o/x.git",
+            "repo_name": "x",
+            "repo_owner": "o",
+            "mirror": false,
+            "private": false,
+            "service": "github"
+        })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(minimal_repo_json("x")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let body = Migrate {
+        clone_addr: "https://github.com/o/x.git",
+        repo_name: "x",
+        repo_owner: "o",
+        mirror: false,
+        private: false,
+        description: None,
+        auth_username: None,
+        auth_password: None,
+        auth_token: None,
+        service: "github",
+        mirror_interval: None,
+    };
+    let repo = crate::api::repo::migrate(&c, &body).await.expect("migrate");
+    assert_eq!(repo.name, "x");
+}
+
+#[tokio::test]
+async fn repo_search_unwraps_envelope_and_pages() {
+    use crate::api::repo::ListOptions;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/search"))
+        .and(query_param("q", "fj"))
+        .and(query_param("limit", "10"))
+        .and(query_param("page", "1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "data": [ minimal_repo_json("fj") ],
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let page = crate::api::repo::search(
+        &c,
+        ListOptions {
+            limit: 10,
+            page: 1,
+            query: Some("fj"),
+        },
+    )
+    .await
+    .expect("search");
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].name, "fj");
+}
