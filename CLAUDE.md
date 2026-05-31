@@ -73,8 +73,14 @@ docs/                  architecture, jq, gh-to-fj, faq, troubleshooting
 ## Things to remember
 
 - Tokens are stored in the OS keychain (service `fj`, key = hostname).
-  Never serialized to disk. Re-prompts after rebuilds are expected on
-  macOS because the binary hash changes; click "Always Allow."
+  Never serialized to disk. The keychain pins "Always Allow" to the
+  binary's code signature; an ad-hoc signature (what `cargo build`
+  emits) is pinned to the cdhash, which changes every rebuild, so the
+  prompt keeps coming back. Fix: `make install` puts a real copy on
+  PATH and signs it with a stable Developer ID identity, so trust
+  survives rebuilds (click "Always Allow" once after the first signed
+  install). Don't symlink `~/.local/bin/fj` to `target/release/fj` —
+  that re-introduces the per-build churn.
 - `cargo test` builds a separate test binary with a different hash, so
   it gets its own keychain prompt. Tests that need keychain access are
   the wiremock-backed ones in `src/client/integration_tests.rs`, which
