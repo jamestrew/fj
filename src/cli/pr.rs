@@ -7,8 +7,8 @@ use crate::api;
 use crate::api::pull::{CreatePull, EditPull, ListOptions};
 use crate::cli::context::{resolve_repo, RepoFlag};
 use crate::cli::pr_args::{MergeStyleArg, ReviewEventArg, StateFilter, UpdateStyle};
-use crate::cli::pr_review;
-use crate::client::Client;
+use crate::cli::pr_status::StatusArgs;
+use crate::cli::{pr_inspect, pr_review, pr_status};
 use crate::git;
 use crate::output;
 
@@ -153,14 +153,6 @@ pub struct ReviewerArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct StatusArgs {
-    #[arg(short = 'L', long, default_value_t = 20)]
-    pub limit: u32,
-    #[arg(long)]
-    pub json: bool,
-}
-
-#[derive(Debug, Args)]
 pub struct CheckoutArgs {
     #[command(flatten)]
     pub r: RepoFlag,
@@ -217,17 +209,17 @@ pub async fn run(cmd: PrCmd, host: Option<&str>) -> Result<()> {
         PrSub::View(args) => view(args, host).await,
         PrSub::Create(args) => create(args, host).await,
         PrSub::Edit(args) => edit(args, host).await,
-        PrSub::Diff(args) => diff(args, host).await,
-        PrSub::Commits(args) => commits(args, host).await,
-        PrSub::Files(args) => files(args, host).await,
-        PrSub::Checks(args) => checks(args, host).await,
+        PrSub::Diff(args) => pr_inspect::diff(args, host).await,
+        PrSub::Commits(args) => pr_inspect::commits(args, host).await,
+        PrSub::Files(args) => pr_inspect::files(args, host).await,
+        PrSub::Checks(args) => pr_inspect::checks(args, host).await,
         PrSub::Ready(args) => ready(args, host).await,
         PrSub::Comment(args) => comment(args, host).await,
         PrSub::UpdateBranch(args) => update_branch(args, host).await,
         PrSub::Review(args) => pr_review::review(args, host).await,
         PrSub::RequestReview(args) => pr_review::request_reviewers(args, host).await,
         PrSub::UnrequestReview(args) => pr_review::unrequest_reviewers(args, host).await,
-        PrSub::Status(args) => status(args, host).await,
+        PrSub::Status(args) => pr_status::status(args, host).await,
         PrSub::Checkout(args) => checkout(args, host).await,
         PrSub::Merge(args) => merge(args, host).await,
         PrSub::Close(args) => set_state(args, host, "closed").await,
@@ -418,112 +410,6 @@ async fn edit(args: EditArgs, host: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-async fn diff(args: SimpleArgs, host: Option<&str>) -> Result<()> {
-    let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
-    let text = api::pull::diff_text(&ctx.client, &ctx.owner, &ctx.name, args.number).await?;
-    print!("{text}");
-    Ok(())
-}
-
-async fn commits(args: SimpleArgs, host: Option<&str>) -> Result<()> {
-    let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
-    let cs = api::pull::commits(&ctx.client, &ctx.owner, &ctx.name, args.number).await?;
-    let rows: Vec<Vec<String>> = cs
-        .iter()
-        .map(|c| {
-            let short = c.sha.get(..7).unwrap_or(&c.sha).to_string();
-            let subject = c.commit.message.lines().next().unwrap_or("").to_string();
-            let author = c
-                .commit
-                .author
-                .as_ref()
-                .map(|a| a.name.clone())
-                .unwrap_or_default();
-            vec![short, output::truncate(&subject, 70), output::dim(&author)]
-        })
-        .collect();
-    if rows.is_empty() {
-        println!("(no commits)");
-    } else {
-        print!(
-            "{}",
-            output::render_table(&["SHA", "SUBJECT", "AUTHOR"], &rows)
-        );
-    }
-    Ok(())
-}
-
-async fn files(args: SimpleArgs, host: Option<&str>) -> Result<()> {
-    let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
-    let fs = api::pull::files(&ctx.client, &ctx.owner, &ctx.name, args.number).await?;
-    let rows: Vec<Vec<String>> = fs
-        .iter()
-        .map(|f| {
-            vec![
-                f.status.clone(),
-                f.filename.clone(),
-                output::dim(&format!("+{} -{}", f.additions, f.deletions)),
-            ]
-        })
-        .collect();
-    if rows.is_empty() {
-        println!("(no file changes)");
-    } else {
-        print!(
-            "{}",
-            output::render_table(&["STATUS", "FILE", "DIFF"], &rows)
-        );
-    }
-    Ok(())
-}
-
-async fn checks(args: SimpleArgs, host: Option<&str>) -> Result<()> {
-    let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
-    let pr = api::pull::get(&ctx.client, &ctx.owner, &ctx.name, args.number).await?;
-    let cs = api::pull::combined_status(&ctx.client, &ctx.owner, &ctx.name, &pr.head.sha).await?;
-    println!(
-        "{}  {}",
-        output::bold(&format!(
-            "Combined: {}",
-            if cs.state.is_empty() {
-                "—"
-            } else {
-                &cs.state
-            }
-        )),
-        output::dim(&format!(
-            "{} checks on {}",
-            cs.total_count,
-            &pr.head.sha[..7.min(pr.head.sha.len())]
-        )),
-    );
-    if cs.statuses.is_empty() {
-        println!("(no per-check statuses reported)");
-        return Ok(());
-    }
-    let rows: Vec<Vec<String>> = cs
-        .statuses
-        .iter()
-        .map(|s| {
-            let when = s
-                .updated_at
-                .map(output::relative_time)
-                .unwrap_or_else(|| "—".into());
-            vec![
-                output::state_pill(&s.status.to_lowercase(), false),
-                s.context.clone(),
-                output::truncate(&s.description, 50),
-                output::dim(&when),
-            ]
-        })
-        .collect();
-    print!(
-        "{}",
-        output::render_table(&["STATE", "CHECK", "DESCRIPTION", "WHEN"], &rows)
-    );
-    Ok(())
-}
-
 async fn ready(args: SimpleArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     api::pull::ready(&ctx.client, &ctx.owner, &ctx.name, args.number).await?;
@@ -563,75 +449,6 @@ async fn update_branch(args: UpdateBranchArgs, host: Option<&str>) -> Result<()>
     .await?;
     println!("✓ Updated PR #{} from its base branch", args.number);
     Ok(())
-}
-
-async fn status(args: StatusArgs, host: Option<&str>) -> Result<()> {
-    // Cross-repo dashboard: PRs authored by you, and PRs where you're listed
-    // as a reviewer or where you're mentioned.
-    let client = Client::connect(host)?;
-    let me = api::user::current(&client).await?;
-    let limit = args.limit.clamp(1, 50);
-
-    let q_authored: Vec<(String, String)> = vec![
-        ("type".into(), "pulls".into()),
-        ("state".into(), "open".into()),
-        ("created_by".into(), me.login.clone()),
-        ("limit".into(), limit.to_string()),
-    ];
-    let q_review: Vec<(String, String)> = vec![
-        ("type".into(), "pulls".into()),
-        ("state".into(), "open".into()),
-        ("reviewed_by".into(), me.login.clone()),
-        ("limit".into(), limit.to_string()),
-    ];
-    let q_mentioned: Vec<(String, String)> = vec![
-        ("type".into(), "pulls".into()),
-        ("state".into(), "open".into()),
-        ("mentioned_by".into(), me.login.clone()),
-        ("limit".into(), limit.to_string()),
-    ];
-
-    let path = "/api/v1/repos/issues/search";
-    let authored: Vec<api::issue::Issue> = client
-        .json(reqwest::Method::GET, path, &q_authored, None::<&()>)
-        .await?;
-    let review_requested: Vec<api::issue::Issue> = client
-        .json(reqwest::Method::GET, path, &q_review, None::<&()>)
-        .await?;
-    let mentioned: Vec<api::issue::Issue> = client
-        .json(reqwest::Method::GET, path, &q_mentioned, None::<&()>)
-        .await?;
-
-    if args.json {
-        return output::print_json(&serde_json::json!({
-            "authored": authored,
-            "review_requested": review_requested,
-            "mentioned": mentioned,
-        }));
-    }
-
-    print_status_section("Created by you", &authored);
-    print_status_section("Requesting your review", &review_requested);
-    print_status_section("Mentioning you", &mentioned);
-    Ok(())
-}
-
-fn print_status_section(label: &str, items: &[api::issue::Issue]) {
-    println!("{}", output::bold(label));
-    if items.is_empty() {
-        println!("  (none)");
-        println!();
-        return;
-    }
-    for i in items {
-        println!(
-            "  #{}  {}  {}",
-            i.number,
-            output::truncate(&i.title, 70),
-            output::dim(&i.html_url)
-        );
-    }
-    println!();
 }
 
 async fn checkout(args: CheckoutArgs, host: Option<&str>) -> Result<()> {
