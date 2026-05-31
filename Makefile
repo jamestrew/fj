@@ -19,7 +19,31 @@ SIGN_ID    ?= Developer ID Application: Raster & State LLC (62Y3FRM8PD)
 IDENTIFIER ?= fj-a88ab591fd97b299
 UNAME      := $(shell uname)
 
-.PHONY: build install test lint
+.PHONY: build install test lint coverage coverage-html
+
+# Files excluded from coverage so the number reflects what we actually
+# intend to unit-test, not glue we don't.
+#
+# What we DO test (kept in the report): the api/ wrappers (via the wiremock
+# suite in client/integration_tests.rs), the HTTP client, config/git/auth/
+# fjord/output layers, and every pure helper or parser. Command modules that
+# also hold tested helpers (pr, repo, issue, release, workflow_run, key,
+# api, instances, …) stay in too; their partial number is honest.
+#
+# What we DON'T unit-test (excluded here):
+#   - entry + dispatch wiring: main.rs, cli/mod.rs
+#   - platform / process glue: output/pager.rs, cli/web.rs, cli/browse.rs,
+#     cli/extension.rs
+#   - thin async command handlers that only orchestrate the (tested) api
+#     layer and are exercised by the e2e smoke instead: cli/auth*.rs,
+#     config, org, status, hook, protect, label, milestone, search,
+#     workflow, workflow_variable, repo_mirror, repo_social, issue_comment,
+#     pr_inspect, pr_status, context
+#
+# Rule of thumb: a cli command file with no `#[cfg(test)]` module is glue we
+# don't unit-test; add it here when you add such a file (or drop it once it
+# grows a test module).
+COV_IGNORE := src/(main\.rs|output/pager\.rs|cli/(mod|web|browse|extension|context|auth|auth_login|config|org|status|hook|protect|label|milestone|search|workflow|workflow_variable|repo_mirror|repo_social|issue_comment|pr_inspect|pr_status)\.rs)
 
 build:
 	cargo build --release
@@ -44,3 +68,12 @@ test:
 lint:
 	cargo clippy --all-targets --all-features -- -D warnings
 	cargo fmt --all -- --check
+
+# Line/region coverage over the surface we intend to unit-test (see
+# COV_IGNORE above). Needs cargo-llvm-cov: `cargo install cargo-llvm-cov`.
+coverage:
+	cargo llvm-cov --all --summary-only --ignore-filename-regex '$(COV_IGNORE)'
+
+# Same scope, rendered as a browsable HTML report under target/llvm-cov/html.
+coverage-html:
+	cargo llvm-cov --all --open --ignore-filename-regex '$(COV_IGNORE)'
