@@ -123,3 +123,35 @@ pub(crate) fn read_value(value: Option<&str>, from_file: Option<&str>) -> Result
         "pass --value or --from-file (use `-` for stdin)"
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn read_value_passes_inline_value_through_verbatim() {
+        // Inline values are intentionally not trimmed: a secret may have
+        // meaningful leading/trailing whitespace.
+        assert_eq!(read_value(Some("  s3cret  "), None).unwrap(), "  s3cret  ");
+    }
+
+    #[test]
+    fn read_value_reads_file_and_trims_trailing_newline() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "tokenvalue").unwrap();
+        let got = read_value(None, Some(f.path().to_str().unwrap())).unwrap();
+        assert_eq!(got, "tokenvalue");
+    }
+
+    #[test]
+    fn read_value_requires_a_source() {
+        assert!(read_value(None, None).is_err());
+    }
+
+    #[test]
+    fn read_value_prefers_inline_over_file() {
+        let got = read_value(Some("inline"), Some("/nonexistent/path")).unwrap();
+        assert_eq!(got, "inline");
+    }
+}

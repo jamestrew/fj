@@ -202,3 +202,51 @@ async fn use_instance(host_flag: Option<&str>, args: UseArgs) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn instance(id: &str) -> ForgeInstance {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "displayName": "My Forge",
+            "slug": "my-forge",
+            "region": "hel1",
+            "plan": "starter",
+            "state": "running",
+            "publicUrl": "https://my-forge.example",
+            "createdAt": "2026-01-01T00:00:00Z",
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn serializable_list_uses_camel_case_keys() {
+        let out = serializable_list(&[instance("inst_1")]);
+        assert_eq!(out.len(), 1);
+        let obj = &out[0];
+        assert_eq!(obj["id"], "inst_1");
+        assert_eq!(obj["displayName"], "My Forge");
+        assert_eq!(obj["slug"], "my-forge");
+        assert_eq!(obj["region"], "hel1");
+        assert_eq!(obj["plan"], "starter");
+        assert_eq!(obj["state"], "running");
+        assert_eq!(obj["publicUrl"], "https://my-forge.example");
+        // createdAt is intentionally not surfaced in the serialized view.
+        assert!(obj.get("createdAt").is_none());
+    }
+
+    #[test]
+    fn serializable_list_preserves_order_and_null_optionals() {
+        let mut sparse: ForgeInstance = instance("inst_2");
+        sparse.region = None;
+        sparse.public_url = None;
+        let out = serializable_list(&[instance("inst_1"), sparse]);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["id"], "inst_1");
+        assert_eq!(out[1]["id"], "inst_2");
+        assert!(out[1]["region"].is_null());
+        assert!(out[1]["publicUrl"].is_null());
+    }
+}

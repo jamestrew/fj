@@ -266,3 +266,49 @@ fn fingerprint_preview(key: &str) -> String {
         .collect::<String>();
     format!("{kind} …{tail}")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn read_key_trims_inline_value() {
+        let got = read_key(Some("  ssh-ed25519 AAAA user@host \n"), None).unwrap();
+        assert_eq!(got, "ssh-ed25519 AAAA user@host");
+    }
+
+    #[test]
+    fn read_key_reads_and_trims_a_file() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "ssh-rsa BBBB host\n").unwrap();
+        let got = read_key(None, Some(f.path().to_str().unwrap())).unwrap();
+        assert_eq!(got, "ssh-rsa BBBB host");
+    }
+
+    #[test]
+    fn read_key_requires_a_source() {
+        assert!(read_key(None, None).is_err());
+    }
+
+    #[test]
+    fn read_key_prefers_inline_over_file() {
+        // With both supplied, the inline value wins and the file is untouched.
+        let got = read_key(Some("inline-key"), Some("/nonexistent/path")).unwrap();
+        assert_eq!(got, "inline-key");
+    }
+
+    #[test]
+    fn fingerprint_preview_shows_kind_and_last_eight() {
+        assert_eq!(
+            fingerprint_preview("ssh-ed25519 AAAAAAAA12345678 me@host"),
+            "ssh-ed25519 …12345678",
+        );
+    }
+
+    #[test]
+    fn fingerprint_preview_handles_short_and_empty_input() {
+        assert_eq!(fingerprint_preview("ssh-rsa AB"), "ssh-rsa …AB");
+        assert_eq!(fingerprint_preview(""), " …");
+    }
+}
