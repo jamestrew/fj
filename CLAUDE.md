@@ -45,10 +45,17 @@ docs/                  architecture, jq, gh-to-fj, faq, troubleshooting
 - `make coverage` reports line/region coverage (needs `cargo-llvm-cov`),
   scoped to the surface we intend to unit-test. The exclusion set lives
   in `COV_IGNORE` in the Makefile: entry/dispatch wiring, platform glue,
-  and thin async command handlers that only orchestrate the (tested) api
-  layer. Don't chase coverage on those; add a new glue file to
-  `COV_IGNORE` if it has no `#[cfg(test)]` module. `make coverage-html`
-  opens a browsable report.
+  and thin command-handler modules. Don't chase coverage on those; add a
+  new glue file to `COV_IGNORE` if it has no `#[cfg(test)]` module.
+  `make coverage-html` opens a browsable report. A test
+  (`cli::tests::cov_ignore_stays_in_sync_with_test_modules`) fails if
+  `COV_IGNORE` drifts from which `cli/*.rs` files carry tests.
+- `make coverage-strict` (needs a nightly toolchain + `llvm-tools-preview`)
+  additionally drops the untested async command handlers inside the mixed
+  command modules, via `#[cfg_attr(coverage_nightly, coverage(off))]` on
+  every cli `async fn` (inert on stable). It's the intent-precise number
+  (~76% vs ~51% for plain `coverage`). When you add a cli `async fn`
+  handler, keep the attribute on it.
 - `./scripts/install-hooks.sh` symlinks `hooks/pre-push` into `.git/hooks`.
 - `FJ_E2E=1` enables the live API smoke against `stephen/fj-cli-test`.
   It read-exercises the command handlers that `COV_IGNORE` excludes from

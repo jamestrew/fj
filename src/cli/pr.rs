@@ -203,6 +203,7 @@ pub struct UpdateBranchArgs {
     pub style: UpdateStyle,
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub async fn run(cmd: PrCmd, host: Option<&str>) -> Result<()> {
     match cmd.command {
         PrSub::List(args) => list(args, host).await,
@@ -227,6 +228,7 @@ pub async fn run(cmd: PrCmd, host: Option<&str>) -> Result<()> {
     }
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn list(args: ListArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     if args.web {
@@ -277,6 +279,7 @@ async fn list(args: ListArgs, host: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn view(args: ViewArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     let pr = api::pull::get(&ctx.client, &ctx.owner, &ctx.name, args.number).await?;
@@ -350,6 +353,7 @@ async fn view(args: ViewArgs, host: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn create(args: CreateArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     let head = match args.head {
@@ -386,6 +390,7 @@ async fn create(args: CreateArgs, host: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn edit(args: EditArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     let body = if args.body_editor {
@@ -410,6 +415,7 @@ async fn edit(args: EditArgs, host: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn ready(args: SimpleArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     api::pull::ready(&ctx.client, &ctx.owner, &ctx.name, args.number).await?;
@@ -417,6 +423,7 @@ async fn ready(args: SimpleArgs, host: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn comment(args: CommentArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     let body = match args.body.as_deref() {
@@ -437,6 +444,7 @@ async fn comment(args: CommentArgs, host: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn update_branch(args: UpdateBranchArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     api::pull::update_branch(
@@ -451,6 +459,7 @@ async fn update_branch(args: UpdateBranchArgs, host: Option<&str>) -> Result<()>
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn checkout(args: CheckoutArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     let pr = api::pull::get(&ctx.client, &ctx.owner, &ctx.name, args.number).await?;
@@ -461,6 +470,7 @@ async fn checkout(args: CheckoutArgs, host: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn merge(args: MergeArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     api::pull::merge(
@@ -477,6 +487,7 @@ async fn merge(args: MergeArgs, host: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn set_state(args: SimpleArgs, host: Option<&str>, state: &str) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     api::pull::edit(

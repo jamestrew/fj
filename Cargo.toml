@@ -13,6 +13,13 @@ readme = "README.md"
 name = "fj"
 path = "src/main.rs"
 
+[lints.rust]
+# Set by cargo-llvm-cov on a nightly toolchain; used to gate the
+# `coverage_attribute` feature so `make coverage-strict` can drop the
+# untested async command handlers from the report. Declare it so it isn't
+# flagged as an unexpected cfg on stable builds.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
+
 [dependencies]
 anyhow = "1"
 thiserror = "2"

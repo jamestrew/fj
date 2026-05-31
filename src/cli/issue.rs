@@ -161,6 +161,7 @@ pub struct DevelopArgs {
     pub dry_run: bool,
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub async fn run(cmd: IssueCmd, host: Option<&str>) -> Result<()> {
     match cmd.command {
         IssueSub::List(args) => list(args, host).await,
@@ -179,6 +180,7 @@ pub async fn run(cmd: IssueCmd, host: Option<&str>) -> Result<()> {
     }
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn list(args: ListArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     if args.web {
@@ -230,6 +232,7 @@ async fn list(args: ListArgs, host: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn view(args: ViewArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     let issue = api::issue::get(&ctx.client, &ctx.owner, &ctx.name, args.number).await?;
@@ -278,6 +281,7 @@ async fn view(args: ViewArgs, host: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn create(args: CreateArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     let title = match args.title {
@@ -303,6 +307,7 @@ async fn create(args: CreateArgs, host: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn edit(args: EditArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     let body = if args.body_editor {
@@ -321,6 +326,7 @@ async fn edit(args: EditArgs, host: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn set_state(args: NumberOnly, host: Option<&str>, state: &str) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     let issue = api::issue::edit(
@@ -342,6 +348,7 @@ async fn set_state(args: NumberOnly, host: Option<&str>, state: &str) -> Result<
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn delete(args: DeleteArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     if !args.yes {
@@ -358,6 +365,7 @@ async fn delete(args: DeleteArgs, host: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn set_pinned(args: NumberOnly, host: Option<&str>, pinned: bool) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     api::issue::set_pinned(&ctx.client, &ctx.owner, &ctx.name, args.number, pinned).await?;
@@ -369,6 +377,7 @@ async fn set_pinned(args: NumberOnly, host: Option<&str>, pinned: bool) -> Resul
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn develop(args: DevelopArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     let issue = api::issue::get(&ctx.client, &ctx.owner, &ctx.name, args.number).await?;

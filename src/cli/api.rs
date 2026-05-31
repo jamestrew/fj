@@ -55,6 +55,7 @@ pub struct ApiArgs {
     pub silent: bool,
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub async fn run(args: ApiArgs, host: Option<&str>) -> Result<()> {
     let client = Client::connect(host)?;
     let method = pick_method(&args)?;
@@ -182,6 +183,7 @@ fn parse_headers(items: &[String]) -> Result<HeaderMap> {
     Ok(map)
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn collect_paginated(
     client: &Client,
     endpoint: &str,

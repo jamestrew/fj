@@ -78,6 +78,7 @@ pub fn save_to(p: &std::path::Path, a: &AliasFile) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub async fn run(cmd: AliasCmd) -> Result<()> {
     let mut file = load()?;
     match cmd.command {

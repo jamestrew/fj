@@ -54,6 +54,7 @@ pub struct SecretDeleteArgs {
     pub yes: bool,
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub async fn run_secret(cmd: SecretCmd, host: Option<&str>) -> Result<()> {
     match cmd.command {
         SecretSub::List(args) => secret_list(args, host).await,
@@ -62,6 +63,7 @@ pub async fn run_secret(cmd: SecretCmd, host: Option<&str>) -> Result<()> {
     }
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn secret_list(args: SecretListArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     let s = api::workflow::list_secrets(&ctx.client, &ctx.owner, &ctx.name).await?;
@@ -82,6 +84,7 @@ async fn secret_list(args: SecretListArgs, host: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn secret_set(args: SecretSetArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     let value = read_value(args.value.as_deref(), args.from_file.as_deref())?;
@@ -90,6 +93,7 @@ async fn secret_set(args: SecretSetArgs, host: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn secret_delete(args: SecretDeleteArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     if !args.yes {

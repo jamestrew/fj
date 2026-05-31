@@ -226,6 +226,7 @@ pub struct TopicsArgs {
     pub set: Option<String>,
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub async fn run(cmd: RepoCmd, host: Option<&str>) -> Result<()> {
     match cmd.command {
         RepoSub::List(args) => list(args, host).await,
@@ -255,6 +256,7 @@ pub async fn run(cmd: RepoCmd, host: Option<&str>) -> Result<()> {
 
 /// `fj repo set-default` pins the repo this directory's commands target,
 /// stored as `fj.resolved` in local git config and read back by `resolve_repo`.
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn set_default(args: SetDefaultArgs) -> Result<()> {
     const KEY: &str = "fj.resolved";
     if args.view {
@@ -279,6 +281,7 @@ async fn set_default(args: SetDefaultArgs) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn list(args: ListArgs, host: Option<&str>) -> Result<()> {
     let client = Client::connect(host)?;
     let opts = api::repo::ListOptions {
@@ -319,6 +322,7 @@ async fn list(args: ListArgs, host: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn view(args: ViewArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(pick_repo(args.repo.as_ref(), args.repo_flag.as_ref()), host)?;
     let repo = api::repo::get(&ctx.client, &ctx.owner, &ctx.name).await?;
@@ -355,6 +359,7 @@ async fn view(args: ViewArgs, host: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn clone(args: CloneArgs, host: Option<&str>) -> Result<()> {
     let (owner, name) = api::split_repo(&args.repo)?;
     let client = Client::connect(host)?;
@@ -374,6 +379,7 @@ async fn clone(args: CloneArgs, host: Option<&str>) -> Result<()> {
     git::clone(&url, args.dir.as_deref())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn create(args: CreateArgs, host: Option<&str>) -> Result<()> {
     let client = Client::connect(host)?;
     let (owner, name) = match args.repo.split_once('/') {
@@ -417,6 +423,7 @@ async fn create(args: CreateArgs, host: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn fork(args: ForkArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(pick_repo(args.repo.as_ref(), args.repo_flag.as_ref()), host)?;
     let r = api::repo::fork(
@@ -447,6 +454,7 @@ async fn fork(args: ForkArgs, host: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn sync(args: SyncArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(pick_repo(args.repo.as_ref(), args.repo_flag.as_ref()), host)?;
     let branch = match args.branch {
@@ -465,6 +473,7 @@ async fn sync(args: SyncArgs, host: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn edit(args: EditArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(pick_repo(args.repo.as_ref(), args.repo_flag.as_ref()), host)?;
     let description = if args.description_editor {
@@ -488,6 +497,7 @@ async fn edit(args: EditArgs, host: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn rename(args: RenameArgs, host: Option<&str>) -> Result<()> {
     let (owner, name) = api::split_repo(&args.repo)?;
     let client = Client::connect(host)?;
@@ -496,6 +506,7 @@ async fn rename(args: RenameArgs, host: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn set_archived(args: ArchiveArgs, host: Option<&str>, archived: bool) -> Result<()> {
     let ctx = resolve_repo(pick_repo(args.repo.as_ref(), args.repo_flag.as_ref()), host)?;
     let body = api::repo::EditRepo {
@@ -512,6 +523,7 @@ async fn set_archived(args: ArchiveArgs, host: Option<&str>, archived: bool) -> 
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn delete(args: DeleteArgs, host: Option<&str>) -> Result<()> {
     let (owner, name) = api::split_repo(&args.repo)?;
     let client = Client::connect(host)?;
@@ -527,6 +539,7 @@ async fn delete(args: DeleteArgs, host: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn branches(args: BranchesArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(pick_repo(args.repo.as_ref(), args.repo_flag.as_ref()), host)?;
     let bs = api::repo::list_branches(&ctx.client, &ctx.owner, &ctx.name).await?;
@@ -559,6 +572,7 @@ async fn branches(args: BranchesArgs, host: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn topics(args: TopicsArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(pick_repo(args.repo.as_ref(), args.repo_flag.as_ref()), host)?;
     if let Some(set) = args.set {

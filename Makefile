@@ -19,7 +19,7 @@ SIGN_ID    ?= Developer ID Application: Raster & State LLC (62Y3FRM8PD)
 IDENTIFIER ?= fj-a88ab591fd97b299
 UNAME      := $(shell uname)
 
-.PHONY: build install test lint coverage coverage-html
+.PHONY: build install test lint coverage coverage-html coverage-strict coverage-strict-html
 
 # Files excluded from coverage so the number reflects what we actually
 # intend to unit-test, not glue we don't.
@@ -75,9 +75,28 @@ lint:
 
 # Line/region coverage over the surface we intend to unit-test (see
 # COV_IGNORE above). Needs cargo-llvm-cov: `cargo install cargo-llvm-cov`.
+#
+# Two tiers:
+#   - `coverage` (stable): excludes whole glue files via COV_IGNORE. The
+#     mixed command modules (pr, repo, issue, …) stay in, so their untested
+#     async handlers still count. ~50%. Works on any toolchain.
+#   - `coverage-strict` (nightly): additionally drops the async command
+#     handlers inside those mixed files, via #[cfg_attr(coverage_nightly,
+#     coverage(off))] on every cli `async fn`. This is the number that
+#     reflects intent most precisely (only tested helpers + the api/client/
+#     util layers count). ~76%. Needs a nightly toolchain with
+#     llvm-tools-preview: `rustup toolchain install nightly && rustup
+#     component add llvm-tools-preview --toolchain nightly`.
 coverage:
 	cargo llvm-cov --all --summary-only --ignore-filename-regex '$(COV_IGNORE)'
 
 # Same scope, rendered as a browsable HTML report under target/llvm-cov/html.
 coverage-html:
 	cargo llvm-cov --all --open --ignore-filename-regex '$(COV_IGNORE)'
+
+# Intent-precise coverage: handler regions excluded on top of COV_IGNORE.
+coverage-strict:
+	cargo +nightly llvm-cov --all --summary-only --ignore-filename-regex '$(COV_IGNORE)'
+
+coverage-strict-html:
+	cargo +nightly llvm-cov --all --open --ignore-filename-regex '$(COV_IGNORE)'
