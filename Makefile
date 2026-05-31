@@ -42,7 +42,10 @@ UNAME      := $(shell uname)
 #
 # Rule of thumb: a cli command file with no `#[cfg(test)]` module is glue we
 # don't unit-test; add it here when you add such a file (or drop it once it
-# grows a test module).
+# grows a test module). main.rs and cli/mod.rs are an exception: they stay
+# excluded as entry/dispatch even though cli/mod.rs carries a structural
+# command-tree guard test (that test validates the clap tree, not the
+# dispatch match, so counting the match arms would just re-add noise).
 COV_IGNORE := src/(main\.rs|output/pager\.rs|cli/(mod|web|browse|extension|context|auth|auth_login|config|org|status|hook|protect|label|milestone|search|workflow|workflow_variable|repo_mirror|repo_social|issue_comment|pr_inspect|pr_status)\.rs)
 
 build:
