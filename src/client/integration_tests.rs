@@ -1539,3 +1539,284 @@ async fn pull_combined_status_decodes_state_and_statuses() {
     // omitted fields default.
     assert_eq!(cs.statuses[1].description, "");
 }
+
+// A minimal repo object that satisfies the non-defaulted fields of
+// `api::repo::Repo`. Used by the search/star tests below.
+fn minimal_repo_json(name: &str) -> serde_json::Value {
+    json!({
+        "id": 1,
+        "name": name,
+        "full_name": format!("o/{name}"),
+        "owner": { "id": 7, "login": "o" },
+        "html_url": "https://x/o/".to_string() + name,
+        "clone_url": "https://x/o/x.git",
+        "ssh_url": "git@x:o/x.git",
+        "updated_at": "2026-01-01T00:00:00Z",
+    })
+}
+
+#[tokio::test]
+async fn search_issues_sends_query_type_and_clamped_limit() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/issues/search"))
+        .and(query_param("q", "bug"))
+        .and(query_param("type", "issues"))
+        // 999 is clamped to the per-page cap of 50.
+        .and(query_param("limit", "50"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {
+                "id": 5, "number": 3, "title": "a bug", "state": "open",
+                "user": { "id": 1, "login": "alice" },
+                "html_url": "https://x/o/r/issues/3",
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z"
+            }
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let issues = crate::api::search::issues(&c, "bug", "issues", 999)
+        .await
+        .expect("search");
+    assert_eq!(issues.len(), 1);
+    assert_eq!(issues[0].title, "a bug");
+}
+
+#[tokio::test]
+async fn search_repos_unwraps_the_data_envelope() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/search"))
+        .and(query_param("q", "fj"))
+        .and(query_param("limit", "10"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "data": [ minimal_repo_json("fj") ],
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let repos = crate::api::search::repos(&c, "fj", 10)
+        .await
+        .expect("repos");
+    assert_eq!(repos.len(), 1);
+    assert_eq!(repos[0].name, "fj");
+}
+
+#[tokio::test]
+async fn search_users_unwraps_the_data_envelope() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/users/search"))
+        .and(query_param("q", "ali"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "data": [ { "id": 1, "login": "alice" } ],
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let users = crate::api::search::users(&c, "ali", 30)
+        .await
+        .expect("users");
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0].login, "alice");
+}
+
+#[tokio::test]
+async fn user_current_decodes_the_authenticated_user() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/user"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 42, "login": "alice", "is_admin": true
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let u = crate::api::user::current(&c).await.expect("user");
+    assert_eq!(u.login, "alice");
+    assert!(u.is_admin);
+    // omitted optionals default.
+    assert_eq!(u.email, "");
+}
+
+#[tokio::test]
+async fn release_list_sends_limit_and_page() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/releases"))
+        .and(query_param("limit", "30"))
+        .and(query_param("page", "1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {
+                "id": 1, "tag_name": "v1.0.0", "target_commitish": "main",
+                "draft": false, "prerelease": false, "html_url": "https://x/r/1",
+                "created_at": "2026-01-01T00:00:00Z", "published_at": null
+            }
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let rels = crate::api::release::list(&c, "o", "r", 30)
+        .await
+        .expect("list");
+    assert_eq!(rels.len(), 1);
+    assert_eq!(rels[0].tag_name, "v1.0.0");
+}
+
+#[tokio::test]
+async fn release_create_posts_only_the_set_fields() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/releases"))
+        // name/body/target are None, so they are skipped from the JSON body.
+        .and(body_json(json!({
+            "tag_name": "v2.0.0",
+            "draft": false,
+            "prerelease": true,
+        })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "id": 9, "tag_name": "v2.0.0", "target_commitish": "main",
+            "draft": false, "prerelease": true, "html_url": "https://x/r/9",
+            "created_at": "2026-01-01T00:00:00Z", "published_at": null
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let payload = crate::api::release::CreateRelease {
+        tag_name: "v2.0.0",
+        name: None,
+        body: None,
+        target_commitish: None,
+        draft: false,
+        prerelease: true,
+    };
+    let r = crate::api::release::create(&c, "o", "r", &payload)
+        .await
+        .expect("create");
+    assert_eq!(r.id, 9);
+    assert!(r.prerelease);
+}
+
+#[tokio::test]
+async fn release_edit_patches_set_fields_only() {
+    let server = MockServer::start().await;
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/repos/o/r/releases/9"))
+        .and(body_json(json!({ "name": "Renamed" })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 9, "tag_name": "v2.0.0", "name": "Renamed",
+            "target_commitish": "main", "draft": false, "prerelease": false,
+            "html_url": "https://x/r/9", "created_at": "2026-01-01T00:00:00Z",
+            "published_at": null
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let payload = crate::api::release::EditRelease {
+        name: Some("Renamed"),
+        ..Default::default()
+    };
+    let r = crate::api::release::edit(&c, "o", "r", 9, &payload)
+        .await
+        .expect("edit");
+    assert_eq!(r.name, "Renamed");
+}
+
+#[tokio::test]
+async fn release_delete_succeeds_on_204() {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/repos/o/r/releases/9"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    crate::api::release::delete(&c, "o", "r", 9)
+        .await
+        .expect("delete");
+}
+
+#[tokio::test]
+async fn repo_watch_puts_subscription_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v1/repos/o/r/subscription"))
+        .and(body_json(json!({ "subscribed": true, "ignored": false })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "subscribed": true, "ignored": false, "url": "https://x/sub"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let sub = crate::api::repo::watch(&c, "o", "r").await.expect("watch");
+    assert!(sub.subscribed);
+}
+
+#[tokio::test]
+async fn repo_unwatch_deletes_subscription() {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/repos/o/r/subscription"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    crate::api::repo::unwatch(&c, "o", "r")
+        .await
+        .expect("unwatch");
+}
+
+#[tokio::test]
+async fn repo_star_and_unstar_hit_user_starred() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v1/user/starred/o/r"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/user/starred/o/r"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    crate::api::repo::star(&c, "o", "r").await.expect("star");
+    crate::api::repo::unstar(&c, "o", "r")
+        .await
+        .expect("unstar");
+}
+
+#[tokio::test]
+async fn repo_list_starred_clamps_limit() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/user/starred"))
+        .and(query_param("limit", "50"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!([minimal_repo_json("starred")])),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let repos = crate::api::repo::list_starred(&c, 200)
+        .await
+        .expect("starred");
+    assert_eq!(repos.len(), 1);
+    assert_eq!(repos[0].name, "starred");
+}
