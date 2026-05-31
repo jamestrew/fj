@@ -183,6 +183,90 @@ pub fn human_size(bytes: u64) -> String {
 mod tests {
     use super::*;
 
+    // Strip ANSI styling so assertions hold whether or not the test
+    // environment advertises color support.
+    fn plain(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' {
+                // Skip until the SGR terminator 'm'.
+                for e in chars.by_ref() {
+                    if e == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn state_pill_maps_known_states_to_labels() {
+        assert_eq!(plain(&state_pill("open", false)), "Open");
+        assert_eq!(plain(&state_pill("closed", false)), "Closed");
+        // The merged flag wins regardless of the underlying state.
+        assert_eq!(plain(&state_pill("closed", true)), "Merged");
+        assert_eq!(plain(&state_pill("open", true)), "Merged");
+    }
+
+    #[test]
+    fn state_pill_passes_unknown_states_through_verbatim() {
+        // The fallback branch returns the input unstyled, color or not.
+        assert_eq!(state_pill("draft", false), "draft");
+    }
+
+    #[test]
+    fn action_status_passes_unknown_words_through() {
+        assert_eq!(action_status("queued-ish"), "queued-ish");
+    }
+
+    #[test]
+    fn action_status_keeps_the_word_for_known_states() {
+        for word in ["success", "failure", "cancelled", "running"] {
+            assert_eq!(plain(&action_status(word)), word);
+        }
+    }
+
+    #[test]
+    fn relative_time_renders_past_and_future() {
+        let now = chrono::Utc::now();
+        let two_hours_ago = now - chrono::Duration::hours(2);
+        assert_eq!(relative_time(two_hours_ago), "2h ago");
+
+        // Add an hour of slack so the micros elapsed before the fn calls
+        // now() can't floor the day count down to 2.
+        let in_three_days = now + chrono::Duration::days(3) + chrono::Duration::hours(1);
+        assert_eq!(relative_time(in_three_days), "in 3d");
+    }
+
+    #[test]
+    fn relative_time_scales_units() {
+        let now = chrono::Utc::now();
+        assert_eq!(relative_time(now - chrono::Duration::seconds(5)), "5s ago");
+        assert_eq!(relative_time(now - chrono::Duration::minutes(7)), "7m ago");
+        assert_eq!(relative_time(now - chrono::Duration::days(45)), "1mo ago");
+        assert_eq!(relative_time(now - chrono::Duration::days(400)), "1y ago");
+    }
+
+    #[test]
+    fn render_table_includes_headers_and_cells() {
+        let rendered = render_table(&["NAME", "VIS"], &[vec!["fj".into(), "public".into()]]);
+        let text = plain(&rendered);
+        assert!(text.contains("NAME"));
+        assert!(text.contains("VIS"));
+        assert!(text.contains("fj"));
+        assert!(text.contains("public"));
+    }
+
+    #[test]
+    fn dim_and_bold_preserve_the_text() {
+        assert_eq!(plain(&dim("hello")), "hello");
+        assert_eq!(plain(&bold("hello")), "hello");
+    }
+
     #[test]
     fn truncate_short_string_untouched() {
         assert_eq!(truncate("hello", 10), "hello");
