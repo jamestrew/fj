@@ -32,21 +32,12 @@ fn project_one(value: &Value, fields: &[String]) -> Value {
     for f in fields {
         // The output key is the full dotted path so users can disambiguate.
         // A user asking for `owner.login` gets that exact key in the result.
-        let extracted = extract_path(value, f);
+        // We share the json_path engine but, gh-style, a missing field
+        // resolves to null instead of erroring.
+        let extracted = super::json_path::extract_path(value, f).unwrap_or(Value::Null);
         out.insert(f.clone(), extracted);
     }
     Value::Object(out)
-}
-
-fn extract_path(value: &Value, path: &str) -> Value {
-    let mut current = value;
-    for segment in path.split('.') {
-        current = match current.get(segment) {
-            Some(v) => v,
-            None => return Value::Null,
-        };
-    }
-    current.clone()
 }
 
 #[cfg(test)]
@@ -103,5 +94,23 @@ mod tests {
     fn scalar_passes_through() {
         let v = json!("hello");
         assert_eq!(project(&v, &["id".into()]), json!("hello"));
+    }
+
+    #[test]
+    fn missing_nested_field_still_yields_null() {
+        // A miss anywhere along the path resolves to null, not an error,
+        // even though the shared engine would error on the bare path.
+        let v = json!({"owner": {"id": 7}});
+        let p = project(&v, &["owner.login".into()]);
+        assert_eq!(p, json!({"owner.login": null}));
+    }
+
+    #[test]
+    fn array_index_paths_work_via_the_shared_engine() {
+        // Sharing the json_path engine means --json-fields now also accepts
+        // the richer path syntax (indices/brackets) as a superset.
+        let v = json!({"labels": [{"name": "bug"}, {"name": "docs"}]});
+        let p = project(&v, &["labels.0.name".into(), "labels[1].name".into()]);
+        assert_eq!(p, json!({"labels.0.name": "bug", "labels[1].name": "docs"}));
     }
 }

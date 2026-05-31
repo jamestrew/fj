@@ -5,9 +5,9 @@ use reqwest::Method;
 use serde_json::Value;
 use url::Url;
 
-use crate::cli::api_jq::extract_path;
 use crate::client::{check_body_size, pagination::parse_link_header, Client};
 use crate::output;
+use crate::output::json_path::extract_path;
 
 #[derive(Debug, Args)]
 pub struct ApiArgs {
