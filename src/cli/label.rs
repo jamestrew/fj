@@ -168,7 +168,7 @@ async fn list(args: ListArgs, host: Option<&str>) -> Result<()> {
             vec![
                 l.name.clone(),
                 format!("#{}", l.color),
-                truncate(&l.description, 60),
+                output::truncate(&l.description, 60),
             ]
         })
         .collect();
@@ -243,13 +243,4 @@ async fn delete(args: DeleteArgs, host: Option<&str>) -> Result<()> {
     label::delete(&ctx.client, &ctx.owner, &ctx.name, existing.id).await?;
     println!("✓ Deleted label '{}'", args.name);
     Ok(())
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-    out.push('…');
-    out
 }

@@ -58,7 +58,7 @@ docs/                  architecture, jq, gh-to-fj, faq, troubleshooting
 - HTTP retry: GET/HEAD/OPTIONS/PUT/DELETE get 3 attempts with 200/400/800
   ms exponential backoff. 429 honors `Retry-After` (capped 30 s). POST
   and PATCH are never retried.
-- The simple jq projector for `fj api` lives in `cli::api::extract_path`.
+- The simple jq projector for `fj api` lives in `cli::api_jq::extract_path`.
   Supports `.field`, `.0`, `.[0]`, `[-1]`, and `|` pipes. See
   `docs/jq.md`.
 - `--json-fields foo,bar` is a GLOBAL flag that applies gh-style

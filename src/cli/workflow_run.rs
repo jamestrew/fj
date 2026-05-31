@@ -136,10 +136,10 @@ async fn list(args: ListArgs, host: Option<&str>) -> Result<()> {
             let conclusion = r.conclusion.clone().unwrap_or_default();
             vec![
                 r.run_number.to_string(),
-                truncate(&r.name, 40),
+                output::truncate(&r.name, 40),
                 r.status.clone(),
                 conclusion,
-                truncate(&r.head_branch, 30),
+                output::truncate(&r.head_branch, 30),
                 output::dim(
                     &r.updated_at
                         .map(output::relative_time)
@@ -406,7 +406,7 @@ async fn download(args: DownloadArgs, host: Option<&str>) -> Result<()> {
             .map(|a| {
                 vec![
                     a.name.clone(),
-                    human_size(a.size),
+                    output::human_size(a.size),
                     output::action_status(&a.status),
                 ]
             })
@@ -456,21 +456,6 @@ fn artifact_dest(dir: &Path, name: &str) -> Result<PathBuf> {
         return Err(anyhow!("refusing unsafe artifact name {name:?}"));
     }
     Ok(dir.join(format!("{name}.zip")))
-}
-
-fn human_size(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
-    let mut v = bytes as f64;
-    let mut i = 0;
-    while v >= 1024.0 && i < UNITS.len() - 1 {
-        v /= 1024.0;
-        i += 1;
-    }
-    if i == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{v:.1} {}", UNITS[i])
-    }
 }
 
 /// Forgejo clamps an out-of-range job index to the first job rather than
@@ -529,29 +514,9 @@ async fn cancel(args: IdArgs, host: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-    out.push('…');
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn human_size_formats_units() {
-        assert_eq!(human_size(0), "0 B");
-        assert_eq!(human_size(512), "512 B");
-        assert_eq!(human_size(1023), "1023 B");
-        assert_eq!(human_size(1024), "1.0 KB");
-        assert_eq!(human_size(1536), "1.5 KB");
-        assert_eq!(human_size(1024 * 1024), "1.0 MB");
-        assert_eq!(human_size(5 * 1024 * 1024 * 1024), "5.0 GB");
-    }
 
     #[test]
     fn artifact_dest_accepts_plain_names() {

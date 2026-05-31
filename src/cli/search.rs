@@ -57,7 +57,7 @@ async fn search_repos(client: &Client, args: QueryArgs) -> Result<()> {
             let vis = if r.private { "private" } else { "public" };
             vec![
                 r.full_name.clone(),
-                truncate(&r.description, 60),
+                output::truncate(&r.description, 60),
                 vis.into(),
                 output::dim(&output::relative_time(r.updated_at)),
             ]
@@ -85,7 +85,7 @@ async fn search_issues(client: &Client, args: QueryArgs, type_: &str) -> Result<
             vec![
                 format!("#{}", i.number),
                 output::state_pill(&i.state, false),
-                truncate(&i.title, 60),
+                output::truncate(&i.title, 60),
                 output::dim(&i.html_url),
             ]
         })
@@ -115,13 +115,4 @@ async fn search_users(client: &Client, args: QueryArgs) -> Result<()> {
         output::render_table(&["LOGIN", "NAME", "EMAIL"], &rows)
     );
     Ok(())
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-    out.push('…');
-    out
 }

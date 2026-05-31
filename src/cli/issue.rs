@@ -283,7 +283,7 @@ async fn list(args: ListArgs, host: Option<&str>) -> Result<()> {
             vec![
                 format!("#{}", i.number),
                 output::state_pill(&i.state, false),
-                truncate(&i.title, 60),
+                output::truncate(&i.title, 60),
                 output::dim(&labels),
                 output::dim(&format!("{}c", i.comments)),
                 output::dim(&output::relative_time(i.updated_at)),
@@ -499,15 +499,6 @@ fn slugify(s: &str) -> String {
         out.push_str("issue");
     }
     out.chars().take(40).collect()
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-    out.push('…');
-    out
 }
 
 #[cfg(test)]

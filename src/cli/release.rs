@@ -185,7 +185,7 @@ async fn list(args: ListArgs, host: Option<&str>) -> Result<()> {
             };
             vec![
                 r.tag_name.clone(),
-                truncate(&r.name, 60),
+                output::truncate(&r.name, 60),
                 output::dim(kind),
                 output::dim(&when),
             ]
@@ -236,7 +236,7 @@ async fn view(args: ViewArgs, host: Option<&str>) -> Result<()> {
             println!(
                 "  • {}  {}  {}",
                 a.name,
-                output::dim(&human_size(a.size)),
+                output::dim(&output::human_size(a.size)),
                 output::dim(&a.browser_download_url)
             );
         }
@@ -347,7 +347,11 @@ async fn upload_one(
     let asset =
         api::release::upload_asset(&ctx.client, &ctx.owner, &ctx.name, release_id, &name, bytes)
             .await?;
-    println!("✓ Uploaded {} ({})", asset.name, human_size(asset.size));
+    println!(
+        "✓ Uploaded {} ({})",
+        asset.name,
+        output::human_size(asset.size)
+    );
     Ok(())
 }
 
@@ -412,33 +416,9 @@ fn safe_asset_dest(out: &Path, asset_name: &str) -> Result<PathBuf> {
     Ok(dest)
 }
 
-fn human_size(bytes: u64) -> String {
-    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
-    let mut size = bytes as f64;
-    let mut unit = 0;
-    while size >= 1024.0 && unit < UNITS.len() - 1 {
-        size /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{}B", bytes)
-    } else {
-        format!("{:.1}{}", size, UNITS[unit])
-    }
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-    out.push('…');
-    out
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{human_size, safe_asset_dest};
+    use super::safe_asset_dest;
     use std::path::Path;
 
     #[test]
@@ -456,22 +436,5 @@ mod tests {
         assert!(safe_asset_dest(Path::new("/tmp/out"), "..").is_err());
         assert!(safe_asset_dest(Path::new("/tmp/out"), "").is_err());
         assert!(safe_asset_dest(Path::new("/tmp/out"), ".").is_err());
-    }
-
-    #[test]
-    fn formats_bytes() {
-        assert_eq!(human_size(0), "0B");
-        assert_eq!(human_size(512), "512B");
-    }
-
-    #[test]
-    fn formats_kb() {
-        assert_eq!(human_size(2048), "2.0KB");
-    }
-
-    #[test]
-    fn formats_mb_gb() {
-        assert!(human_size(5 * 1024 * 1024).ends_with("MB"));
-        assert!(human_size(2 * 1024_u64.pow(3)).ends_with("GB"));
     }
 }
