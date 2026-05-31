@@ -68,13 +68,15 @@ docs/                  architecture, jq, gh-to-fj, faq, troubleshooting
 - HTTP retry: GET/HEAD/OPTIONS/PUT/DELETE get 3 attempts with 200/400/800
   ms exponential backoff. 429 honors `Retry-After` (capped 30 s). POST
   and PATCH are never retried.
-- The simple jq projector for `fj api` lives in `cli::api_jq::extract_path`.
-  Supports `.field`, `.0`, `.[0]`, `[-1]`, and `|` pipes. See
-  `docs/jq.md`.
+- The jq-ish path engine lives in `output::json_path::extract_path`.
+  Supports `.field`, `.0`, `.[0]`, `[-1]`, and `|` pipes. See `docs/jq.md`.
+  Two consumers share it: `fj api --jq` (via `cli::api`) takes the
+  `Result` so a bad path errors; `--json-fields` maps a miss to `null`.
 - `--json-fields foo,bar` is a GLOBAL flag that applies gh-style
   projection to ANY `--json` output. Lives in
   `output::json_filter::project`, set from `cli::run`, read by
-  `output::print_json`.
+  `output::print_json`. It resolves each field through
+  `output::json_path` (null on miss).
 - All commands respect `--host` / `FJ_HOST`, `--debug` / `FJ_DEBUG`,
   `--no-pager`, `FJ_PAGER` / `PAGER`, `--json-fields`.
 - The pager is Unix-only. `output::pager::imp` is gated `#[cfg(unix)]`

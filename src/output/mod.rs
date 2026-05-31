@@ -1,4 +1,5 @@
 pub mod json_filter;
+pub mod json_path;
 pub mod pager;
 
 use std::io::IsTerminal;

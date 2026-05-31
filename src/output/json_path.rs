@@ -1,18 +1,20 @@
-//! The small jq-ish path projector behind `fj api --jq`.
+//! The one jq-ish JSON path engine, shared by both projectors:
+//! - `fj api --jq` (via `cli::api`) wants the `Result` directly, so a bad
+//!   path surfaces as an error.
+//! - `--json-fields` (via `output::json_filter`) maps a miss to `null`,
+//!   matching gh.
 //!
-//! Split out of `cli::api` to keep the request-building logic and the
-//! projection logic in separate files. `extract_path` is the only entry
-//! point; `apply_stage` / `split_segments` are private helpers.
+//! Lives under `output` so both `cli` and `output` can depend on it without
+//! inverting the module layering. Supports:
+//! - dot fields (`.a.b`)
+//! - numeric indices (`.0`, `.data.1`)
+//! - bracket indices (`.data[0]`, negative supported: `.data[-1]`)
+//! - pipes (`.foo | .bar`)
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 
-/// jq-ish projector. Supports:
-/// - dot fields (`.a.b`)
-/// - numeric indices (`.0`, `.data.1`)
-/// - bracket indices (`.data[0]`, negative supported: `.data[-1]`)
-/// - pipes (`.foo | .bar`)
-pub(crate) fn extract_path(value: &Value, expression: &str) -> Result<Value> {
+pub fn extract_path(value: &Value, expression: &str) -> Result<Value> {
     let mut current = value.clone();
     for stage in expression.split('|') {
         current = apply_stage(&current, stage.trim())?;

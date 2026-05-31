@@ -1,6 +1,5 @@
 pub mod alias;
 pub mod api;
-mod api_jq;
 pub mod auth;
 mod auth_login;
 mod auth_probe;
