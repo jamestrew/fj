@@ -193,7 +193,9 @@ fj stack new "Login Flow"             # author a stack + its first branch
 fj stack new "Login Flow" --base develop
 fj stack new "Login Flow" --from issue 123   # link an issue (best-effort title)
 fj stack new "Login Flow" --no-branch --json
-fj stack review                       # the stack + each branch's PR state
+fj stack review                       # each item: PR#, review, CI, mergeable, reviewers
+fj stack review --open                # open every PR in the browser
+fj stack review --request alice       # request alice's review on the whole stack
 fj stack sync                         # push branches + create/update PRs
 fj stack sync --draft --dry-run       # plan only (no pushes / PR writes)
 ```
