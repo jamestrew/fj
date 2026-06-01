@@ -1,8 +1,12 @@
 //! `fj work` — working-context / session-resumption commands.
 //!
-//! `work context` is implemented: it summarizes the resolved repo, the local
-//! git state (branch, dirty files, ahead/behind upstream), and any open PR for
-//! the current branch, as a table or `--json`.
+//! `work context` summarizes "where am I": repo + host, Fjord account/auth,
+//! branch + working-tree state + ahead/behind, and — best-effort over the
+//! Forgejo API — the default branch, the open PR for the branch, and its
+//! combined CI/check status, plus the current local stack (`.git/fj/
+//! stack.json`). Local data is gathered offline; the API parts degrade to
+//! `null` (with `api_reachable: false`) when the server/token is unavailable
+//! rather than failing. Table or `--json` (stable shape for integrations).
 //!
 //! `work context` also persists a local-only session to `<git-dir>/fj/
 //! session.json` (see [`work_session`](super::work_session)). `work resume`
@@ -17,8 +21,12 @@ use clap::{Args, Subcommand};
 use serde::Serialize;
 
 use crate::api;
-use crate::cli::context::{resolve_repo, RepoContext, RepoFlag};
+use crate::cli::context::RepoFlag;
+use crate::cli::stack_state::{self, StackState};
 use crate::cli::work_session::{self, PrRef, Session};
+use crate::client::Client;
+use crate::config::hosts::{AuthKind, Host, Hosts};
+use crate::git::remote::RemoteRepo;
 use crate::{git, output};
 
 #[derive(Debug, Args)]
@@ -76,23 +84,44 @@ pub async fn run(cmd: WorkCmd, host: Option<&str>) -> Result<()> {
     }
 }
 
-/// A snapshot of "where am I right now": the resolved repo, the local git
-/// state, and any open PR for the current branch. Serializes directly for
-/// `--json` (the global `--json-fields` projection still applies).
+/// A snapshot of "where am I right now". Local-only fields are always
+/// populated (offline); the Forgejo-derived fields (`default_branch`,
+/// `pull_request`, `checks`) are best-effort and left `null` when the API
+/// isn't reachable — `api_reachable` says which happened. Serializes directly
+/// for `--json` (the global `--json-fields` projection still applies); the
+/// shape is intended to be stable for future integrations.
 #[derive(Debug, Serialize)]
 struct WorkContext {
-    host: String,
-    repo: String,
-    default_branch: String,
+    /// `owner/name`, or None when not in a repo and no `-R` was given.
+    repo: Option<String>,
+    host: Option<String>,
+    account: AccountInfo,
     /// None when HEAD is detached or we're not inside a git repo.
     branch: Option<String>,
+    /// Repo default branch (Forgejo); None when the API wasn't reachable.
+    default_branch: Option<String>,
     dirty: bool,
     changed_files: usize,
     /// ahead/behind the branch's upstream; None when there is no upstream.
     ahead: Option<u32>,
     behind: Option<u32>,
-    /// The open PR whose head is the current branch, if any.
+    /// The open PR whose head is the current branch (Forgejo, best-effort).
     pull_request: Option<PrSummary>,
+    /// Latest combined CI/check status for the PR's head (best-effort).
+    checks: Option<CheckSummary>,
+    /// The current local stack, if `.git/fj/stack.json` has one.
+    stack: Option<StackSummary>,
+    /// Whether the Forgejo API was reached for this run.
+    api_reachable: bool,
+}
+
+/// The host's auth context, including the Fjord account when in Fjord mode.
+#[derive(Debug, Serialize, PartialEq)]
+struct AccountInfo {
+    /// "pat", "fjord", or None when the host isn't configured.
+    auth: Option<String>,
+    fjord_platform: Option<String>,
+    fjord_instance: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -116,6 +145,112 @@ impl PrSummary {
     }
 }
 
+#[derive(Debug, Serialize, PartialEq)]
+struct CheckSummary {
+    /// Combined state: success / pending / failure / error / "none".
+    state: String,
+    total: u64,
+    sha: String,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+struct StackSummary {
+    name: String,
+    base: String,
+    branches: Vec<String>,
+}
+
+/// Repo identity resolved offline (git remote / `-R` / configured default).
+#[derive(Debug, PartialEq)]
+struct Identity {
+    repo: Option<String>,
+    owner: Option<String>,
+    name: Option<String>,
+    host: Option<String>,
+}
+
+/// Resolve repo identity without any network or keychain access. `-R` (a
+/// `owner/name` slug) wins for the repo; the host comes from `--host`, then
+/// the git remote, then the configured default. Pure for testability.
+fn resolve_identity(
+    repo_flag: Option<&str>,
+    host_flag: Option<&str>,
+    remote: Option<&RemoteRepo>,
+    default_host: Option<&str>,
+) -> Identity {
+    let (owner, name) = match repo_flag.and_then(|s| api::split_repo(s).ok()) {
+        Some((o, n)) => (Some(o.to_string()), Some(n.to_string())),
+        None => match remote {
+            Some(r) => (Some(r.owner.clone()), Some(r.name.clone())),
+            None => (None, None),
+        },
+    };
+    let host = host_flag
+        .map(str::to_string)
+        .or_else(|| remote.map(|r| r.host.clone()))
+        .or_else(|| default_host.map(str::to_string));
+    let repo = match (&owner, &name) {
+        (Some(o), Some(n)) => Some(format!("{o}/{n}")),
+        _ => None,
+    };
+    Identity {
+        repo,
+        owner,
+        name,
+        host,
+    }
+}
+
+/// Auth/account context from the host config (offline).
+fn account_info(host: Option<&Host>) -> AccountInfo {
+    match host {
+        None => AccountInfo {
+            auth: None,
+            fjord_platform: None,
+            fjord_instance: None,
+        },
+        Some(h) => match h.auth_kind {
+            AuthKind::Pat => AccountInfo {
+                auth: Some("pat".into()),
+                fjord_platform: None,
+                fjord_instance: None,
+            },
+            AuthKind::FjordAccount => {
+                let fa = h.fjord_account.as_ref();
+                AccountInfo {
+                    auth: Some("fjord".into()),
+                    fjord_platform: fa.map(|f| f.platform_url.clone()),
+                    fjord_instance: fa.and_then(|f| f.default_instance_display_name.clone()),
+                }
+            }
+        },
+    }
+}
+
+/// Summarize a combined commit status into the compact check view.
+fn summarize_checks(cs: &api::pull::CombinedStatus) -> CheckSummary {
+    CheckSummary {
+        state: if cs.state.is_empty() {
+            "none".to_string()
+        } else {
+            cs.state.clone()
+        },
+        total: cs.total_count,
+        sha: cs.sha.clone(),
+    }
+}
+
+/// The current stack from local stack state, if one is selected.
+fn current_stack_summary(state: &StackState) -> Option<StackSummary> {
+    let name = state.current.as_ref()?;
+    let s = state.find(name)?;
+    Some(StackSummary {
+        name: s.name.clone(),
+        base: s.base.clone(),
+        branches: s.branches.clone(),
+    })
+}
+
 /// Find the open PR whose head ref matches `branch`.
 fn find_pr_for_branch<'a>(
     pulls: &'a [api::pull::Pull],
@@ -124,79 +259,150 @@ fn find_pr_for_branch<'a>(
     pulls.iter().find(|p| p.head.ref_ == branch)
 }
 
-/// Render the human-readable summary (plain text, no ANSI, so it's trivially
-/// testable). `--json` takes a different path through `print_json`.
+/// Render a compact, useful summary (plain text, no ANSI, so it's trivially
+/// testable). Absent/best-effort data is shown briefly rather than omitted so
+/// the layout is predictable. `--json` takes a different path.
 fn render_human(wc: &WorkContext) -> String {
     use std::fmt::Write;
     let mut s = String::new();
-    let _ = writeln!(s, "Repo:     {} ({})", wc.repo, wc.host);
-    let _ = writeln!(s, "Default:  {}", wc.default_branch);
-    match &wc.branch {
-        Some(b) => {
-            let state = if wc.dirty {
-                format!("{} uncommitted file(s)", wc.changed_files)
-            } else {
-                "clean".to_string()
-            };
-            let _ = writeln!(s, "Branch:   {b} ({state})");
+
+    let repo = wc.repo.as_deref().unwrap_or("(not a git repository)");
+    let host = wc.host.as_deref().unwrap_or("?");
+    let _ = writeln!(s, "Repo:    {repo} ({host})");
+
+    // Account / context line.
+    let acct = match (&wc.account.auth, &wc.account.fjord_platform) {
+        (Some(a), Some(p)) if a == "fjord" => {
+            let inst = wc
+                .account
+                .fjord_instance
+                .as_deref()
+                .unwrap_or("no instance");
+            format!("fjord — {p} [{inst}]")
         }
-        None => {
-            let _ = writeln!(s, "Branch:   (detached HEAD or not a git repo)");
-        }
-    }
+        (Some(a), _) => a.clone(),
+        (None, _) => "not signed in".to_string(),
+    };
+    let _ = writeln!(s, "Account: {acct}");
+
+    // Branch + working tree + tracking, on one compact line.
+    let branch = wc.branch.as_deref().unwrap_or("(detached)");
+    let tree = if wc.dirty {
+        format!("{} uncommitted", wc.changed_files)
+    } else {
+        "clean".to_string()
+    };
+    let default = wc.default_branch.as_deref().unwrap_or("?");
+    let mut branch_line = format!("Branch:  {branch} ({tree}; default {default})");
     if let (Some(a), Some(b)) = (wc.ahead, wc.behind) {
-        let _ = writeln!(s, "Tracking: ahead {a}, behind {b} (vs upstream)");
+        let _ = write!(branch_line, "  ↑{a} ↓{b}");
     }
+    let _ = writeln!(s, "{branch_line}");
+
+    // PR + checks.
     match &wc.pull_request {
         Some(pr) => {
-            let draft = if pr.draft { " (draft)" } else { "" };
+            let draft = if pr.draft { " draft" } else { "" };
+            let checks = match &wc.checks {
+                Some(c) => format!("  checks: {} ({})", c.state, c.total),
+                None => String::new(),
+            };
             let _ = writeln!(
                 s,
-                "PR:       #{} {} [{}]{}  {}",
-                pr.number, pr.title, pr.state, draft, pr.url
+                "PR:      #{} {} [{}{}]{}  {}",
+                pr.number, pr.title, pr.state, draft, checks, pr.url
             );
         }
-        None => {
-            let _ = writeln!(s, "PR:       (none open for this branch)");
+        None if !wc.api_reachable => {
+            let _ = writeln!(s, "PR:      (Forgejo API not reachable)");
         }
+        None => {
+            let _ = writeln!(s, "PR:      (none open for this branch)");
+        }
+    }
+
+    // Stack (only when present).
+    if let Some(st) = &wc.stack {
+        let _ = writeln!(
+            s,
+            "Stack:   {} (base {}, {} branch(es))",
+            st.name,
+            st.base,
+            st.branches.len()
+        );
     }
     s
 }
 
-/// Gather the live working context: local git state + the repo's default
-/// branch + the open PR (if any) for the current branch.
+/// Gather the working context. Local git/config/stack data is always
+/// collected (offline); the Forgejo API is best-effort and any failure
+/// (offline, no token, server down) degrades to `None` rather than erroring.
 #[cfg_attr(coverage_nightly, coverage(off))]
-async fn gather(ctx: &RepoContext) -> Result<WorkContext> {
-    let repo = api::repo::get(&ctx.client, &ctx.owner, &ctx.name).await?;
+async fn gather(repo_flag: Option<&str>, host_flag: Option<&str>) -> Result<WorkContext> {
+    // --- local, offline ---
+    let remote = git::remote::discover(host_flag).ok();
+    let hosts = Hosts::load().ok();
+    let default_host = hosts.as_ref().and_then(|h| h.current.as_deref());
+    let id = resolve_identity(repo_flag, host_flag, remote.as_ref(), default_host);
+
     let branch = git::current_branch();
     let (dirty, changed_files) = git::working_tree_status().unwrap_or((false, 0));
     let (ahead, behind) = match git::ahead_behind_upstream() {
         Some((a, b)) => (Some(a), Some(b)),
         None => (None, None),
     };
-    let pull_request = match branch.as_deref() {
-        Some(b) => {
-            let page = api::pull::list(
-                &ctx.client,
-                &ctx.owner,
-                &ctx.name,
-                api::pull::ListOptions::default(),
-            )
-            .await?;
-            find_pr_for_branch(&page.items, b).map(PrSummary::from_pull)
+    let host_cfg = hosts
+        .as_ref()
+        .zip(id.host.as_deref())
+        .and_then(|(h, name)| h.hosts.get(name));
+    let account = account_info(host_cfg);
+    let stack = stack_state::load()
+        .ok()
+        .and_then(|s| current_stack_summary(&s));
+
+    // --- Forgejo API, best-effort ---
+    let mut default_branch = None;
+    let mut pull_request = None;
+    let mut checks = None;
+    let mut api_reachable = false;
+    if let (Some(owner), Some(name)) = (id.owner.as_deref(), id.name.as_deref()) {
+        if let Ok(client) = Client::connect(host_flag) {
+            if let Ok(repo) = api::repo::get(&client, owner, name).await {
+                api_reachable = true;
+                default_branch = Some(repo.default_branch);
+                if let Some(b) = branch.as_deref() {
+                    if let Ok(page) =
+                        api::pull::list(&client, owner, name, api::pull::ListOptions::default())
+                            .await
+                    {
+                        if let Some(pr) = find_pr_for_branch(&page.items, b) {
+                            pull_request = Some(PrSummary::from_pull(pr));
+                            if let Ok(cs) =
+                                api::pull::combined_status(&client, owner, name, &pr.head.sha).await
+                            {
+                                checks = Some(summarize_checks(&cs));
+                            }
+                        }
+                    }
+                }
+            }
         }
-        None => None,
-    };
+    }
+
     Ok(WorkContext {
-        host: ctx.host.clone(),
-        repo: format!("{}/{}", ctx.owner, ctx.name),
-        default_branch: repo.default_branch,
+        repo: id.repo,
+        host: id.host,
+        account,
         branch,
+        default_branch,
         dirty,
         changed_files,
         ahead,
         behind,
         pull_request,
+        checks,
+        stack,
+        api_reachable,
     })
 }
 
@@ -212,8 +418,8 @@ fn to_session(wc: &WorkContext, remote: Option<String>, now: String) -> Session 
     );
     Session {
         saved_at: now,
-        host: wc.host.clone(),
-        repo: wc.repo.clone(),
+        host: wc.host.clone().unwrap_or_default(),
+        repo: wc.repo.clone().unwrap_or_default(),
         remote,
         branch: wc.branch.clone(),
         dirty: wc.dirty,
@@ -231,8 +437,7 @@ fn to_session(wc: &WorkContext, remote: Option<String>, now: String) -> Session 
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn context(args: ContextArgs, host: Option<&str>) -> Result<()> {
-    let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
-    let wc = gather(&ctx).await?;
+    let wc = gather(args.r.repo.as_deref(), host).await?;
 
     // Persist the session as a convenience for `work resume` / `continue`.
     // A failure to write the cache must never sink the inspect command.
@@ -341,8 +546,7 @@ async fn resume(args: ResumeArgs, host: Option<&str>) -> Result<()> {
     }
 
     // Recompute the live context so we can show what moved since the save.
-    let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
-    let fresh = gather(&ctx).await?;
+    let fresh = gather(args.r.repo.as_deref(), host).await?;
     let changes = diff_session_vs_context(&session, &fresh);
 
     if args.json {
@@ -526,10 +730,15 @@ mod tests {
 
     fn sample_context() -> WorkContext {
         WorkContext {
-            host: "git.example.com".into(),
-            repo: "o/n".into(),
-            default_branch: "main".into(),
+            repo: Some("o/n".into()),
+            host: Some("git.example.com".into()),
+            account: AccountInfo {
+                auth: Some("pat".into()),
+                fjord_platform: None,
+                fjord_instance: None,
+            },
             branch: Some("feature/x".into()),
+            default_branch: Some("main".into()),
             dirty: true,
             changed_files: 3,
             ahead: Some(2),
@@ -541,47 +750,177 @@ mod tests {
                 draft: false,
                 url: "https://x/pulls/7".into(),
             }),
+            checks: Some(CheckSummary {
+                state: "success".into(),
+                total: 3,
+                sha: "aaa".into(),
+            }),
+            stack: Some(StackSummary {
+                name: "feat".into(),
+                base: "main".into(),
+                branches: vec!["feature/x".into()],
+            }),
+            api_reachable: true,
         }
     }
 
     #[test]
-    fn render_human_includes_branch_tracking_and_pr() {
+    fn render_human_includes_branch_tracking_pr_and_stack() {
         let out = render_human(&sample_context());
         assert!(out.contains("o/n (git.example.com)"));
-        assert!(out.contains("Branch:   feature/x (3 uncommitted file(s))"));
-        assert!(out.contains("ahead 2, behind 1"));
+        assert!(out.contains("feature/x (3 uncommitted; default main)"));
+        assert!(out.contains("↑2 ↓1"));
         assert!(out.contains("#7 Add feature [open]"));
+        assert!(out.contains("checks: success (3)"));
+        assert!(out.contains("Stack:   feat (base main, 1 branch(es))"));
     }
 
     #[test]
-    fn render_human_handles_clean_detached_and_no_pr() {
+    fn render_human_degrades_when_api_unreachable() {
         let wc = WorkContext {
+            host: None,
+            account: AccountInfo {
+                auth: None,
+                fjord_platform: None,
+                fjord_instance: None,
+            },
             branch: None,
+            default_branch: None,
             dirty: false,
             changed_files: 0,
             ahead: None,
             behind: None,
             pull_request: None,
+            checks: None,
+            stack: None,
+            api_reachable: false,
             ..sample_context()
         };
         let out = render_human(&wc);
-        assert!(out.contains("detached HEAD or not a git repo"));
-        assert!(out.contains("none open for this branch"));
-        // No tracking line when ahead/behind are unknown.
-        assert!(!out.contains("Tracking:"));
+        assert!(out.contains("(detached)"));
+        assert!(out.contains("clean; default ?"));
+        assert!(out.contains("Forgejo API not reachable"));
+        assert!(out.contains("not signed in"));
+        // No stack line when there is no stack.
+        assert!(!out.contains("Stack:"));
+        // No tracking arrows when ahead/behind are unknown.
+        assert!(!out.contains('↑'));
     }
 
     #[test]
-    fn work_context_json_shape() {
+    fn work_context_json_shape_is_stable() {
         let v = serde_json::to_value(sample_context()).unwrap();
         assert_eq!(v["repo"], "o/n");
+        assert_eq!(v["host"], "git.example.com");
+        assert_eq!(v["account"]["auth"], "pat");
         assert_eq!(v["default_branch"], "main");
         assert_eq!(v["branch"], "feature/x");
         assert_eq!(v["dirty"], true);
         assert_eq!(v["changed_files"], 3);
         assert_eq!(v["ahead"], 2);
         assert_eq!(v["pull_request"]["number"], 7);
-        assert_eq!(v["pull_request"]["draft"], false);
+        assert_eq!(v["checks"]["state"], "success");
+        assert_eq!(v["checks"]["total"], 3);
+        assert_eq!(v["stack"]["name"], "feat");
+        assert_eq!(v["api_reachable"], true);
+    }
+
+    #[test]
+    fn resolve_identity_prefers_flag_repo_and_host() {
+        let remote = RemoteRepo {
+            host: "remote.host".into(),
+            owner: "ro".into(),
+            name: "rn".into(),
+        };
+        let id = resolve_identity(
+            Some("o/n"),
+            Some("flag.host"),
+            Some(&remote),
+            Some("def.host"),
+        );
+        assert_eq!(id.repo.as_deref(), Some("o/n"));
+        assert_eq!(id.owner.as_deref(), Some("o"));
+        assert_eq!(id.host.as_deref(), Some("flag.host"));
+    }
+
+    #[test]
+    fn resolve_identity_falls_back_to_remote_then_default_host() {
+        let remote = RemoteRepo {
+            host: "remote.host".into(),
+            owner: "ro".into(),
+            name: "rn".into(),
+        };
+        let id = resolve_identity(None, None, Some(&remote), Some("def.host"));
+        assert_eq!(id.repo.as_deref(), Some("ro/rn"));
+        assert_eq!(id.host.as_deref(), Some("remote.host"));
+
+        // No remote: repo unknown, host falls back to the configured default.
+        let id = resolve_identity(None, None, None, Some("def.host"));
+        assert_eq!(id.repo, None);
+        assert_eq!(id.owner, None);
+        assert_eq!(id.host.as_deref(), Some("def.host"));
+    }
+
+    #[test]
+    fn account_info_reflects_auth_kind() {
+        assert_eq!(
+            account_info(None),
+            AccountInfo {
+                auth: None,
+                fjord_platform: None,
+                fjord_instance: None
+            }
+        );
+        let pat = Host::default(); // AuthKind defaults to Pat
+        assert_eq!(account_info(Some(&pat)).auth.as_deref(), Some("pat"));
+
+        let fjord: Host = serde_json::from_value(serde_json::json!({
+            "auth_kind": "fjord_account",
+            "fjord_account": {
+                "platform_url": "https://platform.example",
+                "default_instance_display_name": "My Forge"
+            }
+        }))
+        .unwrap();
+        let a = account_info(Some(&fjord));
+        assert_eq!(a.auth.as_deref(), Some("fjord"));
+        assert_eq!(
+            a.fjord_platform.as_deref(),
+            Some("https://platform.example")
+        );
+        assert_eq!(a.fjord_instance.as_deref(), Some("My Forge"));
+    }
+
+    #[test]
+    fn summarize_checks_maps_state_and_empty() {
+        let cs: api::pull::CombinedStatus = serde_json::from_value(serde_json::json!({
+            "state": "success", "sha": "abc", "total_count": 4, "statuses": []
+        }))
+        .unwrap();
+        let c = summarize_checks(&cs);
+        assert_eq!(c.state, "success");
+        assert_eq!(c.total, 4);
+        assert_eq!(c.sha, "abc");
+
+        let empty: api::pull::CombinedStatus =
+            serde_json::from_value(serde_json::json!({ "sha": "abc" })).unwrap();
+        assert_eq!(summarize_checks(&empty).state, "none");
+    }
+
+    #[test]
+    fn current_stack_summary_reads_the_current_stack() {
+        let mut st = StackState::default();
+        assert!(current_stack_summary(&st).is_none());
+        st.add(crate::cli::stack_state::Stack {
+            name: "feat".into(),
+            base: "main".into(),
+            branches: vec!["a".into(), "b".into()],
+            created_at: "t".into(),
+        })
+        .unwrap();
+        let s = current_stack_summary(&st).unwrap();
+        assert_eq!(s.name, "feat");
+        assert_eq!(s.branches.len(), 2);
     }
 
     fn sample_session() -> Session {

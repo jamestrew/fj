@@ -171,9 +171,12 @@ Full [gh → fj mapping table](docs/gh-to-fj.md) for migrating from GitHub workf
 
 ### Work context
 
-`fj work context` summarizes where you are: the resolved repo and host, the
-current branch and whether the working tree is dirty, ahead/behind your
-upstream, and the open PR (if any) for the current branch.
+`fj work context` summarizes where you are: repo + host, your Fjord
+account/auth, the current branch, working-tree state and ahead/behind, and —
+best-effort over the Forgejo API — the default branch, the open PR for the
+branch and its CI/check status, plus the current local stack. Local data
+works offline; the API parts degrade gracefully (shown as unavailable) when
+the server or token isn't reachable.
 
 ```sh
 fj work context                   # human-readable summary
