@@ -975,8 +975,7 @@ async fn ship(args: ShipArgs, host: Option<&str>) -> Result<()> {
                 &ctx.name,
                 number,
                 style,
-                None,
-                None,
+                &api::pull::MergeOptions::default(),
             )
             .await
             {

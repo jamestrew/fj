@@ -174,6 +174,9 @@ pub struct MergeArgs {
     pub title: Option<String>,
     #[arg(long)]
     pub message: Option<String>,
+    /// Delete the head branch after the merge succeeds.
+    #[arg(long)]
+    pub delete_branch: bool,
 }
 
 #[derive(Debug, Args)]
@@ -480,8 +483,11 @@ async fn merge(args: MergeArgs, host: Option<&str>) -> Result<()> {
         &ctx.name,
         args.number,
         args.style.into(),
-        args.title.as_deref(),
-        args.message.as_deref(),
+        &api::pull::MergeOptions {
+            title: args.title.as_deref(),
+            message: args.message.as_deref(),
+            delete_branch: args.delete_branch,
+        },
     )
     .await?;
     println!("✓ Merged PR #{}", args.number);
@@ -571,5 +577,40 @@ mod tests {
     fn passes_through_synthetic_when_no_label_no_prefix() {
         let b = br("", "refs/pull/7/head");
         assert_eq!(branch_label(&b), "refs/pull/7/head");
+    }
+
+    #[test]
+    fn merge_parses_style_and_delete_branch() {
+        use crate::cli::{Cli, Command};
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "fj",
+            "pr",
+            "merge",
+            "12",
+            "--style",
+            "squash",
+            "--delete-branch",
+        ])
+        .expect("should parse");
+        match cli.command {
+            Command::Pr(PrCmd {
+                command: PrSub::Merge(a),
+            }) => {
+                assert_eq!(a.number, 12);
+                assert!(a.delete_branch);
+                assert!(matches!(a.style, MergeStyleArg::Squash));
+            }
+            other => panic!("expected pr merge, got {other:?}"),
+        }
+        // defaults: no delete, merge-commit style
+        let cli = Cli::try_parse_from(["fj", "pr", "merge", "3"]).expect("should parse");
+        if let Command::Pr(PrCmd {
+            command: PrSub::Merge(a),
+        }) = cli.command
+        {
+            assert!(!a.delete_branch);
+            assert!(matches!(a.style, MergeStyleArg::Merge));
+        }
     }
 }

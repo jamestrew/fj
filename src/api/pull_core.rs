@@ -267,6 +267,17 @@ struct MergeBody<'a> {
     title: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "MergeMessageField")]
     message: Option<&'a str>,
+    /// Delete the head branch after a successful merge (Forgejo-side).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    delete_branch_after_merge: bool,
+}
+
+/// Optional knobs for [`merge`]. Defaults: auto title/message, keep branch.
+#[derive(Debug, Clone, Default)]
+pub struct MergeOptions<'a> {
+    pub title: Option<&'a str>,
+    pub message: Option<&'a str>,
+    pub delete_branch: bool,
 }
 
 pub async fn merge(
@@ -275,14 +286,14 @@ pub async fn merge(
     name: &str,
     number: u64,
     style: MergeStyle,
-    title: Option<&str>,
-    message: Option<&str>,
+    opts: &MergeOptions<'_>,
 ) -> Result<()> {
     let path = format!("/api/v1/repos/{owner}/{name}/pulls/{number}/merge");
     let body = MergeBody {
         do_: style.as_str(),
-        title,
-        message,
+        title: opts.title,
+        message: opts.message,
+        delete_branch_after_merge: opts.delete_branch,
     };
     let res = client
         .request(

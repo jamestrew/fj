@@ -1378,8 +1378,40 @@ async fn pull_merge_posts_do_and_squash_fields() {
         "r",
         12,
         crate::api::pull::MergeStyle::Squash,
-        Some("Squashed"),
-        Some("all the things"),
+        &crate::api::pull::MergeOptions {
+            title: Some("Squashed"),
+            message: Some("all the things"),
+            delete_branch: false,
+        },
+    )
+    .await
+    .expect("merge");
+}
+
+#[tokio::test]
+async fn pull_merge_sets_delete_branch_after_merge_when_requested() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/pulls/7/merge"))
+        .and(body_json(json!({
+            "Do": "merge",
+            "delete_branch_after_merge": true
+        })))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    crate::api::pull::merge(
+        &c,
+        "o",
+        "r",
+        7,
+        crate::api::pull::MergeStyle::Merge,
+        &crate::api::pull::MergeOptions {
+            delete_branch: true,
+            ..Default::default()
+        },
     )
     .await
     .expect("merge");
