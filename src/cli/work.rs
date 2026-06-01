@@ -7,8 +7,9 @@
 //! `work context` also persists a local-only session to `<git-dir>/fj/
 //! session.json` (see [`work_session`](super::work_session)). `work resume`
 //! reads it back, shows the saved snapshot, and diffs it against a freshly
-//! gathered context. `work continue` (advancing the suggested-step cursor) is
-//! still a placeholder.
+//! gathered context. `work continue` advances the session's suggested-step
+//! cursor by one and reports what's next — advisory only, it never runs the
+//! step for you.
 
 use anyhow::{bail, Result};
 use chrono::Utc;
@@ -59,9 +60,9 @@ pub struct ResumeArgs {
 
 #[derive(Debug, Args)]
 pub struct ContinueArgs {
-    #[command(flatten)]
-    pub r: RepoFlag,
-    /// Print the planned actions and exit without mutating anything.
+    // No `-R`: `continue` walks the local session under the current git dir,
+    // so a repo target is meaningless here.
+    /// Show which step would advance, without moving the cursor.
     #[arg(long)]
     pub dry_run: bool,
 }
@@ -365,20 +366,82 @@ async fn resume(args: ResumeArgs, host: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-#[cfg_attr(coverage_nightly, coverage(off))]
-async fn continue_(args: ContinueArgs, host: Option<&str>) -> Result<()> {
-    let _ctx = resolve_repo(args.r.repo.as_deref(), host)?;
-    if args.dry_run {
-        println!("would: continue the next step of the current work session");
-        return Ok(());
-    }
-    not_implemented("work continue")
+/// Outcome of advancing the session's step cursor. Pure, so it's testable
+/// without touching disk.
+#[derive(Debug, PartialEq)]
+enum ContinueOutcome {
+    /// The cursor was already past the last step.
+    Done,
+    Advanced {
+        completed: String,
+        next: Option<String>,
+        /// 1-based position of the completed step.
+        position: usize,
+        total: usize,
+    },
 }
 
-/// Structured "not yet implemented" error for a placeholder handler.
+/// Advance the cursor one step and report what was completed and what's next.
+/// Only moves the in-memory cursor; never runs the step.
+fn advance(session: &mut Session) -> ContinueOutcome {
+    let total = session.next_steps.len();
+    if session.cursor >= total {
+        return ContinueOutcome::Done;
+    }
+    let completed = session.next_steps[session.cursor].clone();
+    let position = session.cursor + 1;
+    session.cursor += 1;
+    let next = session.next_steps.get(session.cursor).cloned();
+    ContinueOutcome::Advanced {
+        completed,
+        next,
+        position,
+        total,
+    }
+}
+
 #[cfg_attr(coverage_nightly, coverage(off))]
-fn not_implemented(command: &str) -> Result<()> {
-    bail!("`fj {command}` is not yet implemented");
+async fn continue_(args: ContinueArgs, _host: Option<&str>) -> Result<()> {
+    let Some(mut session) = work_session::load()? else {
+        bail!("no saved work session for this repo. Run `fj work context` first.");
+    };
+
+    if args.dry_run {
+        match session.next_steps.get(session.cursor) {
+            Some(step) => {
+                println!(
+                    "would: advance past step {} of {}: {step}",
+                    session.cursor + 1,
+                    session.next_steps.len()
+                );
+            }
+            None => println!("would: nothing — all suggested steps are already done"),
+        }
+        return Ok(());
+    }
+
+    match advance(&mut session) {
+        ContinueOutcome::Done => {
+            println!("All suggested steps are done. Run `fj work context` to refresh.");
+        }
+        ContinueOutcome::Advanced {
+            completed,
+            next,
+            position,
+            total,
+        } => {
+            // Persist the advanced cursor. `continue` is advisory — it never
+            // runs the step for you, it just moves the checklist forward.
+            work_session::save(&session)?;
+            println!("Step {position} of {total}: {completed}");
+            println!("(advisory — fj will not run this for you)");
+            match next {
+                Some(n) => println!("Next: {n}"),
+                None => println!("That was the last suggested step."),
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -583,5 +646,45 @@ mod tests {
         let saved = sample_session();
         let fresh = sample_context(); // same branch/tree/PR as saved derived from
         assert!(diff_session_vs_context(&saved, &fresh).is_empty());
+    }
+
+    fn session_with_steps(steps: &[&str], cursor: usize) -> Session {
+        let mut s = sample_session();
+        s.next_steps = steps.iter().map(|x| x.to_string()).collect();
+        s.cursor = cursor;
+        s
+    }
+
+    #[test]
+    fn advance_walks_steps_then_reports_done() {
+        let mut s = session_with_steps(&["commit", "push"], 0);
+
+        let first = advance(&mut s);
+        assert_eq!(
+            first,
+            ContinueOutcome::Advanced {
+                completed: "commit".into(),
+                next: Some("push".into()),
+                position: 1,
+                total: 2,
+            }
+        );
+        assert_eq!(s.cursor, 1);
+
+        let second = advance(&mut s);
+        assert_eq!(
+            second,
+            ContinueOutcome::Advanced {
+                completed: "push".into(),
+                next: None,
+                position: 2,
+                total: 2,
+            }
+        );
+        assert_eq!(s.cursor, 2);
+
+        // Past the end: Done, and the cursor does not move further.
+        assert_eq!(advance(&mut s), ContinueOutcome::Done);
+        assert_eq!(s.cursor, 2);
     }
 }
