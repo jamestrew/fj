@@ -1,51 +1,74 @@
-//! Local-only stacked-branch state, persisted at `<git-dir>/fj/stack.json`.
+//! Local-only stack metadata, persisted at `<git-dir>/fj/stack.json`.
 //!
-//! Option A from the design: the source of truth is client-side and
-//! git-native — no server state, works offline, and Forgejo needs no stack
-//! support. `stack sync` may later mirror non-authoritative context into PR
-//! descriptions, but never the other way around. Keep this schema stable;
-//! mobile/web may consume it later.
+//! Option A from the design: client-side, git-native, offline, no server
+//! state and no committed manifest (never `.fjord/stack.yml`). One stack per
+//! repo. The schema is versioned and intended to be stable for future
+//! mobile/web consumers.
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct StackState {
-    #[serde(default)]
-    pub stacks: Vec<Stack>,
-    /// Name of the active stack, if any.
-    #[serde(default)]
-    pub current: Option<String>,
-}
+/// Bump when the on-disk schema changes incompatibly.
+pub const STACK_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Stack {
+    pub version: u32,
+    /// Stable identifier (currently the slug).
+    pub id: String,
+    /// Human-readable name as given to `stack new`.
     pub name: String,
-    /// Branch the stack ultimately targets (its trunk), e.g. `main`.
+    /// Branch-safe slug derived from the name.
+    pub slug: String,
+    pub repo: RepoRef,
+    /// Branch the stack ultimately targets (its trunk).
     pub base: String,
-    /// Ordered branches in the stack, bottom to top.
-    #[serde(default)]
-    pub branches: Vec<String>,
-    /// RFC3339 creation timestamp.
     pub created_at: String,
+    pub updated_at: String,
+    /// Linked issue, if the stack was created `--from issue <n>`.
+    pub issue: Option<IssueRef>,
+    #[serde(default)]
+    pub items: Vec<StackItem>,
 }
 
-impl StackState {
-    pub fn find(&self, name: &str) -> Option<&Stack> {
-        self.stacks.iter().find(|s| s.name == name)
-    }
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RepoRef {
+    /// Absolute path to the working tree root.
+    pub path: String,
+    /// Git remote name (e.g. `origin`).
+    pub remote: String,
+    /// Remote URL.
+    pub url: String,
+    /// Host parsed from the remote.
+    pub host: String,
+}
 
-    /// Add a new stack and make it current. Errors if the name is taken.
-    pub fn add(&mut self, stack: Stack) -> Result<()> {
-        if self.find(&stack.name).is_some() {
-            bail!("a stack named '{}' already exists", stack.name);
-        }
-        self.current = Some(stack.name.clone());
-        self.stacks.push(stack);
-        Ok(())
-    }
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IssueRef {
+    pub number: u64,
+    /// Fetched best-effort; null when offline / unavailable.
+    pub title: Option<String>,
+    pub url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StackItem {
+    pub id: String,
+    pub title: String,
+    pub branch: String,
+    pub base: String,
+    pub pr: Option<ItemPr>,
+    /// `local` | `pushed` | `merged` …
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ItemPr {
+    pub number: u64,
+    pub url: String,
+    pub state: String,
 }
 
 /// Path to the stack file under a git directory (`.git/fj/stack.json`).
@@ -53,42 +76,112 @@ pub fn stack_path(git_dir: &Path) -> PathBuf {
     git_dir.join("fj").join("stack.json")
 }
 
-/// Load the stack state. Returns an empty state when not in a repo or no file
-/// exists yet; `Err` only when a present file is unreadable / corrupt.
-pub fn load() -> Result<StackState> {
+/// Load the stack for the current repo, if any. `Ok(None)` when not in a repo
+/// or no stack exists yet; `Err` only when a present file is unreadable.
+pub fn load() -> Result<Option<Stack>> {
     let Some(dir) = crate::git::git_dir() else {
-        return Ok(StackState::default());
+        return Ok(None);
     };
-    let path = stack_path(&dir);
-    match std::fs::read_to_string(&path) {
-        Ok(s) => serde_json::from_str(&s)
-            .with_context(|| format!("parsing stack file {}", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(StackState::default()),
+    load_from(&stack_path(&dir))
+}
+
+/// Load a stack from an explicit path. Testable without git/cwd.
+pub fn load_from(path: &Path) -> Result<Option<Stack>> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => Ok(Some(serde_json::from_str(&s).with_context(|| {
+            format!("parsing stack file {}", path.display())
+        })?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e).with_context(|| format!("reading stack file {}", path.display())),
     }
 }
 
-/// Persist the stack state under the git dir, creating `<git-dir>/fj/`.
-pub fn save(state: &StackState) -> Result<()> {
+/// Persist the stack under the current repo's git dir.
+pub fn save(stack: &Stack) -> Result<()> {
     let dir = crate::git::git_dir().context("not inside a git repository")?;
-    let fj_dir = dir.join("fj");
-    std::fs::create_dir_all(&fj_dir).with_context(|| format!("creating {}", fj_dir.display()))?;
-    let path = stack_path(&dir);
-    let json = serde_json::to_string_pretty(state)?;
-    std::fs::write(&path, json).with_context(|| format!("writing {}", path.display()))?;
-    Ok(())
+    save_to(&stack_path(&dir), stack)
+}
+
+/// Persist a stack to an explicit path, creating parent dirs. Testable.
+pub fn save_to(path: &Path, stack: &Stack) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let json = serde_json::to_string_pretty(stack)?;
+    std::fs::write(path, json).with_context(|| format!("writing {}", path.display()))
+}
+
+/// Lowercase, hyphen-separated, branch-safe slug derived from a name. Falls
+/// back to `stack` for empty input; capped to keep branch names sane.
+pub fn slugify(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut prev_dash = false;
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !prev_dash && !out.is_empty() {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if out.is_empty() {
+        out.push_str("stack");
+    }
+    out.chars().take(50).collect::<String>()
+}
+
+/// A branch-safe handle for branch prefixes: prefer the account login, then
+/// the local git user, then `user`. Sanitized like a slug.
+pub fn safe_handle(account: Option<&str>, git_user: Option<&str>) -> String {
+    // slugify only returns its "stack" fallback for empty / symbol-only input,
+    // so that doubles as "no usable handle here" — move to the next candidate.
+    for candidate in [account, git_user].into_iter().flatten() {
+        let s = slugify(candidate);
+        if s != "stack" {
+            return s;
+        }
+    }
+    "user".to_string()
+}
+
+/// Deterministic branch name for stack item `n` (1-based): `handle/slug-n`.
+pub fn item_branch(handle: &str, slug: &str, n: usize) -> String {
+    format!("{handle}/{slug}-{n}")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn stack(name: &str) -> Stack {
+    fn sample_stack() -> Stack {
         Stack {
-            name: name.into(),
+            version: STACK_VERSION,
+            id: "login-flow".into(),
+            name: "Login Flow".into(),
+            slug: "login-flow".into(),
+            repo: RepoRef {
+                path: "/repo".into(),
+                remote: "origin".into(),
+                url: "ssh://git@host/o/r.git".into(),
+                host: "host".into(),
+            },
             base: "main".into(),
-            branches: vec!["feature/x".into()],
             created_at: "2026-06-01T00:00:00+00:00".into(),
+            updated_at: "2026-06-01T00:00:00+00:00".into(),
+            issue: None,
+            items: vec![StackItem {
+                id: "login-flow-1".into(),
+                title: "Login Flow".into(),
+                branch: "stephen/login-flow-1".into(),
+                base: "main".into(),
+                pr: None,
+                status: "local".into(),
+            }],
         }
     }
 
@@ -101,35 +194,49 @@ mod tests {
     }
 
     #[test]
-    fn add_sets_current_and_rejects_duplicates() {
-        let mut st = StackState::default();
-        st.add(stack("a")).unwrap();
-        assert_eq!(st.current.as_deref(), Some("a"));
-        assert_eq!(st.stacks.len(), 1);
-
-        st.add(stack("b")).unwrap();
-        assert_eq!(st.current.as_deref(), Some("b"));
-        assert_eq!(st.stacks.len(), 2);
-
-        let err = st.add(stack("a")).unwrap_err();
-        assert!(err.to_string().contains("already exists"));
-        assert_eq!(st.stacks.len(), 2);
+    fn slugify_sanitizes() {
+        assert_eq!(slugify("Login Flow"), "login-flow");
+        assert_eq!(slugify("  Add  OAuth!! "), "add-oauth");
+        assert_eq!(slugify("feature/AUTH_v2"), "feature-auth-v2");
+        assert_eq!(slugify("???"), "stack");
+        assert!(slugify(&"x".repeat(100)).len() <= 50);
     }
 
     #[test]
-    fn find_locates_by_name() {
-        let mut st = StackState::default();
-        st.add(stack("a")).unwrap();
-        assert!(st.find("a").is_some());
-        assert!(st.find("missing").is_none());
+    fn safe_handle_precedence_and_sanitization() {
+        // account login wins
+        assert_eq!(safe_handle(Some("stephen"), Some("Stephen Way")), "stephen");
+        // falls back to git user, sanitized
+        assert_eq!(safe_handle(None, Some("Stephen Way")), "stephen-way");
+        // empty/symbol inputs fall through to "user"
+        assert_eq!(safe_handle(Some("  "), None), "user");
+        assert_eq!(safe_handle(None, None), "user");
+    }
+
+    #[test]
+    fn item_branch_is_deterministic() {
+        assert_eq!(
+            item_branch("stephen", "login-flow", 1),
+            "stephen/login-flow-1"
+        );
+        assert_eq!(item_branch("user", "x", 3), "user/x-3");
     }
 
     #[test]
     fn round_trips_through_json() {
-        let mut st = StackState::default();
-        st.add(stack("a")).unwrap();
-        let json = serde_json::to_string(&st).unwrap();
-        let back: StackState = serde_json::from_str(&json).unwrap();
-        assert_eq!(st, back);
+        let s = sample_stack();
+        let json = serde_json::to_string(&s).unwrap();
+        let back: Stack = serde_json::from_str(&json).unwrap();
+        assert_eq!(s, back);
+    }
+
+    #[test]
+    fn save_to_then_load_from_roundtrips_and_missing_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fj").join("stack.json");
+        assert!(load_from(&path).unwrap().is_none()); // missing -> None
+        let s = sample_stack();
+        save_to(&path, &s).unwrap();
+        assert_eq!(load_from(&path).unwrap().unwrap(), s);
     }
 }

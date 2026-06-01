@@ -1,21 +1,24 @@
 //! `fj stack` — stacked-branch / stacked-PR management.
 //!
 //! Stack state is local and git-native (`<git-dir>/fj/stack.json`, see
-//! [`stack_state`](super::stack_state)) — no server state, offline-capable.
-//! `stack new` (records a stack rooted at the current branch) and `stack
-//! review` (shows the stack + each branch's PR state) are implemented.
+//! [`stack_state`](super::stack_state)) — no server state, offline-capable,
+//! never a committed manifest. `stack new` (author a stack) and `stack
+//! review` (show the stack + each branch's PR state) are implemented.
 //! `sync` / `split` / `absorb` / `ship` are still placeholders (dry-run plan,
 //! else a structured "not yet implemented" error); the chain rebases land in
 //! follow-up PRs.
 
-use anyhow::{bail, Context, Result};
+use std::path::{Path, PathBuf};
+
+use anyhow::{bail, Result};
 use chrono::Utc;
 use clap::{Args, Subcommand};
 use serde::Serialize;
 
 use crate::api;
 use crate::cli::context::{resolve_repo, RepoFlag};
-use crate::cli::stack_state::{self, Stack};
+use crate::cli::stack_state::{self, IssueRef, RepoRef, Stack, StackItem, STACK_VERSION};
+use crate::client::Client;
 use crate::{git, output};
 
 #[derive(Debug, Args)]
@@ -43,14 +46,24 @@ pub enum StackSub {
 #[derive(Debug, Args)]
 pub struct NewArgs {
     // No `-R`: stack state is local to the current git dir.
-    /// Name for the new stack (defaults to the current branch name).
-    pub name: Option<String>,
-    /// Branch the stack targets (its trunk).
-    #[arg(long, default_value = "main")]
-    pub base: String,
-    /// Print the planned actions and exit without writing anything.
+    /// Human-readable stack name; the slug and branch names derive from it.
+    pub name: String,
+    /// Base branch the stack targets. Defaults to the repo's default branch
+    /// (when reachable), else `main`.
     #[arg(long)]
-    pub dry_run: bool,
+    pub base: Option<String>,
+    /// Link the stack to an issue, e.g. `--from issue 123`.
+    #[arg(long, num_args = 2, value_names = ["TYPE", "ID"])]
+    pub from: Option<Vec<String>>,
+    /// Create the stack metadata only; don't create the first branch.
+    #[arg(long)]
+    pub no_branch: bool,
+    /// Emit JSON instead of a human summary.
+    #[arg(long)]
+    pub json: bool,
+    /// Replace an existing stack file (never deletes git branches).
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Debug, Args)]
@@ -75,9 +88,6 @@ pub struct SplitArgs {
 pub struct ReviewArgs {
     #[command(flatten)]
     pub r: RepoFlag,
-    /// Stack to review (defaults to the current stack).
-    #[arg(long)]
-    pub name: Option<String>,
     /// Emit JSON instead of a table (honors the global `--json-fields`).
     #[arg(long)]
     pub json: bool,
@@ -113,112 +123,258 @@ pub async fn run(cmd: StackCmd, host: Option<&str>) -> Result<()> {
     }
 }
 
-/// Shared "scaffolding only" exit for a mutating subcommand: print a dry-run
-/// plan and stop when `--dry-run` is set, otherwise bail with a structured
-/// not-yet-implemented error. The `plan` is the human-readable action line.
-fn placeholder_mutation(plan: &str, command: &str, dry_run: bool) -> Result<()> {
-    println!("would: {plan}");
-    if dry_run {
-        return Ok(());
-    }
-    bail!("`fj stack {command}` is not yet implemented");
+// ── stack new ────────────────────────────────────────────────────────────
+
+/// Require being inside a git repo. Pure over the detected git dir.
+fn require_git_repo(git_dir: Option<PathBuf>) -> Result<PathBuf> {
+    git_dir.ok_or_else(|| anyhow::anyhow!("not inside a git repository"))
 }
 
-#[cfg_attr(coverage_nightly, coverage(off))]
-async fn new(args: NewArgs, _host: Option<&str>) -> Result<()> {
-    // Local-only: record metadata under <git-dir>/fj/stack.json. No network,
-    // no git branch creation yet (that comes with sync/split).
-    let branch = git::current_branch()
-        .context("not on a branch (detached HEAD); check out a branch first")?;
-    let name = args.name.clone().unwrap_or_else(|| branch.clone());
-
-    let mut state = stack_state::load()?;
-    if state.find(&name).is_some() {
-        bail!("a stack named '{name}' already exists");
-    }
-
-    if args.dry_run {
-        println!(
-            "would: create stack '{name}' (base {}) tracking branch '{branch}'",
-            args.base
+/// Refuse to clobber an existing stack file unless `--force`.
+fn guard_overwrite(exists: bool, force: bool) -> Result<()> {
+    if exists && !force {
+        bail!(
+            "a stack already exists for this repo (use --force to replace it; branches are kept)"
         );
-        return Ok(());
     }
-
-    state.add(Stack {
-        name: name.clone(),
-        base: args.base.clone(),
-        branches: vec![branch.clone()],
-        created_at: Utc::now().to_rfc3339(),
-    })?;
-    stack_state::save(&state)?;
-    println!(
-        "✓ Created stack '{name}' (base {}) tracking '{branch}'",
-        args.base
-    );
     Ok(())
 }
 
-#[cfg_attr(coverage_nightly, coverage(off))]
-async fn sync(args: SyncArgs, host: Option<&str>) -> Result<()> {
-    let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
-    let plan = format!(
-        "sync the stack in {}/{} with its base branch",
-        ctx.owner, ctx.name
-    );
-    placeholder_mutation(&plan, "sync", args.dry_run)
+/// Parse `--from <TYPE> <ID>`; only `issue` is supported for now.
+fn parse_from(from: Option<&[String]>) -> Result<Option<u64>> {
+    match from {
+        None => Ok(None),
+        Some(parts) => {
+            let kind = parts.first().map(String::as_str).unwrap_or("");
+            if !kind.eq_ignore_ascii_case("issue") {
+                bail!("`--from {kind} …` is not supported; only `--from issue <number>`");
+            }
+            let raw = parts.get(1).map(String::as_str).unwrap_or("");
+            let number: u64 = raw
+                .parse()
+                .map_err(|_| anyhow::anyhow!("`--from issue <number>`: '{raw}' is not a number"))?;
+            Ok(Some(number))
+        }
+    }
+}
+
+/// Build the linked-issue record. `fetched` is `(title, url)` when the API
+/// returned the issue; `None` (offline / unavailable) keeps them null.
+fn issue_ref_from(number: u64, fetched: Option<(String, String)>) -> IssueRef {
+    IssueRef {
+        number,
+        title: fetched.as_ref().map(|(t, _)| t.clone()),
+        url: fetched.map(|(_, u)| u),
+    }
+}
+
+/// Assemble the stack from resolved inputs. Pure: all I/O (git, API, clock)
+/// happens in the caller, so this is fully testable.
+fn build_stack(
+    name: &str,
+    base: &str,
+    repo: RepoRef,
+    issue: Option<IssueRef>,
+    handle: &str,
+    no_branch: bool,
+    now: &str,
+) -> Stack {
+    let slug = stack_state::slugify(name);
+    let items = if no_branch {
+        Vec::new()
+    } else {
+        vec![StackItem {
+            id: format!("{slug}-1"),
+            title: name.to_string(),
+            branch: stack_state::item_branch(handle, &slug, 1),
+            base: base.to_string(),
+            pr: None,
+            status: "local".to_string(),
+        }]
+    };
+    Stack {
+        version: STACK_VERSION,
+        id: slug.clone(),
+        name: name.to_string(),
+        slug,
+        repo,
+        base: base.to_string(),
+        created_at: now.to_string(),
+        updated_at: now.to_string(),
+        issue,
+        items,
+    }
+}
+
+/// Human summary for `stack new`.
+fn render_new(stack: &Stack, path: &Path, branch: Option<&str>) -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    let _ = writeln!(s, "✓ Created stack \"{}\" ({})", stack.name, stack.slug);
+    let _ = writeln!(s, "  base:     {}", stack.base);
+    let _ = writeln!(s, "  metadata: {}", path.display());
+    match branch {
+        Some(b) => {
+            let _ = writeln!(s, "  branch:   {b}");
+        }
+        None => {
+            let _ = writeln!(s, "  branch:   none (--no-branch)");
+        }
+    }
+    if let Some(issue) = &stack.issue {
+        match &issue.title {
+            Some(t) => {
+                let _ = writeln!(s, "  issue:    #{} {}", issue.number, t);
+            }
+            None => {
+                let _ = writeln!(s, "  issue:    #{} (title unavailable)", issue.number);
+            }
+        }
+    }
+    let _ = writeln!(s, "Next: fj stack sync");
+    s
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
-async fn split(args: SplitArgs, host: Option<&str>) -> Result<()> {
-    let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
-    let plan = format!(
-        "split the current change in {}/{} into stacked entries",
-        ctx.owner, ctx.name
+async fn new(args: NewArgs, host: Option<&str>) -> Result<()> {
+    let git_dir = require_git_repo(git::git_dir())?;
+    let path = stack_state::stack_path(&git_dir);
+    guard_overwrite(path.exists(), args.force)?;
+
+    let issue_number = parse_from(args.from.as_deref())?;
+
+    // Repo identity — offline (git remote / `-R`-less detection).
+    let detected = git::remote::discover(host).ok();
+    let (remote_name, url) =
+        git::primary_remote().unwrap_or_else(|| ("origin".into(), String::new()));
+    let repo_root = git::output(&["rev-parse", "--show-toplevel"])
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let repo_ref = RepoRef {
+        path: repo_root,
+        remote: remote_name,
+        url,
+        host: detected
+            .as_ref()
+            .map(|r| r.host.clone())
+            .unwrap_or_default(),
+    };
+
+    // Best-effort Forgejo: default branch, account login, linked issue.
+    let owner_name = detected.as_ref().map(|r| (r.owner.clone(), r.name.clone()));
+    let mut default_branch = None;
+    let mut account_login = None;
+    let mut issue_fetched = None;
+    if let Some((owner, name)) = &owner_name {
+        if let Ok(client) = Client::connect(host) {
+            if args.base.is_none() {
+                default_branch = api::repo::get(&client, owner, name)
+                    .await
+                    .ok()
+                    .map(|r| r.default_branch);
+            }
+            account_login = api::user::current(&client).await.ok().map(|u| u.login);
+            if let Some(n) = issue_number {
+                issue_fetched = api::issue::get(&client, owner, name, n)
+                    .await
+                    .ok()
+                    .map(|i| (i.title, i.html_url));
+            }
+        }
+    }
+
+    let base = args
+        .base
+        .clone()
+        .or(default_branch)
+        .unwrap_or_else(|| "main".to_string());
+    let issue = issue_number.map(|n| issue_ref_from(n, issue_fetched));
+    let git_user = git::output(&["config", "user.name"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let handle = stack_state::safe_handle(account_login.as_deref(), git_user.as_deref());
+
+    let now = Utc::now().to_rfc3339();
+    let stack = build_stack(
+        &args.name,
+        &base,
+        repo_ref,
+        issue,
+        &handle,
+        args.no_branch,
+        &now,
     );
-    placeholder_mutation(&plan, "split", args.dry_run)
+
+    // Create the first branch unless --no-branch (or it already exists).
+    let created_branch = match stack.items.first() {
+        Some(item) => {
+            if !git::rev_exists(&format!("refs/heads/{}", item.branch)) {
+                let start = if git::rev_exists(&base) {
+                    Some(base.as_str())
+                } else {
+                    None
+                };
+                git::create_branch(&item.branch, start)?;
+            }
+            Some(item.branch.clone())
+        }
+        None => None,
+    };
+
+    stack_state::save(&stack)?;
+
+    if args.json {
+        return output::print_json(&serde_json::to_value(&stack)?);
+    }
+    print!("{}", render_new(&stack, &path, created_branch.as_deref()));
+    Ok(())
 }
 
-/// A stack plus the PR state of each of its branches. Serializes for `--json`.
+// ── stack review ───────────────────────────────────────────────────────────
+
+/// A stack plus the live PR state of each of its items. Serializes for JSON.
 #[derive(Debug, Serialize)]
 struct StackReview {
     name: String,
     base: String,
-    current: bool,
     entries: Vec<StackEntryView>,
 }
 
 #[derive(Debug, Serialize)]
 struct StackEntryView {
     branch: String,
+    title: String,
     pull_request: Option<EntryPr>,
 }
 
 #[derive(Debug, Serialize)]
 struct EntryPr {
     number: u64,
-    title: String,
     state: String,
     draft: bool,
     url: String,
 }
 
-/// Build the review view by matching each stack branch to its open PR (by
-/// head ref). Pure — takes the already-fetched PR list.
-fn build_review(stack: &Stack, pulls: &[api::pull::Pull], is_current: bool) -> StackReview {
+/// Build the review view by matching each stack item's branch to its open PR.
+/// Pure — takes the already-fetched PR list.
+fn build_review(stack: &Stack, pulls: &[api::pull::Pull]) -> StackReview {
     let entries = stack
-        .branches
+        .items
         .iter()
-        .map(|b| {
-            let pull_request = pulls.iter().find(|p| p.head.ref_ == *b).map(|p| EntryPr {
-                number: p.number,
-                title: p.title.clone(),
-                state: p.state.clone(),
-                draft: p.draft,
-                url: p.html_url.clone(),
-            });
+        .map(|item| {
+            let pull_request = pulls
+                .iter()
+                .find(|p| p.head.ref_ == item.branch)
+                .map(|p| EntryPr {
+                    number: p.number,
+                    state: p.state.clone(),
+                    draft: p.draft,
+                    url: p.html_url.clone(),
+                });
             StackEntryView {
-                branch: b.clone(),
+                branch: item.branch.clone(),
+                title: item.title.clone(),
                 pull_request,
             }
         })
@@ -226,7 +382,6 @@ fn build_review(stack: &Stack, pulls: &[api::pull::Pull], is_current: bool) -> S
     StackReview {
         name: stack.name.clone(),
         base: stack.base.clone(),
-        current: is_current,
         entries,
     }
 }
@@ -235,8 +390,7 @@ fn build_review(stack: &Stack, pulls: &[api::pull::Pull], is_current: bool) -> S
 fn render_review(r: &StackReview) -> String {
     use std::fmt::Write;
     let mut s = String::new();
-    let marker = if r.current { "  (current)" } else { "" };
-    let _ = writeln!(s, "Stack: {}{}   base: {}", r.name, marker, r.base);
+    let _ = writeln!(s, "Stack: {}   base: {}", r.name, r.base);
     if r.entries.is_empty() {
         let _ = writeln!(s, "  (no branches tracked yet)");
         return s;
@@ -257,18 +411,9 @@ fn render_review(r: &StackReview) -> String {
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn review(args: ReviewArgs, host: Option<&str>) -> Result<()> {
-    let state = stack_state::load()?;
-    if state.stacks.is_empty() {
-        bail!("no stacks yet. Run `fj stack new` to start one.");
-    }
-    let name = match args.name.clone().or_else(|| state.current.clone()) {
-        Some(n) => n,
-        None => bail!("no current stack; pass --name or run `fj stack new`"),
+    let Some(stack) = stack_state::load()? else {
+        bail!("no stack for this repo. Run `fj stack new` to start one.");
     };
-    let stack = state
-        .find(&name)
-        .with_context(|| format!("no stack named '{name}'"))?;
-
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     let page = api::pull::list(
         &ctx.client,
@@ -277,14 +422,46 @@ async fn review(args: ReviewArgs, host: Option<&str>) -> Result<()> {
         api::pull::ListOptions::default(),
     )
     .await?;
-    let is_current = state.current.as_deref() == Some(name.as_str());
-    let review = build_review(stack, &page.items, is_current);
+    let review = build_review(&stack, &page.items);
 
     if args.json {
         return output::print_json(&serde_json::to_value(&review)?);
     }
     print!("{}", render_review(&review));
     Ok(())
+}
+
+// ── placeholders ─────────────────────────────────────────────────────────
+
+/// Shared "scaffolding only" exit for a mutating subcommand: print a dry-run
+/// plan and stop when `--dry-run` is set, otherwise bail with a structured
+/// not-yet-implemented error. The `plan` is the human-readable action line.
+fn placeholder_mutation(plan: &str, command: &str, dry_run: bool) -> Result<()> {
+    println!("would: {plan}");
+    if dry_run {
+        return Ok(());
+    }
+    bail!("`fj stack {command}` is not yet implemented");
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn sync(args: SyncArgs, host: Option<&str>) -> Result<()> {
+    let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
+    let plan = format!(
+        "sync the stack in {}/{} with its base branch",
+        ctx.owner, ctx.name
+    );
+    placeholder_mutation(&plan, "sync", args.dry_run)
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn split(args: SplitArgs, host: Option<&str>) -> Result<()> {
+    let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
+    let plan = format!(
+        "split the current change in {}/{} into stacked entries",
+        ctx.owner, ctx.name
+    );
+    placeholder_mutation(&plan, "split", args.dry_run)
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -315,74 +492,53 @@ mod tests {
 
     #[test]
     fn stack_subtree_is_internally_consistent() {
-        // Structural smoke check over the whole derived tree, including this
-        // group. clap only runs these checks behind debug_assert.
         Cli::command().debug_assert();
     }
 
+    // ---- arg parsing ----
+
     #[test]
-    fn new_parses_name_base_and_dry_run() {
+    fn new_parses_name_base_from_and_flags() {
         let cli = Cli::try_parse_from([
             "fj",
             "stack",
             "new",
-            "feature",
+            "Login Flow",
             "--base",
             "develop",
-            "--dry-run",
+            "--from",
+            "issue",
+            "123",
+            "--no-branch",
+            "--json",
+            "--force",
         ])
         .expect("should parse");
         match cli.command {
             Command::Stack(StackCmd {
                 command: StackSub::New(a),
             }) => {
-                assert!(a.dry_run);
-                assert_eq!(a.name.as_deref(), Some("feature"));
-                assert_eq!(a.base, "develop");
+                assert_eq!(a.name, "Login Flow");
+                assert_eq!(a.base.as_deref(), Some("develop"));
+                assert_eq!(
+                    a.from.as_deref(),
+                    Some(&["issue".to_string(), "123".to_string()][..])
+                );
+                assert!(a.no_branch);
+                assert!(a.json);
+                assert!(a.force);
             }
             other => panic!("expected stack new, got {other:?}"),
         }
     }
 
     #[test]
-    fn new_name_optional_and_base_defaults_to_main() {
-        let cli = Cli::try_parse_from(["fj", "stack", "new"]).expect("should parse");
-        match cli.command {
-            Command::Stack(StackCmd {
-                command: StackSub::New(a),
-            }) => {
-                assert!(a.name.is_none());
-                assert!(!a.dry_run);
-                assert_eq!(a.base, "main");
-            }
-            other => panic!("expected stack new, got {other:?}"),
-        }
+    fn new_requires_a_name() {
+        assert!(Cli::try_parse_from(["fj", "stack", "new"]).is_err());
     }
 
     #[test]
-    fn sync_parses_dry_run_flag() {
-        let cli = Cli::try_parse_from(["fj", "stack", "sync", "--dry-run"]).expect("should parse");
-        match cli.command {
-            Command::Stack(StackCmd {
-                command: StackSub::Sync(a),
-            }) => assert!(a.dry_run),
-            other => panic!("expected stack sync, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn split_parses_dry_run_flag() {
-        let cli = Cli::try_parse_from(["fj", "stack", "split", "--dry-run"]).expect("should parse");
-        match cli.command {
-            Command::Stack(StackCmd {
-                command: StackSub::Split(a),
-            }) => assert!(a.dry_run),
-            other => panic!("expected stack split, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn review_parses_json_flag_and_repo() {
+    fn review_parses_json_and_repo() {
         let cli = Cli::try_parse_from(["fj", "stack", "review", "--json", "-R", "o/n"])
             .expect("should parse");
         match cli.command {
@@ -397,42 +553,180 @@ mod tests {
     }
 
     #[test]
-    fn absorb_parses_dry_run_flag() {
-        let cli =
-            Cli::try_parse_from(["fj", "stack", "absorb", "--dry-run"]).expect("should parse");
-        match cli.command {
+    fn sync_parses_dry_run_flag() {
+        let cli = Cli::try_parse_from(["fj", "stack", "sync", "--dry-run"]).expect("should parse");
+        assert!(matches!(
+            cli.command,
             Command::Stack(StackCmd {
-                command: StackSub::Absorb(a),
-            }) => assert!(a.dry_run),
-            other => panic!("expected stack absorb, got {other:?}"),
+                command: StackSub::Sync(SyncArgs { dry_run: true, .. })
+            })
+        ));
+    }
+
+    // ---- guards ----
+
+    #[test]
+    fn require_git_repo_errors_without_a_repo() {
+        assert!(require_git_repo(None).is_err());
+        assert_eq!(
+            require_git_repo(Some(PathBuf::from("/x/.git"))).unwrap(),
+            PathBuf::from("/x/.git")
+        );
+    }
+
+    #[test]
+    fn guard_overwrite_blocks_existing_unless_forced() {
+        assert!(guard_overwrite(false, false).is_ok()); // no file -> ok
+        assert!(guard_overwrite(true, false).is_err()); // file, no force -> err
+        assert!(guard_overwrite(true, true).is_ok()); // file + force -> ok
+    }
+
+    #[test]
+    fn parse_from_validates_issue() {
+        assert_eq!(parse_from(None).unwrap(), None);
+        assert_eq!(
+            parse_from(Some(&["issue".into(), "123".into()])).unwrap(),
+            Some(123)
+        );
+        assert!(parse_from(Some(&["pr".into(), "1".into()])).is_err());
+        assert!(parse_from(Some(&["issue".into(), "nope".into()])).is_err());
+    }
+
+    #[test]
+    fn issue_ref_from_handles_success_and_unavailable() {
+        let ok = issue_ref_from(123, Some(("Title".into(), "https://x/i/123".into())));
+        assert_eq!(ok.number, 123);
+        assert_eq!(ok.title.as_deref(), Some("Title"));
+        assert_eq!(ok.url.as_deref(), Some("https://x/i/123"));
+
+        let degraded = issue_ref_from(123, None);
+        assert_eq!(degraded.number, 123);
+        assert!(degraded.title.is_none());
+        assert!(degraded.url.is_none());
+    }
+
+    // ---- build_stack ----
+
+    fn repo_ref() -> RepoRef {
+        RepoRef {
+            path: "/repo".into(),
+            remote: "origin".into(),
+            url: "ssh://git@host/o/r.git".into(),
+            host: "host".into(),
         }
     }
 
     #[test]
-    fn ship_parses_dry_run_flag() {
-        let cli = Cli::try_parse_from(["fj", "stack", "ship", "--dry-run"]).expect("should parse");
-        match cli.command {
-            Command::Stack(StackCmd {
-                command: StackSub::Ship(a),
-            }) => assert!(a.dry_run),
-            other => panic!("expected stack ship, got {other:?}"),
-        }
+    fn build_stack_happy_path() {
+        let s = build_stack(
+            "Login Flow",
+            "main",
+            repo_ref(),
+            None,
+            "stephen",
+            false,
+            "2026-06-01T00:00:00+00:00",
+        );
+        assert_eq!(s.version, STACK_VERSION);
+        assert_eq!(s.name, "Login Flow");
+        assert_eq!(s.slug, "login-flow");
+        assert_eq!(s.id, "login-flow");
+        assert_eq!(s.base, "main");
+        assert_eq!(s.created_at, s.updated_at);
+        assert!(s.issue.is_none());
+        assert_eq!(s.items.len(), 1);
+        let item = &s.items[0];
+        assert_eq!(item.id, "login-flow-1");
+        assert_eq!(item.title, "Login Flow");
+        assert_eq!(item.branch, "stephen/login-flow-1");
+        assert_eq!(item.base, "main");
+        assert!(item.pr.is_none());
+        assert_eq!(item.status, "local");
     }
 
     #[test]
-    fn review_parses_name_and_json() {
-        let cli = Cli::try_parse_from(["fj", "stack", "review", "--name", "feat", "--json"])
-            .expect("should parse");
-        match cli.command {
-            Command::Stack(StackCmd {
-                command: StackSub::Review(a),
-            }) => {
-                assert_eq!(a.name.as_deref(), Some("feat"));
-                assert!(a.json);
-            }
-            other => panic!("expected stack review, got {other:?}"),
-        }
+    fn build_stack_custom_base_and_no_branch() {
+        let s = build_stack(
+            "Login Flow",
+            "develop",
+            repo_ref(),
+            None,
+            "stephen",
+            true,
+            "t",
+        );
+        assert_eq!(s.base, "develop");
+        // --no-branch -> empty items (no first branch authored yet).
+        assert!(s.items.is_empty());
     }
+
+    #[test]
+    fn build_stack_with_linked_issue() {
+        let issue = issue_ref_from(7, Some(("Add login".into(), "https://x/i/7".into())));
+        let s = build_stack("Login", "main", repo_ref(), Some(issue), "user", false, "t");
+        let i = s.issue.unwrap();
+        assert_eq!(i.number, 7);
+        assert_eq!(i.title.as_deref(), Some("Add login"));
+    }
+
+    #[test]
+    fn new_json_shape_is_stable() {
+        let issue = issue_ref_from(123, None);
+        let s = build_stack(
+            "Login Flow",
+            "main",
+            repo_ref(),
+            Some(issue),
+            "stephen",
+            false,
+            "2026-06-01T00:00:00+00:00",
+        );
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["version"], 1);
+        assert_eq!(v["id"], "login-flow");
+        assert_eq!(v["name"], "Login Flow");
+        assert_eq!(v["slug"], "login-flow");
+        assert_eq!(v["repo"]["remote"], "origin");
+        assert_eq!(v["repo"]["host"], "host");
+        assert_eq!(v["base"], "main");
+        assert_eq!(v["issue"]["number"], 123);
+        assert!(v["issue"]["title"].is_null());
+        assert_eq!(v["items"][0]["branch"], "stephen/login-flow-1");
+        assert_eq!(v["items"][0]["status"], "local");
+        assert!(v["items"][0]["pr"].is_null());
+    }
+
+    #[test]
+    fn render_new_mentions_branch_base_and_next() {
+        let s = build_stack(
+            "Login Flow",
+            "main",
+            repo_ref(),
+            None,
+            "stephen",
+            false,
+            "t",
+        );
+        let out = render_new(
+            &s,
+            Path::new("/repo/.git/fj/stack.json"),
+            Some("stephen/login-flow-1"),
+        );
+        assert!(out.contains("Created stack \"Login Flow\" (login-flow)"));
+        assert!(out.contains("base:     main"));
+        assert!(out.contains("/repo/.git/fj/stack.json"));
+        assert!(out.contains("branch:   stephen/login-flow-1"));
+        assert!(out.contains("Next: fj stack sync"));
+    }
+
+    #[test]
+    fn render_new_no_branch() {
+        let s = build_stack("X", "main", repo_ref(), None, "u", true, "t");
+        let out = render_new(&s, Path::new("/p"), None);
+        assert!(out.contains("branch:   none (--no-branch)"));
+    }
+
+    // ---- review ----
 
     fn pull_with_head(number: u64, head: &str, state: &str) -> api::pull::Pull {
         serde_json::from_value(serde_json::json!({
@@ -448,27 +742,42 @@ mod tests {
         .unwrap()
     }
 
-    fn sample_stack() -> Stack {
+    fn stack_with_branches(branches: &[&str]) -> Stack {
+        let items = branches
+            .iter()
+            .enumerate()
+            .map(|(i, b)| StackItem {
+                id: format!("feat-{}", i + 1),
+                title: format!("Item {}", i + 1),
+                branch: b.to_string(),
+                base: "main".into(),
+                pr: None,
+                status: "local".into(),
+            })
+            .collect();
         Stack {
+            version: STACK_VERSION,
+            id: "feat".into(),
             name: "feat".into(),
+            slug: "feat".into(),
+            repo: repo_ref(),
             base: "main".into(),
-            branches: vec!["feature/a".into(), "feature/b".into()],
-            created_at: "2026-06-01T00:00:00+00:00".into(),
+            created_at: "t".into(),
+            updated_at: "t".into(),
+            issue: None,
+            items,
         }
     }
 
     #[test]
-    fn build_review_matches_branches_to_prs() {
+    fn build_review_matches_items_to_prs() {
         let pulls = vec![
             pull_with_head(7, "feature/a", "open"),
             pull_with_head(9, "other", "open"),
         ];
-        let r = build_review(&sample_stack(), &pulls, true);
+        let r = build_review(&stack_with_branches(&["feature/a", "feature/b"]), &pulls);
         assert_eq!(r.name, "feat");
-        assert_eq!(r.base, "main");
-        assert!(r.current);
         assert_eq!(r.entries.len(), 2);
-        // feature/a has PR #7; feature/b has none.
         assert_eq!(r.entries[0].pull_request.as_ref().unwrap().number, 7);
         assert!(r.entries[1].pull_request.is_none());
     }
@@ -476,20 +785,12 @@ mod tests {
     #[test]
     fn render_review_shows_branches_and_pr_state() {
         let pulls = vec![pull_with_head(7, "feature/a", "open")];
-        let out = render_review(&build_review(&sample_stack(), &pulls, true));
-        assert!(out.contains("Stack: feat  (current)   base: main"));
+        let out = render_review(&build_review(
+            &stack_with_branches(&["feature/a", "feature/b"]),
+            &pulls,
+        ));
+        assert!(out.contains("Stack: feat   base: main"));
         assert!(out.contains("feature/a  #7 [open]"));
         assert!(out.contains("feature/b  (no PR)"));
-    }
-
-    #[test]
-    fn build_review_json_shape() {
-        let pulls = vec![pull_with_head(7, "feature/a", "open")];
-        let v = serde_json::to_value(build_review(&sample_stack(), &pulls, false)).unwrap();
-        assert_eq!(v["name"], "feat");
-        assert_eq!(v["current"], false);
-        assert_eq!(v["entries"][0]["branch"], "feature/a");
-        assert_eq!(v["entries"][0]["pull_request"]["number"], 7);
-        assert!(v["entries"][1]["pull_request"].is_null());
     }
 }
