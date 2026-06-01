@@ -162,7 +162,7 @@ has its own `--help`. Highlights:
 | `extension` | discover and run `fj-<name>` plugins on PATH                                    |
 | `api`       | raw HTTP with `-X`, `-f`, `-F`, `-H`, `-q`, `--paginate`, `--include`           |
 | `work`      | working-context / session: context; resume, continue _(preview)_               |
-| `stack`     | stacked branches / PRs: new, sync, split, review, absorb, ship _(preview)_      |
+| `stack`     | stacked branches / PRs: new, review; sync, split, absorb, ship _(preview)_      |
 | `agent`     | AI-assisted code ops: review, fix, explain _(preview)_                          |
 | `completion`| shell completions (bash, zsh, fish, powershell, elvish)                         |
 | `man`       | generate man pages                                                              |
@@ -183,22 +183,34 @@ fj work context                   # human-readable summary
 fj work context --json            # same, as JSON (honors --json-fields)
 ```
 
-### Preview: the rest of `work`, plus `stack` and `agent`
+### Stacks
 
-`work resume`/`continue`, all of `stack`, and all of `agent` are scaffolded:
-the command tree, `--help`, argument parsing, `--json` (inspect) and
-`--dry-run` (mutating) are wired, but the handlers are placeholders that
-return a structured "not yet implemented" error. `--dry-run` prints the
-planned actions and exits cleanly so you can see the shape today.
+Stacked branches/PRs, tracked locally and git-natively in
+`.git/fj/stack.json` (no server state, no committed manifest).
 
 ```sh
-fj stack new my-feature --dry-run # plan a new stack
-fj stack review --json            # stack + review state as JSON
-fj stack ship --dry-run           # plan shipping the ready entries
+fj stack new "Login Flow"             # author a stack + its first branch
+fj stack new "Login Flow" --base develop
+fj stack new "Login Flow" --from issue 123   # link an issue (best-effort title)
+fj stack new "Login Flow" --no-branch --json
+fj stack review                       # the stack + each branch's PR state
+```
 
-fj agent review --json            # automated review of the current change
-fj agent fix --dry-run            # plan automated fixes
-fj agent explain --json           # explain a change
+`fj stack new` derives a safe slug and branch (`<handle>/<slug>-1`), records
+schema/repo/base/timestamps/issue/items, and won't clobber an existing stack
+without `--force`. `sync` / `split` / `absorb` / `ship` are still scaffolded
+(`--dry-run` prints the plan, else a structured "not yet implemented").
+
+### Agent (AI-assisted)
+
+`fj agent review` / `fix` / `explain` route through a provider configured by
+`FJ_AGENT_PROVIDER` / `FJ_AGENT_API_KEY` / `FJ_AGENT_MODEL` (the Fjord token is
+never reused). With nothing configured they report "agent backend not
+configured"; `fix` only ever emits a patch.
+
+```sh
+fj agent explain src/main.rs --json
+fj agent review --pr 42
 ```
 
 ## Global flags

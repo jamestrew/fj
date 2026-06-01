@@ -149,6 +149,12 @@ pub fn git_dir() -> Option<PathBuf> {
 /// URL of the primary remote (`upstream`, else `origin`). None if neither is
 /// set or we aren't in a repo.
 pub fn remote_url() -> Option<String> {
+    primary_remote().map(|(_, url)| url)
+}
+
+/// `(name, url)` of the primary remote: `upstream` if present, else `origin`.
+/// None when neither is set or we aren't in a repo.
+pub fn primary_remote() -> Option<(String, String)> {
     for name in ["upstream", "origin"] {
         if let Ok(out) = Command::new("git")
             .args(["remote", "get-url", name])
@@ -157,12 +163,33 @@ pub fn remote_url() -> Option<String> {
             if out.status.success() {
                 let u = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 if !u.is_empty() {
-                    return Some(u);
+                    return Some((name.to_string(), u));
                 }
             }
         }
     }
     None
+}
+
+/// True if `rev` resolves to something in this repo (branch, tag, sha).
+pub fn rev_exists(rev: &str) -> bool {
+    Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", rev])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Create a new branch (`git checkout -b <name> [<start>]`). `name`/`start`
+/// must not be `-`-leading (argument injection).
+pub fn create_branch(name: &str, start: Option<&str>) -> Result<()> {
+    reject_dash_lead("branch name", name)?;
+    let mut args = vec!["checkout", "-b", name];
+    if let Some(s) = start {
+        reject_dash_lead("start point", s)?;
+        args.push(s);
+    }
+    run(&args)
 }
 
 /// `(ahead, behind)` of HEAD relative to its upstream `@{u}`. None when there

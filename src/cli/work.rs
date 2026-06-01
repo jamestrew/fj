@@ -22,7 +22,7 @@ use serde::Serialize;
 
 use crate::api;
 use crate::cli::context::RepoFlag;
-use crate::cli::stack_state::{self, StackState};
+use crate::cli::stack_state::{self, Stack};
 use crate::cli::work_session::{self, PrRef, Session};
 use crate::client::Client;
 use crate::config::hosts::{AuthKind, Host, Hosts};
@@ -240,15 +240,13 @@ fn summarize_checks(cs: &api::pull::CombinedStatus) -> CheckSummary {
     }
 }
 
-/// The current stack from local stack state, if one is selected.
-fn current_stack_summary(state: &StackState) -> Option<StackSummary> {
-    let name = state.current.as_ref()?;
-    let s = state.find(name)?;
-    Some(StackSummary {
+/// Compact summary of the repo's local stack.
+fn stack_summary(s: &Stack) -> StackSummary {
+    StackSummary {
         name: s.name.clone(),
         base: s.base.clone(),
-        branches: s.branches.clone(),
-    })
+        branches: s.items.iter().map(|i| i.branch.clone()).collect(),
+    }
 }
 
 /// Find the open PR whose head ref matches `branch`.
@@ -358,7 +356,8 @@ async fn gather(repo_flag: Option<&str>, host_flag: Option<&str>) -> Result<Work
     let account = account_info(host_cfg);
     let stack = stack_state::load()
         .ok()
-        .and_then(|s| current_stack_summary(&s));
+        .flatten()
+        .map(|s| stack_summary(&s));
 
     // --- Forgejo API, best-effort ---
     let mut default_branch = None;
@@ -908,19 +907,21 @@ mod tests {
     }
 
     #[test]
-    fn current_stack_summary_reads_the_current_stack() {
-        let mut st = StackState::default();
-        assert!(current_stack_summary(&st).is_none());
-        st.add(crate::cli::stack_state::Stack {
-            name: "feat".into(),
-            base: "main".into(),
-            branches: vec!["a".into(), "b".into()],
-            created_at: "t".into(),
-        })
+    fn stack_summary_flattens_item_branches() {
+        let stack: Stack = serde_json::from_value(serde_json::json!({
+            "version": 1, "id": "feat", "name": "feat", "slug": "feat",
+            "repo": { "path": "/r", "remote": "origin", "url": "u", "host": "h" },
+            "base": "main", "created_at": "t", "updated_at": "t", "issue": null,
+            "items": [
+                { "id": "feat-1", "title": "a", "branch": "u/feat-1", "base": "main", "pr": null, "status": "local" },
+                { "id": "feat-2", "title": "b", "branch": "u/feat-2", "base": "main", "pr": null, "status": "local" }
+            ]
+        }))
         .unwrap();
-        let s = current_stack_summary(&st).unwrap();
+        let s = stack_summary(&stack);
         assert_eq!(s.name, "feat");
-        assert_eq!(s.branches.len(), 2);
+        assert_eq!(s.base, "main");
+        assert_eq!(s.branches, vec!["u/feat-1", "u/feat-2"]);
     }
 
     fn sample_session() -> Session {
