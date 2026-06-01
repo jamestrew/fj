@@ -110,6 +110,24 @@ pub fn working_tree_status() -> Option<(bool, usize)> {
     Some(parse_porcelain(&String::from_utf8_lossy(&out.stdout)))
 }
 
+/// Run git and capture stdout. Errors if git can't be spawned or exits
+/// non-zero (surfacing stderr). Caller must ensure no `-`-leading arg is
+/// passed from untrusted input (see `reject_dash_lead`).
+pub fn output(args: &[&str]) -> Result<String> {
+    let out = Command::new("git")
+        .args(args)
+        .output()
+        .with_context(|| "spawning git (is it installed and on PATH?)")?;
+    if !out.status.success() {
+        bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
 /// The repo's git directory (e.g. `.git`), or None when not in a repo. Used
 /// to anchor fj's local-only state under `<git-dir>/fj/`.
 pub fn git_dir() -> Option<PathBuf> {
