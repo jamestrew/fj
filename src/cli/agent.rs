@@ -7,8 +7,8 @@
 //! error; the built-in `mock` provider echoes for development.
 //!
 //! `explain [target]` feeds the provider real context: a file's contents, a
-//! git revision (`git show`), or the working-tree diff when omitted. `review`
-//! still uses generic context (PR7 wires the PR/working diff). `fix` emits a
+//! git revision (`git show`), or the working-tree diff when omitted.
+//! `review` reviews the working-tree diff, or `--pr <n>`'s diff. `fix` emits a
 //! patch only (never mutates); `--write` / `--pr` come later.
 
 use std::path::Path;
@@ -16,8 +16,9 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
 
+use crate::api;
 use crate::cli::agent_provider::{self, AgentConfig, AgentRequest, AgentTask};
-use crate::cli::context::RepoFlag;
+use crate::cli::context::{resolve_repo, RepoFlag};
 use crate::{git, output};
 
 #[derive(Debug, Args)]
@@ -40,6 +41,9 @@ pub enum AgentSub {
 pub struct ReviewArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Review a specific PR's diff instead of the working-tree diff.
+    #[arg(long)]
+    pub pr: Option<u64>,
     /// Emit JSON instead of a table (honors the global `--json-fields`).
     #[arg(long)]
     pub json: bool,
@@ -99,14 +103,31 @@ fn run_task(task: AgentTask, input: String, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Header line describing what `review` is looking at.
+fn review_context_header(pr: Option<u64>) -> String {
+    match pr {
+        Some(n) => format!("Diff for PR #{n}:"),
+        None => "Working-tree diff:".to_string(),
+    }
+}
+
 #[cfg_attr(coverage_nightly, coverage(off))]
-async fn review(args: ReviewArgs, _host: Option<&str>) -> Result<()> {
-    // PR7 enriches this with the actual PR/working diff to review.
-    run_task(
-        AgentTask::Review,
-        "the current change".to_string(),
-        args.json,
-    )
+async fn review(args: ReviewArgs, host: Option<&str>) -> Result<()> {
+    let diff = match args.pr {
+        Some(number) => {
+            let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
+            api::pull::diff_text(&ctx.client, &ctx.owner, &ctx.name, number).await?
+        }
+        None => {
+            let d = git::output(&["diff", "HEAD"])?;
+            if d.trim().is_empty() {
+                bail!("no uncommitted changes to review; pass --pr <number>");
+            }
+            d
+        }
+    };
+    let input = format!("{}\n{diff}", review_context_header(args.pr));
+    run_task(AgentTask::Review, input, args.json)
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -190,18 +211,26 @@ mod tests {
     }
 
     #[test]
-    fn review_parses_json_flag_and_repo() {
-        let cli = Cli::try_parse_from(["fj", "agent", "review", "--json", "-R", "o/n"])
-            .expect("should parse");
+    fn review_parses_pr_json_and_repo() {
+        let cli =
+            Cli::try_parse_from(["fj", "agent", "review", "--pr", "42", "--json", "-R", "o/n"])
+                .expect("should parse");
         match cli.command {
             Command::Agent(AgentCmd {
                 command: AgentSub::Review(a),
             }) => {
                 assert!(a.json);
+                assert_eq!(a.pr, Some(42));
                 assert_eq!(a.r.repo.as_deref(), Some("o/n"));
             }
             other => panic!("expected agent review, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn review_context_header_reflects_target() {
+        assert_eq!(review_context_header(Some(42)), "Diff for PR #42:");
+        assert_eq!(review_context_header(None), "Working-tree diff:");
     }
 
     #[test]
