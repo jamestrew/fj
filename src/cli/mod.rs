@@ -31,6 +31,7 @@ mod repo_mirror;
 mod repo_social;
 pub mod search;
 pub mod stack;
+mod stack_state;
 pub mod status;
 pub mod web;
 pub mod work;
