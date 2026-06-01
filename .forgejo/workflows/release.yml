@@ -46,19 +46,13 @@ jobs:
       - name: checkout
         uses: actions/checkout@v4
 
-      # On linux-x86_64 the container is catthehacker/ubuntu:act-22.04
-      # which has node bundled but no rustup. Install rustup at job
-      # start. On macOS the runners come with rustup preinstalled.
-      - name: install rust toolchain (linux only)
-        if: matrix.name == 'linux-x86_64'
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --profile minimal --default-toolchain 1.95.0
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-
-      - name: install rust target
-        run: |
-          rustup target add ${{ matrix.target }} || true
+      # Installs rustup from rustup.rs when absent (the linux container has
+      # none; macOS runners already have it) and adds the cross-compile target.
+      - name: setup rust
+        uses: https://rasterhub.com/rasterstate/setup-rust-action@v1
+        with:
+          toolchain: '1.95.0'
+          targets: ${{ matrix.target }}
 
       - name: cache cargo
         uses: https://rasterhub.com/rasterstate/rust-cache-action@v1
@@ -193,7 +187,7 @@ jobs:
       RASTER_ARTIFACTS_S3_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_AWS_SECRET_KEY }}
     steps:
       - name: install tools
-        run: apk add --no-cache curl jq coreutils bash tar zstd gzip
+        run: apk add --no-cache coreutils bash tar zstd gzip
 
       - name: fetch artifacts
         uses: https://rasterhub.com/rasterstate/download-artifact-action@v1
@@ -208,44 +202,6 @@ jobs:
           # Concatenate per-artifact sha256 files into a single SHA256SUMS.
           cat *.sha256 | sort > SHA256SUMS
           cat SHA256SUMS
-
-      - name: create or update release
-        env:
-          FORGEJO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          TAG: ${{ github.ref_name }}
-          API: ${{ github.server_url }}/api/v1
-        run: |
-          set -euo pipefail
-
-          # Look up the release by tag (Forgejo auto-creates one on tag push,
-          # but the API call above may run first); create if missing.
-          RELEASE_JSON=$(curl -sf \
-            -H "Authorization: token $FORGEJO_TOKEN" \
-            "$API/repos/$REPO/releases/tags/$TAG" || echo "")
-
-          if [ -z "$RELEASE_JSON" ]; then
-            RELEASE_JSON=$(curl -sf \
-              -X POST \
-              -H "Authorization: token $FORGEJO_TOKEN" \
-              -H "Content-Type: application/json" \
-              -d "{\"tag_name\":\"$TAG\",\"name\":\"$TAG\",\"draft\":false,\"prerelease\":false}" \
-              "$API/repos/$REPO/releases")
-          fi
-
-          RELEASE_ID=$(echo "$RELEASE_JSON" | jq -r .id)
-          echo "Release id: $RELEASE_ID"
-
-          cd dist
-          for f in fj-*.tar.gz SHA256SUMS; do
-            [ -f "$f" ] || continue
-            echo "Uploading $f"
-            curl -sf \
-              -X POST \
-              -H "Authorization: token $FORGEJO_TOKEN" \
-              -F "attachment=@$f" \
-              "$API/repos/$REPO/releases/$RELEASE_ID/assets?name=$f"
-          done
 
       - name: render homebrew formula
         env:
@@ -299,19 +255,15 @@ jobs:
           echo "Rendered formula:"
           cat homebrew-out/fj.rb
 
-      - name: upload rendered formula as release asset
+      # Create (or update, if Forgejo auto-created it on the tag push) the
+      # release and upload every asset in one step. Replaces the hand-rolled
+      # find-or-create + per-asset curl loop.
+      - name: publish release
+        uses: https://rasterhub.com/rasterstate/forgejo-release-action@v1
+        with:
+          files: |
+            dist/fj-*.tar.gz
+            dist/SHA256SUMS
+            homebrew-out/fj.rb
         env:
-          FORGEJO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          TAG: ${{ github.ref_name }}
-          API: ${{ github.server_url }}/api/v1
-        run: |
-          set -euo pipefail
-          RELEASE_ID=$(curl -sf \
-            -H "Authorization: token $FORGEJO_TOKEN" \
-            "$API/repos/$REPO/releases/tags/$TAG" | jq -r .id)
-          curl -sf \
-            -X POST \
-            -H "Authorization: token $FORGEJO_TOKEN" \
-            -F "attachment=@homebrew-out/fj.rb" \
-            "$API/repos/$REPO/releases/$RELEASE_ID/assets?name=fj.rb"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
