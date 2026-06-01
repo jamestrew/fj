@@ -2,11 +2,11 @@
 //!
 //! Stack state is local and git-native (`<git-dir>/fj/stack.json`, see
 //! [`stack_state`](super::stack_state)) — no server state, offline-capable,
-//! never a committed manifest. `stack new` (author a stack) and `stack
-//! review` (show the stack + each branch's PR state) are implemented.
-//! `sync` / `split` / `absorb` / `ship` are still placeholders (dry-run plan,
-//! else a structured "not yet implemented" error); the chain rebases land in
-//! follow-up PRs.
+//! never a committed manifest. `stack new` (author a stack), `stack review`
+//! (show the stack + each branch's PR state), and `stack sync` (push each
+//! branch and create/update its Forgejo PR, chaining bases so each PR targets
+//! the previous branch) are implemented. `split` / `absorb` / `ship` are
+//! still placeholders (dry-run plan, else a structured "not yet implemented").
 
 use std::path::{Path, PathBuf};
 
@@ -16,8 +16,9 @@ use clap::{Args, Subcommand};
 use serde::Serialize;
 
 use crate::api;
+use crate::api::pull::CreatePull;
 use crate::cli::context::{resolve_repo, RepoFlag};
-use crate::cli::stack_state::{self, IssueRef, RepoRef, Stack, StackItem, STACK_VERSION};
+use crate::cli::stack_state::{self, IssueRef, ItemPr, RepoRef, Stack, StackItem, STACK_VERSION};
 use crate::client::Client;
 use crate::{git, output};
 
@@ -70,7 +71,16 @@ pub struct NewArgs {
 pub struct SyncArgs {
     #[command(flatten)]
     pub r: RepoFlag,
-    /// Print the planned actions and exit without mutating anything.
+    /// Create new PRs as drafts.
+    #[arg(long, conflicts_with = "ready")]
+    pub draft: bool,
+    /// Mark the stack's PRs ready for review.
+    #[arg(long)]
+    pub ready: bool,
+    /// Emit machine-readable operations/results as JSON.
+    #[arg(long)]
+    pub json: bool,
+    /// Print intended actions without pushing or writing to Forgejo.
     #[arg(long)]
     pub dry_run: bool,
 }
@@ -444,14 +454,215 @@ fn placeholder_mutation(plan: &str, command: &str, dry_run: bool) -> Result<()> 
     bail!("`fj stack {command}` is not yet implemented");
 }
 
+// ── stack sync ─────────────────────────────────────────────────────────────
+
+/// The PR base for stack item `i`: the previous item's branch, or the stack
+/// base for the first item.
+fn pr_base(stack_base: &str, items: &[StackItem], i: usize) -> String {
+    if i == 0 {
+        stack_base.to_string()
+    } else {
+        items[i - 1].branch.clone()
+    }
+}
+
+/// Validate the stack is syncable: at least one item, and unique, non-empty
+/// branch names (a malformed/duplicated chain would push/PR incorrectly).
+fn validate_items(items: &[StackItem]) -> Result<()> {
+    if items.is_empty() {
+        bail!("stack has no items to sync (author one with `fj stack new`)");
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for item in items {
+        if item.branch.trim().is_empty() {
+            bail!("stack item '{}' has an empty branch name", item.id);
+        }
+        if !seen.insert(item.branch.as_str()) {
+            bail!("duplicate branch '{}' in the stack", item.branch);
+        }
+    }
+    Ok(())
+}
+
+/// What a sync intends to do for one item. Serializes for `--json` / dry-run.
+#[derive(Debug, Serialize, PartialEq)]
+struct PlannedOp {
+    branch: String,
+    base: String,
+    title: String,
+}
+
+fn plan_sync(stack: &Stack) -> Vec<PlannedOp> {
+    stack
+        .items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| PlannedOp {
+            branch: item.branch.clone(),
+            base: pr_base(&stack.base, &stack.items, i),
+            title: item.title.clone(),
+        })
+        .collect()
+}
+
+fn render_plan(plan: &[PlannedOp]) -> String {
+    use std::fmt::Write;
+    let mut s = String::from("Would sync (no pushes or PR writes):\n");
+    for op in plan {
+        let _ = writeln!(
+            s,
+            "  push {0} → origin; ensure PR {0} → {1}",
+            op.branch, op.base
+        );
+    }
+    s
+}
+
+/// The result of syncing one item. Serializes for `--json`.
+#[derive(Debug, Serialize)]
+struct SyncOp {
+    branch: String,
+    base: String,
+    /// "created" | "updated"
+    action: String,
+    pr: ItemPr,
+}
+
+fn render_ops(ops: &[SyncOp]) -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    for op in ops {
+        let _ = writeln!(
+            s,
+            "✓ {} {} → {}  (#{} {})",
+            op.action, op.branch, op.base, op.pr.number, op.pr.url
+        );
+    }
+    let _ = writeln!(s, "Synced {} item(s).", ops.len());
+    s
+}
+
+/// How sync should set PR draft/ready state.
+#[derive(Debug, Clone, Copy)]
+struct PrMode {
+    draft: bool,
+    ready: bool,
+}
+
+/// Create the PR for `branch` if missing, else record (and optionally mark
+/// ready) the existing one. Idempotent: re-running finds the existing PR and
+/// updates rather than duplicating. Returns `(action, pr)`.
+async fn ensure_pr(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    branch: &str,
+    base: &str,
+    title: &str,
+    mode: PrMode,
+) -> Result<(String, ItemPr)> {
+    let page = api::pull::list(client, owner, name, api::pull::ListOptions::default()).await?;
+    if let Some(existing) = page.items.iter().find(|p| p.head.ref_ == branch) {
+        let mut state = existing.state.clone();
+        if mode.ready && existing.draft {
+            api::pull::ready(client, owner, name, existing.number).await?;
+            state = "open".to_string();
+        }
+        return Ok((
+            "updated".to_string(),
+            ItemPr {
+                number: existing.number,
+                url: existing.html_url.clone(),
+                state,
+            },
+        ));
+    }
+    let created = api::pull::create(
+        client,
+        owner,
+        name,
+        &CreatePull {
+            title,
+            head: branch,
+            base,
+            body: None,
+            draft: mode.draft,
+        },
+    )
+    .await?;
+    Ok((
+        "created".to_string(),
+        ItemPr {
+            number: created.number,
+            url: created.html_url,
+            state: created.state,
+        },
+    ))
+}
+
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn sync(args: SyncArgs, host: Option<&str>) -> Result<()> {
+    let Some(mut stack) = stack_state::load()? else {
+        bail!("no stack for this repo. Run `fj stack new` to start one.");
+    };
+    validate_items(&stack.items)?;
+
+    if args.dry_run {
+        let plan = plan_sync(&stack);
+        if args.json {
+            return output::print_json(&serde_json::to_value(&plan)?);
+        }
+        print!("{}", render_plan(&plan));
+        return Ok(());
+    }
+
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
-    let plan = format!(
-        "sync the stack in {}/{} with its base branch",
-        ctx.owner, ctx.name
-    );
-    placeholder_mutation(&plan, "sync", args.dry_run)
+    let mode = PrMode {
+        draft: args.draft,
+        ready: args.ready,
+    };
+    let remote = stack.repo.remote.clone();
+    let bases: Vec<String> = (0..stack.items.len())
+        .map(|i| pr_base(&stack.base, &stack.items, i))
+        .collect();
+
+    let mut ops = Vec::with_capacity(stack.items.len());
+    for (i, base) in bases.iter().enumerate() {
+        let branch = stack.items[i].branch.clone();
+        let title = stack.items[i].title.clone();
+
+        git::push(&remote, &branch)?;
+        let (action, pr) = ensure_pr(
+            &ctx.client,
+            &ctx.owner,
+            &ctx.name,
+            &branch,
+            base,
+            &title,
+            mode,
+        )
+        .await?;
+
+        stack.items[i].pr = Some(pr.clone());
+        stack.items[i].status = "pushed".to_string();
+        // Persist incrementally so a mid-run failure keeps completed progress
+        // (and a re-run is idempotent from where it stopped).
+        stack.updated_at = Utc::now().to_rfc3339();
+        stack_state::save(&stack)?;
+
+        ops.push(SyncOp {
+            branch,
+            base: base.clone(),
+            action,
+            pr,
+        });
+    }
+
+    if args.json {
+        return output::print_json(&serde_json::to_value(&ops)?);
+    }
+    print!("{}", render_ops(&ops));
+    Ok(())
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -792,5 +1003,241 @@ mod tests {
         assert!(out.contains("Stack: feat   base: main"));
         assert!(out.contains("feature/a  #7 [open]"));
         assert!(out.contains("feature/b  (no PR)"));
+    }
+
+    // ---- sync: pure helpers ----
+
+    #[test]
+    fn sync_parses_flags_and_draft_conflicts_ready() {
+        let cli = Cli::try_parse_from(["fj", "stack", "sync", "--draft", "--json", "--dry-run"])
+            .expect("should parse");
+        match cli.command {
+            Command::Stack(StackCmd {
+                command: StackSub::Sync(a),
+            }) => {
+                assert!(a.draft && a.json && a.dry_run && !a.ready);
+            }
+            other => panic!("expected stack sync, got {other:?}"),
+        }
+        assert!(Cli::try_parse_from(["fj", "stack", "sync", "--draft", "--ready"]).is_err());
+    }
+
+    #[test]
+    fn pr_base_chains_items() {
+        let items = stack_with_branches(&["a", "b", "c"]).items;
+        assert_eq!(pr_base("main", &items, 0), "main");
+        assert_eq!(pr_base("main", &items, 1), "a");
+        assert_eq!(pr_base("main", &items, 2), "b");
+    }
+
+    #[test]
+    fn validate_items_rejects_empty_and_duplicates() {
+        assert!(validate_items(&[]).is_err());
+        assert!(validate_items(&stack_with_branches(&["a", "b"]).items).is_ok());
+        assert!(validate_items(&stack_with_branches(&["a", "a"]).items).is_err());
+    }
+
+    #[test]
+    fn plan_sync_uses_chained_bases() {
+        let plan = plan_sync(&stack_with_branches(&["a", "b"]));
+        assert_eq!(plan[0].base, "main");
+        assert_eq!(plan[1].base, "a");
+        let v = serde_json::to_value(&plan).unwrap();
+        assert_eq!(v[1]["branch"], "b");
+        assert_eq!(v[1]["base"], "a");
+    }
+
+    #[test]
+    fn render_ops_lists_actions() {
+        let ops = vec![SyncOp {
+            branch: "feature/a".into(),
+            base: "main".into(),
+            action: "created".into(),
+            pr: ItemPr {
+                number: 7,
+                url: "https://x/pulls/7".into(),
+                state: "open".into(),
+            },
+        }];
+        let out = render_ops(&ops);
+        assert!(out.contains("created feature/a → main  (#7 https://x/pulls/7)"));
+        assert!(out.contains("Synced 1 item(s)."));
+    }
+
+    // ---- sync: mocked Forgejo API (ensure_pr) ----
+
+    fn pull_value(number: u64, head: &str, state: &str, draft: bool) -> serde_json::Value {
+        serde_json::json!({
+            "id": number, "number": number, "title": "t", "state": state,
+            "user": { "id": 1, "login": "alice" },
+            "html_url": format!("https://x/pulls/{number}"),
+            "head": { "ref": head, "sha": "aaa" },
+            "base": { "ref": "main", "sha": "bbb" },
+            "draft": draft,
+            "created_at": "2026-06-01T00:00:00Z",
+            "updated_at": "2026-06-01T00:00:00Z"
+        })
+    }
+
+    fn client_for(server: &wiremock::MockServer) -> Client {
+        Client::for_base_url(
+            format!("{}/api/v1/", server.uri()).parse().unwrap(),
+            "t".into(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn ensure_pr_creates_when_missing() {
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/o/r/pulls"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/repos/o/r/pulls"))
+            .and(body_json(serde_json::json!({
+                "title": "Add login", "head": "stephen/login-1", "base": "main", "draft": false
+            })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(pull_value(
+                12,
+                "stephen/login-1",
+                "open",
+                false,
+            )))
+            .mount(&server)
+            .await;
+        let c = client_for(&server);
+        let (action, pr) = ensure_pr(
+            &c,
+            "o",
+            "r",
+            "stephen/login-1",
+            "main",
+            "Add login",
+            PrMode {
+                draft: false,
+                ready: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(action, "created");
+        assert_eq!(pr.number, 12);
+        assert_eq!(pr.state, "open");
+    }
+
+    #[tokio::test]
+    async fn ensure_pr_updates_existing_idempotently() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        // The branch already has a PR -> no POST is mounted, so a create would 404.
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/o/r/pulls"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                pull_value(7, "stephen/login-1", "open", false)
+            ])))
+            .mount(&server)
+            .await;
+        let c = client_for(&server);
+        let (action, pr) = ensure_pr(
+            &c,
+            "o",
+            "r",
+            "stephen/login-1",
+            "main",
+            "Add login",
+            PrMode {
+                draft: false,
+                ready: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(action, "updated");
+        assert_eq!(pr.number, 7);
+    }
+
+    #[tokio::test]
+    async fn ensure_pr_creates_draft_with_draft_flag() {
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/o/r/pulls"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/repos/o/r/pulls"))
+            .and(body_json(serde_json::json!({
+                "title": "t", "head": "b", "base": "main", "draft": true
+            })))
+            .respond_with(
+                ResponseTemplate::new(201).set_body_json(pull_value(3, "b", "open", true)),
+            )
+            .mount(&server)
+            .await;
+        let c = client_for(&server);
+        let (action, _pr) = ensure_pr(
+            &c,
+            "o",
+            "r",
+            "b",
+            "main",
+            "t",
+            PrMode {
+                draft: true,
+                ready: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(action, "created");
+    }
+
+    #[tokio::test]
+    async fn ensure_pr_marks_draft_ready_with_ready_flag() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/o/r/pulls"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!([pull_value(7, "b", "open", true)])),
+            )
+            .mount(&server)
+            .await;
+        // ready = PATCH the pull with {draft:false}
+        Mock::given(method("PATCH"))
+            .and(path("/api/v1/repos/o/r/pulls/7"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(pull_value(7, "b", "open", false)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let c = client_for(&server);
+        let (action, pr) = ensure_pr(
+            &c,
+            "o",
+            "r",
+            "b",
+            "main",
+            "t",
+            PrMode {
+                draft: false,
+                ready: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(action, "updated");
+        assert_eq!(pr.state, "open");
     }
 }

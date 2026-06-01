@@ -180,6 +180,37 @@ pub fn rev_exists(rev: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Push a branch to a remote. Idempotent (an up-to-date push is a no-op).
+/// A non-fast-forward rejection is surfaced as a clear "diverged" error so
+/// callers never silently force-push.
+pub fn push(remote: &str, branch: &str) -> Result<()> {
+    reject_dash_lead("remote", remote)?;
+    reject_dash_lead("branch name", branch)?;
+    let out = Command::new("git")
+        .args(["push", remote, branch])
+        .output()
+        .with_context(|| "spawning git push")?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if is_non_fast_forward(&stderr) {
+        bail!(
+            "remote branch '{branch}' has diverged (non-fast-forward). Integrate \
+             the remote changes (e.g. `git pull --rebase`), then re-run `fj stack sync`."
+        );
+    }
+    bail!("git push {remote} {branch} failed: {}", stderr.trim());
+}
+
+/// Recognize git's non-fast-forward / rejected-push messages.
+fn is_non_fast_forward(stderr: &str) -> bool {
+    let s = stderr.to_lowercase();
+    s.contains("non-fast-forward")
+        || s.contains("fetch first")
+        || (s.contains("[rejected]") && s.contains("failed to push"))
+}
+
 /// Create a new branch (`git checkout -b <name> [<start>]`). `name`/`start`
 /// must not be `-`-leading (argument injection).
 pub fn create_branch(name: &str, start: Option<&str>) -> Result<()> {
@@ -246,6 +277,17 @@ mod tests {
         assert_eq!(parse_porcelain(""), (false, 0));
         assert_eq!(parse_porcelain("\n  \n"), (false, 0));
         assert_eq!(parse_porcelain(" M src/a.rs\n?? b.rs\n"), (true, 2));
+    }
+
+    #[test]
+    fn detects_non_fast_forward_pushes() {
+        use super::is_non_fast_forward;
+        assert!(is_non_fast_forward(
+            " ! [rejected]        main -> main (non-fast-forward)\nerror: failed to push some refs"
+        ));
+        assert!(is_non_fast_forward("Updates were rejected; fetch first"));
+        assert!(!is_non_fast_forward("Everything up-to-date"));
+        assert!(!is_non_fast_forward("Permission denied (publickey)"));
     }
 
     #[test]
