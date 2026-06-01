@@ -34,6 +34,7 @@ pub mod stack;
 pub mod status;
 pub mod web;
 pub mod work;
+mod work_session;
 pub mod workflow;
 mod workflow_artifact;
 mod workflow_run;

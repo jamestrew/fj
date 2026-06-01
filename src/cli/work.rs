@@ -4,16 +4,20 @@
 //! git state (branch, dirty files, ahead/behind upstream), and any open PR for
 //! the current branch, as a table or `--json`.
 //!
-//! `work resume` / `work continue` are still placeholders (a saved-session
-//! model is TBD): they honor `--dry-run`/`--json` and otherwise return a
-//! structured "not yet implemented" error.
+//! `work context` also persists a local-only session to `<git-dir>/fj/
+//! session.json` (see [`work_session`](super::work_session)). `work resume`
+//! reads it back, shows the saved snapshot, and diffs it against a freshly
+//! gathered context. `work continue` (advancing the suggested-step cursor) is
+//! still a placeholder.
 
 use anyhow::{bail, Result};
+use chrono::Utc;
 use clap::{Args, Subcommand};
 use serde::Serialize;
 
 use crate::api;
-use crate::cli::context::{resolve_repo, RepoFlag};
+use crate::cli::context::{resolve_repo, RepoContext, RepoFlag};
+use crate::cli::work_session::{self, PrRef, Session};
 use crate::{git, output};
 
 #[derive(Debug, Args)]
@@ -158,19 +162,17 @@ fn render_human(wc: &WorkContext) -> String {
     s
 }
 
+/// Gather the live working context: local git state + the repo's default
+/// branch + the open PR (if any) for the current branch.
 #[cfg_attr(coverage_nightly, coverage(off))]
-async fn context(args: ContextArgs, host: Option<&str>) -> Result<()> {
-    let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
+async fn gather(ctx: &RepoContext) -> Result<WorkContext> {
     let repo = api::repo::get(&ctx.client, &ctx.owner, &ctx.name).await?;
-
     let branch = git::current_branch();
     let (dirty, changed_files) = git::working_tree_status().unwrap_or((false, 0));
     let (ahead, behind) = match git::ahead_behind_upstream() {
         Some((a, b)) => (Some(a), Some(b)),
         None => (None, None),
     };
-
-    // Only look up a PR when we actually know the local branch.
     let pull_request = match branch.as_deref() {
         Some(b) => {
             let page = api::pull::list(
@@ -184,8 +186,7 @@ async fn context(args: ContextArgs, host: Option<&str>) -> Result<()> {
         }
         None => None,
     };
-
-    let wc = WorkContext {
+    Ok(WorkContext {
         host: ctx.host.clone(),
         repo: format!("{}/{}", ctx.owner, ctx.name),
         default_branch: repo.default_branch,
@@ -195,7 +196,47 @@ async fn context(args: ContextArgs, host: Option<&str>) -> Result<()> {
         ahead,
         behind,
         pull_request,
-    };
+    })
+}
+
+/// Build the persisted session snapshot from a live context. `now` is the
+/// RFC3339 save timestamp; `remote` the primary remote URL, if any.
+fn to_session(wc: &WorkContext, remote: Option<String>, now: String) -> Session {
+    let next_steps = work_session::derive_next_steps(
+        wc.branch.as_deref(),
+        wc.dirty,
+        wc.changed_files,
+        wc.ahead,
+        wc.pull_request.is_some(),
+    );
+    Session {
+        saved_at: now,
+        host: wc.host.clone(),
+        repo: wc.repo.clone(),
+        remote,
+        branch: wc.branch.clone(),
+        dirty: wc.dirty,
+        changed_files: wc.changed_files,
+        pull_request: wc.pull_request.as_ref().map(|p| PrRef {
+            number: p.number,
+            title: p.title.clone(),
+            state: p.state.clone(),
+            url: p.url.clone(),
+        }),
+        next_steps,
+        cursor: 0,
+    }
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn context(args: ContextArgs, host: Option<&str>) -> Result<()> {
+    let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
+    let wc = gather(&ctx).await?;
+
+    // Persist the session as a convenience for `work resume` / `continue`.
+    // A failure to write the cache must never sink the inspect command.
+    let session = to_session(&wc, git::remote_url(), Utc::now().to_rfc3339());
+    let _ = work_session::save(&session);
 
     if args.json {
         return output::print_json(&serde_json::to_value(&wc)?);
@@ -204,17 +245,124 @@ async fn context(args: ContextArgs, host: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Render the saved session: the snapshot fields plus the suggested next
+/// step at the cursor. Plain text for easy testing.
+fn render_session(s: &Session) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(out, "Saved session ({})", s.saved_at);
+    let _ = writeln!(out, "  Repo:    {} ({})", s.repo, s.host);
+    let _ = writeln!(
+        out,
+        "  Branch:  {}",
+        s.branch.as_deref().unwrap_or("(detached)")
+    );
+    let state = if s.dirty {
+        format!("{} uncommitted file(s)", s.changed_files)
+    } else {
+        "clean".to_string()
+    };
+    let _ = writeln!(out, "  Tree:    {state}");
+    match &s.pull_request {
+        Some(pr) => {
+            let _ = writeln!(out, "  PR:      #{} {} [{}]", pr.number, pr.title, pr.state);
+        }
+        None => {
+            let _ = writeln!(out, "  PR:      (none saved)");
+        }
+    }
+    match s.next_steps.get(s.cursor) {
+        Some(step) => {
+            let _ = writeln!(out, "  Next:    {step}");
+        }
+        None => {
+            let _ = writeln!(out, "  Next:    (no further steps)");
+        }
+    }
+    out
+}
+
+/// Human-readable lines describing what changed between the saved session and
+/// the freshly-gathered context. Empty when nothing notable changed.
+fn diff_session_vs_context(s: &Session, wc: &WorkContext) -> Vec<String> {
+    let mut changes = Vec::new();
+    if s.branch != wc.branch {
+        changes.push(format!(
+            "branch: {} -> {}",
+            s.branch.as_deref().unwrap_or("(detached)"),
+            wc.branch.as_deref().unwrap_or("(detached)")
+        ));
+    }
+    if (s.dirty, s.changed_files) != (wc.dirty, wc.changed_files) {
+        let fmt = |dirty: bool, n: usize| {
+            if dirty {
+                format!("{n} file(s)")
+            } else {
+                "clean".to_string()
+            }
+        };
+        changes.push(format!(
+            "working tree: {} -> {}",
+            fmt(s.dirty, s.changed_files),
+            fmt(wc.dirty, wc.changed_files)
+        ));
+    }
+    let saved_pr_state = s
+        .pull_request
+        .as_ref()
+        .map(|p| (p.number, p.state.as_str()));
+    let fresh_pr_state = wc
+        .pull_request
+        .as_ref()
+        .map(|p| (p.number, p.state.as_str()));
+    if saved_pr_state != fresh_pr_state {
+        match (s.pull_request.as_ref(), wc.pull_request.as_ref()) {
+            (Some(a), Some(b)) => {
+                changes.push(format!("PR #{}: {} -> {}", a.number, a.state, b.state))
+            }
+            (None, Some(b)) => changes.push(format!("PR: (none) -> #{} {}", b.number, b.state)),
+            (Some(a), None) => changes.push(format!("PR: #{} {} -> (none)", a.number, a.state)),
+            (None, None) => {}
+        }
+    }
+    changes
+}
+
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn resume(args: ResumeArgs, host: Option<&str>) -> Result<()> {
-    let _ctx = resolve_repo(args.r.repo.as_deref(), host)?;
+    let Some(session) = work_session::load()? else {
+        bail!("no saved work session for this repo. Run `fj work context` first.");
+    };
+
     if args.dry_run {
-        println!("would: resume the saved work session");
+        println!("would: resume the session saved at {}", session.saved_at);
         return Ok(());
     }
+
+    // Recompute the live context so we can show what moved since the save.
+    let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
+    let fresh = gather(&ctx).await?;
+    let changes = diff_session_vs_context(&session, &fresh);
+
     if args.json {
-        return not_implemented_json("work resume");
+        return output::print_json(&serde_json::json!({
+            "session": session,
+            "current": fresh,
+            "changes": changes,
+        }));
     }
-    not_implemented("work resume")
+
+    print!("{}", render_session(&session));
+    println!();
+    if changes.is_empty() {
+        println!("No changes since you saved.");
+    } else {
+        println!("Changes since saved:");
+        for c in &changes {
+            println!("  - {c}");
+        }
+    }
+    Ok(())
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -231,16 +379,6 @@ async fn continue_(args: ContinueArgs, host: Option<&str>) -> Result<()> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 fn not_implemented(command: &str) -> Result<()> {
     bail!("`fj {command}` is not yet implemented");
-}
-
-/// JSON placeholder describing an unimplemented command, routed through
-/// `output::print_json` so the global `--json-fields` projection applies.
-#[cfg_attr(coverage_nightly, coverage(off))]
-fn not_implemented_json(command: &str) -> Result<()> {
-    output::print_json(&serde_json::json!({
-        "command": command,
-        "status": "not_implemented",
-    }))
 }
 
 #[cfg(test)]
@@ -381,5 +519,69 @@ mod tests {
         assert_eq!(v["ahead"], 2);
         assert_eq!(v["pull_request"]["number"], 7);
         assert_eq!(v["pull_request"]["draft"], false);
+    }
+
+    fn sample_session() -> Session {
+        to_session(
+            &sample_context(),
+            Some("git@git.example.com:o/n.git".into()),
+            "2026-06-01T08:00:00+00:00".into(),
+        )
+    }
+
+    #[test]
+    fn to_session_carries_fields_and_derives_steps() {
+        let s = sample_session();
+        assert_eq!(s.repo, "o/n");
+        assert_eq!(s.branch.as_deref(), Some("feature/x"));
+        assert!(s.dirty);
+        assert_eq!(s.pull_request.as_ref().unwrap().number, 7);
+        assert_eq!(s.cursor, 0);
+        // dirty + ahead(2) + has PR -> commit, push, review steps.
+        assert!(!s.next_steps.is_empty());
+        assert!(s.next_steps.iter().any(|x| x.contains("uncommitted")));
+    }
+
+    #[test]
+    fn render_session_shows_snapshot_and_next_step() {
+        let out = render_session(&sample_session());
+        assert!(out.contains("Saved session (2026-06-01T08:00:00+00:00)"));
+        assert!(out.contains("Branch:  feature/x"));
+        assert!(out.contains("#7 Add feature [open]"));
+        assert!(out.contains("Next:"));
+    }
+
+    #[test]
+    fn diff_reports_branch_tree_and_pr_changes() {
+        let saved = sample_session();
+        // Fresh: switched branch, now clean, PR merged.
+        let fresh = WorkContext {
+            branch: Some("feature/y".into()),
+            dirty: false,
+            changed_files: 0,
+            pull_request: Some(PrSummary {
+                number: 7,
+                title: "Add feature".into(),
+                state: "merged".into(),
+                draft: false,
+                url: "https://x/pulls/7".into(),
+            }),
+            ..sample_context()
+        };
+        let changes = diff_session_vs_context(&saved, &fresh);
+        assert!(changes
+            .iter()
+            .any(|c| c.contains("branch: feature/x -> feature/y")));
+        assert!(changes
+            .iter()
+            .any(|c| c.contains("working tree: 3 file(s) -> clean")));
+        assert!(changes.iter().any(|c| c.contains("PR #7: open -> merged")));
+    }
+
+    #[test]
+    fn diff_is_empty_when_nothing_changed() {
+        let saved = sample_session();
+        let fresh = sample_context(); // same branch/tree/PR as saved derived from
+        assert!(diff_session_vs_context(&saved, &fresh).is_empty());
     }
 }
