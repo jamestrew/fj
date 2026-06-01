@@ -1,5 +1,6 @@
 pub mod remote;
 
+use std::path::PathBuf;
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
@@ -107,6 +108,43 @@ pub fn working_tree_status() -> Option<(bool, usize)> {
         return None;
     }
     Some(parse_porcelain(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// The repo's git directory (e.g. `.git`), or None when not in a repo. Used
+/// to anchor fj's local-only state under `<git-dir>/fj/`.
+pub fn git_dir() -> Option<PathBuf> {
+    let out = Command::new("git")
+        .args(["rev-parse", "--git-dir"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if p.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(p))
+    }
+}
+
+/// URL of the primary remote (`upstream`, else `origin`). None if neither is
+/// set or we aren't in a repo.
+pub fn remote_url() -> Option<String> {
+    for name in ["upstream", "origin"] {
+        if let Ok(out) = Command::new("git")
+            .args(["remote", "get-url", name])
+            .output()
+        {
+            if out.status.success() {
+                let u = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !u.is_empty() {
+                    return Some(u);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// `(ahead, behind)` of HEAD relative to its upstream `@{u}`. None when there
