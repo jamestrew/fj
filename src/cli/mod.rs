@@ -1,4 +1,5 @@
 pub mod agent;
+mod agent_provider;
 pub mod alias;
 pub mod api;
 pub mod auth;

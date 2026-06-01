@@ -1,19 +1,20 @@
-//! `fj agent` — AI-assisted code operations (scaffolding).
+//! `fj agent` — AI-assisted code operations (review / fix / explain).
 //!
-//! Three subcommands: two inspect (`review`, `explain`) and one mutating
-//! (`fix`). All handlers are placeholders that emit a structured plan or a
-//! `not_implemented` JSON stub, and otherwise surface a structured
-//! not-yet-implemented error. Once the real endpoints exist, replace the
-//! `not_implemented` helper calls with the typed `crate::api::agent::*`
-//! wrappers.
+//! All three route through the [`agent_provider`](super::agent_provider)
+//! abstraction: config comes from `FJ_AGENT_PROVIDER` / `FJ_AGENT_API_KEY` /
+//! `FJ_AGENT_MODEL` (the Fjord token is never reused). With nothing
+//! configured, every command reports a clear "agent backend not configured"
+//! error; the built-in `mock` provider echoes for development.
 //!
-//! Because this file carries a `#[cfg(test)]` module it must NOT be added to
-//! COV_IGNORE in the Makefile.
+//! The task-specific context is still generic ("the current change"); PR6
+//! enriches `explain` and PR7 enriches `review` with the real diff/target.
+//! `fix` emits a patch only (never mutates); `--write` / `--pr` come later.
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use clap::{Args, Subcommand};
 
-use crate::cli::context::{resolve_repo, RepoFlag};
+use crate::cli::agent_provider::{self, AgentConfig, AgentRequest, AgentTask};
+use crate::cli::context::RepoFlag;
 use crate::output;
 
 #[derive(Debug, Args)]
@@ -68,50 +69,62 @@ pub async fn run(cmd: AgentCmd, host: Option<&str>) -> Result<()> {
     }
 }
 
-/// Emit a `not_implemented` JSON stub for an inspect command and return Ok.
-/// Routes through `output::print_json` so the global `--json-fields`
-/// projection applies uniformly.
-fn json_stub(command: &str) -> Result<()> {
-    output::print_json(&serde_json::json!({
-        "command": command,
-        "status": "not_implemented",
-    }))
-}
-
-/// The single shared not-yet-implemented error for the agent group.
-fn not_implemented(command: &str) -> Result<()> {
-    bail!("`fj agent {command}` is not yet implemented");
-}
-
+/// Resolve the configured provider, run a task, and print the result.
+/// Shared by every agent command. With no backend configured this surfaces
+/// the provider's "not configured" error; with `mock` it echoes the request.
+/// `input` is the context the command gathered (PR6/PR7 enrich it per task).
 #[cfg_attr(coverage_nightly, coverage(off))]
-async fn review(args: ReviewArgs, host: Option<&str>) -> Result<()> {
-    let _ctx = resolve_repo(args.r.repo.as_deref(), host)?;
-    if args.json {
-        return json_stub("review");
+fn run_task(task: AgentTask, input: String, json: bool) -> Result<()> {
+    let cfg = AgentConfig::from_env();
+    let provider = agent_provider::resolve(&cfg)?;
+    let resp = provider.complete(&AgentRequest {
+        task,
+        input,
+        model: cfg.model.clone(),
+    })?;
+    if json {
+        return output::print_json(&serde_json::json!({
+            "task": task.as_str(),
+            "provider": resp.provider,
+            "model": resp.model,
+            "output": resp.output,
+        }));
     }
-    not_implemented("review")
+    println!("{}", resp.output);
+    Ok(())
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
-async fn fix(args: FixArgs, host: Option<&str>) -> Result<()> {
-    let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
+async fn review(args: ReviewArgs, _host: Option<&str>) -> Result<()> {
+    // PR7 enriches this with the actual PR/working diff to review.
+    run_task(
+        AgentTask::Review,
+        "the current change".to_string(),
+        args.json,
+    )
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn fix(args: FixArgs, _host: Option<&str>) -> Result<()> {
+    // Default contract: emit a patch only, never mutate. --write / --pr come
+    // later; for now --dry-run just reports the plan without calling out.
     if args.dry_run {
         println!(
-            "would: apply automated fixes to the current change in {}/{}",
-            ctx.owner, ctx.name
+            "would: ask the configured agent to propose a patch and print it (no changes applied)"
         );
         return Ok(());
     }
-    not_implemented("fix")
+    run_task(AgentTask::Fix, "the current change".to_string(), false)
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
-async fn explain(args: ExplainArgs, host: Option<&str>) -> Result<()> {
-    let _ctx = resolve_repo(args.r.repo.as_deref(), host)?;
-    if args.json {
-        return json_stub("explain");
-    }
-    not_implemented("explain")
+async fn explain(args: ExplainArgs, _host: Option<&str>) -> Result<()> {
+    // PR6 enriches this with the actual target (a ref / file / question).
+    run_task(
+        AgentTask::Explain,
+        "the current change".to_string(),
+        args.json,
+    )
 }
 
 #[cfg(test)]
@@ -170,12 +183,3 @@ mod tests {
         }
     }
 }
-
-// To register in src/cli/mod.rs:
-//   pub mod agent;
-//   // in `enum Command`:
-//   /// AI-assisted code operations.
-//   Agent(agent::AgentCmd),
-//   // in `dispatch`:
-//   Command::Agent(cmd) => agent::run(cmd, host).await,
-// To register in src/main.rs KNOWN_SUBCOMMANDS: add "agent".
