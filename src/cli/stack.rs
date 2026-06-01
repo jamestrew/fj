@@ -1,18 +1,19 @@
 //! `fj stack` — stacked-branch / stacked-PR management.
 //!
-//! Scaffolding only: every handler resolves the repo context (so the
-//! `-R`/auto-detect plumbing is exercised) and then either prints a dry-run
-//! plan, emits a `not_implemented` JSON stub, or bails with a structured
-//! "not yet implemented" error. No subcommand is wired to a real endpoint.
-//!
-//! Because this file carries a `#[cfg(test)]` module it must NOT be added to
-//! COV_IGNORE in the Makefile.
+//! Stack state is local and git-native (`<git-dir>/fj/stack.json`, see
+//! [`stack_state`](super::stack_state)) — no server state, offline-capable.
+//! `stack new` is implemented (records a stack rooted at the current branch).
+//! `sync` / `split` / `review` / `absorb` / `ship` are still placeholders
+//! (dry-run plan, else a structured "not yet implemented" error); the chain
+//! rebases and the PR-state review land in follow-up PRs.
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
+use chrono::Utc;
 use clap::{Args, Subcommand};
 
 use crate::cli::context::{resolve_repo, RepoFlag};
-use crate::output;
+use crate::cli::stack_state::{self, Stack};
+use crate::{git, output};
 
 #[derive(Debug, Args)]
 pub struct StackCmd {
@@ -38,11 +39,13 @@ pub enum StackSub {
 
 #[derive(Debug, Args)]
 pub struct NewArgs {
-    #[command(flatten)]
-    pub r: RepoFlag,
-    /// Name for the new stack.
+    // No `-R`: stack state is local to the current git dir.
+    /// Name for the new stack (defaults to the current branch name).
     pub name: Option<String>,
-    /// Print the planned actions and exit without mutating anything.
+    /// Branch the stack targets (its trunk).
+    #[arg(long, default_value = "main")]
+    pub base: String,
+    /// Print the planned actions and exit without writing anything.
     #[arg(long)]
     pub dry_run: bool,
 }
@@ -116,11 +119,38 @@ fn placeholder_mutation(plan: &str, command: &str, dry_run: bool) -> Result<()> 
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
-async fn new(args: NewArgs, host: Option<&str>) -> Result<()> {
-    let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
-    let name = args.name.as_deref().unwrap_or("(unnamed)");
-    let plan = format!("start a new stack '{}' in {}/{}", name, ctx.owner, ctx.name);
-    placeholder_mutation(&plan, "new", args.dry_run)
+async fn new(args: NewArgs, _host: Option<&str>) -> Result<()> {
+    // Local-only: record metadata under <git-dir>/fj/stack.json. No network,
+    // no git branch creation yet (that comes with sync/split).
+    let branch = git::current_branch()
+        .context("not on a branch (detached HEAD); check out a branch first")?;
+    let name = args.name.clone().unwrap_or_else(|| branch.clone());
+
+    let mut state = stack_state::load()?;
+    if state.find(&name).is_some() {
+        bail!("a stack named '{name}' already exists");
+    }
+
+    if args.dry_run {
+        println!(
+            "would: create stack '{name}' (base {}) tracking branch '{branch}'",
+            args.base
+        );
+        return Ok(());
+    }
+
+    state.add(Stack {
+        name: name.clone(),
+        base: args.base.clone(),
+        branches: vec![branch.clone()],
+        created_at: Utc::now().to_rfc3339(),
+    })?;
+    stack_state::save(&state)?;
+    println!(
+        "✓ Created stack '{name}' (base {}) tracking '{branch}'",
+        args.base
+    );
+    Ok(())
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -190,23 +220,31 @@ mod tests {
     }
 
     #[test]
-    fn new_parses_optional_name_and_dry_run() {
-        let cli = Cli::try_parse_from(["fj", "stack", "new", "feature", "--dry-run", "-R", "o/n"])
-            .expect("should parse");
+    fn new_parses_name_base_and_dry_run() {
+        let cli = Cli::try_parse_from([
+            "fj",
+            "stack",
+            "new",
+            "feature",
+            "--base",
+            "develop",
+            "--dry-run",
+        ])
+        .expect("should parse");
         match cli.command {
             Command::Stack(StackCmd {
                 command: StackSub::New(a),
             }) => {
                 assert!(a.dry_run);
                 assert_eq!(a.name.as_deref(), Some("feature"));
-                assert_eq!(a.r.repo.as_deref(), Some("o/n"));
+                assert_eq!(a.base, "develop");
             }
             other => panic!("expected stack new, got {other:?}"),
         }
     }
 
     #[test]
-    fn new_name_is_optional() {
+    fn new_name_optional_and_base_defaults_to_main() {
         let cli = Cli::try_parse_from(["fj", "stack", "new"]).expect("should parse");
         match cli.command {
             Command::Stack(StackCmd {
@@ -214,6 +252,7 @@ mod tests {
             }) => {
                 assert!(a.name.is_none());
                 assert!(!a.dry_run);
+                assert_eq!(a.base, "main");
             }
             other => panic!("expected stack new, got {other:?}"),
         }
