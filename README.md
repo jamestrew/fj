@@ -132,7 +132,7 @@ fj api /version --include                # response headers + body
 
 ## Command surface
 
-Twenty-six top-level groups. Run `fj --help` for the live list; each group
+Twenty-nine top-level groups. Run `fj --help` for the live list; each group
 has its own `--help`. Highlights:
 
 | Group       | What it covers                                                                  |
@@ -161,10 +161,34 @@ has its own `--help`. Highlights:
 | `hook`      | webhook CRUD + test delivery                                                    |
 | `extension` | discover and run `fj-<name>` plugins on PATH                                    |
 | `api`       | raw HTTP with `-X`, `-f`, `-F`, `-H`, `-q`, `--paginate`, `--include`           |
+| `work`      | working-context / session: context, resume, continue _(preview)_               |
+| `stack`     | stacked branches / PRs: new, sync, split, review, absorb, ship _(preview)_      |
+| `agent`     | AI-assisted code ops: review, fix, explain _(preview)_                          |
 | `completion`| shell completions (bash, zsh, fish, powershell, elvish)                         |
 | `man`       | generate man pages                                                              |
 
 Full [gh → fj mapping table](docs/gh-to-fj.md) for migrating from GitHub workflows.
+
+### Preview: `work`, `stack`, `agent`
+
+These three groups are scaffolded: the command tree, `--help`, argument
+parsing, `--json` (on inspect commands), and `--dry-run` (on mutating ones)
+are all wired, but the handlers are placeholders that return a structured
+"not yet implemented" error. `--dry-run` prints the planned actions and exits
+cleanly so you can see the shape today.
+
+```sh
+fj work context --json            # inspect the current working context
+fj work resume --dry-run          # show what resuming would do
+
+fj stack new my-feature --dry-run # plan a new stack
+fj stack review --json            # stack + review state as JSON
+fj stack ship --dry-run           # plan shipping the ready entries
+
+fj agent review --json            # automated review of the current change
+fj agent fix --dry-run            # plan automated fixes
+fj agent explain --json           # explain a change
+```
 
 ## Global flags
 

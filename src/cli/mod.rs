@@ -1,3 +1,4 @@
+pub mod agent;
 pub mod alias;
 pub mod api;
 pub mod auth;
@@ -29,8 +30,10 @@ mod repo_deploy_key;
 mod repo_mirror;
 mod repo_social;
 pub mod search;
+pub mod stack;
 pub mod status;
 pub mod web;
+pub mod work;
 pub mod workflow;
 mod workflow_artifact;
 mod workflow_run;
@@ -123,6 +126,12 @@ pub enum Command {
     Extension(extension::ExtensionCmd),
     /// Make a raw API request (like `gh api`).
     Api(api::ApiArgs),
+    /// Inspect and resume your working context / session.
+    Work(work::WorkCmd),
+    /// Manage stacked branches / stacked PRs.
+    Stack(stack::StackCmd),
+    /// AI-assisted code operations (review, fix, explain).
+    Agent(agent::AgentCmd),
     /// Print shell completions to stdout.
     Completion(CompletionArgs),
     /// Generate man pages for `fj` and all subcommands into a directory.
@@ -206,6 +215,9 @@ async fn dispatch(command: Command, host: Option<&str>) -> Result<()> {
         Command::Hook(cmd) => hook::run(cmd, host).await,
         Command::Extension(cmd) => extension::run(cmd).await,
         Command::Api(args) => api::run(args, host).await,
+        Command::Work(cmd) => work::run(cmd, host).await,
+        Command::Stack(cmd) => stack::run(cmd, host).await,
+        Command::Agent(cmd) => agent::run(cmd, host).await,
         Command::Completion(args) => {
             use clap::CommandFactory;
             let mut cmd = Cli::command();

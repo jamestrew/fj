@@ -111,6 +111,9 @@ const KNOWN_SUBCOMMANDS: &[&str] = &[
     "protect",
     "hook",
     "api",
+    "work",
+    "stack",
+    "agent",
     "completion",
     "help",
 ];
