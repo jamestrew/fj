@@ -161,7 +161,7 @@ has its own `--help`. Highlights:
 | `hook`      | webhook CRUD + test delivery                                                    |
 | `extension` | discover and run `fj-<name>` plugins on PATH                                    |
 | `api`       | raw HTTP with `-X`, `-f`, `-F`, `-H`, `-q`, `--paginate`, `--include`           |
-| `work`      | working-context / session: context, resume, continue _(preview)_               |
+| `work`      | working-context / session: context; resume, continue _(preview)_               |
 | `stack`     | stacked branches / PRs: new, sync, split, review, absorb, ship _(preview)_      |
 | `agent`     | AI-assisted code ops: review, fix, explain _(preview)_                          |
 | `completion`| shell completions (bash, zsh, fish, powershell, elvish)                         |
@@ -169,18 +169,26 @@ has its own `--help`. Highlights:
 
 Full [gh → fj mapping table](docs/gh-to-fj.md) for migrating from GitHub workflows.
 
-### Preview: `work`, `stack`, `agent`
+### Work context
 
-These three groups are scaffolded: the command tree, `--help`, argument
-parsing, `--json` (on inspect commands), and `--dry-run` (on mutating ones)
-are all wired, but the handlers are placeholders that return a structured
-"not yet implemented" error. `--dry-run` prints the planned actions and exits
-cleanly so you can see the shape today.
+`fj work context` summarizes where you are: the resolved repo and host, the
+current branch and whether the working tree is dirty, ahead/behind your
+upstream, and the open PR (if any) for the current branch.
 
 ```sh
-fj work context --json            # inspect the current working context
-fj work resume --dry-run          # show what resuming would do
+fj work context                   # human-readable summary
+fj work context --json            # same, as JSON (honors --json-fields)
+```
 
+### Preview: the rest of `work`, plus `stack` and `agent`
+
+`work resume`/`continue`, all of `stack`, and all of `agent` are scaffolded:
+the command tree, `--help`, argument parsing, `--json` (inspect) and
+`--dry-run` (mutating) are wired, but the handlers are placeholders that
+return a structured "not yet implemented" error. `--dry-run` prints the
+planned actions and exits cleanly so you can see the shape today.
+
+```sh
 fj stack new my-feature --dry-run # plan a new stack
 fj stack review --json            # stack + review state as JSON
 fj stack ship --dry-run           # plan shipping the ready entries
