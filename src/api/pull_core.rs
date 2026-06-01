@@ -34,6 +34,13 @@ pub struct Pull {
     pub mergeable: bool,
     #[serde(default)]
     pub merged: bool,
+    /// Users with a pending review request. Populated by GET pull; empty on
+    /// list responses that omit it.
+    #[serde(
+        default,
+        deserialize_with = "crate::api::serde_util::deserialize_null_to_default"
+    )]
+    pub requested_reviewers: Vec<User>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     #[serde(default)]

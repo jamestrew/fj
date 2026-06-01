@@ -98,6 +98,12 @@ pub struct SplitArgs {
 pub struct ReviewArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Open each PR URL in your browser.
+    #[arg(long)]
+    pub open: bool,
+    /// Request review from a Forgejo user/team on every PR in the stack.
+    #[arg(long, value_name = "USER")]
+    pub request: Option<String>,
     /// Emit JSON instead of a table (honors the global `--json-fields`).
     #[arg(long)]
     pub json: bool,
@@ -343,7 +349,7 @@ async fn new(args: NewArgs, host: Option<&str>) -> Result<()> {
 
 // ── stack review ───────────────────────────────────────────────────────────
 
-/// A stack plus the live PR state of each of its items. Serializes for JSON.
+/// A stack plus the live review state of each of its items. Stable for JSON.
 #[derive(Debug, Serialize)]
 struct StackReview {
     name: String,
@@ -354,46 +360,93 @@ struct StackReview {
 #[derive(Debug, Serialize)]
 struct StackEntryView {
     branch: String,
+    /// The stack item's title.
     title: String,
+    /// The PR for this branch, or null when none exists / is unreachable.
     pull_request: Option<EntryPr>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, PartialEq)]
 struct EntryPr {
     number: u64,
+    /// PR title (may differ from the item title).
+    title: String,
     state: String,
     draft: bool,
     url: String,
+    /// "approved" | "changes_requested" | "commented" | "none".
+    review: String,
+    /// Combined CI state, or null when unavailable.
+    checks: Option<String>,
+    /// Mergeability for open PRs; null when not applicable / unknown.
+    mergeable: Option<bool>,
+    /// Logins with a pending review request.
+    requested_reviewers: Vec<String>,
 }
 
-/// Build the review view by matching each stack item's branch to its open PR.
-/// Pure — takes the already-fetched PR list.
-fn build_review(stack: &Stack, pulls: &[api::pull::Pull]) -> StackReview {
-    let entries = stack
-        .items
-        .iter()
-        .map(|item| {
-            let pull_request = pulls
-                .iter()
-                .find(|p| p.head.ref_ == item.branch)
-                .map(|p| EntryPr {
-                    number: p.number,
-                    state: p.state.clone(),
-                    draft: p.draft,
-                    url: p.html_url.clone(),
-                });
-            StackEntryView {
-                branch: item.branch.clone(),
-                title: item.title.clone(),
-                pull_request,
-            }
-        })
-        .collect();
-    StackReview {
-        name: stack.name.clone(),
-        base: stack.base.clone(),
-        entries,
+/// Aggregate PR review state. Request-changes dominates an approval; an
+/// approval dominates plain comments; no reviews → "none".
+fn summarize_reviews(reviews: &[api::pull::Review]) -> String {
+    let has = |s: &str| reviews.iter().any(|r| r.state.eq_ignore_ascii_case(s));
+    if has("REQUEST_CHANGES") {
+        "changes_requested".to_string()
+    } else if has("APPROVED") {
+        "approved".to_string()
+    } else if reviews.is_empty() {
+        "none".to_string()
+    } else {
+        "commented".to_string()
     }
+}
+
+/// Assemble the per-PR view from already-fetched pieces. Pure for testing.
+fn build_entry_pr(full: &api::pull::Pull, review: String, checks: Option<String>) -> EntryPr {
+    EntryPr {
+        number: full.number,
+        title: full.title.clone(),
+        state: full.state.clone(),
+        draft: full.draft,
+        url: full.html_url.clone(),
+        review,
+        checks,
+        // Mergeability is only meaningful while the PR is open.
+        mergeable: (full.state == "open").then_some(full.mergeable),
+        requested_reviewers: full
+            .requested_reviewers
+            .iter()
+            .map(|u| u.login.clone())
+            .collect(),
+    }
+}
+
+/// Resolve the PR number for an item: a live open PR matching the branch,
+/// else the number stored by a previous `sync` (covers merged/closed PRs).
+fn entry_pr_number(item: &StackItem, open_pulls: &[api::pull::Pull]) -> Option<u64> {
+    open_pulls
+        .iter()
+        .find(|p| p.head.ref_ == item.branch)
+        .map(|p| p.number)
+        .or_else(|| item.pr.as_ref().map(|p| p.number))
+}
+
+/// Fetch the full PR plus its reviews and CI status, best-effort. Returns
+/// `None` when the PR can't be fetched (deleted / unavailable) — graceful.
+async fn enrich_pr(client: &Client, owner: &str, name: &str, number: u64) -> Option<EntryPr> {
+    let full = api::pull::get(client, owner, name, number).await.ok()?;
+    let reviews = api::pull::list_reviews(client, owner, name, number)
+        .await
+        .unwrap_or_default();
+    let checks = api::pull::combined_status(client, owner, name, &full.head.sha)
+        .await
+        .ok()
+        .map(|cs| {
+            if cs.state.is_empty() {
+                "none".to_string()
+            } else {
+                cs.state
+            }
+        });
+    Some(build_entry_pr(&full, summarize_reviews(&reviews), checks))
 }
 
 /// Plain-text render of a stack review (no ANSI, so it's easy to test).
@@ -408,8 +461,21 @@ fn render_review(r: &StackReview) -> String {
     for e in &r.entries {
         match &e.pull_request {
             Some(pr) => {
-                let draft = if pr.draft { " (draft)" } else { "" };
-                let _ = writeln!(s, "  {}  #{} [{}]{}", e.branch, pr.number, pr.state, draft);
+                let draft = if pr.draft { " draft" } else { "" };
+                let checks = pr.checks.as_deref().unwrap_or("?");
+                let merge = match pr.mergeable {
+                    Some(true) => "mergeable",
+                    Some(false) => "conflicts",
+                    None => "-",
+                };
+                let _ = writeln!(
+                    s,
+                    "  {}  #{} {} [{}{}]  review:{}  ci:{}  {}",
+                    e.branch, pr.number, pr.title, pr.state, draft, pr.review, checks, merge
+                );
+                if !pr.requested_reviewers.is_empty() {
+                    let _ = writeln!(s, "       requested: {}", pr.requested_reviewers.join(", "));
+                }
             }
             None => {
                 let _ = writeln!(s, "  {}  (no PR)", e.branch);
@@ -432,7 +498,49 @@ async fn review(args: ReviewArgs, host: Option<&str>) -> Result<()> {
         api::pull::ListOptions::default(),
     )
     .await?;
-    let review = build_review(&stack, &page.items);
+
+    // --request: ask the user for review on each item's PR before reporting,
+    // so the requested-reviewers column reflects it.
+    if let Some(user) = &args.request {
+        for item in &stack.items {
+            if let Some(n) = entry_pr_number(item, &page.items) {
+                api::pull::request_reviewers(
+                    &ctx.client,
+                    &ctx.owner,
+                    &ctx.name,
+                    n,
+                    vec![user.clone()],
+                )
+                .await?;
+            }
+        }
+    }
+
+    let mut entries = Vec::with_capacity(stack.items.len());
+    for item in &stack.items {
+        let pull_request = match entry_pr_number(item, &page.items) {
+            Some(n) => enrich_pr(&ctx.client, &ctx.owner, &ctx.name, n).await,
+            None => None,
+        };
+        entries.push(StackEntryView {
+            branch: item.branch.clone(),
+            title: item.title.clone(),
+            pull_request,
+        });
+    }
+    let review = StackReview {
+        name: stack.name.clone(),
+        base: stack.base.clone(),
+        entries,
+    };
+
+    if args.open {
+        for e in &review.entries {
+            if let Some(pr) = &e.pull_request {
+                let _ = crate::cli::web::open(&pr.url);
+            }
+        }
+    }
 
     if args.json {
         return output::print_json(&serde_json::to_value(&review)?);
@@ -981,28 +1089,193 @@ mod tests {
     }
 
     #[test]
-    fn build_review_matches_items_to_prs() {
-        let pulls = vec![
-            pull_with_head(7, "feature/a", "open"),
-            pull_with_head(9, "other", "open"),
-        ];
-        let r = build_review(&stack_with_branches(&["feature/a", "feature/b"]), &pulls);
-        assert_eq!(r.name, "feat");
-        assert_eq!(r.entries.len(), 2);
-        assert_eq!(r.entries[0].pull_request.as_ref().unwrap().number, 7);
-        assert!(r.entries[1].pull_request.is_none());
+    fn review_parses_open_request_and_json() {
+        let cli = Cli::try_parse_from([
+            "fj",
+            "stack",
+            "review",
+            "--open",
+            "--request",
+            "bob",
+            "--json",
+        ])
+        .expect("should parse");
+        match cli.command {
+            Command::Stack(StackCmd {
+                command: StackSub::Review(a),
+            }) => {
+                assert!(a.open && a.json);
+                assert_eq!(a.request.as_deref(), Some("bob"));
+            }
+            other => panic!("expected stack review, got {other:?}"),
+        }
+    }
+
+    fn review_value(state: &str) -> api::pull::Review {
+        serde_json::from_value(serde_json::json!({
+            "id": 1, "state": state, "user": { "id": 1, "login": "bob" },
+            "html_url": "https://x/r/1"
+        }))
+        .unwrap()
     }
 
     #[test]
-    fn render_review_shows_branches_and_pr_state() {
-        let pulls = vec![pull_with_head(7, "feature/a", "open")];
-        let out = render_review(&build_review(
-            &stack_with_branches(&["feature/a", "feature/b"]),
-            &pulls,
-        ));
-        assert!(out.contains("Stack: feat   base: main"));
-        assert!(out.contains("feature/a  #7 [open]"));
+    fn summarize_reviews_aggregates() {
+        assert_eq!(summarize_reviews(&[]), "none");
+        assert_eq!(summarize_reviews(&[review_value("COMMENT")]), "commented");
+        assert_eq!(summarize_reviews(&[review_value("APPROVED")]), "approved");
+        // request-changes dominates an approval
+        assert_eq!(
+            summarize_reviews(&[review_value("APPROVED"), review_value("REQUEST_CHANGES")]),
+            "changes_requested"
+        );
+    }
+
+    fn full_pull(number: u64, state: &str, mergeable: bool, reviewers: &[&str]) -> api::pull::Pull {
+        serde_json::from_value(serde_json::json!({
+            "id": number, "number": number, "title": "PR title", "state": state,
+            "user": { "id": 1, "login": "alice" },
+            "html_url": format!("https://x/pulls/{number}"),
+            "head": { "ref": "feature/a", "sha": "aaa" },
+            "base": { "ref": "main", "sha": "bbb" },
+            "draft": false, "mergeable": mergeable,
+            "requested_reviewers": reviewers.iter().map(|l| serde_json::json!({"id":1,"login":l})).collect::<Vec<_>>(),
+            "created_at": "2026-06-01T00:00:00Z", "updated_at": "2026-06-01T00:00:00Z"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn build_entry_pr_carries_review_checks_mergeable_reviewers() {
+        let pr = build_entry_pr(
+            &full_pull(7, "open", true, &["bob", "carol"]),
+            "approved".into(),
+            Some("success".into()),
+        );
+        assert_eq!(pr.number, 7);
+        assert_eq!(pr.review, "approved");
+        assert_eq!(pr.checks.as_deref(), Some("success"));
+        assert_eq!(pr.mergeable, Some(true)); // open -> reported
+        assert_eq!(pr.requested_reviewers, vec!["bob", "carol"]);
+    }
+
+    #[test]
+    fn build_entry_pr_hides_mergeable_when_not_open() {
+        let pr = build_entry_pr(&full_pull(7, "merged", false, &[]), "none".into(), None);
+        assert_eq!(pr.mergeable, None); // not open -> not applicable
+    }
+
+    #[test]
+    fn entry_pr_number_prefers_open_then_stored() {
+        let open = vec![pull_with_head(7, "feature/a", "open")];
+        let mut items = stack_with_branches(&["feature/a", "feature/b"]).items;
+        // feature/a matches an open PR
+        assert_eq!(entry_pr_number(&items[0], &open), Some(7));
+        // feature/b has no open PR; falls back to a stored pr number
+        items[1].pr = Some(ItemPr {
+            number: 99,
+            url: "u".into(),
+            state: "merged".into(),
+        });
+        assert_eq!(entry_pr_number(&items[1], &open), Some(99));
+        items[1].pr = None;
+        assert_eq!(entry_pr_number(&items[1], &open), None);
+    }
+
+    #[test]
+    fn render_review_shows_enriched_fields_and_missing_pr() {
+        let review = StackReview {
+            name: "feat".into(),
+            base: "main".into(),
+            entries: vec![
+                StackEntryView {
+                    branch: "feature/a".into(),
+                    title: "A".into(),
+                    pull_request: Some(EntryPr {
+                        number: 7,
+                        title: "Add A".into(),
+                        state: "open".into(),
+                        draft: false,
+                        url: "https://x/pulls/7".into(),
+                        review: "approved".into(),
+                        checks: Some("success".into()),
+                        mergeable: Some(true),
+                        requested_reviewers: vec!["bob".into()],
+                    }),
+                },
+                StackEntryView {
+                    branch: "feature/b".into(),
+                    title: "B".into(),
+                    pull_request: None,
+                },
+            ],
+        };
+        let out = render_review(&review);
+        assert!(out.contains("feature/a  #7 Add A [open]  review:approved  ci:success  mergeable"));
+        assert!(out.contains("requested: bob"));
         assert!(out.contains("feature/b  (no PR)"));
+
+        let v = serde_json::to_value(&review).unwrap();
+        assert_eq!(v["entries"][0]["pull_request"]["review"], "approved");
+        assert_eq!(v["entries"][0]["pull_request"]["checks"], "success");
+        assert_eq!(v["entries"][0]["pull_request"]["mergeable"], true);
+        assert_eq!(
+            v["entries"][0]["pull_request"]["requested_reviewers"][0],
+            "bob"
+        );
+        assert!(v["entries"][1]["pull_request"].is_null());
+    }
+
+    #[tokio::test]
+    async fn enrich_pr_gathers_full_reviews_and_checks() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/o/r/pulls/7"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::to_value(full_pull(7, "open", true, &["bob"])).unwrap(),
+                ),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/o/r/pulls/7/reviews"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!([review_value("APPROVED")])),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/o/r/commits/aaa/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "state": "success", "sha": "aaa", "total_count": 2, "statuses": []
+            })))
+            .mount(&server)
+            .await;
+        let c = client_for(&server);
+        let pr = enrich_pr(&c, "o", "r", 7).await.expect("should enrich");
+        assert_eq!(pr.number, 7);
+        assert_eq!(pr.review, "approved");
+        assert_eq!(pr.checks.as_deref(), Some("success"));
+        assert_eq!(pr.mergeable, Some(true));
+        assert_eq!(pr.requested_reviewers, vec!["bob"]);
+    }
+
+    #[tokio::test]
+    async fn enrich_pr_returns_none_when_pr_missing() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/o/r/pulls/9"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let c = client_for(&server);
+        assert!(enrich_pr(&c, "o", "r", 9).await.is_none());
     }
 
     // ---- sync: pure helpers ----
