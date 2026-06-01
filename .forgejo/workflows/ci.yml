@@ -27,17 +27,14 @@ jobs:
       - name: checkout
         uses: actions/checkout@v4
 
-      - name: install rust toolchain
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --profile minimal --default-toolchain 1.95.0
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+      - name: setup rust
+        uses: https://rasterhub.com/rasterstate/setup-rust-action@v1
+        with:
+          toolchain: '1.95.0'
+          components: rustfmt, clippy
 
       - name: cache cargo
         uses: https://rasterhub.com/rasterstate/rust-cache-action@v1
-
-      - name: install rustfmt + clippy
-        run: rustup component add rustfmt clippy
 
       - name: cargo fmt
         run: cargo fmt --all -- --check
@@ -77,19 +74,20 @@ jobs:
       - name: checkout
         uses: actions/checkout@v4
 
-      - name: install rust toolchains
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --profile minimal --default-toolchain 1.95.0
-          # $GITHUB_PATH only affects later steps; source env so rustup is on
-          # PATH for the nightly install in this same step.
-          . "$HOME/.cargo/env"
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-          # The coverage(off) regions only take effect on a nightly toolchain
-          # (cargo-llvm-cov sets cfg(coverage_nightly) there). llvm-tools-preview
-          # provides the profdata/cov tooling.
-          rustup toolchain install nightly --profile minimal
-          rustup component add llvm-tools-preview --toolchain nightly
+      - name: setup rust (stable)
+        uses: https://rasterhub.com/rasterstate/setup-rust-action@v1
+        with:
+          toolchain: '1.95.0'
+
+      # The coverage(off) regions only take effect on a nightly toolchain
+      # (cargo-llvm-cov sets cfg(coverage_nightly) there). llvm-tools-preview
+      # provides the profdata/cov tooling. override:false keeps 1.95.0 default.
+      - name: setup rust (nightly for coverage)
+        uses: https://rasterhub.com/rasterstate/setup-rust-action@v1
+        with:
+          toolchain: nightly
+          components: llvm-tools-preview
+          override: 'false'
 
       - name: cache cargo
         uses: https://rasterhub.com/rasterstate/rust-cache-action@v1
