@@ -222,12 +222,25 @@ structured "not yet implemented").
 
 `fj agent review` / `fix` / `explain` route through a provider configured by
 `FJ_AGENT_PROVIDER` / `FJ_AGENT_API_KEY` / `FJ_AGENT_MODEL` (the Fjord token is
-never reused). With nothing configured they report "agent backend not
-configured"; `fix` only ever emits a patch.
+never reused).
+
+`fj agent review` is a local diff-analysis command. It gathers the working-tree
+diff (or `--pr <n>`, or each `--stack` item), redacts secrets and sensitive
+files before anything leaves your machine (`.env`, private keys, `secret = …`
+assignments, known token prefixes, PEM blocks), and prints severity-tagged
+findings with file references: secret-bearing files, source changed without
+tests, and risky areas (migrations, auth/crypto, CI, dependency manifests).
+That local analysis runs even with no AI backend configured; when a provider
+*is* set it adds a narrative review on top. `--security` focuses the pass, and
+`--json` emits the full report for editor/mobile clients. `fix` only ever emits
+a patch.
 
 ```sh
-fj agent explain src/main.rs --json
+fj agent review                 # analyze the working-tree diff
+fj agent review --stack         # review each stack item separately
+fj agent review --security --json
 fj agent review --pr 42
+fj agent explain src/main.rs --json
 ```
 
 ## Global flags
