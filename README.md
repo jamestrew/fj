@@ -162,7 +162,7 @@ has its own `--help`. Highlights:
 | `extension` | discover and run `fj-<name>` plugins on PATH                                    |
 | `api`       | raw HTTP with `-X`, `-f`, `-F`, `-H`, `-q`, `--paginate`, `--include`           |
 | `work`      | working-context / session: context; resume, continue _(preview)_               |
-| `stack`     | stacked branches / PRs: new, review, sync; split, absorb, ship _(preview)_      |
+| `stack`     | stacked branches / PRs: new, review, sync, ship; split, absorb _(preview)_      |
 | `agent`     | AI-assisted code ops: review, fix, explain _(preview)_                          |
 | `completion`| shell completions (bash, zsh, fish, powershell, elvish)                         |
 | `man`       | generate man pages                                                              |
@@ -198,6 +198,9 @@ fj stack review --open                # open every PR in the browser
 fj stack review --request alice       # request alice's review on the whole stack
 fj stack sync                         # push branches + create/update PRs
 fj stack sync --draft --dry-run       # plan only (no pushes / PR writes)
+fj stack ship                         # merge bottom-up (green + approved gate)
+fj stack ship --dry-run               # print the merge plan, change nothing
+fj stack ship --squash --delete-branches
 ```
 
 `fj stack new` derives a safe slug and branch (`<handle>/<slug>-1`), records
@@ -206,8 +209,14 @@ without `--force`. `fj stack sync` pushes each branch to origin and
 creates/updates its PR, chaining bases (item _n_ targets item _n-1_'s branch,
 the first targets the stack base) and writing PR numbers/URLs back into the
 stack file; it's idempotent and `--draft`/`--ready` control PR state.
-`split` / `absorb` / `ship` are still scaffolded (`--dry-run` prints the
-plan, else a structured "not yet implemented").
+`fj stack ship` merges the stack bottom-up: it pre-flights every PR (each must
+be approved and green unless `--force`), merges from the base up, re-points the
+next PR onto the trunk after each merge, and stops on the first failure with
+recovery instructions (merged items are skipped on re-run). `--merge` (default)
+/ `--squash` pick the strategy, `--delete-branches` cleans up merged branches,
+and `--dry-run` prints the plan without touching anything.
+`split` / `absorb` are still scaffolded (`--dry-run` prints the plan, else a
+structured "not yet implemented").
 
 ### Agent (AI-assisted)
 

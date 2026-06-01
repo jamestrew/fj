@@ -172,6 +172,10 @@ pub struct EditPull<'a> {
     pub body: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state: Option<&'a str>,
+    /// Re-point the PR's base branch (used by `stack ship` to retarget the
+    /// next PR onto the trunk after the one below it merges).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base: Option<&'a str>,
 }
 
 pub async fn edit(
@@ -245,7 +249,7 @@ pub enum MergeStyle {
 }
 
 impl MergeStyle {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             MergeStyle::Merge => "merge",
             MergeStyle::Rebase => "rebase",

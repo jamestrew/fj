@@ -408,6 +408,7 @@ async fn edit(args: EditArgs, host: Option<&str>) -> Result<()> {
             title: args.title.as_deref(),
             body: body.as_deref(),
             state: None,
+            base: None,
         },
     )
     .await?;

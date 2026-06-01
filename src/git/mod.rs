@@ -211,6 +211,21 @@ fn is_non_fast_forward(stderr: &str) -> bool {
         || (s.contains("[rejected]") && s.contains("failed to push"))
 }
 
+/// Force-delete a local branch (`git branch -D <name>`). Used by
+/// `stack ship --delete-branches` after a PR merges.
+pub fn delete_local_branch(name: &str) -> Result<()> {
+    reject_dash_lead("branch name", name)?;
+    run(&["branch", "-D", name])
+}
+
+/// Delete a branch on a remote (`git push <remote> --delete <name>`). This is
+/// a ref deletion, not a force-push of content.
+pub fn delete_remote_branch(remote: &str, name: &str) -> Result<()> {
+    reject_dash_lead("remote", remote)?;
+    reject_dash_lead("branch name", name)?;
+    run(&["push", remote, "--delete", name])
+}
+
 /// Create a new branch (`git checkout -b <name> [<start>]`). `name`/`start`
 /// must not be `-`-leading (argument injection).
 pub fn create_branch(name: &str, start: Option<&str>) -> Result<()> {

@@ -31,6 +31,9 @@ pub struct Stack {
     pub issue: Option<IssueRef>,
     #[serde(default)]
     pub items: Vec<StackItem>,
+    /// Set by `stack ship` once every item has merged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shipped_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -182,6 +185,7 @@ mod tests {
                 pr: None,
                 status: "local".into(),
             }],
+            shipped_at: None,
         }
     }
 

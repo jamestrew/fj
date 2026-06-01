@@ -3,10 +3,12 @@
 //! Stack state is local and git-native (`<git-dir>/fj/stack.json`, see
 //! [`stack_state`](super::stack_state)) — no server state, offline-capable,
 //! never a committed manifest. `stack new` (author a stack), `stack review`
-//! (show the stack + each branch's PR state), and `stack sync` (push each
-//! branch and create/update its Forgejo PR, chaining bases so each PR targets
-//! the previous branch) are implemented. `split` / `absorb` / `ship` are
-//! still placeholders (dry-run plan, else a structured "not yet implemented").
+//! (show the stack + each branch's PR state), `stack sync` (push each branch
+//! and create/update its Forgejo PR, chaining bases so each PR targets the
+//! previous branch), and `stack ship` (merge bottom-up, re-pointing each next
+//! PR onto the trunk as the one below it merges) are implemented. `split` /
+//! `absorb` are still placeholders (dry-run plan, else a structured "not yet
+//! implemented").
 
 use std::path::{Path, PathBuf};
 
@@ -16,7 +18,7 @@ use clap::{Args, Subcommand};
 use serde::Serialize;
 
 use crate::api;
-use crate::api::pull::CreatePull;
+use crate::api::pull::{CreatePull, EditPull, MergeStyle};
 use crate::cli::context::{resolve_repo, RepoFlag};
 use crate::cli::stack_state::{self, IssueRef, ItemPr, RepoRef, Stack, StackItem, STACK_VERSION};
 use crate::client::Client;
@@ -122,7 +124,22 @@ pub struct AbsorbArgs {
 pub struct ShipArgs {
     #[command(flatten)]
     pub r: RepoFlag,
-    /// Print the planned actions and exit without mutating anything.
+    /// Squash-merge each PR.
+    #[arg(long, conflicts_with = "merge")]
+    pub squash: bool,
+    /// Merge-commit each PR.
+    #[arg(long)]
+    pub merge: bool,
+    /// Delete each branch (remote + local) after its PR merges.
+    #[arg(long)]
+    pub delete_branches: bool,
+    /// Ship even if a PR isn't green/approved.
+    #[arg(long)]
+    pub force: bool,
+    /// Emit machine-readable operations/results as JSON.
+    #[arg(long)]
+    pub json: bool,
+    /// Print the merge plan without merging or deleting anything.
     #[arg(long)]
     pub dry_run: bool,
 }
@@ -219,6 +236,7 @@ fn build_stack(
         updated_at: now.to_string(),
         issue,
         items,
+        shipped_at: None,
     }
 }
 
@@ -793,14 +811,232 @@ async fn absorb(args: AbsorbArgs, host: Option<&str>) -> Result<()> {
     placeholder_mutation(&plan, "absorb", args.dry_run)
 }
 
+// ── stack ship ─────────────────────────────────────────────────────────────
+
+/// The merge style to use. `--squash`/`--merge` are explicit; the default is
+/// a plain merge commit, the most universally-allowed (safest) style.
+fn merge_style(squash: bool, merge: bool) -> MergeStyle {
+    match (squash, merge) {
+        (true, _) => MergeStyle::Squash,
+        _ => MergeStyle::Merge,
+    }
+}
+
+/// Whether a PR is shippable: approved and green. "Green" treats no CI
+/// (`none`/absent) as non-blocking; only pending/failure/error block.
+/// Already-merged PRs are shippable (they're skipped). Returns the blocking
+/// reason on failure.
+fn shippable(review: &str, checks: Option<&str>, state: &str) -> std::result::Result<(), String> {
+    if state == "merged" {
+        return Ok(());
+    }
+    if review != "approved" {
+        return Err(format!("not approved (review: {review})"));
+    }
+    match checks {
+        Some(s) if s != "success" && s != "none" => Err(format!("checks not green (ci: {s})")),
+        _ => Ok(()),
+    }
+}
+
+/// What `ship` intends to do per item, bottom-up. For `--dry-run` / `--json`.
+#[derive(Debug, Serialize, PartialEq)]
+struct ShipPlan {
+    branch: String,
+    base: String,
+    style: String,
+}
+
+fn plan_ship(stack: &Stack, style: MergeStyle) -> Vec<ShipPlan> {
+    let bases: Vec<String> = (0..stack.items.len())
+        .map(|i| pr_base(&stack.base, &stack.items, i))
+        .collect();
+    stack
+        .items
+        .iter()
+        .zip(bases)
+        .map(|(item, base)| ShipPlan {
+            branch: item.branch.clone(),
+            base,
+            style: style.as_str().to_string(),
+        })
+        .collect()
+}
+
+fn render_ship_plan(plan: &[ShipPlan]) -> String {
+    use std::fmt::Write;
+    let mut s = String::from("Would ship bottom-up (no merges or deletes):\n");
+    for p in plan {
+        let _ = writeln!(s, "  merge {} → {} ({})", p.branch, p.base, p.style);
+    }
+    s
+}
+
+/// Recovery guidance printed when a merge fails partway through.
+fn recovery_message(failed_branch: &str, merged: &[String]) -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    let _ = writeln!(s, "Stopped: merging '{failed_branch}' failed.");
+    if merged.is_empty() {
+        let _ = writeln!(s, "  Nothing was merged.");
+    } else {
+        let _ = writeln!(s, "  Already merged: {}", merged.join(", "));
+    }
+    let _ = writeln!(
+        s,
+        "  Fix the issue, then re-run `fj stack ship` — merged items are skipped."
+    );
+    s
+}
+
+#[derive(Debug, Serialize)]
+struct ShipOp {
+    branch: String,
+    number: u64,
+    /// "merged" | "skipped"
+    action: String,
+}
+
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn ship(args: ShipArgs, host: Option<&str>) -> Result<()> {
+    let Some(mut stack) = stack_state::load()? else {
+        bail!("no stack for this repo. Run `fj stack new` to start one.");
+    };
+    validate_items(&stack.items)?;
+    let style = merge_style(args.squash, args.merge);
+
+    if args.dry_run {
+        let plan = plan_ship(&stack, style);
+        if args.json {
+            return output::print_json(&serde_json::to_value(&plan)?);
+        }
+        print!("{}", render_ship_plan(&plan));
+        return Ok(());
+    }
+
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
-    let plan = format!(
-        "ship the ready entries of the stack in {}/{}",
-        ctx.owner, ctx.name
-    );
-    placeholder_mutation(&plan, "ship", args.dry_run)
+    let page = api::pull::list(
+        &ctx.client,
+        &ctx.owner,
+        &ctx.name,
+        api::pull::ListOptions::default(),
+    )
+    .await?;
+    // Once an item merges, everything above it should target the trunk (its
+    // own base branch has merged away), so re-point the next PR onto `trunk`.
+    let trunk = stack.base.clone();
+
+    // Resolve each item's PR number; every item must have one to ship.
+    let mut numbers = Vec::with_capacity(stack.items.len());
+    for item in &stack.items {
+        match entry_pr_number(item, &page.items) {
+            Some(n) => numbers.push(n),
+            None => bail!(
+                "stack item '{}' has no PR — run `fj stack sync` first",
+                item.branch
+            ),
+        }
+    }
+
+    // Pre-flight: validate ALL PRs before merging any (unless --force), so we
+    // never merge the bottom and then stop.
+    if !args.force {
+        for (item, &number) in stack.items.iter().zip(&numbers) {
+            let pr = enrich_pr(&ctx.client, &ctx.owner, &ctx.name, number)
+                .await
+                .ok_or_else(|| {
+                    anyhow::anyhow!("could not fetch PR #{number} for '{}'", item.branch)
+                })?;
+            if let Err(reason) = shippable(&pr.review, pr.checks.as_deref(), &pr.state) {
+                bail!(
+                    "'{}' (PR #{number}) is not ready: {reason}. Pass --force to ship anyway.",
+                    item.branch
+                );
+            }
+        }
+    }
+
+    // Merge bottom-up; stop immediately on failure with recovery guidance.
+    let mut ops = Vec::with_capacity(stack.items.len());
+    let mut merged: Vec<String> = Vec::new();
+    for i in 0..stack.items.len() {
+        let branch = stack.items[i].branch.clone();
+        let number = numbers[i];
+        let already_merged = stack.items[i]
+            .pr
+            .as_ref()
+            .map(|p| p.state == "merged")
+            .unwrap_or(false);
+
+        if !already_merged {
+            if let Err(e) = api::pull::merge(
+                &ctx.client,
+                &ctx.owner,
+                &ctx.name,
+                number,
+                style,
+                None,
+                None,
+            )
+            .await
+            {
+                eprint!("{}", recovery_message(&branch, &merged));
+                return Err(e.context(format!("merging PR #{number} ({branch})")));
+            }
+            // Re-point the next PR onto the trunk this one merged into.
+            if let Some(next) = numbers.get(i + 1) {
+                let _ = api::pull::edit(
+                    &ctx.client,
+                    &ctx.owner,
+                    &ctx.name,
+                    *next,
+                    &EditPull {
+                        base: Some(&trunk),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            }
+            if args.delete_branches {
+                let _ = git::delete_remote_branch(&stack.repo.remote, &branch);
+                let _ = git::delete_local_branch(&branch);
+            }
+            ops.push(ShipOp {
+                branch: branch.clone(),
+                number,
+                action: "merged".to_string(),
+            });
+        } else {
+            ops.push(ShipOp {
+                branch: branch.clone(),
+                number,
+                action: "skipped".to_string(),
+            });
+        }
+
+        if let Some(pr) = stack.items[i].pr.as_mut() {
+            pr.state = "merged".to_string();
+        }
+        stack.items[i].status = "merged".to_string();
+        merged.push(branch);
+        stack.updated_at = Utc::now().to_rfc3339();
+        stack_state::save(&stack)?;
+    }
+
+    stack.shipped_at = Some(Utc::now().to_rfc3339());
+    stack_state::save(&stack)?;
+
+    if args.json {
+        return output::print_json(&serde_json::to_value(&ops)?);
+    }
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for op in &ops {
+        let _ = writeln!(out, "✓ {} {} (#{})", op.action, op.branch, op.number);
+    }
+    let _ = writeln!(out, "Shipped {} item(s).", ops.len());
+    print!("{out}");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1085,6 +1321,7 @@ mod tests {
             updated_at: "t".into(),
             issue: None,
             items,
+            shipped_at: None,
         }
     }
 
@@ -1276,6 +1513,95 @@ mod tests {
             .await;
         let c = client_for(&server);
         assert!(enrich_pr(&c, "o", "r", 9).await.is_none());
+    }
+
+    // ---- ship ----
+
+    #[test]
+    fn ship_parses_flags_and_squash_conflicts_merge() {
+        let cli = Cli::try_parse_from([
+            "fj",
+            "stack",
+            "ship",
+            "--squash",
+            "--delete-branches",
+            "--force",
+            "--json",
+            "--dry-run",
+        ])
+        .expect("should parse");
+        match cli.command {
+            Command::Stack(StackCmd {
+                command: StackSub::Ship(a),
+            }) => {
+                assert!(a.squash && a.delete_branches && a.force && a.json && a.dry_run);
+                assert!(!a.merge);
+            }
+            other => panic!("expected stack ship, got {other:?}"),
+        }
+        // --squash and --merge are mutually exclusive.
+        assert!(Cli::try_parse_from(["fj", "stack", "ship", "--squash", "--merge"]).is_err());
+    }
+
+    #[test]
+    fn merge_style_defaults_to_merge_commit() {
+        assert!(matches!(merge_style(false, false), MergeStyle::Merge));
+        assert!(matches!(merge_style(false, true), MergeStyle::Merge));
+        assert!(matches!(merge_style(true, false), MergeStyle::Squash));
+    }
+
+    #[test]
+    fn shippable_requires_approved_and_green() {
+        // approved + success
+        assert!(shippable("approved", Some("success"), "open").is_ok());
+        // approved + no CI configured is fine
+        assert!(shippable("approved", Some("none"), "open").is_ok());
+        assert!(shippable("approved", None, "open").is_ok());
+        // already merged is always shippable (it'll be skipped)
+        assert!(shippable("none", Some("failure"), "merged").is_ok());
+        // not approved blocks
+        let e = shippable("none", Some("success"), "open").unwrap_err();
+        assert!(e.contains("not approved"));
+        let e = shippable("changes_requested", Some("success"), "open").unwrap_err();
+        assert!(e.contains("changes_requested"));
+        // pending/failing CI blocks
+        let e = shippable("approved", Some("pending"), "open").unwrap_err();
+        assert!(e.contains("checks not green"));
+        assert!(shippable("approved", Some("failure"), "open").is_err());
+    }
+
+    #[test]
+    fn plan_ship_chains_bases_and_renders_dry_run() {
+        let stack = stack_with_branches(&["feature/a", "feature/b", "feature/c"]);
+        let plan = plan_ship(&stack, MergeStyle::Squash);
+        assert_eq!(plan.len(), 3);
+        assert_eq!(plan[0].base, "main"); // bottom targets trunk
+        assert_eq!(plan[1].base, "feature/a"); // chained onto the one below
+        assert_eq!(plan[2].base, "feature/b");
+        assert!(plan.iter().all(|p| p.style == "squash"));
+
+        let out = render_ship_plan(&plan);
+        assert!(out.contains("Would ship bottom-up"));
+        assert!(out.contains("merge feature/a → main (squash)"));
+        assert!(out.contains("merge feature/b → feature/a (squash)"));
+
+        // JSON shape is stable.
+        let v = serde_json::to_value(&plan).unwrap();
+        assert_eq!(v[0]["branch"], "feature/a");
+        assert_eq!(v[0]["base"], "main");
+        assert_eq!(v[2]["style"], "squash");
+    }
+
+    #[test]
+    fn recovery_message_reflects_progress() {
+        // nothing merged yet
+        let m = recovery_message("feature/a", &[]);
+        assert!(m.contains("merging 'feature/a' failed"));
+        assert!(m.contains("Nothing was merged"));
+        assert!(m.contains("merged items are skipped"));
+        // some merged before the failure
+        let m = recovery_message("feature/c", &["feature/a".into(), "feature/b".into()]);
+        assert!(m.contains("Already merged: feature/a, feature/b"));
     }
 
     // ---- sync: pure helpers ----
