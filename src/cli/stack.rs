@@ -2,15 +2,18 @@
 //!
 //! Stack state is local and git-native (`<git-dir>/fj/stack.json`, see
 //! [`stack_state`](super::stack_state)) — no server state, offline-capable.
-//! `stack new` is implemented (records a stack rooted at the current branch).
-//! `sync` / `split` / `review` / `absorb` / `ship` are still placeholders
-//! (dry-run plan, else a structured "not yet implemented" error); the chain
-//! rebases and the PR-state review land in follow-up PRs.
+//! `stack new` (records a stack rooted at the current branch) and `stack
+//! review` (shows the stack + each branch's PR state) are implemented.
+//! `sync` / `split` / `absorb` / `ship` are still placeholders (dry-run plan,
+//! else a structured "not yet implemented" error); the chain rebases land in
+//! follow-up PRs.
 
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use clap::{Args, Subcommand};
+use serde::Serialize;
 
+use crate::api;
 use crate::cli::context::{resolve_repo, RepoFlag};
 use crate::cli::stack_state::{self, Stack};
 use crate::{git, output};
@@ -72,6 +75,9 @@ pub struct SplitArgs {
 pub struct ReviewArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Stack to review (defaults to the current stack).
+    #[arg(long)]
+    pub name: Option<String>,
     /// Emit JSON instead of a table (honors the global `--json-fields`).
     #[arg(long)]
     pub json: bool,
@@ -173,17 +179,112 @@ async fn split(args: SplitArgs, host: Option<&str>) -> Result<()> {
     placeholder_mutation(&plan, "split", args.dry_run)
 }
 
+/// A stack plus the PR state of each of its branches. Serializes for `--json`.
+#[derive(Debug, Serialize)]
+struct StackReview {
+    name: String,
+    base: String,
+    current: bool,
+    entries: Vec<StackEntryView>,
+}
+
+#[derive(Debug, Serialize)]
+struct StackEntryView {
+    branch: String,
+    pull_request: Option<EntryPr>,
+}
+
+#[derive(Debug, Serialize)]
+struct EntryPr {
+    number: u64,
+    title: String,
+    state: String,
+    draft: bool,
+    url: String,
+}
+
+/// Build the review view by matching each stack branch to its open PR (by
+/// head ref). Pure — takes the already-fetched PR list.
+fn build_review(stack: &Stack, pulls: &[api::pull::Pull], is_current: bool) -> StackReview {
+    let entries = stack
+        .branches
+        .iter()
+        .map(|b| {
+            let pull_request = pulls.iter().find(|p| p.head.ref_ == *b).map(|p| EntryPr {
+                number: p.number,
+                title: p.title.clone(),
+                state: p.state.clone(),
+                draft: p.draft,
+                url: p.html_url.clone(),
+            });
+            StackEntryView {
+                branch: b.clone(),
+                pull_request,
+            }
+        })
+        .collect();
+    StackReview {
+        name: stack.name.clone(),
+        base: stack.base.clone(),
+        current: is_current,
+        entries,
+    }
+}
+
+/// Plain-text render of a stack review (no ANSI, so it's easy to test).
+fn render_review(r: &StackReview) -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    let marker = if r.current { "  (current)" } else { "" };
+    let _ = writeln!(s, "Stack: {}{}   base: {}", r.name, marker, r.base);
+    if r.entries.is_empty() {
+        let _ = writeln!(s, "  (no branches tracked yet)");
+        return s;
+    }
+    for e in &r.entries {
+        match &e.pull_request {
+            Some(pr) => {
+                let draft = if pr.draft { " (draft)" } else { "" };
+                let _ = writeln!(s, "  {}  #{} [{}]{}", e.branch, pr.number, pr.state, draft);
+            }
+            None => {
+                let _ = writeln!(s, "  {}  (no PR)", e.branch);
+            }
+        }
+    }
+    s
+}
+
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn review(args: ReviewArgs, host: Option<&str>) -> Result<()> {
-    let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
-    if args.json {
-        return output::print_json(&serde_json::json!({
-            "command": "stack review",
-            "repo": format!("{}/{}", ctx.owner, ctx.name),
-            "status": "not_implemented",
-        }));
+    let state = stack_state::load()?;
+    if state.stacks.is_empty() {
+        bail!("no stacks yet. Run `fj stack new` to start one.");
     }
-    bail!("`fj stack review` is not yet implemented");
+    let name = match args.name.clone().or_else(|| state.current.clone()) {
+        Some(n) => n,
+        None => bail!("no current stack; pass --name or run `fj stack new`"),
+    };
+    let stack = state
+        .find(&name)
+        .with_context(|| format!("no stack named '{name}'"))?;
+
+    let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
+    let page = api::pull::list(
+        &ctx.client,
+        &ctx.owner,
+        &ctx.name,
+        api::pull::ListOptions::default(),
+    )
+    .await?;
+    let is_current = state.current.as_deref() == Some(name.as_str());
+    let review = build_review(stack, &page.items, is_current);
+
+    if args.json {
+        return output::print_json(&serde_json::to_value(&review)?);
+    }
+    print!("{}", render_review(&review));
+    Ok(())
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -317,13 +418,78 @@ mod tests {
             other => panic!("expected stack ship, got {other:?}"),
         }
     }
-}
 
-// To register in src/cli/mod.rs:
-//   pub mod stack;
-//   // in `enum Command`:
-//   /// Manage stacked branches / stacked PRs.
-//   Stack(stack::StackCmd),
-//   // in `dispatch`:
-//   Command::Stack(cmd) => stack::run(cmd, host).await,
-// To register in src/main.rs KNOWN_SUBCOMMANDS: add "stack".
+    #[test]
+    fn review_parses_name_and_json() {
+        let cli = Cli::try_parse_from(["fj", "stack", "review", "--name", "feat", "--json"])
+            .expect("should parse");
+        match cli.command {
+            Command::Stack(StackCmd {
+                command: StackSub::Review(a),
+            }) => {
+                assert_eq!(a.name.as_deref(), Some("feat"));
+                assert!(a.json);
+            }
+            other => panic!("expected stack review, got {other:?}"),
+        }
+    }
+
+    fn pull_with_head(number: u64, head: &str, state: &str) -> api::pull::Pull {
+        serde_json::from_value(serde_json::json!({
+            "id": number, "number": number, "title": format!("PR {number}"),
+            "state": state, "user": { "id": 1, "login": "alice" },
+            "html_url": format!("https://x/pulls/{number}"),
+            "head": { "ref": head, "sha": "aaa" },
+            "base": { "ref": "main", "sha": "bbb" },
+            "draft": false,
+            "created_at": "2026-06-01T00:00:00Z",
+            "updated_at": "2026-06-01T00:00:00Z"
+        }))
+        .unwrap()
+    }
+
+    fn sample_stack() -> Stack {
+        Stack {
+            name: "feat".into(),
+            base: "main".into(),
+            branches: vec!["feature/a".into(), "feature/b".into()],
+            created_at: "2026-06-01T00:00:00+00:00".into(),
+        }
+    }
+
+    #[test]
+    fn build_review_matches_branches_to_prs() {
+        let pulls = vec![
+            pull_with_head(7, "feature/a", "open"),
+            pull_with_head(9, "other", "open"),
+        ];
+        let r = build_review(&sample_stack(), &pulls, true);
+        assert_eq!(r.name, "feat");
+        assert_eq!(r.base, "main");
+        assert!(r.current);
+        assert_eq!(r.entries.len(), 2);
+        // feature/a has PR #7; feature/b has none.
+        assert_eq!(r.entries[0].pull_request.as_ref().unwrap().number, 7);
+        assert!(r.entries[1].pull_request.is_none());
+    }
+
+    #[test]
+    fn render_review_shows_branches_and_pr_state() {
+        let pulls = vec![pull_with_head(7, "feature/a", "open")];
+        let out = render_review(&build_review(&sample_stack(), &pulls, true));
+        assert!(out.contains("Stack: feat  (current)   base: main"));
+        assert!(out.contains("feature/a  #7 [open]"));
+        assert!(out.contains("feature/b  (no PR)"));
+    }
+
+    #[test]
+    fn build_review_json_shape() {
+        let pulls = vec![pull_with_head(7, "feature/a", "open")];
+        let v = serde_json::to_value(build_review(&sample_stack(), &pulls, false)).unwrap();
+        assert_eq!(v["name"], "feat");
+        assert_eq!(v["current"], false);
+        assert_eq!(v["entries"][0]["branch"], "feature/a");
+        assert_eq!(v["entries"][0]["pull_request"]["number"], 7);
+        assert!(v["entries"][1]["pull_request"].is_null());
+    }
+}
