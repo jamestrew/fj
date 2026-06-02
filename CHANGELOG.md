@@ -55,6 +55,13 @@ All notable changes will be recorded here. The format follows
   one engine, and CI gained a strict region-level coverage gate. CI cache and
   release artifacts moved onto Fjord Actions.
 
+### Fixed
+
+- `fj run view` no longer errors with "invalid type: null, expected a sequence"
+  when a run's job is still running or blocked. Forgejo returns `null` where the
+  Actions UI sends arrays (jobs, steps, attempts, log lines); these now decode
+  to empty.
+
 ## [0.1.3] — 2026-05-14
 
 ### Added

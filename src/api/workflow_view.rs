@@ -75,7 +75,11 @@ pub struct RunView {
 
 #[derive(Debug, Default, Deserialize)]
 pub struct LogsPayload {
-    #[serde(default, rename = "stepsLog")]
+    #[serde(
+        default,
+        rename = "stepsLog",
+        deserialize_with = "crate::api::serde_util::deserialize_null_to_default"
+    )]
     pub steps_log: Vec<StepLog>,
 }
 
@@ -86,7 +90,10 @@ pub struct StepLog {
     /// Opaque resume position to send back as the next request's `cursor`.
     #[serde(default)]
     pub cursor: u64,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::api::serde_util::deserialize_null_to_default"
+    )]
     pub lines: Vec<LogLine>,
 }
 
@@ -126,7 +133,10 @@ pub struct RunStateView {
     pub link: String,
     #[serde(default)]
     pub commit: Commit,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::api::serde_util::deserialize_null_to_default"
+    )]
     pub jobs: Vec<JobBrief>,
 }
 
@@ -166,9 +176,16 @@ pub struct JobBrief {
 pub struct CurrentJob {
     #[serde(default)]
     pub title: String,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::api::serde_util::deserialize_null_to_default"
+    )]
     pub steps: Vec<StepBrief>,
-    #[serde(default, rename = "allAttempts")]
+    #[serde(
+        default,
+        rename = "allAttempts",
+        deserialize_with = "crate::api::serde_util::deserialize_null_to_default"
+    )]
     pub all_attempts: Vec<AttemptBrief>,
 }
 
@@ -335,6 +352,26 @@ mod tests {
             url,
             "https://example.com/octo/repo/actions/runs/7/jobs/3/attempt/2"
         );
+    }
+
+    #[test]
+    fn run_view_tolerates_null_arrays() {
+        // A running / blocked job can return `null` where the UI sends arrays;
+        // `#[serde(default)]` alone rejects an explicit null, so this used to
+        // fail with "invalid type: null, expected a sequence".
+        let json = serde_json::json!({
+            "logs": { "stepsLog": [ { "step": 0, "cursor": 0, "lines": null } ] },
+            "state": {
+                "run": { "jobs": null },
+                "currentJob": { "steps": null, "allAttempts": null }
+            }
+        });
+        let view: RunView = serde_json::from_value(json).expect("null arrays decode to empty");
+        assert!(view.state.run.jobs.is_empty());
+        assert!(view.state.current_job.steps.is_empty());
+        assert!(view.state.current_job.all_attempts.is_empty());
+        assert_eq!(view.logs.steps_log.len(), 1);
+        assert!(view.logs.steps_log[0].lines.is_empty());
     }
 
     #[test]
