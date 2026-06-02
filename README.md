@@ -118,7 +118,9 @@ fj release create v1.2.3 \
 **Inspect an Actions run, scripting-friendly:**
 
 ```sh
-fj run view 42 --log-failed                 # just the steps that failed
+fj run view 42 --log-failed                 # failed steps across every job
+fj run view 42 --log                        # full log, all jobs in the run
+fj run view 42 --log --job 1                # just the second job's log
 fj run download 42 --list --json            # artifacts as JSON
 ```
 

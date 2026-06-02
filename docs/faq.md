@@ -121,13 +121,16 @@ Files: `hosts.toml`, `aliases.toml`, `config.toml`.
 
 ```sh
 fj run list                 # find the run number in the `#` column
-fj run view 56 --log        # full job log
-fj run view 56 --log-failed # only the steps that failed
+fj run view 56 --log        # full log of every job in the run
+fj run view 56 --log-failed # failed steps, across every job that failed
 fj run watch 56             # stream the log live until the job ends
 ```
 
-Multi-job runs: pass `--job <index>` (0-based). After a rerun, the
-latest attempt is shown by default; pin one with `--attempt <n>`.
+By default `--log` spans all of a run's jobs, and `--log-failed` shows
+only the jobs that did not finish green (so a failure in a later job
+isn't hidden behind an earlier passing one). Narrow to one job with
+`--job <index>` (0-based). After a rerun, the latest attempt is shown by
+default; pin one with `--attempt <n>`.
 
 Two things to know, because they look like bugs but aren't:
 

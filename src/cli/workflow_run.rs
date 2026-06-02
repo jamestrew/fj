@@ -56,9 +56,10 @@ pub struct ViewArgs {
     /// Print only the log of steps that did not succeed.
     #[arg(long)]
     pub log_failed: bool,
-    /// Job index within the run (0-based). Most runs have a single job.
-    #[arg(short = 'j', long, default_value_t = 0)]
-    pub job: usize,
+    /// Job index within the run (0-based). Omit to log every job (with
+    /// `--log-failed`, only the jobs that did not succeed).
+    #[arg(short = 'j', long)]
+    pub job: Option<usize>,
     /// Attempt number. Defaults to the latest attempt (follows reruns).
     #[arg(long)]
     pub attempt: Option<u32>,
@@ -151,30 +152,71 @@ async fn view(args: ViewArgs, host: Option<&str>) -> Result<()> {
     guard_web_routes(&ctx.client)?;
 
     if args.log || args.log_failed {
-        let attempt = match args.attempt {
-            Some(a) => a,
+        // An explicit `--job N` logs just that job. Otherwise span the whole
+        // run: every job for `--log`, only the non-green ones for
+        // `--log-failed` (so a failure in job 1 isn't hidden behind a green
+        // job 0, which is the default-to-job-0 trap this avoids).
+        let targets = match args.job {
+            Some(j) => vec![j],
             None => {
-                api::workflow::latest_attempt(
+                let summary = api::workflow::fetch_run_summary(
                     &ctx.client,
                     &ctx.owner,
                     &ctx.name,
                     args.run_id,
-                    args.job,
                 )
-                .await?
+                .await?;
+                let statuses: Vec<String> = summary
+                    .state
+                    .run
+                    .jobs
+                    .iter()
+                    .map(|j| j.status.clone())
+                    .collect();
+                let sel = jobs_to_log(&statuses, args.log_failed);
+                if sel.is_empty() {
+                    let note = if statuses.is_empty() {
+                        "This run has no jobs."
+                    } else {
+                        "No failed jobs in this run."
+                    };
+                    println!("{}", output::dim(note));
+                    return Ok(());
+                }
+                sel
             }
         };
-        let view = api::workflow::fetch_job_logs(
-            &ctx.client,
-            &ctx.owner,
-            &ctx.name,
-            args.run_id,
-            args.job,
-            attempt,
-        )
-        .await?;
-        validate_job(&view, args.job)?;
-        print_logs(&view, args.log_failed);
+
+        let multi = targets.len() > 1;
+        for (i, &job) in targets.iter().enumerate() {
+            let attempt = match args.attempt {
+                Some(a) => a,
+                None => {
+                    api::workflow::latest_attempt(
+                        &ctx.client,
+                        &ctx.owner,
+                        &ctx.name,
+                        args.run_id,
+                        job,
+                    )
+                    .await?
+                }
+            };
+            let view = api::workflow::fetch_job_logs(
+                &ctx.client,
+                &ctx.owner,
+                &ctx.name,
+                args.run_id,
+                job,
+                attempt,
+            )
+            .await?;
+            validate_job(&view, job)?;
+            if multi && i > 0 {
+                println!();
+            }
+            print_logs(&view, args.log_failed);
+        }
         return Ok(());
     }
 
@@ -373,6 +415,22 @@ async fn watch(args: WatchArgs, host: Option<&str>) -> Result<()> {
     }
 }
 
+/// Which job indices `view --log` should fetch when `--job` is omitted.
+/// `--log` spans every job; `--log-failed` keeps only the jobs that did not
+/// finish green (anything but `success` / `skipped`), so a failure isn't
+/// hidden behind an earlier passing job.
+fn jobs_to_log(statuses: &[String], failed_only: bool) -> Vec<usize> {
+    if !failed_only {
+        return (0..statuses.len()).collect();
+    }
+    statuses
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| !matches!(s.as_str(), "success" | "skipped"))
+        .map(|(i, _)| i)
+        .collect()
+}
+
 /// Forgejo clamps an out-of-range job index to the first job rather than
 /// 404ing, which would silently show the wrong logs. Reject it instead.
 fn validate_job(view: &api::workflow::RunView, job: usize) -> Result<()> {
@@ -460,6 +518,31 @@ mod tests {
     fn validate_job_allows_any_index_when_no_jobs() {
         let view = run_view_with_jobs(0);
         assert!(validate_job(&view, 5).is_ok());
+    }
+
+    fn statuses(ss: &[&str]) -> Vec<String> {
+        ss.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn jobs_to_log_full_spans_every_job() {
+        let s = statuses(&["success", "failure", "skipped"]);
+        assert_eq!(jobs_to_log(&s, false), vec![0, 1, 2]);
+        assert_eq!(jobs_to_log(&statuses(&[]), false), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn jobs_to_log_failed_keeps_only_non_green_jobs() {
+        // job 0 passed, job 1 failed, job 2 skipped -> only job 1
+        let s = statuses(&["success", "failure", "skipped"]);
+        assert_eq!(jobs_to_log(&s, true), vec![1]);
+        // cancelled / error count as failed too
+        assert_eq!(
+            jobs_to_log(&statuses(&["cancelled", "error"]), true),
+            vec![0, 1]
+        );
+        // all green -> empty (caller prints "No failed jobs")
+        assert!(jobs_to_log(&statuses(&["success", "skipped"]), true).is_empty());
     }
 
     fn test_client() -> crate::client::Client {
