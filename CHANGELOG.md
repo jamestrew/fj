@@ -6,6 +6,55 @@ All notable changes will be recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-06-01
+
+### Added
+
+- **`fj work`** — local working-context commands. `work context` prints an
+  offline-first snapshot of the repo (branch, dirty state, current PR and its
+  CI checks, account, active stack); `work resume` / `work continue` restore a
+  saved session. Session state is local at `<git-dir>/fj/session.json`.
+- **`fj stack`** — stacked-branch / stacked-PR management, local and
+  git-native (`<git-dir>/fj/stack.json`, never a committed manifest).
+  - `stack new` authors a stack and its first branch.
+  - `stack review` shows each item's PR number, review state, CI status, and
+    mergeability; `--open` opens the PRs in a browser, `--request <user>`
+    requests review across the stack.
+  - `stack sync` pushes each branch and creates/updates its PR, chaining bases
+    so each PR targets the branch below it; idempotent, with `--draft` /
+    `--ready` controlling PR state and `--dry-run` for a plan.
+  - `stack ship` merges the stack bottom-up behind a green-and-approved gate,
+    re-pointing each next PR onto the trunk as the one below it merges, and
+    stops on the first failure with recovery instructions (merged items are
+    skipped on re-run). `--squash` / `--merge`, `--delete-branches`,
+    `--force`, `--dry-run`.
+- **`fj agent`** — AI-assisted code operations through an env-var provider
+  abstraction (`FJ_AGENT_PROVIDER` / `FJ_AGENT_API_KEY` / `FJ_AGENT_MODEL`;
+  null default, built-in `mock`; the Fjord token is never reused for AI).
+  - `agent review` is a local diff-analysis command: it gathers the
+    working-tree diff (or `--pr <n>`, or each `--stack` item), redacts secrets
+    and sensitive files before anything leaves the machine, and prints
+    severity-tagged findings with file references (secret-bearing files,
+    source changed without tests, risky areas). `--security` focuses the pass;
+    `--json` emits a structured report for editor/mobile clients.
+  - `agent explain` explains a file, a git revision, or the working-tree diff.
+  - `agent fix` emits a patch only and never mutates.
+- **`fj pr merge --delete-branch`** — delete the head branch after the merge
+  succeeds (matching `gh pr merge --delete-branch`).
+
+### Changed
+
+- `fj run view --log` / `--log-failed` now cover every job in a run by default
+  (only the failed jobs for `--log-failed`) instead of silently defaulting to
+  job 0, which hid failures in later jobs. Narrow to one job with
+  `--job <index>`.
+- `make install` signs the installed binary with a stable Developer ID, so the
+  macOS keychain trust ("Always Allow") survives rebuilds.
+- Internal: the large `cli/` and `api/` command modules were split into focused
+  siblings with backfilled tests, the two JSON-path extractors converged onto
+  one engine, and CI gained a strict region-level coverage gate. CI cache and
+  release artifacts moved onto Fjord Actions.
+
 ## [0.1.3] — 2026-05-14
 
 ### Added
