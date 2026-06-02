@@ -15,10 +15,10 @@ jobs:
       matrix:
         include:
           - name: darwin-aarch64
-            runs-on: macos
+            runs-on: macos-15
             target: aarch64-apple-darwin
           - name: darwin-x86_64
-            runs-on: macos
+            runs-on: macos-15
             target: x86_64-apple-darwin
           - name: linux-x86_64
             runs-on: docker
