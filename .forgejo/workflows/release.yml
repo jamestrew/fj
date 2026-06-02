@@ -187,7 +187,9 @@ jobs:
       RASTER_ARTIFACTS_S3_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_AWS_SECRET_KEY }}
     steps:
       - name: install tools
-        run: apk add --no-cache coreutils bash tar zstd gzip
+        # nodejs is required by the JS actions in this job (download-artifact,
+        # forgejo-release); the bare alpine image doesn't ship it.
+        run: apk add --no-cache coreutils bash tar zstd gzip nodejs
 
       - name: fetch artifacts
         uses: https://rasterhub.com/rasterstate/download-artifact-action@v1
