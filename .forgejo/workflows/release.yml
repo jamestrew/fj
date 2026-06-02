@@ -49,7 +49,7 @@ jobs:
       # Installs rustup from rustup.rs when absent (the linux container has
       # none; macOS runners already have it) and adds the cross-compile target.
       - name: setup rust
-        uses: https://rasterhub.com/rasterstate/setup-rust-action@v1
+        uses: https://rasterhub.com/rasterstate/setup-rust-action@v1.0.1
         with:
           toolchain: '1.95.0'
           targets: ${{ matrix.target }}

@@ -28,7 +28,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: setup rust
-        uses: https://rasterhub.com/rasterstate/setup-rust-action@v1
+        uses: https://rasterhub.com/rasterstate/setup-rust-action@v1.0.1
         with:
           toolchain: '1.95.0'
           components: rustfmt, clippy
@@ -75,7 +75,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: setup rust (stable)
-        uses: https://rasterhub.com/rasterstate/setup-rust-action@v1
+        uses: https://rasterhub.com/rasterstate/setup-rust-action@v1.0.1
         with:
           toolchain: '1.95.0'
 
@@ -83,7 +83,7 @@ jobs:
       # (cargo-llvm-cov sets cfg(coverage_nightly) there). llvm-tools-preview
       # provides the profdata/cov tooling. override:false keeps 1.95.0 default.
       - name: setup rust (nightly for coverage)
-        uses: https://rasterhub.com/rasterstate/setup-rust-action@v1
+        uses: https://rasterhub.com/rasterstate/setup-rust-action@v1.0.1
         with:
           toolchain: nightly
           components: llvm-tools-preview
