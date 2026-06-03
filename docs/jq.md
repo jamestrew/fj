@@ -32,9 +32,20 @@ segment is one of:
 | `.[0]`       | Same as `.0`, bracket form                    |
 | `.[-1]`      | Last element of an array                      |
 | `.[-2]`      | Second-to-last element                        |
+| `.[]`        | Iterate: map the rest of the path over every element |
 
 Bracket form and dot form are interchangeable: `.data.0.name` and
 `.data[0].name` mean the same thing.
+
+`.[]` fans out. Whatever follows it is applied to every element of the
+array (or every value of an object) and the results are collected back
+into an array. So `.[].id` over a list of objects yields a list of ids,
+and a bare `.[]` yields the elements themselves. It pairs naturally with
+`--paginate`:
+
+```sh
+fj api /repos/foo/bar/pulls --paginate -q '.[].number'
+```
 
 ## Examples
 
@@ -58,6 +69,8 @@ Given:
 | `.data[-1].owner.login`        | `"bob"`            |
 | `.data | .[0]`                 | first element      |
 | `.data[0] | .owner | .login`   | `"alice"`          |
+| `.data[].id`                   | `[1, 2]`           |
+| `.data[].owner.login`          | `["alice", "bob"]` |
 
 ## Errors
 
@@ -70,7 +83,8 @@ Given:
 
 The following are intentionally NOT implemented; reach for real jq:
 
-- Filters like `.[] | select(.state == "open")`
+- Filters: `select(.state == "open")`
 - Functions: `map`, `length`, `keys`, etc.
 - String interpolation
-- Multiple outputs from a single expression
+- Iterating across a pipe boundary (`.[] | .title`); keep the iterate and
+  its path in one stage instead (`.[].title`)

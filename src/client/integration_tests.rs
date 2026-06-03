@@ -487,6 +487,10 @@ async fn run_list_tolerates_inconsistent_forgejo_rows() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/api/v1/repos/o/r/actions/runs"))
+        // Forgejo only honors `limit` when `page` is also present, so the
+        // wrapper must send both or `-L` is silently ignored.
+        .and(query_param("page", "1"))
+        .and(query_param("limit", "50"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "total_count": 3,
             "workflow_runs": [

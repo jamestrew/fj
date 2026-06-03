@@ -9,6 +9,9 @@
 //! - dot fields (`.a.b`)
 //! - numeric indices (`.0`, `.data.1`)
 //! - bracket indices (`.data[0]`, negative supported: `.data[-1]`)
+//! - array iterate (`.[]`, `.data[].name`): maps the rest of the path over
+//!   every element of an array (or every value of an object) and collects the
+//!   results into a JSON array
 //! - pipes (`.foo | .bar`)
 
 use anyhow::{anyhow, Context, Result};
@@ -27,47 +30,59 @@ fn apply_stage(value: &Value, stage: &str) -> Result<Value> {
     if stage.is_empty() {
         return Ok(value.clone());
     }
+    apply_segments(value, &split_segments(stage))
+}
 
-    let mut current = value;
-    let mut owned: Option<Value> = None;
+/// Walk `segments` against `value`. An empty-bracket segment (`[]`) fans out:
+/// the remaining segments are applied to each element and collected into an
+/// array, so `.[].title` over a list of objects yields a list of titles.
+fn apply_segments(value: &Value, segments: &[String]) -> Result<Value> {
+    let Some((raw, rest)) = segments.split_first() else {
+        return Ok(value.clone());
+    };
+    let raw_str = raw.as_str();
 
-    for raw in split_segments(stage) {
-        let target = owned.as_ref().unwrap_or(current);
-        let raw_str = raw.as_str();
-        if let Some(rest) = raw_str.strip_prefix('[') {
-            let inner = rest
-                .strip_suffix(']')
-                .ok_or_else(|| anyhow!("unterminated bracket in '{raw_str}'"))?;
-            let idx: i64 = inner
-                .parse()
-                .with_context(|| format!("invalid bracket index '{inner}'"))?;
-            let Some(arr) = target.as_array() else {
-                return Err(anyhow!("not an array; can't index with '{raw_str}'"));
-            };
-            let real = if idx < 0 { arr.len() as i64 + idx } else { idx };
-            let v = arr
-                .get(real as usize)
-                .ok_or_else(|| anyhow!("index {idx} out of range"))?
-                .clone();
-            owned = Some(v);
-            current = owned.as_ref().unwrap();
-        } else if let Ok(idx) = raw_str.parse::<usize>() {
-            let v = target
-                .get(idx)
-                .ok_or_else(|| anyhow!("index {idx} out of range"))?
-                .clone();
-            owned = Some(v);
-            current = owned.as_ref().unwrap();
-        } else {
-            let v = target
-                .get(raw_str)
-                .ok_or_else(|| anyhow!("no field '{raw_str}'"))?
-                .clone();
-            owned = Some(v);
-            current = owned.as_ref().unwrap();
-        }
+    if raw_str == "[]" {
+        let items: Vec<&Value> = match value {
+            Value::Array(a) => a.iter().collect(),
+            Value::Object(o) => o.values().collect(),
+            _ => return Err(anyhow!("can't iterate with '[]' over a non-array/object")),
+        };
+        let mapped = items
+            .into_iter()
+            .map(|el| apply_segments(el, rest))
+            .collect::<Result<Vec<_>>>()?;
+        return Ok(Value::Array(mapped));
     }
-    Ok(owned.unwrap_or_else(|| value.clone()))
+
+    if let Some(inner) = raw_str.strip_prefix('[') {
+        let inner = inner
+            .strip_suffix(']')
+            .ok_or_else(|| anyhow!("unterminated bracket in '{raw_str}'"))?;
+        let idx: i64 = inner
+            .parse()
+            .with_context(|| format!("invalid bracket index '{inner}'"))?;
+        let Some(arr) = value.as_array() else {
+            return Err(anyhow!("not an array; can't index with '{raw_str}'"));
+        };
+        let real = if idx < 0 { arr.len() as i64 + idx } else { idx };
+        let next = arr
+            .get(real as usize)
+            .ok_or_else(|| anyhow!("index {idx} out of range"))?;
+        return apply_segments(next, rest);
+    }
+
+    if let Ok(idx) = raw_str.parse::<usize>() {
+        let next = value
+            .get(idx)
+            .ok_or_else(|| anyhow!("index {idx} out of range"))?;
+        return apply_segments(next, rest);
+    }
+
+    let next = value
+        .get(raw_str)
+        .ok_or_else(|| anyhow!("no field '{raw_str}'"))?;
+    apply_segments(next, rest)
 }
 
 /// Split a stage like `data.0[3].name` into ["data", "0", "[3]", "name"].
@@ -145,6 +160,44 @@ mod tests {
     fn extract_pipe() {
         let v = json!({"data": [{"x": 7}]});
         assert_eq!(extract_path(&v, ".data[0] | .x").unwrap(), json!(7));
+    }
+
+    #[test]
+    fn extract_iterate_field() {
+        let v = json!([{"title": "a"}, {"title": "b"}, {"title": "c"}]);
+        assert_eq!(
+            extract_path(&v, ".[].title").unwrap(),
+            json!(["a", "b", "c"])
+        );
+        // leading dot is optional, matching the rest of the engine
+        assert_eq!(
+            extract_path(&v, "[].title").unwrap(),
+            json!(["a", "b", "c"])
+        );
+    }
+
+    #[test]
+    fn extract_iterate_nested() {
+        let v = json!({"data": [{"owner": {"login": "alice"}}, {"owner": {"login": "bob"}}]});
+        assert_eq!(
+            extract_path(&v, ".data[].owner.login").unwrap(),
+            json!(["alice", "bob"])
+        );
+    }
+
+    #[test]
+    fn extract_iterate_bare_returns_elements() {
+        let arr = json!([1, 2, 3]);
+        assert_eq!(extract_path(&arr, ".[]").unwrap(), json!([1, 2, 3]));
+        // over an object, iterate yields its values (insertion order)
+        let obj = json!({"a": 1, "b": 2});
+        assert_eq!(extract_path(&obj, ".[]").unwrap(), json!([1, 2]));
+    }
+
+    #[test]
+    fn extract_iterate_over_scalar_errors() {
+        let v = json!({"n": 5});
+        assert!(extract_path(&v, ".n[]").is_err());
     }
 
     #[test]

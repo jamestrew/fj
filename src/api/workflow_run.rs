@@ -61,7 +61,12 @@ pub async fn list_runs(
     limit: u32,
 ) -> Result<Vec<WorkflowRun>> {
     let path = format!("/api/v1/repos/{owner}/{name}/actions/runs");
-    let q = vec![("limit".into(), limit.clamp(1, 50).to_string())];
+    // Forgejo's actions/runs endpoint ignores `limit` unless `page` is also
+    // present; without it the server returns every run regardless of `-L`.
+    let q = vec![
+        ("page".into(), "1".to_string()),
+        ("limit".into(), limit.clamp(1, 50).to_string()),
+    ];
     let list: RunList = client.json(Method::GET, &path, &q, None::<&()>).await?;
     Ok(list.workflow_runs)
 }
