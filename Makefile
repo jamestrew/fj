@@ -19,7 +19,7 @@ SIGN_ID    ?= Developer ID Application: Raster & State LLC (62Y3FRM8PD)
 IDENTIFIER ?= fj-a88ab591fd97b299
 UNAME      := $(shell uname)
 
-.PHONY: build install test lint coverage coverage-html coverage-strict coverage-strict-html
+.PHONY: build install test lint coverage coverage-html coverage-strict coverage-strict-html release-preflight
 
 # Files excluded from coverage so the number reflects what we actually
 # intend to unit-test, not glue we don't.
@@ -68,6 +68,13 @@ endif
 
 test:
 	cargo test --all
+
+# Validate the release environment BEFORE pushing a v* tag: Cargo.toml version
+# vs the tag, an online runner for each required label, and that the signing /
+# notarization secrets are set. See scripts/release-preflight.sh.
+#   make release-preflight TAG=v0.2.1
+release-preflight:
+	@bash scripts/release-preflight.sh $(TAG)
 
 lint:
 	cargo clippy --all-targets --all-features -- -D warnings
