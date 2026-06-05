@@ -263,6 +263,91 @@ pub fn set_branch(name: &str, start: &str) -> Result<()> {
     run(&["branch", "-f", name, start])
 }
 
+/// Raw `git --version` output (e.g. "git version 2.54.0"). Used by
+/// `stack absorb` to gate on rebase `--update-refs` / `--autosquash` support.
+pub fn version_string() -> Result<String> {
+    output(&["--version"])
+}
+
+/// Resolve a revision to its full sha (`git rev-parse <rev>`).
+pub fn rev_parse(rev: &str) -> Result<String> {
+    reject_dash_lead("rev", rev)?;
+    Ok(output(&["rev-parse", rev])?.trim().to_string())
+}
+
+/// True if `ancestor` is an ancestor of `descendant` (or they're equal).
+/// `git merge-base --is-ancestor` exits 0/1; any spawn error reads as false.
+pub fn is_ancestor(ancestor: &str, descendant: &str) -> bool {
+    if reject_dash_lead("ancestor", ancestor).is_err()
+        || reject_dash_lead("descendant", descendant).is_err()
+    {
+        return false;
+    }
+    Command::new("git")
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Create a `fixup!` commit for `target` consuming only `files` from the index
+/// (`git commit --no-verify --fixup=<target> -- <files>`). The remaining index
+/// entries are left staged. Used by `stack absorb`.
+pub fn commit_fixup(target: &str, files: &[String]) -> Result<()> {
+    reject_dash_lead("target", target)?;
+    let mut args: Vec<String> = vec![
+        "commit".into(),
+        "--no-verify".into(),
+        format!("--fixup={target}"),
+        "--".into(),
+    ];
+    args.extend(files.iter().cloned());
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run(&refs)
+}
+
+/// Non-interactively autosquash-rebase the current branch onto `base`,
+/// rewriting fixups into their targets and moving every stacked branch ref
+/// (`--update-refs`). `--autostash` sets aside any leftover index/worktree
+/// changes and restores them afterward. The sequence editor is disabled so the
+/// rebase never opens an editor.
+pub fn rebase_autosquash_update_refs(base: &str) -> Result<()> {
+    reject_dash_lead("base", base)?;
+    let status = Command::new("git")
+        .args([
+            "-c",
+            "sequence.editor=:",
+            "rebase",
+            "--interactive",
+            "--autosquash",
+            "--update-refs",
+            "--autostash",
+            base,
+        ])
+        .env("GIT_SEQUENCE_EDITOR", ":")
+        .env("GIT_EDITOR", "true")
+        .status()
+        .with_context(|| "spawning git rebase")?;
+    if !status.success() {
+        bail!("git rebase --autosquash failed (status {status})");
+    }
+    Ok(())
+}
+
+/// Abort an in-progress rebase, best effort (`git rebase --abort`). Errors are
+/// swallowed: it's only called on a recovery path.
+pub fn rebase_abort() {
+    let _ = Command::new("git").args(["rebase", "--abort"]).status();
+}
+
+/// Soft-reset HEAD to `rev`, keeping the index and worktree (`git reset
+/// --soft`). Used by `stack absorb` to undo fixup commits while re-staging
+/// their contents after a failed rebase.
+pub fn reset_soft(rev: &str) -> Result<()> {
+    reject_dash_lead("rev", rev)?;
+    run(&["reset", "--soft", rev])
+}
+
 /// `(ahead, behind)` of HEAD relative to its upstream `@{u}`. None when there
 /// is no upstream configured or we aren't in a repo.
 pub fn ahead_behind_upstream() -> Option<(u32, u32)> {

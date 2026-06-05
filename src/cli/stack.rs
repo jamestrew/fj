@@ -8,8 +8,9 @@
 //! previous branch), and `stack ship` (merge bottom-up, re-pointing each next
 //! PR onto the trunk as the one below it merges) are implemented, as is
 //! `stack split` (turn a single branch's commits into one stacked entry each,
-//! moving only local refs). `absorb` is still a placeholder (dry-run plan,
-//! else a structured "not yet implemented").
+//! moving only local refs) and `stack absorb` (fold staged changes into the
+//! entries that introduced them, via `fixup!` commits + an autosquash
+//! `--update-refs` rebase). All five are implemented.
 
 use std::path::{Path, PathBuf};
 
@@ -116,11 +117,13 @@ pub struct ReviewArgs {
 
 #[derive(Debug, Args)]
 pub struct AbsorbArgs {
-    #[command(flatten)]
-    pub r: RepoFlag,
-    /// Print the planned actions and exit without mutating anything.
+    // No `-R`: absorb rewrites local branches; it needs no repo API.
+    /// Print the attribution plan and exit without mutating anything.
     #[arg(long)]
     pub dry_run: bool,
+    /// Emit the attribution plan as JSON.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -570,19 +573,6 @@ async fn review(args: ReviewArgs, host: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-// ── placeholders ─────────────────────────────────────────────────────────
-
-/// Shared "scaffolding only" exit for a mutating subcommand: print a dry-run
-/// plan and stop when `--dry-run` is set, otherwise bail with a structured
-/// not-yet-implemented error. The `plan` is the human-readable action line.
-fn placeholder_mutation(plan: &str, command: &str, dry_run: bool) -> Result<()> {
-    println!("would: {plan}");
-    if dry_run {
-        return Ok(());
-    }
-    bail!("`fj stack {command}` is not yet implemented");
-}
-
 // ── stack sync ─────────────────────────────────────────────────────────────
 
 /// The PR base for stack item `i`: the previous item's branch, or the stack
@@ -990,14 +980,304 @@ async fn split(args: SplitArgs, _host: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-#[cfg_attr(coverage_nightly, coverage(off))]
-async fn absorb(args: AbsorbArgs, host: Option<&str>) -> Result<()> {
-    let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
-    let plan = format!(
-        "absorb staged changes into the stack entries in {}/{}",
-        ctx.owner, ctx.name
+// ── stack absorb ─────────────────────────────────────────────────────────
+//
+// Fold staged changes into the stack entries that introduced the lines, the
+// way `git absorb` does. Attribution is per-file (the most recent stack commit
+// to touch a file wins); each target gets a `fixup!` commit, then a single
+// `git rebase --autosquash --update-refs` rewrites the stack in place and moves
+// every branch ref. Offline (no API) but it rewrites history, so the branches
+// need a force-push afterward.
+
+/// Parse a major/minor from `git --version` output. None when it doesn't look
+/// like "git version X.Y…".
+fn parse_git_version(s: &str) -> Option<(u32, u32)> {
+    let rest = s.split("version").nth(1)?;
+    let nums = rest.trim();
+    let mut parts = nums.split(['.', ' ', '\n', '\t']).filter(|p| !p.is_empty());
+    let major: u32 = parts.next()?.parse().ok()?;
+    let minor: u32 = parts.next().unwrap_or("0").parse().ok()?;
+    Some((major, minor))
+}
+
+/// `rebase --update-refs` landed in git 2.38; absorb relies on it (plus
+/// `--autosquash`) to move the intermediate branch refs during the rewrite.
+fn supports_update_refs(version: (u32, u32)) -> bool {
+    version >= (2, 38)
+}
+
+/// Map every commit sha in the stack to the entry (0-based) it belongs to.
+/// `entries[i]` is the list of shas in item `i`'s range (`prev..branch`).
+/// Later entries win a tie (a sha should only appear once in a linear stack).
+fn index_commits(entries: &[Vec<String>]) -> std::collections::HashMap<String, usize> {
+    let mut map = std::collections::HashMap::new();
+    for (i, shas) in entries.iter().enumerate() {
+        for sha in shas {
+            map.insert(sha.clone(), i);
+        }
+    }
+    map
+}
+
+/// A staged file routed to a stack entry, or left unattributed.
+#[derive(Debug, PartialEq)]
+struct FileAttribution {
+    file: String,
+    /// `Some(entry_index)` when the file's last-touching commit is in the stack.
+    entry: Option<usize>,
+}
+
+/// Attribute each `(file, last_touching_sha)` to a stack entry via the
+/// sha→entry index. A file whose last touch is outside the stack (e.g. from the
+/// base branch, or brand new) is left unattributed.
+fn attribute_files(
+    files: &[(String, Option<String>)],
+    sha_to_entry: &std::collections::HashMap<String, usize>,
+) -> Vec<FileAttribution> {
+    files
+        .iter()
+        .map(|(file, sha)| FileAttribution {
+            file: file.clone(),
+            entry: sha.as_ref().and_then(|s| sha_to_entry.get(s).copied()),
+        })
+        .collect()
+}
+
+/// One entry's absorb group: the target commit to fix up, the entry's branch,
+/// and the files headed for it. Serializes for `--json` / dry-run.
+#[derive(Debug, Serialize, PartialEq)]
+struct AbsorbGroup {
+    branch: String,
+    /// The commit (a stack entry's tip) the fixup targets.
+    target: String,
+    files: Vec<String>,
+}
+
+/// The full absorb plan: per-entry groups plus the files left staged.
+#[derive(Debug, Serialize, PartialEq)]
+struct AbsorbPlan {
+    groups: Vec<AbsorbGroup>,
+    /// Files that couldn't be attributed; they stay staged, untouched.
+    skipped: Vec<String>,
+}
+
+/// Build the plan from attributions. `tips[i]` is item `i`'s target commit sha
+/// (its branch tip); `branches[i]` its branch name. Groups preserve entry order
+/// (bottom-up) and are dropped when they have no files.
+fn plan_absorb(
+    attributions: &[FileAttribution],
+    branches: &[String],
+    tips: &[String],
+) -> AbsorbPlan {
+    let mut groups: Vec<AbsorbGroup> = branches
+        .iter()
+        .zip(tips)
+        .map(|(branch, target)| AbsorbGroup {
+            branch: branch.clone(),
+            target: target.clone(),
+            files: Vec::new(),
+        })
+        .collect();
+    let mut skipped = Vec::new();
+    for a in attributions {
+        match a.entry {
+            Some(i) if i < groups.len() => groups[i].files.push(a.file.clone()),
+            _ => skipped.push(a.file.clone()),
+        }
+    }
+    groups.retain(|g| !g.files.is_empty());
+    AbsorbPlan { groups, skipped }
+}
+
+fn render_absorb_plan(plan: &AbsorbPlan) -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    if plan.groups.is_empty() {
+        s.push_str("Nothing to absorb: no staged file maps to a stack entry.\n");
+    } else {
+        let _ = writeln!(s, "Would absorb staged changes into {}:", {
+            let n = plan.groups.len();
+            if n == 1 {
+                "1 entry".to_string()
+            } else {
+                format!("{n} entries")
+            }
+        });
+        for g in &plan.groups {
+            let short: String = g.target.chars().take(8).collect();
+            let _ = writeln!(s, "  {} ({}):", g.branch, short);
+            for f in &g.files {
+                let _ = writeln!(s, "      {f}");
+            }
+        }
+    }
+    if !plan.skipped.is_empty() {
+        let _ = writeln!(s, "Left staged (no matching entry):");
+        for f in &plan.skipped {
+            let _ = writeln!(s, "      {f}");
+        }
+    }
+    s
+}
+
+fn render_absorb_done(plan: &AbsorbPlan) -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    for g in &plan.groups {
+        let _ = writeln!(s, "✓ absorbed {} file(s) into {}", g.files.len(), g.branch);
+    }
+    let _ = writeln!(
+        s,
+        "Rewrote {} entr{}. Branches now need a force-push: \
+         git push --force-with-lease (per branch) or re-run after.",
+        plan.groups.len(),
+        if plan.groups.len() == 1 { "y" } else { "ies" }
     );
-    placeholder_mutation(&plan, "absorb", args.dry_run)
+    if !plan.skipped.is_empty() {
+        let _ = writeln!(
+            s,
+            "{} file(s) left staged (no matching entry).",
+            plan.skipped.len()
+        );
+    }
+    s
+}
+
+/// Resolve, per staged file, the most recent stack commit (`base..top`) that
+/// touched it. `None` means no stack commit touched it (base-owned / new).
+fn last_touch_in_stack(base: &str, top: &str, file: &str) -> Option<String> {
+    let range = format!("{base}..{top}");
+    let out = git::output(&["log", "-1", "--format=%H", &range, "--", file]).ok()?;
+    let sha = out.trim();
+    (!sha.is_empty()).then(|| sha.to_string())
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn absorb(args: AbsorbArgs, _host: Option<&str>) -> Result<()> {
+    let Some(mut stack) = stack_state::load()? else {
+        bail!("no stack for this repo. Run `fj stack new` to start one.");
+    };
+    validate_items(&stack.items)?;
+
+    let version = parse_git_version(&git::version_string()?)
+        .ok_or_else(|| anyhow::anyhow!("could not determine the git version"))?;
+    if !supports_update_refs(version) {
+        bail!(
+            "stack absorb needs git >= 2.38 (for rebase --update-refs); found {}.{}",
+            version.0,
+            version.1
+        );
+    }
+
+    // The whole stack must be checked out at its top, and linear, so a single
+    // autosquash rebase rebuilds every entry and --update-refs moves the refs.
+    let current = git::current_branch().ok_or_else(|| {
+        anyhow::anyhow!("HEAD is detached; checkout the stack's top branch first")
+    })?;
+    let top_branch = stack
+        .items
+        .last()
+        .expect("validated non-empty")
+        .branch
+        .clone();
+    if current != top_branch {
+        bail!("checkout the top branch '{top_branch}' before absorbing (currently on '{current}')");
+    }
+    for pair in stack.items.windows(2) {
+        if !git::is_ancestor(&pair[0].branch, &pair[1].branch) {
+            bail!(
+                "stack is not linear: '{}' is not an ancestor of '{}'. Run `fj stack sync` first.",
+                pair[0].branch,
+                pair[1].branch
+            );
+        }
+    }
+
+    // Only staged changes are absorbed (deterministic, like `git add` then
+    // `git absorb --and-rebase`). Unstaged/untracked are ignored.
+    let staged_raw = git::output(&["diff", "--cached", "--name-only"])?;
+    let staged: Vec<String> = staged_raw
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    if staged.is_empty() {
+        bail!(
+            "nothing staged to absorb (stage changes with `git add`); unstaged changes are ignored"
+        );
+    }
+
+    // Per-entry commit shas (for sha→entry indexing) and each entry's tip.
+    let mut entry_shas: Vec<Vec<String>> = Vec::with_capacity(stack.items.len());
+    let mut tips: Vec<String> = Vec::with_capacity(stack.items.len());
+    let mut branches: Vec<String> = Vec::with_capacity(stack.items.len());
+    for (i, item) in stack.items.iter().enumerate() {
+        let prev = if i == 0 {
+            stack.base.clone()
+        } else {
+            stack.items[i - 1].branch.clone()
+        };
+        let range = format!("{prev}..{}", item.branch);
+        let shas: Vec<String> = git::output(&["rev-list", &range])?
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        entry_shas.push(shas);
+        tips.push(git::rev_parse(&item.branch)?);
+        branches.push(item.branch.clone());
+    }
+
+    let sha_to_entry = index_commits(&entry_shas);
+    let files_with_touch: Vec<(String, Option<String>)> = staged
+        .iter()
+        .map(|f| (f.clone(), last_touch_in_stack(&stack.base, &top_branch, f)))
+        .collect();
+    let attributions = attribute_files(&files_with_touch, &sha_to_entry);
+    let plan = plan_absorb(&attributions, &branches, &tips);
+
+    if args.dry_run {
+        if args.json {
+            return output::print_json(&serde_json::to_value(&plan)?);
+        }
+        print!("{}", render_absorb_plan(&plan));
+        return Ok(());
+    }
+
+    if plan.groups.is_empty() {
+        // Nothing maps to an entry: don't rewrite anything.
+        print!("{}", render_absorb_plan(&plan));
+        return Ok(());
+    }
+
+    // Snapshot for recovery: the top tip (to undo fixups) and the staged patch.
+    let orig_top = git::rev_parse("HEAD")?;
+
+    // One fixup commit per target entry, peeling its files off the index.
+    for g in &plan.groups {
+        git::commit_fixup(&g.target, &g.files)?;
+    }
+
+    // Rebuild the stack; on failure, abort and re-stage the fixup contents so
+    // the user's working state is preserved.
+    if let Err(e) = git::rebase_autosquash_update_refs(&stack.base) {
+        git::rebase_abort();
+        let _ = git::reset_soft(&orig_top);
+        return Err(e.context(
+            "absorb rebase hit a conflict and was rolled back; resolve by hand \
+             (git rebase -i --autosquash --update-refs) or stage a smaller change",
+        ));
+    }
+
+    stack.updated_at = Utc::now().to_rfc3339();
+    stack_state::save(&stack)?;
+
+    if args.json {
+        return output::print_json(&serde_json::to_value(&plan)?);
+    }
+    print!("{}", render_absorb_done(&plan));
+    Ok(())
 }
 
 // ── stack ship ─────────────────────────────────────────────────────────────
@@ -2144,5 +2424,178 @@ mod tests {
         assert_eq!(v[1]["base"], "u/feat-1");
         assert_eq!(v[1]["title"], "b");
         assert!(v[0]["pr"].is_null());
+    }
+
+    // ---- absorb ----
+
+    #[test]
+    fn absorb_parses_dry_run_and_json() {
+        let cli =
+            Cli::try_parse_from(["fj", "stack", "absorb", "--dry-run", "--json"]).expect("parses");
+        match cli.command {
+            Command::Stack(StackCmd {
+                command: StackSub::Absorb(a),
+            }) => assert!(a.dry_run && a.json),
+            other => panic!("expected stack absorb, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_git_version_reads_major_minor() {
+        assert_eq!(parse_git_version("git version 2.54.0"), Some((2, 54)));
+        assert_eq!(
+            parse_git_version("git version 2.39.3 (Apple Git-145)"),
+            Some((2, 39))
+        );
+        assert_eq!(parse_git_version("git version 3"), Some((3, 0)));
+        assert_eq!(parse_git_version("nonsense"), None);
+    }
+
+    #[test]
+    fn supports_update_refs_gates_on_2_38() {
+        assert!(!supports_update_refs((2, 37)));
+        assert!(supports_update_refs((2, 38)));
+        assert!(supports_update_refs((2, 54)));
+        assert!(supports_update_refs((3, 0)));
+    }
+
+    #[test]
+    fn index_commits_maps_sha_to_entry() {
+        let entries = vec![
+            vec!["a1".to_string(), "a2".to_string()],
+            vec!["b1".to_string()],
+        ];
+        let map = index_commits(&entries);
+        assert_eq!(map.get("a1"), Some(&0));
+        assert_eq!(map.get("a2"), Some(&0));
+        assert_eq!(map.get("b1"), Some(&1));
+        assert_eq!(map.get("zz"), None);
+    }
+
+    fn attribs(pairs: &[(&str, Option<&str>)]) -> Vec<(String, Option<String>)> {
+        pairs
+            .iter()
+            .map(|(f, s)| (f.to_string(), s.map(str::to_string)))
+            .collect()
+    }
+
+    #[test]
+    fn attribute_files_routes_or_skips() {
+        let mut map = std::collections::HashMap::new();
+        map.insert("a1".to_string(), 0usize);
+        map.insert("b1".to_string(), 1usize);
+        let files = attribs(&[
+            ("form.rs", Some("a1")), // -> entry 0
+            ("api.rs", Some("b1")),  // -> entry 1
+            ("README", Some("zz")),  // last touch outside the stack -> skip
+            ("new.rs", None),        // brand new -> skip
+        ]);
+        let got = attribute_files(&files, &map);
+        assert_eq!(got[0].entry, Some(0));
+        assert_eq!(got[1].entry, Some(1));
+        assert_eq!(got[2].entry, None);
+        assert_eq!(got[3].entry, None);
+    }
+
+    #[test]
+    fn plan_absorb_groups_by_entry_and_drops_empty() {
+        let attributions = vec![
+            FileAttribution {
+                file: "form.rs".into(),
+                entry: Some(0),
+            },
+            FileAttribution {
+                file: "form_test.rs".into(),
+                entry: Some(0),
+            },
+            FileAttribution {
+                file: "api.rs".into(),
+                entry: Some(2),
+            },
+            FileAttribution {
+                file: "stray.rs".into(),
+                entry: None,
+            },
+        ];
+        let branches = vec!["u/f-1".into(), "u/f-2".into(), "u/f-3".into()];
+        let tips = vec!["sha1".into(), "sha2".into(), "sha3".into()];
+        let plan = plan_absorb(&attributions, &branches, &tips);
+        // entry 1 has no files -> dropped; 0 and 2 kept, in order.
+        assert_eq!(plan.groups.len(), 2);
+        assert_eq!(plan.groups[0].branch, "u/f-1");
+        assert_eq!(plan.groups[0].target, "sha1");
+        assert_eq!(plan.groups[0].files, vec!["form.rs", "form_test.rs"]);
+        assert_eq!(plan.groups[1].branch, "u/f-3");
+        assert_eq!(plan.groups[1].target, "sha3");
+        assert_eq!(plan.skipped, vec!["stray.rs"]);
+    }
+
+    #[test]
+    fn render_absorb_plan_covers_groups_skips_and_empty() {
+        let branches = vec!["u/f-1".into(), "u/f-2".into()];
+        let tips = vec!["abc12345def".into(), "999".into()];
+        let attributions = vec![
+            FileAttribution {
+                file: "form.rs".into(),
+                entry: Some(0),
+            },
+            FileAttribution {
+                file: "stray.rs".into(),
+                entry: None,
+            },
+        ];
+        let plan = plan_absorb(&attributions, &branches, &tips);
+        let out = render_absorb_plan(&plan);
+        assert!(out.contains("Would absorb staged changes into 1 entry:"));
+        assert!(out.contains("u/f-1 (abc12345):"));
+        assert!(out.contains("      form.rs"));
+        assert!(out.contains("Left staged (no matching entry):"));
+        assert!(out.contains("      stray.rs"));
+
+        // Nothing maps to an entry.
+        let empty = plan_absorb(
+            &[FileAttribution {
+                file: "x".into(),
+                entry: None,
+            }],
+            &branches,
+            &tips,
+        );
+        let out = render_absorb_plan(&empty);
+        assert!(out.contains("Nothing to absorb"));
+    }
+
+    #[test]
+    fn render_absorb_done_reports_and_warns_force_push() {
+        let plan = AbsorbPlan {
+            groups: vec![AbsorbGroup {
+                branch: "u/f-1".into(),
+                target: "sha1".into(),
+                files: vec!["a.rs".into(), "b.rs".into()],
+            }],
+            skipped: vec!["s.rs".into()],
+        };
+        let out = render_absorb_done(&plan);
+        assert!(out.contains("absorbed 2 file(s) into u/f-1"));
+        assert!(out.contains("Rewrote 1 entry"));
+        assert!(out.contains("force-with-lease"));
+        assert!(out.contains("1 file(s) left staged"));
+    }
+
+    #[test]
+    fn absorb_plan_json_shape_is_stable() {
+        let plan = AbsorbPlan {
+            groups: vec![AbsorbGroup {
+                branch: "u/f-1".into(),
+                target: "sha1".into(),
+                files: vec!["a.rs".into()],
+            }],
+            skipped: vec!["s.rs".into()],
+        };
+        let v = serde_json::to_value(&plan).unwrap();
+        assert_eq!(v["groups"][0]["branch"], "u/f-1");
+        assert_eq!(v["groups"][0]["target"], "sha1");
+        assert_eq!(v["groups"][0]["files"][0], "a.rs");
+        assert_eq!(v["skipped"][0], "s.rs");
     }
 }

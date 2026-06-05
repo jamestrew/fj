@@ -221,8 +221,15 @@ and `--dry-run` prints the plan without touching anything.
 the _N_ commits ahead of the base become branches `<handle>/<slug>-1..N`, each
 chained on the one below. It only moves local refs (no push, no API), so it's
 offline and reversible; it refuses a dirty tree or a multi-entry stack, and
-`--dry-run` shows the commit-to-branch mapping. `absorb` is still scaffolded
-(`--dry-run` prints the plan, else a structured "not yet implemented").
+`--dry-run` shows the commit-to-branch mapping.
+`fj stack absorb` folds your staged changes into the entries that introduced
+them, the way `git absorb` does: it attributes each staged file to the most
+recent stack commit that touched it (per-file), creates a `fixup!` commit per
+target, then runs one autosquash `git rebase --update-refs` to rewrite the
+entries in place and move every branch ref. Files with no matching entry are
+left staged. It needs git >= 2.38, operates on the stack's top branch, and
+rewrites history, so the branches need a force-push afterward; `--dry-run` (and
+`--json`) print the attribution plan without touching anything.
 
 ### Agent (AI-assisted)
 
