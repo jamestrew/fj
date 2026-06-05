@@ -2,6 +2,9 @@
 
 - [`architecture.md`](architecture.md): module graph, layering rules,
   the HTTP funnel, pager + SIGINT, repo resolution, test strategy.
+- [`stacks.md`](stacks.md): stacked branches and PRs (new, sync, ship,
+  split, absorb).
+- [`agent.md`](agent.md): AI-assisted code ops (review, fix, explain).
 - [`jq.md`](jq.md): the `fj api --jq` syntax. Dot paths, brackets,
   negative indices, pipes.
 - [`gh-to-fj.md`](gh-to-fj.md): command-by-command mapping from gh.
