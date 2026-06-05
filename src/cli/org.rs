@@ -23,20 +23,25 @@ pub enum OrgSub {
 
 #[derive(Debug, Args)]
 pub struct ListArgs {
+    /// Emit JSON instead of a table
     #[arg(long)]
     pub json: bool,
 }
 
 #[derive(Debug, Args)]
 pub struct ViewArgs {
+    /// Organization name
     pub org: String,
+    /// Emit JSON instead of a table
     #[arg(long)]
     pub json: bool,
 }
 
 #[derive(Debug, Args)]
 pub struct TeamsArgs {
+    /// Organization name
     pub org: String,
+    /// Emit JSON instead of a table
     #[arg(long)]
     pub json: bool,
 }

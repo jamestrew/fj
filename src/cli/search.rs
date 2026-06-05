@@ -25,9 +25,12 @@ pub enum SearchSub {
 
 #[derive(Debug, Args)]
 pub struct QueryArgs {
+    /// Search query
     pub query: String,
+    /// Maximum number of results to fetch
     #[arg(short = 'L', long, default_value_t = 20)]
     pub limit: u32,
+    /// Emit JSON instead of a table
     #[arg(long)]
     pub json: bool,
 }

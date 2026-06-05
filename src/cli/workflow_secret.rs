@@ -36,6 +36,7 @@ pub struct SecretListArgs {
 pub struct SecretSetArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Secret name
     pub name: String,
     /// Value (raw string). For multi-line secrets, prefer `--from-file -` and pipe stdin.
     #[arg(short = 'v', long)]
@@ -49,7 +50,9 @@ pub struct SecretSetArgs {
 pub struct SecretDeleteArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Secret name
     pub name: String,
+    /// Skip the confirmation prompt
     #[arg(short = 'y', long)]
     pub yes: bool,
 }

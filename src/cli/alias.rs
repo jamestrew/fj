@@ -32,6 +32,7 @@ pub enum AliasSub {
 
 #[derive(Debug, Args)]
 pub struct SetArgs {
+    /// Alias name
     pub name: String,
     /// Expansion: the rest of the line after the alias name.
     pub expansion: String,
@@ -39,6 +40,7 @@ pub struct SetArgs {
 
 #[derive(Debug, Args)]
 pub struct DeleteArgs {
+    /// Alias name
     pub name: String,
 }
 

@@ -36,6 +36,7 @@ pub enum WorkflowSub {
 pub struct WorkflowListArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Emit JSON instead of a table
     #[arg(long)]
     pub json: bool,
 }

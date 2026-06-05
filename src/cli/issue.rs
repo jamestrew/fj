@@ -67,18 +67,25 @@ impl From<StateFilter> for State {
 pub struct ListArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Filter by state
     #[arg(short = 's', long, value_enum, default_value_t = StateFilter::Open)]
     pub state: StateFilter,
+    /// Maximum number of issues to fetch
     #[arg(short = 'L', long, default_value_t = 30)]
     pub limit: u32,
+    /// Page of results to fetch
     #[arg(long, default_value_t = 1)]
     pub page: u32,
+    /// Filter by label
     #[arg(short = 'l', long)]
     pub label: Option<String>,
+    /// Filter by assignee
     #[arg(short = 'a', long)]
     pub assignee: Option<String>,
+    /// Search text to filter by
     #[arg(short = 'S', long = "search")]
     pub query: Option<String>,
+    /// Emit JSON instead of a table
     #[arg(long)]
     pub json: bool,
     /// Open the issue list in your browser.
@@ -90,9 +97,12 @@ pub struct ListArgs {
 pub struct ViewArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Issue number
     pub number: u64,
+    /// Include the comment thread
     #[arg(long, default_value_t = false)]
     pub comments: bool,
+    /// Emit JSON instead of a table
     #[arg(long)]
     pub json: bool,
     /// Open the issue in your browser.
@@ -104,6 +114,7 @@ pub struct ViewArgs {
 pub struct CreateArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Issue title
     #[arg(short = 't', long)]
     pub title: Option<String>,
     /// Body. Use `-` to read from stdin. Omit to open `$EDITOR`.
@@ -118,7 +129,9 @@ pub struct CreateArgs {
 pub struct EditArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Issue number
     pub number: u64,
+    /// Issue title
     #[arg(short = 't', long)]
     pub title: Option<String>,
     /// New body. Use `-` to read from stdin. Pass `--body-editor` to open `$EDITOR`.
@@ -133,6 +146,7 @@ pub struct EditArgs {
 pub struct NumberOnly {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Issue number
     pub number: u64,
 }
 
@@ -140,7 +154,9 @@ pub struct NumberOnly {
 pub struct DeleteArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Issue number
     pub number: u64,
+    /// Skip the confirmation prompt
     #[arg(short = 'y', long)]
     pub yes: bool,
 }
@@ -149,6 +165,7 @@ pub struct DeleteArgs {
 pub struct DevelopArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Issue number
     pub number: u64,
     /// Branch name. Defaults to `issue-<number>-<slug-of-title>`.
     #[arg(short = 'n', long)]

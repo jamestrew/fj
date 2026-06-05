@@ -40,8 +40,10 @@ pub enum MilestoneSub {
 pub struct ListArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Filter by state
     #[arg(short = 's', long, default_value = "open")]
     pub state: String,
+    /// Emit JSON instead of a table
     #[arg(long)]
     pub json: bool,
 }
@@ -50,7 +52,9 @@ pub struct ListArgs {
 pub struct IdArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Milestone id
     pub id: u64,
+    /// Emit JSON instead of a table
     #[arg(long)]
     pub json: bool,
 }
@@ -59,7 +63,9 @@ pub struct IdArgs {
 pub struct CreateArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Milestone title
     pub title: String,
+    /// Description (use - for stdin, omit to open $EDITOR)
     #[arg(short = 'b', long)]
     pub body: Option<String>,
     /// Due date in ISO-8601 (e.g. 2026-06-01T00:00:00Z).
@@ -71,13 +77,18 @@ pub struct CreateArgs {
 pub struct EditArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Milestone id
     pub id: u64,
+    /// Milestone title
     #[arg(short = 't', long)]
     pub title: Option<String>,
+    /// Description (use - for stdin, omit to open $EDITOR)
     #[arg(short = 'b', long)]
     pub body: Option<String>,
+    /// Due date (YYYY-MM-DD)
     #[arg(long)]
     pub due_on: Option<String>,
+    /// Edit the description in $EDITOR
     #[arg(long)]
     pub body_editor: bool,
 }
@@ -86,7 +97,9 @@ pub struct EditArgs {
 pub struct DeleteArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Milestone id
     pub id: u64,
+    /// Skip the confirmation prompt
     #[arg(short = 'y', long)]
     pub yes: bool,
 }

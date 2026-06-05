@@ -60,16 +60,19 @@ pub enum GpgKeySub {
 
 #[derive(Debug, Args)]
 pub struct ListArgs {
+    /// Emit JSON instead of a table
     #[arg(long)]
     pub json: bool,
 }
 
 #[derive(Debug, Args)]
 pub struct AddArgs {
+    /// Key title
     pub title: String,
     /// SSH public key. Pass `--from-file ~/.ssh/id_ed25519.pub` instead for files.
     #[arg(long)]
     pub key: Option<String>,
+    /// Read the key from a file (or - for stdin)
     #[arg(long = "from-file")]
     pub from_file: Option<String>,
 }
@@ -79,13 +82,16 @@ pub struct GpgAddArgs {
     /// Armored public GPG key. Use `--from-file -` for stdin.
     #[arg(long)]
     pub key: Option<String>,
+    /// Read the key from a file (or - for stdin)
     #[arg(long = "from-file")]
     pub from_file: Option<String>,
 }
 
 #[derive(Debug, Args)]
 pub struct DeleteArgs {
+    /// Key id
     pub id: u64,
+    /// Skip the confirmation prompt
     #[arg(short = 'y', long)]
     pub yes: bool,
 }

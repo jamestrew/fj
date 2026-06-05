@@ -83,8 +83,10 @@ pub struct SetDefaultArgs {
 
 #[derive(Debug, Args)]
 pub struct ListArgs {
+    /// Maximum number of repositories to fetch
     #[arg(short = 'L', long, default_value_t = 30)]
     pub limit: u32,
+    /// Page of results to fetch
     #[arg(long, default_value_t = 1)]
     pub page: u32,
     /// Search query (uses `/repos/search`).
@@ -102,6 +104,7 @@ pub struct ViewArgs {
     /// Alias for the positional repo arg.
     #[arg(short = 'R', long = "repo")]
     pub repo_flag: Option<String>,
+    /// Emit JSON instead of a table
     #[arg(long)]
     pub json: bool,
     /// Open the repo's web page.
@@ -126,10 +129,13 @@ pub struct CloneArgs {
 pub struct CreateArgs {
     /// `[owner/]name`. Without an owner, the authenticated user is used.
     pub repo: String,
+    /// Repository description
     #[arg(short, long)]
     pub description: Option<String>,
+    /// Make the repository private
     #[arg(long, default_value_t = false)]
     pub private: bool,
+    /// Initialize with a commit
     #[arg(long, default_value_t = false)]
     pub init: bool,
     /// Clone the new repo into the current directory.
@@ -144,6 +150,7 @@ pub struct CreateArgs {
 pub struct ForkArgs {
     /// Source repo `owner/name`. Inferred when omitted.
     pub repo: Option<String>,
+    /// Alias for the positional repo arg
     #[arg(short = 'R', long = "repo")]
     pub repo_flag: Option<String>,
     /// Place the fork under this organization instead of your user account.
@@ -159,7 +166,9 @@ pub struct ForkArgs {
 
 #[derive(Debug, Args)]
 pub struct SyncArgs {
+    /// Repository as owner/name
     pub repo: Option<String>,
+    /// Alias for the positional repo arg
     #[arg(short = 'R', long = "repo")]
     pub repo_flag: Option<String>,
     /// Branch to sync. Defaults to the repo's default branch.
@@ -169,13 +178,18 @@ pub struct SyncArgs {
 
 #[derive(Debug, Args)]
 pub struct EditArgs {
+    /// Repository as owner/name
     pub repo: Option<String>,
+    /// Alias for the positional repo arg
     #[arg(short = 'R', long = "repo")]
     pub repo_flag: Option<String>,
+    /// Repository description
     #[arg(long)]
     pub description: Option<String>,
+    /// Repository website URL
     #[arg(long)]
     pub website: Option<String>,
+    /// Default branch name
     #[arg(long)]
     pub default_branch: Option<String>,
     /// Force private/public. Accepts `true` or `false`.
@@ -188,19 +202,24 @@ pub struct EditArgs {
 
 #[derive(Debug, Args)]
 pub struct RenameArgs {
+    /// Repository as owner/name
     pub repo: String,
+    /// New repository name
     pub new_name: String,
 }
 
 #[derive(Debug, Args)]
 pub struct ArchiveArgs {
+    /// Repository as owner/name
     pub repo: Option<String>,
+    /// Alias for the positional repo arg
     #[arg(short = 'R', long = "repo")]
     pub repo_flag: Option<String>,
 }
 
 #[derive(Debug, Args)]
 pub struct DeleteArgs {
+    /// Repository as owner/name
     pub repo: String,
     /// Skip the confirmation prompt.
     #[arg(short = 'y', long)]
@@ -209,16 +228,21 @@ pub struct DeleteArgs {
 
 #[derive(Debug, Args)]
 pub struct BranchesArgs {
+    /// Repository as owner/name
     pub repo: Option<String>,
+    /// Alias for the positional repo arg
     #[arg(short = 'R', long = "repo")]
     pub repo_flag: Option<String>,
+    /// Emit JSON instead of a table
     #[arg(long)]
     pub json: bool,
 }
 
 #[derive(Debug, Args)]
 pub struct TopicsArgs {
+    /// Repository as owner/name
     pub repo: Option<String>,
+    /// Alias for the positional repo arg
     #[arg(short = 'R', long = "repo")]
     pub repo_flag: Option<String>,
     /// Set the topic list (comma-separated). Omit to just print.

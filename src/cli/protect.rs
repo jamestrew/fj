@@ -29,6 +29,7 @@ pub enum ProtectSub {
 pub struct ListArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Emit JSON instead of a table
     #[arg(long)]
     pub json: bool,
 }
@@ -37,7 +38,9 @@ pub struct ListArgs {
 pub struct BranchArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Branch name (or pattern)
     pub branch: String,
+    /// Emit JSON instead of a table
     #[arg(long)]
     pub json: bool,
 }
@@ -46,6 +49,7 @@ pub struct BranchArgs {
 pub struct SetArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Branch name (or pattern)
     pub branch: String,
     /// Require signed commits.
     #[arg(long)]

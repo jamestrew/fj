@@ -12,8 +12,10 @@ pub struct StatusArgs {
     /// Show all (including already-read) notifications.
     #[arg(short = 'a', long)]
     pub all: bool,
+    /// Maximum number of notifications to fetch
     #[arg(short = 'L', long, default_value_t = 20)]
     pub limit: u32,
+    /// Emit JSON instead of a table
     #[arg(long)]
     pub json: bool,
     /// Mark all notifications as read.

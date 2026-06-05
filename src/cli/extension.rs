@@ -30,6 +30,7 @@ pub enum ExtensionSub {
 
 #[derive(Debug, Args)]
 pub struct RunArgs {
+    /// Extension name (the fj-<name> binary)
     pub name: String,
     /// Arguments forwarded verbatim to the plugin binary.
     pub args: Vec<String>,

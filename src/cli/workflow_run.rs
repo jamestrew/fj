@@ -38,8 +38,10 @@ pub enum RunSub {
 pub struct ListArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Maximum number of runs to fetch
     #[arg(short = 'L', long, default_value_t = 20)]
     pub limit: u32,
+    /// Emit JSON instead of a table
     #[arg(long)]
     pub json: bool,
 }
@@ -63,6 +65,7 @@ pub struct ViewArgs {
     /// Attempt number. Defaults to the latest attempt (follows reruns).
     #[arg(long)]
     pub attempt: Option<u32>,
+    /// Emit JSON instead of a table
     #[arg(long)]
     pub json: bool,
 }
@@ -88,6 +91,7 @@ pub struct WatchArgs {
 pub struct IdArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Workflow run id
     pub run_id: u64,
 }
 

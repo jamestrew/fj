@@ -29,6 +29,7 @@ pub enum HookSub {
 pub struct ListArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Emit JSON instead of a table
     #[arg(long)]
     pub json: bool,
 }
@@ -57,6 +58,7 @@ pub struct CreateArgs {
 pub struct DeleteArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Webhook id
     pub id: u64,
 }
 

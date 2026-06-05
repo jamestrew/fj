@@ -41,10 +41,13 @@ pub enum ReleaseSub {
 pub struct ListArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Maximum number of releases to fetch
     #[arg(short = 'L', long, default_value_t = 30)]
     pub limit: u32,
+    /// Emit JSON instead of a table
     #[arg(long)]
     pub json: bool,
+    /// Open the release in your browser
     #[arg(long)]
     pub web: bool,
 }
@@ -53,9 +56,12 @@ pub struct ListArgs {
 pub struct ViewArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Release tag
     pub tag: String,
+    /// Emit JSON instead of a table
     #[arg(long)]
     pub json: bool,
+    /// Open the release in your browser
     #[arg(long)]
     pub web: bool,
 }
@@ -64,16 +70,21 @@ pub struct ViewArgs {
 pub struct CreateArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Release tag
     pub tag: String,
+    /// Release title
     #[arg(short = 't', long)]
     pub title: Option<String>,
+    /// Release notes (use - for stdin, omit to open $EDITOR)
     #[arg(short = 'b', long)]
     pub body: Option<String>,
     /// Target commitish (branch or SHA). Defaults to default branch.
     #[arg(long)]
     pub target: Option<String>,
+    /// Save as a draft instead of publishing
     #[arg(long)]
     pub draft: bool,
+    /// Mark as a prerelease
     #[arg(long)]
     pub prerelease: bool,
     /// Files to upload as assets (repeatable).
@@ -85,15 +96,21 @@ pub struct CreateArgs {
 pub struct EditArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Release tag
     pub tag: String,
+    /// Release title
     #[arg(short = 't', long)]
     pub title: Option<String>,
+    /// Release notes (use - for stdin, omit to open $EDITOR)
     #[arg(short = 'b', long)]
     pub body: Option<String>,
+    /// Save as a draft instead of publishing
     #[arg(long)]
     pub draft: Option<bool>,
+    /// Mark as a prerelease
     #[arg(long)]
     pub prerelease: Option<bool>,
+    /// Edit the release notes in $EDITOR
     #[arg(long)]
     pub body_editor: bool,
 }
@@ -102,7 +119,9 @@ pub struct EditArgs {
 pub struct DeleteArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Release tag
     pub tag: String,
+    /// Skip the confirmation prompt
     #[arg(short = 'y', long)]
     pub yes: bool,
 }
@@ -111,6 +130,7 @@ pub struct DeleteArgs {
 pub struct UploadArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Release tag
     pub tag: String,
     /// File paths to upload.
     pub files: Vec<String>,
@@ -120,6 +140,7 @@ pub struct UploadArgs {
 pub struct DownloadArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Release tag
     pub tag: String,
     /// Asset name. If omitted, all assets are downloaded.
     #[arg(short = 'n', long)]
@@ -133,9 +154,11 @@ pub struct DownloadArgs {
 pub struct DeleteAssetArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Release tag
     pub tag: String,
     /// Name of the asset to delete.
     pub asset: String,
+    /// Skip the confirmation prompt
     #[arg(short = 'y', long)]
     pub yes: bool,
 }

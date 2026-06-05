@@ -40,6 +40,7 @@ pub struct CloneArgs {
 pub struct ListArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Emit JSON instead of a table
     #[arg(long)]
     pub json: bool,
 }
@@ -48,10 +49,12 @@ pub struct ListArgs {
 pub struct CreateArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Label name
     pub name: String,
     /// Color as 6-char hex (with or without `#`).
     #[arg(long, default_value = "ededed")]
     pub color: String,
+    /// Label description
     #[arg(long)]
     pub description: Option<String>,
 }
@@ -65,8 +68,10 @@ pub struct EditArgs {
     /// New name.
     #[arg(long)]
     pub rename: Option<String>,
+    /// Label color (hex, e.g. d73a4a)
     #[arg(long)]
     pub color: Option<String>,
+    /// Label description
     #[arg(long)]
     pub description: Option<String>,
 }
@@ -75,7 +80,9 @@ pub struct EditArgs {
 pub struct DeleteArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Label name
     pub name: String,
+    /// Skip the confirmation prompt
     #[arg(short = 'y', long)]
     pub yes: bool,
 }

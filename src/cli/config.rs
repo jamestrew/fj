@@ -47,12 +47,15 @@ pub enum ConfigSub {
 
 #[derive(Debug, Args)]
 pub struct GetArgs {
+    /// Configuration key
     pub key: String,
 }
 
 #[derive(Debug, Args)]
 pub struct SetArgs {
+    /// Configuration key
     pub key: String,
+    /// Value to set
     pub value: String,
 }
 

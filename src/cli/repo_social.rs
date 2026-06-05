@@ -12,15 +12,19 @@ use crate::output;
 
 #[derive(Debug, Args)]
 pub struct SimpleRepoArgs {
+    /// Repository as owner/name
     pub repo: Option<String>,
+    /// Alias for the positional repo arg
     #[arg(short = 'R', long = "repo")]
     pub repo_flag: Option<String>,
 }
 
 #[derive(Debug, Args)]
 pub struct StarredArgs {
+    /// Maximum number of repositories to fetch
     #[arg(short = 'L', long, default_value_t = 30)]
     pub limit: u32,
+    /// Emit JSON instead of a table
     #[arg(long)]
     pub json: bool,
 }

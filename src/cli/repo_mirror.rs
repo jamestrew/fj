@@ -42,7 +42,9 @@ pub struct MirrorArgs {
 
 #[derive(Debug, Args)]
 pub struct MirrorSyncArgs {
+    /// Pull-mirror repository as owner/name (inferred from the git remote when omitted)
     pub repo: Option<String>,
+    /// Alias for the positional repository arg
     #[arg(short = 'R', long = "repo")]
     pub repo_flag: Option<String>,
 }

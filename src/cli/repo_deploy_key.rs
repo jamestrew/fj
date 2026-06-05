@@ -28,6 +28,7 @@ pub enum DeployKeySub {
 pub struct DeployKeyListArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Emit JSON instead of a table
     #[arg(long)]
     pub json: bool,
 }
@@ -36,10 +37,12 @@ pub struct DeployKeyListArgs {
 pub struct DeployKeyAddArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Key title
     pub title: String,
     /// Public key string. Use `--from-file path` (or `-` for stdin) instead for files.
     #[arg(long)]
     pub key: Option<String>,
+    /// Read the key from a file (or - for stdin)
     #[arg(long = "from-file")]
     pub from_file: Option<String>,
     /// Allow the key to push (default is read-only).
@@ -51,7 +54,9 @@ pub struct DeployKeyAddArgs {
 pub struct DeployKeyDeleteArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Deploy key id
     pub id: u64,
+    /// Skip the confirmation prompt
     #[arg(short = 'y', long)]
     pub yes: bool,
 }

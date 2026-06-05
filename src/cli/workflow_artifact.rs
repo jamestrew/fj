@@ -27,6 +27,7 @@ pub struct DownloadArgs {
     /// List the run's artifacts instead of downloading.
     #[arg(long)]
     pub list: bool,
+    /// Emit JSON instead of a table
     #[arg(long)]
     pub json: bool,
 }

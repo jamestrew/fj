@@ -36,6 +36,7 @@ pub enum AuthSub {
 
 #[derive(Debug, Args)]
 pub struct TokenArgs {
+    /// Forgejo host whose token to print (defaults to the current host)
     #[arg(long)]
     pub host: Option<String>,
     /// Print the token even if stdout is a terminal (default refuses to, to
@@ -46,6 +47,7 @@ pub struct TokenArgs {
 
 #[derive(Debug, Args)]
 pub struct RefreshArgs {
+    /// Forgejo host whose token to re-verify (defaults to the current host)
     #[arg(long)]
     pub host: Option<String>,
     /// Replace the stored token. If omitted, fj just re-verifies the existing one.
@@ -58,6 +60,7 @@ pub struct RefreshArgs {
 
 #[derive(Debug, Args)]
 pub struct SetupGitArgs {
+    /// Forgejo host to configure the credential helper for (defaults to the current host)
     #[arg(long)]
     pub host: Option<String>,
     /// Print the recommended git config commands without applying them.

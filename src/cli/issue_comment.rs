@@ -16,6 +16,7 @@ use super::editor;
 pub struct CommentArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Issue number
     pub number: u64,
     /// Comment body. Use `-` to read from stdin. Omit to open `$EDITOR`.
     #[arg(short = 'b', long)]
@@ -37,7 +38,9 @@ pub struct EditCommentArgs {
 pub struct DeleteCommentArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Comment id
     pub comment_id: u64,
+    /// Skip the confirmation prompt
     #[arg(short = 'y', long)]
     pub yes: bool,
 }

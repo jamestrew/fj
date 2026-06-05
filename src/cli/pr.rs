@@ -67,14 +67,19 @@ pub enum PrSub {
 pub struct ListArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Filter by state
     #[arg(short = 's', long, value_enum, default_value_t = StateFilter::Open)]
     pub state: StateFilter,
+    /// Maximum number of pull requests to fetch
     #[arg(short = 'L', long, default_value_t = 30)]
     pub limit: u32,
+    /// Page of results to fetch
     #[arg(long, default_value_t = 1)]
     pub page: u32,
+    /// Emit JSON instead of a table
     #[arg(long)]
     pub json: bool,
+    /// Open the pull request list in your browser
     #[arg(long)]
     pub web: bool,
 }
@@ -83,11 +88,15 @@ pub struct ListArgs {
 pub struct ViewArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Pull request number
     pub number: u64,
+    /// Include the comment thread
     #[arg(long, default_value_t = false)]
     pub comments: bool,
+    /// Emit JSON instead of a table
     #[arg(long)]
     pub json: bool,
+    /// Open the pull request in your browser
     #[arg(long)]
     pub web: bool,
 }
@@ -96,8 +105,10 @@ pub struct ViewArgs {
 pub struct CreateArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Pull request title
     #[arg(short = 't', long)]
     pub title: Option<String>,
+    /// Base branch the PR targets
     #[arg(short = 'B', long, default_value = "main")]
     pub base: String,
     /// Head branch. Either a branch name on the same repo, or `owner:branch`.
@@ -118,9 +129,12 @@ pub struct CreateArgs {
 pub struct EditArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Pull request number
     pub number: u64,
+    /// Pull request title
     #[arg(short = 't', long)]
     pub title: Option<String>,
+    /// Body (use - for stdin, omit to open $EDITOR)
     #[arg(short = 'b', long)]
     pub body: Option<String>,
     /// Open `$EDITOR` for the body (replaces the current body).
@@ -132,6 +146,7 @@ pub struct EditArgs {
 pub struct ReviewArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Pull request number
     pub number: u64,
     /// Review action.
     #[arg(value_enum, long, short = 'e')]
@@ -146,6 +161,7 @@ pub struct ReviewArgs {
 pub struct ReviewerArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Pull request number
     pub number: u64,
     /// Reviewer usernames (repeatable, comma-separated also allowed).
     #[arg(value_name = "USERNAME")]
@@ -156,9 +172,12 @@ pub struct ReviewerArgs {
 pub struct CheckoutArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Pull request number
     pub number: u64,
+    /// Local branch name to check out into (defaults to pr-<number>)
     #[arg(short = 'b', long)]
     pub branch: Option<String>,
+    /// Git remote to fetch the PR ref from
     #[arg(long, default_value = "origin")]
     pub remote: String,
 }
@@ -167,11 +186,15 @@ pub struct CheckoutArgs {
 pub struct MergeArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Pull request number
     pub number: u64,
+    /// Merge method to use
     #[arg(long, value_enum, default_value_t = MergeStyleArg::Merge)]
     pub style: MergeStyleArg,
+    /// Title for the merge commit
     #[arg(long)]
     pub title: Option<String>,
+    /// Message body for the merge commit
     #[arg(long)]
     pub message: Option<String>,
     /// Delete the head branch after the merge succeeds.
@@ -183,6 +206,7 @@ pub struct MergeArgs {
 pub struct SimpleArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Pull request number
     pub number: u64,
 }
 
@@ -190,6 +214,7 @@ pub struct SimpleArgs {
 pub struct CommentArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Pull request number
     pub number: u64,
     /// Comment body. Use `-` to read from stdin. Omit to open `$EDITOR`.
     #[arg(short = 'b', long)]
@@ -200,6 +225,7 @@ pub struct CommentArgs {
 pub struct UpdateBranchArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Pull request number
     pub number: u64,
     /// Update strategy: merge (default) or rebase.
     #[arg(long, value_enum, default_value_t = UpdateStyle::Merge)]
