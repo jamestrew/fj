@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>A native CLI for <a href="https://forgejo.org">Forgejo</a> and Gitea-compatible forges.</strong><br>
-  <code>fj</code> does for Forgejo what <code>gh</code> does for GitHub: open PRs, triage issues,<br>
+  <code>fj</code> drives your forge from the terminal: open PRs, triage issues,<br>
   ship releases, tail Actions logs, drive workflows, all from a single binary.<br>
   Tokens stay in your OS keychain. Multi-host from day one.
 </p>
@@ -27,7 +27,7 @@
 If you self-host a Forgejo or Gitea instance, your options for scripting it
 have been: paste curl commands, juggle a `~/.netrc`, or wrap your own scripts
 around `git` and the web UI. `tea` exists but lags Forgejo features and has
-no signed release. `gh` works on GitHub only.
+no signed release.
 
 `fj` is the thing in the middle. It tracks the Forgejo `/api/v1` surface,
 ships **signed and notarized** macOS binaries (no Gatekeeper warnings, no
@@ -44,9 +44,6 @@ Three concrete wins over hand-rolled curl scripts:
 - **Agent-friendly.** Ships a [Claude Code](#claude-code-plugin) plugin so
   AI agents can drive fj from natural-language requests, and a `--json
   --json-fields name,number` projection mode for scripts.
-
-If you came from `gh`, the [gh → fj mapping table](docs/gh-to-fj.md) covers
-every command you reach for.
 
 ## Install
 
@@ -169,8 +166,6 @@ has its own `--help`. Highlights:
 | `completion`| shell completions (bash, zsh, fish, powershell, elvish)                         |
 | `man`       | generate man pages                                                              |
 
-Full [gh → fj mapping table](docs/gh-to-fj.md) for migrating from GitHub workflows.
-
 ### Work context
 
 `fj work context` summarizes where you are: repo + host, your Fjord
@@ -280,7 +275,7 @@ fj agent explain src/main.rs --json
   remote, otherwise the configured default.
 - `--debug` or `FJ_DEBUG=1`: log every HTTP request to stderr.
 - `--json`: switch list/view output to JSON.
-- `--json-fields field1,field2,owner.login`: gh-style projection on top of
+- `--json-fields field1,field2,owner.login`: field projection on top of
   `--json`. Dotted paths supported.
 - `--no-pager` or `FJ_NO_PAGER=1`: skip the pager.
 - `--web` on list/view: open the relevant page in `$BROWSER`.
@@ -297,9 +292,7 @@ natural-language requests:
 ```
 
 The skill activates whenever the user mentions fj, Forgejo, Gitea, or any
-forge-side action. Source lives in [`claude/`](claude/); canonical install
-URL points at the mirror at
-[`rasterandstate/fj-claude-plugin`](https://github.com/rasterandstate/fj-claude-plugin).
+forge-side action. Source lives in [`claude/`](claude/).
 
 ## Configuration
 
@@ -328,7 +321,6 @@ smoke against your configured host.
 ## Documentation
 
 - [`docs/architecture.md`](docs/architecture.md): module graph, HTTP funnel, repo resolution, test strategy
-- [`docs/gh-to-fj.md`](docs/gh-to-fj.md): command-by-command mapping from gh
 - [`docs/jq.md`](docs/jq.md): `fj api --jq` projection syntax
 - [`docs/compatibility.md`](docs/compatibility.md): Forgejo version matrix and known caveats
 - [`docs/faq.md`](docs/faq.md): tokens, hosts, debug, scripting, plugins
