@@ -169,8 +169,8 @@ has its own `--help`. Highlights:
 ### Work context
 
 `fj work context` summarizes where you are: repo + host, your Fjord
-account/auth, the current branch, working-tree state and ahead/behind, and —
-best-effort over the Forgejo API — the default branch, the open PR for the
+account/auth, the current branch, working-tree state and ahead/behind, and,
+best-effort over the Forgejo API, the default branch, the open PR for the
 branch and its CI/check status, plus the current local stack. Local data
 works offline; the API parts degrade gracefully (shown as unavailable) when
 the server or token isn't reachable.
