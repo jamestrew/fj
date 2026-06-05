@@ -1,68 +1,42 @@
 #!/usr/bin/env bash
-# Record the fj README demo from scripts/demo.tape using vhs.
+# Record the fj README demo GIFs from scripts/demo-*.tape using vhs.
 #
-# vhs is from Charmbracelet (https://github.com/charmbracelet/vhs):
-# a declarative tape format that drives a headless terminal and writes
-# GIF/MP4/WebM directly. Reproducible, scriptable, no manual typing.
+# vhs is from Charmbracelet (https://github.com/charmbracelet/vhs): a
+# declarative tape format that drives a headless terminal and writes a GIF
+# directly. Reproducible, scriptable, no manual typing.
+#
+# The footage runs against the public demo repo rasterstate/fj-demo, never fj
+# itself, so it isn't self-referential. Seed that repo once with
+# scripts/seed-demo.sh, then point this at the resulting clone.
 #
 # Pre-flight:
-#   * `brew install vhs` (or download from the vhs releases page)
-#   * `cargo build --release && ln -sf $PWD/target/release/fj ~/.local/bin/fj`
-#   * `fj auth login --host rasterhub.com`
-#
-# Outputs:
-#   assets/demo.gif    embed in README
-#   assets/demo.mp4    optional, higher-fidelity for social cards
+#   * brew install vhs
+#   * fj on PATH and `fj auth login --host rasterhub.com` done
+#   * ./scripts/seed-demo.sh    (creates + seeds rasterstate/fj-demo)
 #
 # Usage:
-#   ./scripts/record-demo.sh                 # records both outputs
-#   ./scripts/record-demo.sh --gif-only      # GIF only (faster)
+#   FJ_DEMO_DIR=/path/to/fj-demo ./scripts/record-demo.sh         # all three
+#   FJ_DEMO_DIR=/path/to/fj-demo ./scripts/record-demo.sh stacks  # one tape
+#
+# Outputs (embedded in README.md):
+#   assets/demo-everyday.gif
+#   assets/demo-stacks.gif
+#   assets/demo-automation.gif
 
 set -euo pipefail
-
 cd "$(git rev-parse --show-toplevel)"
 
-GIF_ONLY=0
-case "${1:-}" in
-  --gif-only) GIF_ONLY=1 ;;
-  "") ;;
-  --help|-h)
-    sed -n '/^# /{s/^# \{0,1\}//;p;}' "$0" | head -25
-    exit 0
-    ;;
-  *)
-    echo "unknown arg: $1 (try --help)" >&2
-    exit 2
-    ;;
-esac
+export FJ_DEMO_DIR="${FJ_DEMO_DIR:-/tmp/fj-demo}"
 
-require() {
-  local cmd=$1 hint=$2
-  if ! command -v "$cmd" >/dev/null 2>&1; then
-    echo "missing $cmd. $hint" >&2
-    exit 1
-  fi
-}
-
-require vhs "Install with: brew install vhs"
-require fj  "Build with: cargo build --release && ln -sf \$PWD/target/release/fj ~/.local/bin/fj"
-
-if ! fj auth status >/dev/null 2>&1; then
-  echo "fj is not authenticated. Run: fj auth login --host rasterhub.com" >&2
-  exit 1
-fi
+command -v vhs >/dev/null || { echo "vhs not found. Install with: brew install vhs" >&2; exit 1; }
+command -v fj  >/dev/null || { echo "fj not found on PATH." >&2; exit 1; }
+[ -d "$FJ_DEMO_DIR/.git" ] || { echo "No clone at FJ_DEMO_DIR=$FJ_DEMO_DIR. Run scripts/seed-demo.sh first." >&2; exit 1; }
 
 mkdir -p assets
+if [ $# -gt 0 ]; then tapes=("$@"); else tapes=(everyday stacks automation); fi
 
-if [ "$GIF_ONLY" = 1 ]; then
-  TAPE=$(mktemp -t fj-demo.XXXXXX.tape)
-  trap 'rm -f "$TAPE"' EXIT
-  grep -v '^Output assets/demo\.mp4' scripts/demo.tape > "$TAPE"
-  vhs "$TAPE"
-else
-  vhs scripts/demo.tape
-fi
-
-echo ""
-echo "✓ wrote assets/demo.gif"
-[ "$GIF_ONLY" = 1 ] || echo "✓ wrote assets/demo.mp4"
+for t in "${tapes[@]}"; do
+  echo "Recording scripts/demo-$t.tape ..."
+  vhs "scripts/demo-$t.tape"
+  echo "✓ wrote assets/demo-$t.gif"
+done

@@ -18,7 +18,7 @@
 </p>
 
 <p align="center">
-  <img src="assets/demo.gif" alt="fj demo" width="800">
+  <img src="assets/demo-everyday.gif" alt="fj: view a repo, list issues and PRs from the terminal" width="800">
 </p>
 
 ## Why fj
@@ -123,9 +123,13 @@ fj run download 42 --list --json         # artifacts as JSON
 parsing tables:
 
 ```sh
-fj pr list --json --json-fields number,title,author.login   # gh-style projection
-fj api /repos/foo/bar/pulls --paginate -q '.[].number'      # raw API + jq-ish path
+fj pr list --json --json-fields number,title,user.login   # selective JSON projection
+fj api /repos/foo/bar/pulls --paginate -q '.[].number'    # raw API + jq-ish path
 ```
+
+<p align="center">
+  <img src="assets/demo-automation.gif" alt="fj: Actions runs, JSON projection, and raw API from the terminal" width="800">
+</p>
 
 It also ships a **[Claude Code](https://docs.claude.com/en/docs/claude-code)
 plugin** so agents (and people) can drive fj from natural language:
@@ -151,6 +155,10 @@ fj stack review               # PR number, review, CI, and mergeability per item
 fj stack sync                 # push branches and create/update the PRs
 fj stack ship                 # merge bottom-up behind a green-and-approved gate
 ```
+
+<p align="center">
+  <img src="assets/demo-stacks.gif" alt="fj stack review and sync on a three-PR stack" width="800">
+</p>
 
 Full guide, including `split` and `absorb`: [docs/stacks.md](docs/stacks.md). _(preview)_
 
