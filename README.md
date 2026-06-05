@@ -217,8 +217,12 @@ next PR onto the trunk after each merge, and stops on the first failure with
 recovery instructions (merged items are skipped on re-run). `--merge` (default)
 / `--squash` pick the strategy, `--delete-branches` cleans up merged branches,
 and `--dry-run` prints the plan without touching anything.
-`split` / `absorb` are still scaffolded (`--dry-run` prints the plan, else a
-structured "not yet implemented").
+`fj stack split` turns a single-branch stack into one stacked entry per commit:
+the _N_ commits ahead of the base become branches `<handle>/<slug>-1..N`, each
+chained on the one below. It only moves local refs (no push, no API), so it's
+offline and reversible; it refuses a dirty tree or a multi-entry stack, and
+`--dry-run` shows the commit-to-branch mapping. `absorb` is still scaffolded
+(`--dry-run` prints the plan, else a structured "not yet implemented").
 
 ### Agent (AI-assisted)
 

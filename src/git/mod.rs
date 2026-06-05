@@ -238,6 +238,31 @@ pub fn create_branch(name: &str, start: Option<&str>) -> Result<()> {
     run(&args)
 }
 
+/// Commits reachable from HEAD but not `base`, oldest first, as raw
+/// "<sha>\x1f<subject>" lines (unit separator, so any subject char is safe).
+/// Used by `stack split` to turn a branch's commits into stacked entries.
+pub fn commits_since(base: &str) -> Result<String> {
+    reject_dash_lead("base", base)?;
+    let range = format!("{base}..HEAD");
+    output(&["log", "--reverse", "--format=%H%x1f%s", &range])
+}
+
+/// Detach HEAD at its current commit (`git checkout --detach`). Used before
+/// re-pointing the checked-out branch, since git refuses to move a branch
+/// that is currently checked out.
+pub fn checkout_detach() -> Result<()> {
+    run(&["checkout", "--detach"])
+}
+
+/// Force a branch ref to point at `start` (`git branch -f <name> <start>`),
+/// creating it if absent. No checkout, no content force-push; just a local
+/// ref move. `name`/`start` must not be `-`-leading (argument injection).
+pub fn set_branch(name: &str, start: &str) -> Result<()> {
+    reject_dash_lead("branch name", name)?;
+    reject_dash_lead("start point", start)?;
+    run(&["branch", "-f", name, start])
+}
+
 /// `(ahead, behind)` of HEAD relative to its upstream `@{u}`. None when there
 /// is no upstream configured or we aren't in a repo.
 pub fn ahead_behind_upstream() -> Option<(u32, u32)> {

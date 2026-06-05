@@ -6,9 +6,10 @@
 //! (show the stack + each branch's PR state), `stack sync` (push each branch
 //! and create/update its Forgejo PR, chaining bases so each PR targets the
 //! previous branch), and `stack ship` (merge bottom-up, re-pointing each next
-//! PR onto the trunk as the one below it merges) are implemented. `split` /
-//! `absorb` are still placeholders (dry-run plan, else a structured "not yet
-//! implemented").
+//! PR onto the trunk as the one below it merges) are implemented, as is
+//! `stack split` (turn a single branch's commits into one stacked entry each,
+//! moving only local refs). `absorb` is still a placeholder (dry-run plan,
+//! else a structured "not yet implemented").
 
 use std::path::{Path, PathBuf};
 
@@ -89,11 +90,13 @@ pub struct SyncArgs {
 
 #[derive(Debug, Args)]
 pub struct SplitArgs {
-    #[command(flatten)]
-    pub r: RepoFlag,
+    // No `-R`: split rewrites local branches; it needs no repo API.
     /// Print the planned actions and exit without mutating anything.
     #[arg(long)]
     pub dry_run: bool,
+    /// Emit the planned/created entries as JSON.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -791,14 +794,200 @@ async fn sync(args: SyncArgs, host: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-#[cfg_attr(coverage_nightly, coverage(off))]
-async fn split(args: SplitArgs, host: Option<&str>) -> Result<()> {
-    let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
-    let plan = format!(
-        "split the current change in {}/{} into stacked entries",
-        ctx.owner, ctx.name
+// ── stack split ──────────────────────────────────────────────────────────
+//
+// Turn a single-branch stack into one stacked entry per commit. The N commits
+// ahead of the stack base become branches `handle/slug-1..N`, each chained on
+// the one below, bottom-up. It only moves local refs (no force-push, no API),
+// so it's offline and reversible: the original commits stay reachable.
+
+/// One commit ahead of the base: its full sha and subject line.
+#[derive(Debug, PartialEq)]
+struct Commit {
+    sha: String,
+    subject: String,
+}
+
+/// Parse `git log --format=%H\x1f%s` output (oldest first) into commits.
+/// Blank lines and sha-less rows are skipped.
+fn parse_commits(raw: &str) -> Vec<Commit> {
+    raw.lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(2, '\x1f');
+            let sha = parts.next()?.trim();
+            if sha.is_empty() {
+                return None;
+            }
+            Some(Commit {
+                sha: sha.to_string(),
+                subject: parts.next().unwrap_or("").trim().to_string(),
+            })
+        })
+        .collect()
+}
+
+/// A split needs at least two commits; one (or zero) is a no-op.
+fn validate_split(commits: &[Commit]) -> Result<()> {
+    match commits.len() {
+        0 => bail!("no commits between the stack base and HEAD to split"),
+        1 => bail!("only one commit ahead of the base; nothing to split"),
+        _ => Ok(()),
+    }
+}
+
+/// Split only operates on a pristine single-entry stack, checked out on its
+/// branch — so the commit→branch mapping is unambiguous and nothing is lost.
+fn ensure_splittable(items: &[StackItem], current: &str) -> Result<()> {
+    match items.len() {
+        0 => bail!("stack has no branch yet (author one with `fj stack new`)"),
+        1 => {}
+        n => bail!("split expects a single-entry stack; this one already has {n} entries"),
+    }
+    if items[0].branch != current {
+        bail!(
+            "checkout the stack branch '{}' before splitting (currently on '{}')",
+            items[0].branch,
+            current
+        );
+    }
+    Ok(())
+}
+
+/// Derive the branch-prefix handle from the stack's first item (`handle/slug-1`
+/// → `handle`). `None` when there's no item or no `/` to split on.
+fn handle_from_items(items: &[StackItem]) -> Option<String> {
+    items
+        .first()
+        .and_then(|it| it.branch.split_once('/'))
+        .map(|(prefix, _)| prefix)
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+}
+
+/// Resolve the handle for split: the existing item's prefix, else the local
+/// git user (offline), else `user`.
+fn stack_handle(stack: &Stack) -> String {
+    if let Some(h) = handle_from_items(&stack.items) {
+        return h;
+    }
+    let git_user = git::output(&["config", "user.name"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    stack_state::safe_handle(None, git_user.as_deref())
+}
+
+/// Build the new stacked items from the commit list. Item `k` (1-based) lives
+/// on `handle/slug-k`, bases on the one below (the stack base for the first),
+/// and takes its title from the commit subject (falling back to the branch).
+fn plan_split(base: &str, handle: &str, slug: &str, commits: &[Commit]) -> Vec<StackItem> {
+    commits
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let n = i + 1;
+            let branch = stack_state::item_branch(handle, slug, n);
+            let item_base = if i == 0 {
+                base.to_string()
+            } else {
+                stack_state::item_branch(handle, slug, i)
+            };
+            let title = if c.subject.is_empty() {
+                format!("{slug}-{n}")
+            } else {
+                c.subject.clone()
+            };
+            StackItem {
+                id: format!("{slug}-{n}"),
+                title,
+                branch,
+                base: item_base,
+                pr: None,
+                status: "local".to_string(),
+            }
+        })
+        .collect()
+}
+
+/// Human dry-run render. Zips items with their source commits to show the
+/// short sha each branch will point at.
+fn render_split_plan(items: &[StackItem], commits: &[Commit]) -> String {
+    use std::fmt::Write;
+    let mut s = format!(
+        "Would split into {} stacked entries (no pushes, local refs only):\n",
+        items.len()
     );
-    placeholder_mutation(&plan, "split", args.dry_run)
+    for (item, c) in items.iter().zip(commits) {
+        let short: String = c.sha.chars().take(8).collect();
+        let _ = writeln!(
+            s,
+            "  {} ← {}  {}  (base: {})",
+            item.branch, short, item.title, item.base
+        );
+    }
+    s
+}
+
+/// Confirmation render after the refs are moved.
+fn render_split_done(items: &[StackItem]) -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    for item in items {
+        let _ = writeln!(s, "✓ {} → {}  {}", item.branch, item.base, item.title);
+    }
+    let _ = writeln!(s, "Split into {} entries. Next: fj stack sync", items.len());
+    s
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn split(args: SplitArgs, _host: Option<&str>) -> Result<()> {
+    let Some(mut stack) = stack_state::load()? else {
+        bail!("no stack for this repo. Run `fj stack new` to start one.");
+    };
+
+    // Refuse on a dirty tree: split moves the checked-out branch, and a stray
+    // uncommitted change could be left stranded on a now-unreferenced state.
+    if let Some((dirty, n)) = git::working_tree_status() {
+        if dirty {
+            bail!("working tree has {n} uncommitted change(s); commit or stash before splitting");
+        }
+    }
+    let current = git::current_branch()
+        .ok_or_else(|| anyhow::anyhow!("HEAD is detached; checkout the stack branch first"))?;
+    ensure_splittable(&stack.items, &current)?;
+
+    let handle = stack_handle(&stack);
+    let commits = parse_commits(&git::commits_since(&stack.base)?);
+    validate_split(&commits)?;
+    let items = plan_split(&stack.base, &handle, &stack.slug, &commits);
+
+    if args.dry_run {
+        if args.json {
+            return output::print_json(&serde_json::to_value(&items)?);
+        }
+        print!("{}", render_split_plan(&items, &commits));
+        return Ok(());
+    }
+
+    // Detach first so the currently-checked-out branch can be re-pointed, then
+    // lay down each entry's ref at its commit, and land on the top branch.
+    git::checkout_detach()?;
+    for (item, c) in items.iter().zip(&commits) {
+        git::set_branch(&item.branch, &c.sha)?;
+    }
+    if let Some(top) = items.last() {
+        git::checkout(&top.branch)?;
+    }
+
+    stack.items = items.clone();
+    stack.updated_at = Utc::now().to_rfc3339();
+    stack_state::save(&stack)?;
+
+    if args.json {
+        return output::print_json(&serde_json::to_value(&items)?);
+    }
+    print!("{}", render_split_done(&items));
+    Ok(())
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -1837,5 +2026,123 @@ mod tests {
         .unwrap();
         assert_eq!(action, "updated");
         assert_eq!(pr.state, "open");
+    }
+
+    // ---- split ----
+
+    #[test]
+    fn split_parses_dry_run_and_json() {
+        let cli =
+            Cli::try_parse_from(["fj", "stack", "split", "--dry-run", "--json"]).expect("parses");
+        match cli.command {
+            Command::Stack(StackCmd {
+                command: StackSub::Split(a),
+            }) => assert!(a.dry_run && a.json),
+            other => panic!("expected stack split, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_commits_skips_blank_and_subjectless_rows() {
+        let raw = "aaa\u{1f}first commit\nbbb\u{1f}second\n\n  \nccc\u{1f}";
+        let commits = parse_commits(raw);
+        assert_eq!(commits.len(), 3);
+        assert_eq!(commits[0].sha, "aaa");
+        assert_eq!(commits[0].subject, "first commit");
+        assert_eq!(commits[2].sha, "ccc");
+        assert_eq!(commits[2].subject, ""); // subjectless still counts
+    }
+
+    fn commits(subjects: &[&str]) -> Vec<Commit> {
+        subjects
+            .iter()
+            .enumerate()
+            .map(|(i, s)| Commit {
+                sha: format!("sha{}", i + 1),
+                subject: s.to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn validate_split_requires_at_least_two() {
+        assert!(validate_split(&commits(&[])).is_err());
+        assert!(validate_split(&commits(&["one"])).is_err());
+        assert!(validate_split(&commits(&["one", "two"])).is_ok());
+    }
+
+    #[test]
+    fn ensure_splittable_guards_count_and_branch() {
+        let one = stack_with_branches(&["u/feat-1"]).items;
+        assert!(ensure_splittable(&one, "u/feat-1").is_ok());
+        // wrong branch checked out
+        assert!(ensure_splittable(&one, "other").is_err());
+        // empty stack
+        assert!(ensure_splittable(&[], "x").is_err());
+        // already multi-entry
+        let many = stack_with_branches(&["u/feat-1", "u/feat-2"]).items;
+        assert!(ensure_splittable(&many, "u/feat-1").is_err());
+    }
+
+    #[test]
+    fn handle_from_items_takes_branch_prefix() {
+        let items = stack_with_branches(&["stephen/login-1"]).items;
+        assert_eq!(handle_from_items(&items).as_deref(), Some("stephen"));
+        // no slash -> none
+        let items = stack_with_branches(&["nodash"]).items;
+        assert_eq!(handle_from_items(&items), None);
+        assert_eq!(handle_from_items(&[]), None);
+    }
+
+    #[test]
+    fn plan_split_chains_bases_ids_and_titles() {
+        let items = plan_split(
+            "main",
+            "stephen",
+            "login",
+            &commits(&["add form", "wire api"]),
+        );
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].id, "login-1");
+        assert_eq!(items[0].branch, "stephen/login-1");
+        assert_eq!(items[0].base, "main"); // first targets the trunk
+        assert_eq!(items[0].title, "add form");
+        assert_eq!(items[0].status, "local");
+        assert!(items[0].pr.is_none());
+        assert_eq!(items[1].branch, "stephen/login-2");
+        assert_eq!(items[1].base, "stephen/login-1"); // chained on the one below
+        assert_eq!(items[1].title, "wire api");
+    }
+
+    #[test]
+    fn plan_split_falls_back_to_branch_title_when_subject_empty() {
+        let items = plan_split("main", "u", "feat", &commits(&["", "real"]));
+        assert_eq!(items[0].title, "feat-1"); // empty subject -> id-ish title
+        assert_eq!(items[1].title, "real");
+    }
+
+    #[test]
+    fn render_split_plan_and_done_are_legible() {
+        let cs = commits(&["add form", "wire api"]);
+        let items = plan_split("main", "stephen", "login", &cs);
+        let plan = render_split_plan(&items, &cs);
+        assert!(plan.contains("Would split into 2 stacked entries"));
+        assert!(plan.contains("stephen/login-1 ← sha1  add form  (base: main)"));
+        assert!(plan.contains("stephen/login-2 ← sha2  wire api  (base: stephen/login-1)"));
+
+        let done = render_split_done(&items);
+        assert!(done.contains("✓ stephen/login-1 → main  add form"));
+        assert!(done.contains("Split into 2 entries. Next: fj stack sync"));
+    }
+
+    #[test]
+    fn split_items_json_shape_is_stable() {
+        let items = plan_split("main", "u", "feat", &commits(&["a", "b"]));
+        let v = serde_json::to_value(&items).unwrap();
+        assert_eq!(v[0]["branch"], "u/feat-1");
+        assert_eq!(v[0]["base"], "main");
+        assert_eq!(v[1]["base"], "u/feat-1");
+        assert_eq!(v[1]["title"], "b");
+        assert!(v[0]["pr"].is_null());
     }
 }
