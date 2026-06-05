@@ -1,7 +1,8 @@
 pub mod remote;
 
+use std::io::Write;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context, Result};
 
@@ -346,6 +347,50 @@ pub fn rebase_abort() {
 pub fn reset_soft(rev: &str) -> Result<()> {
     reject_dash_lead("rev", rev)?;
     run(&["reset", "--soft", rev])
+}
+
+/// Apply a unified-diff `patch` to the working tree, feeding it on stdin
+/// (`git apply`). `check_only` runs `git apply --check` so callers can verify a
+/// patch applies before committing to it. Surfaces git's stderr on rejection.
+pub fn apply_patch(patch: &str, check_only: bool) -> Result<()> {
+    let mut args = vec!["apply"];
+    if check_only {
+        args.push("--check");
+    }
+    let mut child = Command::new("git")
+        .args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| "spawning git apply")?;
+    child
+        .stdin
+        .take()
+        .context("git apply stdin unavailable")?
+        .write_all(patch.as_bytes())
+        .context("writing patch to git apply")?;
+    let out = child
+        .wait_with_output()
+        .with_context(|| "waiting on git apply")?;
+    if !out.status.success() {
+        bail!(
+            "git apply failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Stage everything (`git add -A`).
+pub fn add_all() -> Result<()> {
+    run(&["add", "-A"])
+}
+
+/// Commit the staged changes with `message`, skipping hooks. The `--message=`
+/// form is used so a `-`-leading message can't be parsed as a flag.
+pub fn commit(message: &str) -> Result<()> {
+    run(&["commit", "--no-verify", &format!("--message={message}")])
 }
 
 /// `(ahead, behind)` of HEAD relative to its upstream `@{u}`. None when there

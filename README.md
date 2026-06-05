@@ -245,14 +245,26 @@ findings with file references: secret-bearing files, source changed without
 tests, and risky areas (migrations, auth/crypto, CI, dependency manifests).
 That local analysis runs even with no AI backend configured; when a provider
 *is* set it adds a narrative review on top. `--security` focuses the pass, and
-`--json` emits the full report for editor/mobile clients. `fix` only ever emits
-a patch.
+`--json` emits the full report for editor/mobile clients.
+
+`fj agent fix` asks the provider for a patch over the current change (the
+`git diff HEAD`). By default it just prints the patch and changes nothing.
+`--write` applies the patch to your working tree (validating it first, leaving
+the result unstaged to review). `--pr` carries the current change plus the fix
+onto a fresh branch (`--branch`, default `agent-fix`), commits (`--title`,
+default "Apply agent fix"), pushes, and opens a PR against the branch you ran
+from; every local check runs before anything touches the network, and on
+failure it restores your previous branch. `--dry-run` reports the plan without
+calling the provider.
 
 ```sh
 fj agent review                 # analyze the working-tree diff
 fj agent review --stack         # review each stack item separately
 fj agent review --security --json
 fj agent review --pr 42
+fj agent fix                    # print a proposed patch
+fj agent fix --write            # apply it to the working tree
+fj agent fix --pr --branch tidy # open it as a PR
 fj agent explain src/main.rs --json
 ```
 

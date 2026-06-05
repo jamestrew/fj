@@ -12,8 +12,10 @@
 //! (or `--pr <n>`, or each `--stack` item), redacts secrets / sensitive files
 //! ([`agent_redact`](super::agent_redact)), derives severity-tagged local
 //! findings ([`agent_review`](super::agent_review)), and asks the provider for
-//! a narrative when one is configured (local-only otherwise). `fix` emits a
-//! patch only (never mutates); `--write` / `--pr` come later.
+//! a narrative when one is configured (local-only otherwise). `fix` asks the
+//! provider for a patch over the current change: by default it prints the patch
+//! (no mutation); `--write` applies it to the working tree; `--pr` carries the
+//! change plus the fix onto a fresh branch, commits, pushes, and opens a PR.
 
 use std::path::Path;
 
@@ -21,6 +23,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
 
 use crate::api;
+use crate::api::pull::CreatePull;
 use crate::cli::agent_provider::{self, AgentConfig, AgentRequest, AgentTask};
 use crate::cli::agent_redact::redact_diff;
 use crate::cli::agent_review::{
@@ -70,6 +73,18 @@ pub struct ReviewArgs {
 pub struct FixArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Apply the proposed patch to the working tree (instead of printing it).
+    #[arg(long, conflicts_with = "pr")]
+    pub write: bool,
+    /// Apply the patch on a new branch, commit, push, and open a PR.
+    #[arg(long)]
+    pub pr: bool,
+    /// Branch name for `--pr` (default: `agent-fix`).
+    #[arg(long, requires = "pr")]
+    pub branch: Option<String>,
+    /// PR title and commit subject for `--pr` (default: "Apply agent fix").
+    #[arg(long, requires = "pr")]
+    pub title: Option<String>,
     /// Print the planned actions and exit without mutating anything.
     #[arg(long)]
     pub dry_run: bool,
@@ -286,17 +301,199 @@ async fn review(args: ReviewArgs, host: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// The prompt handed to the provider for `fix`: the current change plus an
+/// instruction to answer with a patch only. Pure over the diff.
+fn fix_input(diff: &str) -> String {
+    format!(
+        "Task: propose a fix for the change below. Respond with ONLY a unified diff \
+         that `git apply` accepts, no prose or fences.\n\nDiff:\n{diff}"
+    )
+}
+
+/// The fix branch for `--pr`: the caller's `--branch`, else `agent-fix`.
+fn fix_branch(provided: Option<&str>) -> String {
+    provided
+        .map(str::to_string)
+        .unwrap_or_else(|| "agent-fix".to_string())
+}
+
+/// The PR title / commit subject for `--pr`.
+fn fix_title(provided: Option<&str>) -> String {
+    provided
+        .map(str::to_string)
+        .unwrap_or_else(|| "Apply agent fix".to_string())
+}
+
+/// Human description of what a given flag combination will do. Used by
+/// `--dry-run` so the user sees the intent before anything happens.
+fn fix_plan(write: bool, pr: bool, branch: &str, base: &str) -> String {
+    if pr {
+        format!(
+            "would: ask the agent for a patch, commit it on branch '{branch}', \
+             push, and open a PR against '{base}'"
+        )
+    } else if write {
+        "would: ask the agent for a patch and apply it to the working tree".to_string()
+    } else {
+        "would: ask the agent for a patch and print it (no changes applied)".to_string()
+    }
+}
+
+/// Pull the unified diff out of a provider response. Prefers the first fenced
+/// code block; otherwise accepts the text as-is when it looks like a patch.
+/// `None` when nothing patch-shaped is present.
+fn extract_patch(output: &str) -> Option<String> {
+    if let Some(block) = first_fenced_block(output) {
+        let b = block.trim();
+        if looks_like_patch(b) {
+            return Some(ensure_trailing_newline(b));
+        }
+    }
+    let trimmed = output.trim();
+    if looks_like_patch(trimmed) {
+        return Some(ensure_trailing_newline(trimmed));
+    }
+    None
+}
+
+/// First ```...``` fenced block's contents (without the fences), or `None` when
+/// there's no terminated block.
+fn first_fenced_block(s: &str) -> Option<String> {
+    let mut in_block = false;
+    let mut buf = String::new();
+    for line in s.lines() {
+        let is_fence = line.trim_start().starts_with("```");
+        if !in_block {
+            if is_fence {
+                in_block = true;
+            }
+        } else if is_fence {
+            return Some(buf);
+        } else {
+            buf.push_str(line);
+            buf.push('\n');
+        }
+    }
+    None
+}
+
+/// Heuristic: does this text start like a unified diff git can apply?
+fn looks_like_patch(s: &str) -> bool {
+    let s = s.trim_start();
+    s.starts_with("diff --git ") || s.starts_with("--- ") || s.starts_with("Index: ")
+}
+
+fn ensure_trailing_newline(s: &str) -> String {
+    if s.ends_with('\n') {
+        s.to_string()
+    } else {
+        format!("{s}\n")
+    }
+}
+
 #[cfg_attr(coverage_nightly, coverage(off))]
-async fn fix(args: FixArgs, _host: Option<&str>) -> Result<()> {
-    // Default contract: emit a patch only, never mutate. --write / --pr come
-    // later; for now --dry-run just reports the plan without calling out.
+async fn fix(args: FixArgs, host: Option<&str>) -> Result<()> {
+    // Never mutate on --dry-run: report the plan and stop before any API call.
     if args.dry_run {
+        let base = git::current_branch().unwrap_or_else(|| "HEAD".to_string());
         println!(
-            "would: ask the configured agent to propose a patch and print it (no changes applied)"
+            "{}",
+            fix_plan(
+                args.write,
+                args.pr,
+                &fix_branch(args.branch.as_deref()),
+                &base
+            )
         );
         return Ok(());
     }
-    run_task(AgentTask::Fix, "the current change".to_string(), false)
+
+    // The "current change" is the uncommitted working-tree diff, matching
+    // `agent review` / `explain`.
+    let diff = git::output(&["diff", "HEAD"])?;
+    if diff.trim().is_empty() {
+        bail!("no uncommitted changes to fix; make a change first (agent fix works on `git diff HEAD`)");
+    }
+
+    let cfg = AgentConfig::from_env();
+    let provider = agent_provider::resolve(&cfg)?;
+    let resp = provider.complete(&AgentRequest {
+        task: AgentTask::Fix,
+        input: fix_input(&diff),
+        model: cfg.model.clone(),
+    })?;
+
+    // Default contract: emit the patch only, never mutate.
+    if !args.write && !args.pr {
+        println!("{}", resp.output);
+        return Ok(());
+    }
+
+    let patch = extract_patch(&resp.output).ok_or_else(|| {
+        anyhow::anyhow!(
+            "the agent did not return a unified diff; re-run without --write/--pr to see its raw output"
+        )
+    })?;
+
+    if args.write {
+        git::apply_patch(&patch, true)?; // validate before touching the tree
+        git::apply_patch(&patch, false)?;
+        println!("✓ applied the agent's patch to the working tree (review with `git diff`)");
+        return Ok(());
+    }
+
+    // --pr: carry the current change + the fix onto a fresh branch and PR it.
+    // Do every cheap local check first, before resolve_repo touches the network
+    // or the keychain, so a bad branch/patch fails fast and offline.
+    let base = git::current_branch()
+        .ok_or_else(|| anyhow::anyhow!("HEAD is detached; checkout a branch before --pr"))?;
+    let branch = fix_branch(args.branch.as_deref());
+    if git::rev_exists(&format!("refs/heads/{branch}")) {
+        bail!("branch '{branch}' already exists; pass --branch <name>");
+    }
+    git::apply_patch(&patch, true)?; // validate against the working tree first
+    let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
+
+    let title = fix_title(args.title.as_deref());
+    // Create the branch (carries the uncommitted change), then apply + commit.
+    // On any failure, return to the base branch and drop the empty branch so
+    // the user's working state is preserved.
+    git::create_branch(&branch, None)?;
+    let staged = (|| -> Result<()> {
+        git::apply_patch(&patch, false)?;
+        git::add_all()?;
+        git::commit(&title)?;
+        Ok(())
+    })();
+    if let Err(e) = staged {
+        let _ = git::checkout(&base);
+        let _ = git::delete_local_branch(&branch);
+        return Err(e.context("preparing the fix branch failed; restored your previous branch"));
+    }
+
+    let remote = git::primary_remote()
+        .map(|(name, _)| name)
+        .unwrap_or_else(|| "origin".to_string());
+    git::push(&remote, &branch)?;
+    let body = "Automated fix proposed by `fj agent fix`.";
+    let created = api::pull::create(
+        &ctx.client,
+        &ctx.owner,
+        &ctx.name,
+        &CreatePull {
+            title: &title,
+            head: &branch,
+            base: &base,
+            body: Some(body),
+            draft: false,
+        },
+    )
+    .await?;
+    println!(
+        "✓ Created PR #{}: {title}\n{}",
+        created.number, created.html_url
+    );
+    Ok(())
 }
 
 /// Where `agent explain` draws its context from.
@@ -427,6 +624,96 @@ mod tests {
             }
             other => panic!("expected agent fix, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn fix_parses_write_pr_branch_title() {
+        let cli = Cli::try_parse_from([
+            "fj", "agent", "fix", "--pr", "--branch", "fix-1", "--title", "Tidy",
+        ])
+        .expect("should parse");
+        match cli.command {
+            Command::Agent(AgentCmd {
+                command: AgentSub::Fix(a),
+            }) => {
+                assert!(a.pr && !a.write);
+                assert_eq!(a.branch.as_deref(), Some("fix-1"));
+                assert_eq!(a.title.as_deref(), Some("Tidy"));
+            }
+            other => panic!("expected agent fix, got {other:?}"),
+        }
+        // --write and --pr are mutually exclusive.
+        assert!(Cli::try_parse_from(["fj", "agent", "fix", "--write", "--pr"]).is_err());
+        // --branch / --title require --pr.
+        assert!(Cli::try_parse_from(["fj", "agent", "fix", "--branch", "x"]).is_err());
+        assert!(Cli::try_parse_from(["fj", "agent", "fix", "--title", "x"]).is_err());
+    }
+
+    #[test]
+    fn fix_branch_and_title_defaults() {
+        assert_eq!(fix_branch(None), "agent-fix");
+        assert_eq!(fix_branch(Some("custom")), "custom");
+        assert_eq!(fix_title(None), "Apply agent fix");
+        assert_eq!(fix_title(Some("Tidy up")), "Tidy up");
+    }
+
+    #[test]
+    fn fix_plan_describes_each_mode() {
+        assert!(fix_plan(false, false, "agent-fix", "main").contains("print it"));
+        assert!(fix_plan(true, false, "agent-fix", "main").contains("apply it to the working tree"));
+        let pr = fix_plan(false, true, "agent-fix", "main");
+        assert!(pr.contains("branch 'agent-fix'"));
+        assert!(pr.contains("against 'main'"));
+    }
+
+    #[test]
+    fn fix_input_frames_task_and_carries_diff() {
+        let s = fix_input("diff --git a/x b/x\n@@ -1 +1 @@");
+        assert!(s.contains("ONLY a unified diff"));
+        assert!(s.contains("diff --git a/x b/x"));
+    }
+
+    #[test]
+    fn looks_like_patch_recognizes_diff_shapes() {
+        assert!(looks_like_patch("diff --git a/x b/x\n"));
+        assert!(looks_like_patch("--- a/x\n+++ b/x\n"));
+        assert!(looks_like_patch("Index: x\n"));
+        assert!(!looks_like_patch("here is your patch:\n"));
+        assert!(!looks_like_patch("[mock fix output]\n"));
+    }
+
+    #[test]
+    fn extract_patch_handles_fenced_raw_and_missing() {
+        // fenced ```diff block, with prose around it
+        let fenced =
+            "Sure, here's the fix:\n```diff\ndiff --git a/x b/x\n--- a/x\n+++ b/x\n```\nHope it helps!";
+        let got = extract_patch(fenced).expect("fenced patch");
+        assert!(got.starts_with("diff --git a/x b/x"));
+        assert!(got.ends_with('\n'));
+        assert!(!got.contains("```"));
+        assert!(!got.contains("Hope it helps"));
+
+        // raw patch, no fence, no trailing newline -> one is added
+        let raw = "diff --git a/x b/x\n--- a/x\n+++ b/x";
+        let got = extract_patch(raw).expect("raw patch");
+        assert!(got.ends_with("+++ b/x\n"));
+
+        // a fenced block that isn't a patch -> falls through to None
+        assert!(extract_patch("```\njust some text\n```").is_none());
+        // pure prose -> None (e.g. the mock's default echo)
+        assert!(extract_patch("[mock fix output]\nthe current change").is_none());
+    }
+
+    #[test]
+    fn first_fenced_block_extracts_contents_only() {
+        assert_eq!(
+            first_fenced_block("a\n```\nL1\nL2\n```\nb").as_deref(),
+            Some("L1\nL2\n")
+        );
+        // unterminated fence -> None
+        assert!(first_fenced_block("```\nL1\nL2").is_none());
+        // no fence -> None
+        assert!(first_fenced_block("no fences here").is_none());
     }
 
     #[test]

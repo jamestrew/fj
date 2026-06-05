@@ -81,14 +81,21 @@ impl AgentProvider for NullProvider {
 }
 
 /// Deterministic provider for development and tests: echoes the request back.
+/// `FJ_AGENT_MOCK_OUTPUT`, when set, overrides the echo with a verbatim payload
+/// so flows that consume the output (e.g. `agent fix --write`, which expects a
+/// patch) can be exercised end-to-end without a real backend.
 struct MockProvider;
 
 impl AgentProvider for MockProvider {
     fn complete(&self, req: &AgentRequest) -> Result<AgentResponse> {
+        let output = std::env::var("FJ_AGENT_MOCK_OUTPUT")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| format!("[mock {} output]\n{}", req.task.as_str(), req.input));
         Ok(AgentResponse {
             provider: "mock".to_string(),
             model: req.model.clone(),
-            output: format!("[mock {} output]\n{}", req.task.as_str(), req.input),
+            output,
         })
     }
 }
