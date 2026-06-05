@@ -37,7 +37,7 @@ docs/                  architecture, jq, gh-to-fj, faq, troubleshooting
 ## Build / test / hook
 
 - `cargo build --release` produces a ~4 MB binary at `target/release/fj`.
-- `cargo test --all` runs ~228 tests (unit + wiremock integration).
+- `cargo test --all` runs ~410 tests (unit + wiremock integration).
   2 tests are `#[ignore]` (env-mutating, racy with cargo's harness).
 - `cargo clippy --all-targets --all-features -- -D warnings` is the lint
   bar. Both the pre-push hook and `.forgejo/workflows/ci.yml` treat

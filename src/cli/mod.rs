@@ -293,6 +293,35 @@ mod tests {
         walk(&mut Cli::command());
     }
 
+    /// `KNOWN_SUBCOMMANDS` in `main.rs` is a hand-maintained allowlist that
+    /// `detect_plugin` consults so a `fj-<name>` binary on PATH can't shadow a
+    /// real subcommand. It must match the derived command tree exactly; a
+    /// missing entry (as `man` once was) silently lets a same-named plugin
+    /// hijack the built-in. clap injects its own `help` subcommand, which is
+    /// not a plugin concern, so it's exempt on both sides.
+    #[test]
+    fn known_subcommands_matches_the_command_tree() {
+        use std::collections::BTreeSet;
+        let derived: BTreeSet<String> = Cli::command()
+            .get_subcommands()
+            .map(|s| s.get_name().to_string())
+            .filter(|n| n != "help")
+            .collect();
+        let allow: BTreeSet<String> = crate::KNOWN_SUBCOMMANDS
+            .iter()
+            .filter(|n| **n != "help")
+            .map(|s| s.to_string())
+            .collect();
+        let missing: Vec<&String> = derived.difference(&allow).collect();
+        let stale: Vec<&String> = allow.difference(&derived).collect();
+        assert!(
+            missing.is_empty() && stale.is_empty(),
+            "KNOWN_SUBCOMMANDS is out of sync with the command tree:\n  \
+             missing (add to main.rs KNOWN_SUBCOMMANDS): {missing:?}\n  \
+             stale (remove from main.rs KNOWN_SUBCOMMANDS): {stale:?}"
+        );
+    }
+
     /// Keep the coverage scope honest: the `COV_IGNORE` list in the Makefile
     /// must stay in sync with reality. A `cli/*.rs` with no `#[cfg(test)]`
     /// module is glue we don't unit-test and must be excluded; one that has

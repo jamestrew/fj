@@ -105,13 +105,13 @@ impl Client {
     /// Construct a client pointing at an arbitrary base URL. Used for tests
     /// against a local mock server. `base_url` must end with `/`. Defaults to
     /// PAT-style auth; use `for_base_url_with_scheme` to override.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn for_base_url(base_url: Url, token: String) -> Result<Self> {
         Self::for_base_url_with_scheme(base_url, token, AuthScheme::Pat)
     }
 
     /// Like `for_base_url` but lets tests pick the auth scheme.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn for_base_url_with_scheme(
         base_url: Url,
         token: String,
@@ -383,11 +383,7 @@ impl Client {
         let headers = res.headers().clone();
         let text = res.text().await.context("reading list response body")?;
         // Forgejo returns `null` for some empty list endpoints. Normalize.
-        let items: Vec<T> = if text.trim().is_empty() || text.trim() == "null" {
-            Vec::new()
-        } else {
-            serde_json::from_str(&text).context("decoding JSON list response")?
-        };
+        let items: Vec<T> = decode_list(&text)?;
         Ok(Page::from_headers(items, &headers))
     }
 
@@ -421,7 +417,12 @@ impl Client {
                 .await?;
             let res = ensure_success(res).await?;
             let headers = res.headers().clone();
-            let mut items: Vec<T> = res.json().await.context("decoding JSON list response")?;
+            let text = res.text().await.context("reading list response body")?;
+            // Some Forgejo list endpoints answer an empty collection with a
+            // `null` (or empty) body rather than `[]`. Normalize it exactly as
+            // `get_page` does, so a large-`--limit` walk doesn't error where a
+            // single page would have succeeded.
+            let mut items: Vec<T> = decode_list(&text)?;
             if items.is_empty() {
                 break;
             }
@@ -454,6 +455,18 @@ impl Client {
                 .collect();
         }
         Ok(out)
+    }
+}
+
+/// Decode a Forgejo list-response body, normalizing the `null`/empty bodies
+/// some endpoints return for an empty collection into an empty `Vec`. Shared
+/// by `get_page` and `get_all` so both tolerate the same shapes.
+fn decode_list<T: DeserializeOwned>(text: &str) -> Result<Vec<T>> {
+    let t = text.trim();
+    if t.is_empty() || t == "null" {
+        Ok(Vec::new())
+    } else {
+        serde_json::from_str(t).context("decoding JSON list response")
     }
 }
 

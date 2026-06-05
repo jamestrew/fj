@@ -195,6 +195,27 @@ async fn get_all_respects_total_limit() {
 }
 
 #[tokio::test]
+async fn get_all_handles_null_body() {
+    // Mirrors `get_page_handles_null_body`: an endpoint that answers an empty
+    // collection with `null` must yield an empty Vec, not a decode error, even
+    // on the multi-page `get_all` path (regression: it used to `res.json()`
+    // straight into a Vec and choke on `null`).
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/items"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("null"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let items: Vec<i32> = c
+        .get_all("/api/v1/items", &[], 100)
+        .await
+        .expect("null tolerated");
+    assert!(items.is_empty());
+}
+
+#[tokio::test]
 async fn honors_retry_after_on_429() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
