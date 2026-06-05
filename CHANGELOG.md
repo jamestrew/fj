@@ -6,15 +6,52 @@ All notable changes will be recorded here. The format follows
 
 ## [Unreleased]
 
-## [0.2.0] — 2026-06-02
+### Added
+
+- **`fj stack split`**: turn a single-branch stack into one stacked entry per
+  commit. The N commits ahead of the base become chained branches
+  `<handle>/<slug>-1..N`; it moves local refs only (no push, no API), so it's
+  offline and reversible, and `--dry-run` shows the commit-to-branch mapping.
+- **`fj stack absorb`**: fold staged changes into the stack entries that
+  introduced them, the way `git absorb` does. It attributes each staged file to
+  the most recent entry that touched it, makes a `fixup!` per target, then runs
+  one autosquash `git rebase --update-refs` to rewrite the entries in place.
+  Needs git >= 2.38; `--dry-run` / `--json` print the attribution plan.
+- **`fj agent fix --write` / `--pr`**: `--write` applies the proposed patch to
+  the working tree (validated first, left unstaged to review); `--pr` carries
+  the current change plus the fix onto a fresh branch, commits, pushes, and
+  opens a PR, restoring your previous branch on failure. The default still
+  prints the patch and changes nothing.
+- **`fj stack sync` PR annotations**: once the PRs exist, sync mirrors a
+  navigation block (the whole stack, linked, current entry marked) into each PR
+  description, wrapped in `fj-stack` markers so hand-written body text is
+  preserved. The block carries a versioned JSON payload so the Fjord apps can
+  read the stack as data instead of scraping markdown; `--no-annotate` skips it.
+- **Man pages on install**: `make install` now generates and installs man pages
+  to `$(MANDIR)`, so `man fj` works out of the box. The top-level page gained a
+  real description and examples instead of echoing the one-line summary.
+
+### Fixed
+
+- Following `Link: rel=next` pagination no longer errors on the `null` body some
+  Forgejo list endpoints return for an empty collection. `get_all` normalizes it
+  to an empty list, matching single-page `get_page`.
+- `fj man` is back in the plugin allowlist, so a `fj-man` binary on PATH can no
+  longer shadow the built-in man generator. A test now keeps the allowlist in
+  sync with the command tree.
+- `fj api --jq` iteration (`.[]`) and the `-L` / `--limit` flag on `fj run list`.
+- The stack PR-annotation caption renders again: Forgejo's sanitizer drops the
+  raw `<sub>` tag, so it is now plain markdown italics.
+
+## [0.2.0] - 2026-06-02
 
 ### Added
 
-- **`fj work`** — local working-context commands. `work context` prints an
+- **`fj work`**: local working-context commands. `work context` prints an
   offline-first snapshot of the repo (branch, dirty state, current PR and its
   CI checks, account, active stack); `work resume` / `work continue` restore a
   saved session. Session state is local at `<git-dir>/fj/session.json`.
-- **`fj stack`** — stacked-branch / stacked-PR management, local and
+- **`fj stack`**: stacked-branch / stacked-PR management, local and
   git-native (`<git-dir>/fj/stack.json`, never a committed manifest).
   - `stack new` authors a stack and its first branch.
   - `stack review` shows each item's PR number, review state, CI status, and
@@ -28,7 +65,7 @@ All notable changes will be recorded here. The format follows
     stops on the first failure with recovery instructions (merged items are
     skipped on re-run). `--squash` / `--merge`, `--delete-branches`,
     `--force`, `--dry-run`.
-- **`fj agent`** — AI-assisted code operations through an env-var provider
+- **`fj agent`**: AI-assisted code operations through an env-var provider
   abstraction (`FJ_AGENT_PROVIDER` / `FJ_AGENT_API_KEY` / `FJ_AGENT_MODEL`;
   null default, built-in `mock`; the Fjord token is never reused for AI).
   - `agent review` is a local diff-analysis command: it gathers the
@@ -39,7 +76,7 @@ All notable changes will be recorded here. The format follows
     `--json` emits a structured report for editor/mobile clients.
   - `agent explain` explains a file, a git revision, or the working-tree diff.
   - `agent fix` emits a patch only and never mutates.
-- **`fj pr merge --delete-branch`** — delete the head branch after the merge
+- **`fj pr merge --delete-branch`**: delete the head branch after the merge
   succeeds (matching `gh pr merge --delete-branch`).
 
 ### Changed
@@ -62,7 +99,7 @@ All notable changes will be recorded here. The format follows
   Actions UI sends arrays (jobs, steps, attempts, log lines); these now decode
   to empty.
 
-## [0.1.3] — 2026-05-14
+## [0.1.3] - 2026-05-14
 
 ### Added
 
@@ -86,7 +123,7 @@ All notable changes will be recorded here. The format follows
 - `docs/faq.md` Windows entry is now honest: "nobody's tried."
   Drops the implied claim of cross-platform support.
 
-## [0.1.2] — 2026-05-14
+## [0.1.2] - 2026-05-14
 
 ### Added
 
@@ -121,7 +158,7 @@ All notable changes will be recorded here. The format follows
   `support@rasterstate.com` (marketplace.json, plugin.json,
   CLAUDE.md). Personal-email references removed from tracked files.
 
-## [0.1.1] — 2026-05-14
+## [0.1.1] - 2026-05-14
 
 ### Fixed
 
@@ -139,7 +176,7 @@ All notable changes will be recorded here. The format follows
   **Recovery on already-affected machines:** re-run `fj auth setup-git
   --host <hostname>`.
 
-## [0.1.0] — 2026-05-13 — distribution & open-source ready
+## [0.1.0] - 2026-05-13 - distribution & open-source ready
 
 ### Added (distribution + open-source ready)
 
@@ -198,8 +235,8 @@ All notable changes will be recorded here. The format follows
 ### Added (docs)
 
 - `SECURITY.md` covering threat model, known sharp edges, and reporting.
-- `docs/gh-to-fj.md` — complete command-by-command mapping.
-- `docs/faq.md` — common questions about tokens, hosts, debug,
+- `docs/gh-to-fj.md`: complete command-by-command mapping.
+- `docs/faq.md`: common questions about tokens, hosts, debug,
   scripting, plugins.
 
 ### Changed
@@ -226,7 +263,7 @@ All notable changes will be recorded here. The format follows
 - Replaced the panicking `.expect("token contains invalid header chars")`
   in `auth_headers` with a typed error.
 
-## 0.1.0 — 2026-05-13
+## 0.1.0 - 2026-05-13
 
 Initial release. Multi-host Forgejo CLI with feature parity to `gh`
 across the surface Forgejo exposes. Commands:

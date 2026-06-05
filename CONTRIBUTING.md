@@ -37,15 +37,15 @@ live API smoke (requires `fj auth login` already done).
 
 Concrete example: adding `fj sticker list`.
 
-1. `src/api/sticker.rs` — typed API wrappers and request/response
+1. `src/api/sticker.rs`: typed API wrappers and request/response
    structs. Use the `serde_util::deserialize_null_to_default` helper
    for fields that Forgejo returns as `null` when empty.
-2. `src/cli/sticker.rs` — clap `Args` / `Subcommand` definitions and
+2. `src/cli/sticker.rs`: clap `Args` / `Subcommand` definitions and
    the `run` dispatch.
-3. `src/api/mod.rs` — `pub mod sticker;`
-4. `src/cli/mod.rs` — `pub mod sticker;`, add to `Command`, add the
+3. `src/api/mod.rs`: `pub mod sticker;`
+4. `src/cli/mod.rs`: `pub mod sticker;`, add to `Command`, add the
    dispatch arm in `dispatch()`.
-5. `src/main.rs` — add `"sticker"` to `KNOWN_SUBCOMMANDS` so plugin
+5. `src/main.rs`: add `"sticker"` to `KNOWN_SUBCOMMANDS` so plugin
    discovery doesn't shadow it.
 6. Add inline `#[cfg(test)] mod tests` for any non-trivial pure code.
 7. If you touched HTTP behavior, add a wiremock test in

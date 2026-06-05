@@ -14,12 +14,12 @@ Tagged pushes (`v*`) trigger `.forgejo/workflows/release.yml`. The workflow:
 ## Runner requirements
 
 The release matrix needs self-hosted runners with these labels, **online at tag
-time** (a missing label leaves the job in `waiting` indefinitely — that's what
+time** (a missing label leaves the job in `waiting` indefinitely, that's what
 `make release-preflight` checks):
 
-- **`macos-15`** — the two darwin legs (build + sign + notarize). An
+- **`macos-15`**: the two darwin legs (build + sign + notarize). An
   Apple-silicon Mac; the x86_64 binary cross-compiles there.
-- **`docker`** — the linux build and the `publish` job.
+- **`docker`**: the linux build and the `publish` job.
 
 Two environment gotchas that have broken releases:
 
@@ -46,7 +46,7 @@ Two environment gotchas that have broken releases:
 #    per discovery.
 make release-preflight TAG=v0.1.4
 
-# 3. Tag and push — only once preflight is green.
+# 3. Tag and push, only once preflight is green.
 git tag -a v0.1.4 -m "v0.1.4"
 git push origin v0.1.4
 ```
@@ -68,7 +68,7 @@ tagged release. They are all org/repo-scoped, not workflow-scoped.
 
 > **The `.p12` must be a full *identity*: the certificate AND its private key.**
 > Export from Keychain Access's **My Certificates** view (not "Certificates"),
-> selecting the identity row — the cert with a disclosure triangle (▶) that
+> selecting the identity row, the cert with a disclosure triangle (▶) that
 > reveals a nested private key. If the `.p12` (Personal Information Exchange)
 > format is greyed out in the export dialog, you've selected a cert with no key;
 > pick the identity, or the private key itself, instead. A key-only (or
@@ -119,7 +119,7 @@ codesign -dvv fj-v0.1.4-darwin-aarch64/fj 2>&1 | grep -E 'Authority|TeamIdentifi
 > **Don't use `spctl --assess` on the binary.** `fj` is a bare CLI executable,
 > and `spctl --assess --type execute` reports `rejected (the code is valid but
 > does not seem to be an app)` for it *even when it's correctly signed and
-> notarized* — `spctl` only meaningfully assesses app bundles / installers.
+> notarized*, `spctl` only meaningfully assesses app bundles / installers.
 > Notarization is confirmed by the release job's `notarytool submit --wait`
 > returning **Accepted**; a standalone executable can't be stapled, so there is
 > nothing to check offline. The signals above (`codesign --verify` passing, the

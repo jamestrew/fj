@@ -7,7 +7,7 @@ macOS keychain treats it as a new application and re-prompts. Click
 "Always Allow" once and it'll stick until the next rebuild.
 
 For automated test environments, see
-`src/client/integration_tests.rs` — those tests use
+`src/client/integration_tests.rs`, those tests use
 `Client::for_base_url` to bypass the keychain entirely.
 
 ## `fj` hangs on the first command after a rebuild
@@ -129,4 +129,4 @@ Every warning is an error. Either fix it or, very rarely and with a
 comment explaining why, add a targeted `#[allow(clippy::lint_name)]`.
 
 Don't add `#[allow(dead_code)]` to silence "never used" warnings on
-real code — that's a signal you have unused code paths to remove.
+real code, that's a signal you have unused code paths to remove.

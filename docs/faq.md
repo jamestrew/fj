@@ -74,7 +74,7 @@ plugin if it collides is the workaround.
 
 ## Can I script `git push` to also push via `fj`?
 
-`fj` doesn't push git refs — `git` does that. But `fj auth setup-git`
+`fj` doesn't push git refs; `git` does that. But `fj auth setup-git`
 installs a credential helper so that `git push` to your Forgejo host
 authenticates via your stored token, no `~/.netrc` needed.
 

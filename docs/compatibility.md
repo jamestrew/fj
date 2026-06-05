@@ -51,8 +51,8 @@ no-`/api/v1` capability we looked at:
 | Run summary (`run view`) | yes (read) | yes | ✅ implemented |
 | Artifact **list** (`run download --list`) | yes, returns JSON (read) | yes | ✅ implemented |
 | Artifact **download** (`run download`) | documented `.../artifacts/{name}` (read) | likely (unverified) | ⚠️ implemented, see note |
-| Workflow **list** (`workflow list`) | n/a — read the files via the contents API | yes | ✅ implemented |
-| Run rerun / cancel | yes (write) | **no** — 404s a token POST | degrades, prints run URL |
+| Workflow **list** (`workflow list`) | n/a, read the files via the contents API | yes | ✅ implemented |
+| Run rerun / cancel | yes (write) | **no**, 404s a token POST | degrades, prints run URL |
 | Run delete, workflow enable/disable | write | no | not offered |
 | Issue/PR lock/unlock, issue transfer, pr revert | write | no | not offered |
 | Code search / commit search | web route returns **HTML only**, indexer-gated | scrape-only | not offered (fragile) |
@@ -92,7 +92,7 @@ Forgejo extensions of the Gitea base.
 - Branch protection rules (`fj protect`)
 - Mirrors (`fj repo mirror`)
 - Topics (`fj repo topics`)
-- Webhooks (`fj hook`) — present in Gitea too, identical surface
+- Webhooks (`fj hook`), present in Gitea too, identical surface
 - Actions runs / secrets / variables (`fj run`, `fj secret`,
   `fj variable`)
 

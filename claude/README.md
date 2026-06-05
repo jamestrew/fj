@@ -25,7 +25,7 @@ After install, the skill activates automatically when relevant.
 ```
 claude/
 ├── .claude-plugin/
-│   └── marketplace.json    marketplace manifest — declares plugins[]
+│   └── marketplace.json    marketplace manifest, declares plugins[]
 ├── README.md               this file
 └── plugins/
     └── fj/
@@ -33,7 +33,7 @@ claude/
         │   └── plugin.json plugin manifest (name, version, keywords)
         └── skills/
             └── fj/
-                └── SKILL.md  the skill body — what Claude reads
+                └── SKILL.md  the skill body, what Claude reads
 ```
 
 The marketplace lives at the root; each plugin lives in `plugins/<name>/`.

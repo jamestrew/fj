@@ -1,4 +1,4 @@
-# fj — project notes for Claude
+# fj: project notes for Claude
 
 `fj` is a Forgejo CLI, in the spirit of GitHub's `gh`. Multi-host, tokens
 in the OS keychain, ~10k LOC Rust with full feature parity to `gh` for
@@ -100,7 +100,7 @@ docs/                  architecture, jq, gh-to-fj, faq, troubleshooting
   prompt keeps coming back. Fix: `make install` puts a real copy on
   PATH and signs it with a stable Developer ID identity, so trust
   survives rebuilds (click "Always Allow" once after the first signed
-  install). Don't symlink `~/.local/bin/fj` to `target/release/fj` —
+  install). Don't symlink `~/.local/bin/fj` to `target/release/fj`;
   that re-introduces the per-build churn.
 - `cargo test` builds a separate test binary with a different hash, so
   it gets its own keychain prompt. Tests that need keychain access are
