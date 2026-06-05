@@ -807,9 +807,11 @@ fn render_stack_block(stack: &Stack, current: usize) -> String {
         let _ = writeln!(s, "{}. {} {}{}", i + 1, label, item.title, here);
     }
     let _ = writeln!(s);
+    // Plain markdown italics, not `<sub>`: Forgejo's PR-body sanitizer drops the
+    // raw HTML tag, so the caption wouldn't render.
     let _ = write!(
         s,
-        "<sub>Maintained by `fj stack sync`; edits inside this block are overwritten.</sub>"
+        "_Maintained by `fj stack sync`; edits inside this block are overwritten._"
     );
     s
 }
@@ -2337,7 +2339,10 @@ mod tests {
         assert!(block.contains("### Stack: feat"));
         assert!(block.contains("1. #7 Item 1"));
         assert!(block.contains("2. #8 Item 2 ← this PR"));
-        assert!(block.contains("Maintained by `fj stack sync`"));
+        // The caption is markdown italics, not raw `<sub>` (Forgejo strips it).
+        assert!(block
+            .contains("_Maintained by `fj stack sync`; edits inside this block are overwritten._"));
+        assert!(!block.contains("<sub>"));
         // an item without a PR yet falls back to its branch name
         let mut partial = stack_with_prs(&["feature/a", "feature/b"], &[7]);
         partial.items[1].pr = None;
