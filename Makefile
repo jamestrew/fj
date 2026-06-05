@@ -13,13 +13,14 @@
 
 PREFIX     ?= $(HOME)/.local
 BINDIR     := $(PREFIX)/bin
+MANDIR     ?= $(PREFIX)/share/man/man1
 # A stable code-signing identity (see `security find-identity -v -p codesigning`).
 SIGN_ID    ?= Developer ID Application: Raster & State LLC (62Y3FRM8PD)
 # Pin the signing identifier so every re-sign satisfies the same keychain trust.
 IDENTIFIER ?= fj-a88ab591fd97b299
 UNAME      := $(shell uname)
 
-.PHONY: build install test lint coverage coverage-html coverage-strict coverage-strict-html release-preflight
+.PHONY: build install man test lint coverage coverage-html coverage-strict coverage-strict-html release-preflight
 
 # Files excluded from coverage so the number reflects what we actually
 # intend to unit-test, not glue we don't.
@@ -52,18 +53,32 @@ COV_IGNORE := src/(main\.rs|output/pager\.rs|cli/(mod|web|browse|extension|auth|
 build:
 	cargo build --release
 
-# Build, install a real copy to $(BINDIR), and (on macOS) code-sign it with a
+# Generate the man pages (top level + one per subcommand) into target/man via
+# the built binary. `fj man` renders them from the clap definitions, so they
+# never drift from the actual command surface. Generation reads no token, so it
+# is safe to run an unsigned binary here.
+man: build
+	target/release/fj man -o target/man
+	@echo "Generated man pages in target/man"
+
+# Build, install a real copy to $(BINDIR), install the man pages to $(MANDIR)
+# so `man fj` works out of the box, and (on macOS) code-sign the binary with a
 # stable identity so the keychain "Always Allow" survives future rebuilds.
 install: build
 	install -d "$(BINDIR)"
 	rm -f "$(BINDIR)/fj"
 	install -m 0755 target/release/fj "$(BINDIR)/fj"
+	target/release/fj man -o target/man
+	install -d "$(MANDIR)"
+	install -m 0644 target/man/*.1 "$(MANDIR)"
 ifeq ($(UNAME),Darwin)
 	codesign --force --sign "$(SIGN_ID)" --identifier "$(IDENTIFIER)" "$(BINDIR)/fj"
 	@echo "Installed and signed $(BINDIR)/fj"
+	@echo "Man pages installed to $(MANDIR) (run: man fj)"
 	@echo 'Run any fj command once and click "Always Allow" — it will stick across rebuilds.'
 else
 	@echo "Installed $(BINDIR)/fj"
+	@echo "Man pages installed to $(MANDIR) (run: man fj)"
 endif
 
 test:

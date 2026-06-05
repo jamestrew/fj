@@ -54,9 +54,30 @@ use clap::{Parser, Subcommand};
     name = "fj",
     version,
     about = "Command-line tool for Forgejo",
-    long_about = None,
+    long_about = "fj is a command-line tool for Forgejo, in the spirit of GitHub's gh. It spans \
+multiple hosts, stores tokens in your OS keychain, and mirrors the gh command surface for what \
+Forgejo exposes: repositories, issues, pull requests, releases, and Actions (runs, workflows, \
+secrets, variables), plus stacked-PR and working-session helpers.\n\
+\n\
+Most subcommands accept -R <owner>/<name> and otherwise infer the repository from the current \
+git remote (preferring `upstream`, then `origin`). Authenticate once with `fj auth login`. Global \
+flags --host, --debug, --no-pager, and --json-fields work on every command.\n\
+\n\
+Examples:\n\
+\n\
+fj auth login: authenticate against a Forgejo host.\n\
+\n\
+fj repo clone owner/name: clone a repository over git.\n\
+\n\
+fj pr create: open a pull request from the current branch.\n\
+\n\
+fj pr list: list pull requests for the current repo.\n\
+\n\
+fj run watch: stream the latest Actions run's logs live.\n\
+\n\
+fj api /user: make a raw authenticated API request.",
     propagate_version = true,
-    arg_required_else_help = true,
+    arg_required_else_help = true
 )]
 pub struct Cli {
     /// Override the host for this command (otherwise the current host from
