@@ -214,7 +214,9 @@ stack file; it's idempotent and `--draft`/`--ready` control PR state. After the
 PRs exist it mirrors a navigation block (the whole stack, linked, with the
 current entry marked) into each PR description, wrapped in `fj-stack` markers so
 any hand-written body around it is preserved; the block is a convenience, never
-the source of truth, and `--no-annotate` skips it.
+the source of truth, and `--no-annotate` skips it. The block also carries a
+versioned JSON payload so the Fjord apps can read the stack as data instead of
+scraping markdown (see [docs/stack-annotation.md](docs/stack-annotation.md)).
 `fj stack ship` merges the stack bottom-up: it pre-flights every PR (each must
 be approved and green unless `--force`), merges from the base up, re-points the
 next PR onto the trunk after each merge, and stops on the first failure with

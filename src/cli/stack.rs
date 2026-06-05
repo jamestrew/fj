@@ -729,12 +729,73 @@ async fn ensure_pr(
 const STACK_BLOCK_START: &str = "<!-- fj-stack:start -->";
 const STACK_BLOCK_END: &str = "<!-- fj-stack:end -->";
 
-/// Render the navigation block (without markers) for the PR of item `current`:
-/// the whole stack, bottom-up, each line linking the item's PR (or naming its
+/// Schema version of the machine-readable stack payload embedded in PR bodies.
+/// Bump when the shape changes incompatibly; consumers should check it.
+const STACK_PAYLOAD_VERSION: u32 = 1;
+
+/// One entry in the machine-readable stack payload.
+#[derive(Debug, Serialize, PartialEq)]
+struct StackPayloadEntry {
+    /// 1-based position from the stack base upward.
+    position: usize,
+    branch: String,
+    title: String,
+    /// PR number, or null when this entry has no PR yet.
+    pr: Option<u64>,
+}
+
+/// The structured stack data mirrored into each PR body alongside the human
+/// rendering, so consumers (the Fjord mobile/web apps) read data instead of
+/// scraping markdown. Stable and versioned. See `docs/stack-annotation.md`.
+#[derive(Debug, Serialize, PartialEq)]
+struct StackPayload {
+    version: u32,
+    name: String,
+    base: String,
+    /// 1-based position of the PR this payload is embedded in.
+    current: usize,
+    entries: Vec<StackPayloadEntry>,
+}
+
+/// Build the payload for the PR of item `current`.
+fn stack_payload(stack: &Stack, current: usize) -> StackPayload {
+    StackPayload {
+        version: STACK_PAYLOAD_VERSION,
+        name: stack.name.clone(),
+        base: stack.base.clone(),
+        current: current + 1,
+        entries: stack
+            .items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| StackPayloadEntry {
+                position: i + 1,
+                branch: item.branch.clone(),
+                title: item.title.clone(),
+                pr: item.pr.as_ref().map(|p| p.number),
+            })
+            .collect(),
+    }
+}
+
+/// Serialize the payload into a one-line HTML comment. Any `-->` inside string
+/// values (e.g. a title) is escaped to `-->` so it can't terminate the
+/// comment early; a JSON parser decodes that back to `-->`, so the data round
+/// trips losslessly.
+fn payload_comment(stack: &Stack, current: usize) -> String {
+    let json = serde_json::to_string(&stack_payload(stack, current)).unwrap_or_default();
+    let safe = json.replace("-->", "--\\u003e");
+    format!("<!-- fj-stack-data: {safe} -->")
+}
+
+/// Render the navigation block (without the start/end markers) for the PR of
+/// item `current`: a machine-readable payload line, then the human rendering of
+/// the whole stack bottom-up, each line linking the item's PR (or naming its
 /// branch when it has none yet) and marking the current entry.
 fn render_stack_block(stack: &Stack, current: usize) -> String {
     use std::fmt::Write;
     let mut s = String::new();
+    let _ = writeln!(s, "{}", payload_comment(stack, current));
     let _ = writeln!(s, "### Stack: {}", stack.name);
     let _ = writeln!(s);
     for (i, item) in stack.items.iter().enumerate() {
@@ -2282,6 +2343,61 @@ mod tests {
         partial.items[1].pr = None;
         let block = render_stack_block(&partial, 0);
         assert!(block.contains("2. `feature/b` Item 2"));
+    }
+
+    /// Pull the JSON out of the `<!-- fj-stack-data: ... -->` comment in a block,
+    /// mirroring what a consumer (mobile/web) does.
+    fn payload_json(block: &str) -> serde_json::Value {
+        let start = block.find("<!-- fj-stack-data: ").unwrap() + "<!-- fj-stack-data: ".len();
+        let rest = &block[start..];
+        let end = rest.find(" -->").unwrap();
+        serde_json::from_str(&rest[..end]).expect("payload is valid JSON")
+    }
+
+    #[test]
+    fn stack_payload_shape_is_stable() {
+        let stack = stack_with_prs(&["feature/a", "feature/b"], &[7, 8]);
+        let p = stack_payload(&stack, 1);
+        let v = serde_json::to_value(&p).unwrap();
+        assert_eq!(v["version"], STACK_PAYLOAD_VERSION);
+        assert_eq!(v["name"], "feat");
+        assert_eq!(v["base"], "main");
+        assert_eq!(v["current"], 2); // 1-based position of "this PR"
+        assert_eq!(v["entries"][0]["position"], 1);
+        assert_eq!(v["entries"][0]["branch"], "feature/a");
+        assert_eq!(v["entries"][0]["pr"], 7);
+        assert_eq!(v["entries"][1]["pr"], 8);
+        // entry without a PR -> null
+        let mut partial = stack_with_prs(&["feature/a", "feature/b"], &[7]);
+        partial.items[1].pr = None;
+        let v = serde_json::to_value(stack_payload(&partial, 0)).unwrap();
+        assert!(v["entries"][1]["pr"].is_null());
+    }
+
+    #[test]
+    fn render_block_embeds_parseable_payload() {
+        let stack = stack_with_prs(&["feature/a", "feature/b"], &[7, 8]);
+        let block = render_stack_block(&stack, 0);
+        let v = payload_json(&block);
+        assert_eq!(v["version"], 1);
+        assert_eq!(v["current"], 1);
+        assert_eq!(v["entries"][1]["branch"], "feature/b");
+    }
+
+    #[test]
+    fn payload_comment_escapes_arrow_in_titles() {
+        // A title containing `-->` must not terminate the HTML comment early,
+        // and must round-trip through a JSON parser.
+        let mut stack = stack_with_prs(&["feature/a"], &[7]);
+        stack.items[0].title = "fix --> bar".to_string();
+        let comment = payload_comment(&stack, 0);
+        // exactly one comment terminator (the real one at the end)
+        assert_eq!(comment.matches("-->").count(), 1);
+        assert!(comment.trim_end().ends_with("-->"));
+        // and the escaped form decodes back to the original title
+        let block = format!("{comment}\n");
+        let v = payload_json(&block);
+        assert_eq!(v["entries"][0]["title"], "fix --> bar");
     }
 
     #[test]
