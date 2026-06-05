@@ -5,7 +5,8 @@
 //! never a committed manifest. `stack new` (author a stack), `stack review`
 //! (show the stack + each branch's PR state), `stack sync` (push each branch
 //! and create/update its Forgejo PR, chaining bases so each PR targets the
-//! previous branch), and `stack ship` (merge bottom-up, re-pointing each next
+//! previous branch, and mirroring a navigation block into each PR body unless
+//! `--no-annotate`), and `stack ship` (merge bottom-up, re-pointing each next
 //! PR onto the trunk as the one below it merges) are implemented, as is
 //! `stack split` (turn a single branch's commits into one stacked entry each,
 //! moving only local refs) and `stack absorb` (fold staged changes into the
@@ -84,6 +85,9 @@ pub struct SyncArgs {
     /// Emit machine-readable operations/results as JSON.
     #[arg(long)]
     pub json: bool,
+    /// Don't write the stack-navigation block into each PR description.
+    #[arg(long)]
+    pub no_annotate: bool,
     /// Print intended actions without pushing or writing to Forgejo.
     #[arg(long)]
     pub dry_run: bool,
@@ -719,6 +723,93 @@ async fn ensure_pr(
     ))
 }
 
+/// Markers bracketing the fj-managed navigation block in a PR body. Content
+/// outside them is human-authored and always preserved; content inside is
+/// regenerated on every sync.
+const STACK_BLOCK_START: &str = "<!-- fj-stack:start -->";
+const STACK_BLOCK_END: &str = "<!-- fj-stack:end -->";
+
+/// Render the navigation block (without markers) for the PR of item `current`:
+/// the whole stack, bottom-up, each line linking the item's PR (or naming its
+/// branch when it has none yet) and marking the current entry.
+fn render_stack_block(stack: &Stack, current: usize) -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    let _ = writeln!(s, "### Stack: {}", stack.name);
+    let _ = writeln!(s);
+    for (i, item) in stack.items.iter().enumerate() {
+        let label = match &item.pr {
+            Some(pr) => format!("#{}", pr.number),
+            None => format!("`{}`", item.branch),
+        };
+        let here = if i == current { " ← this PR" } else { "" };
+        let _ = writeln!(s, "{}. {} {}{}", i + 1, label, item.title, here);
+    }
+    let _ = writeln!(s);
+    let _ = write!(
+        s,
+        "<sub>Maintained by `fj stack sync`; edits inside this block are overwritten.</sub>"
+    );
+    s
+}
+
+/// Splice the navigation block into `existing`, replacing a prior fj block when
+/// present and otherwise appending it. Everything outside the markers is kept
+/// verbatim, so a hand-written PR description survives re-syncs.
+fn apply_stack_block(existing: &str, block: &str) -> String {
+    let wrapped = format!("{STACK_BLOCK_START}\n{block}\n{STACK_BLOCK_END}");
+    if let (Some(start), Some(end)) = (
+        existing.find(STACK_BLOCK_START),
+        existing.find(STACK_BLOCK_END),
+    ) {
+        if start < end {
+            let after = &existing[end + STACK_BLOCK_END.len()..];
+            return format!("{}{}{}", &existing[..start], wrapped, after);
+        }
+    }
+    if existing.trim().is_empty() {
+        wrapped
+    } else {
+        format!("{}\n\n{}", existing.trim_end(), wrapped)
+    }
+}
+
+/// Mirror the stack navigation into every item's PR body, preserving any
+/// human-authored content. Lists the PRs once for their current bodies, then
+/// PATCHes only those whose body actually changes. Returns how many were
+/// updated. Items without a PR number are skipped.
+async fn annotate_prs(client: &Client, owner: &str, name: &str, stack: &Stack) -> Result<usize> {
+    let page = api::pull::list(client, owner, name, api::pull::ListOptions::default()).await?;
+    let mut annotated = 0usize;
+    for (i, item) in stack.items.iter().enumerate() {
+        let Some(pr) = &item.pr else {
+            continue;
+        };
+        let existing = page
+            .items
+            .iter()
+            .find(|p| p.number == pr.number)
+            .map(|p| p.body.clone())
+            .unwrap_or_default();
+        let new_body = apply_stack_block(&existing, &render_stack_block(stack, i));
+        if new_body != existing {
+            api::pull::edit(
+                client,
+                owner,
+                name,
+                pr.number,
+                &EditPull {
+                    body: Some(&new_body),
+                    ..Default::default()
+                },
+            )
+            .await?;
+            annotated += 1;
+        }
+    }
+    Ok(annotated)
+}
+
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn sync(args: SyncArgs, host: Option<&str>) -> Result<()> {
     let Some(mut stack) = stack_state::load()? else {
@@ -732,6 +823,12 @@ async fn sync(args: SyncArgs, host: Option<&str>) -> Result<()> {
             return output::print_json(&serde_json::to_value(&plan)?);
         }
         print!("{}", render_plan(&plan));
+        if !args.no_annotate {
+            println!(
+                "Would annotate {} PR description(s) with the stack.",
+                plan.len()
+            );
+        }
         return Ok(());
     }
 
@@ -777,10 +874,22 @@ async fn sync(args: SyncArgs, host: Option<&str>) -> Result<()> {
         });
     }
 
+    // Second pass: now that every item has a PR number, mirror the stack
+    // navigation into each PR body. Convenience annotation, never the source of
+    // truth; human-authored content is preserved. Skipped with `--no-annotate`.
+    let annotated = if args.no_annotate {
+        0
+    } else {
+        annotate_prs(&ctx.client, &ctx.owner, &ctx.name, &stack).await?
+    };
+
     if args.json {
         return output::print_json(&serde_json::to_value(&ops)?);
     }
     print!("{}", render_ops(&ops));
+    if annotated > 0 {
+        println!("Annotated {annotated} PR description(s) with the stack.");
+    }
     Ok(())
 }
 
@@ -2131,6 +2240,120 @@ mod tests {
         assert!(out.contains("Synced 1 item(s)."));
     }
 
+    // ---- sync: PR-body annotation ----
+
+    #[test]
+    fn sync_parses_no_annotate() {
+        let cli =
+            Cli::try_parse_from(["fj", "stack", "sync", "--no-annotate"]).expect("should parse");
+        assert!(matches!(
+            cli.command,
+            Command::Stack(StackCmd {
+                command: StackSub::Sync(SyncArgs {
+                    no_annotate: true,
+                    ..
+                })
+            })
+        ));
+    }
+
+    fn stack_with_prs(branches: &[&str], numbers: &[u64]) -> Stack {
+        let mut s = stack_with_branches(branches);
+        for (item, n) in s.items.iter_mut().zip(numbers) {
+            item.pr = Some(ItemPr {
+                number: *n,
+                url: format!("https://x/pulls/{n}"),
+                state: "open".into(),
+            });
+        }
+        s
+    }
+
+    #[test]
+    fn render_stack_block_lists_entries_and_marks_current() {
+        let stack = stack_with_prs(&["feature/a", "feature/b"], &[7, 8]);
+        let block = render_stack_block(&stack, 1);
+        assert!(block.contains("### Stack: feat"));
+        assert!(block.contains("1. #7 Item 1"));
+        assert!(block.contains("2. #8 Item 2 ← this PR"));
+        assert!(block.contains("Maintained by `fj stack sync`"));
+        // an item without a PR yet falls back to its branch name
+        let mut partial = stack_with_prs(&["feature/a", "feature/b"], &[7]);
+        partial.items[1].pr = None;
+        let block = render_stack_block(&partial, 0);
+        assert!(block.contains("2. `feature/b` Item 2"));
+    }
+
+    #[test]
+    fn apply_stack_block_appends_when_absent() {
+        let out = apply_stack_block("Human-written description.", "NAV");
+        assert!(out.starts_with("Human-written description.\n\n"));
+        assert!(out.contains(STACK_BLOCK_START));
+        assert!(out.contains("\nNAV\n"));
+        assert!(out.trim_end().ends_with(STACK_BLOCK_END));
+        // empty existing body -> just the wrapped block
+        let only = apply_stack_block("", "NAV");
+        assert_eq!(only, format!("{STACK_BLOCK_START}\nNAV\n{STACK_BLOCK_END}"));
+    }
+
+    #[test]
+    fn apply_stack_block_replaces_in_place_preserving_surroundings() {
+        let existing = format!(
+            "Top prose.\n\n{STACK_BLOCK_START}\nOLD NAV\n{STACK_BLOCK_END}\n\nBottom prose."
+        );
+        let out = apply_stack_block(&existing, "NEW NAV");
+        assert!(out.contains("Top prose."));
+        assert!(out.contains("Bottom prose."));
+        assert!(out.contains("NEW NAV"));
+        assert!(!out.contains("OLD NAV"));
+        // exactly one block remains
+        assert_eq!(out.matches(STACK_BLOCK_START).count(), 1);
+        assert_eq!(out.matches(STACK_BLOCK_END).count(), 1);
+    }
+
+    #[test]
+    fn apply_stack_block_is_idempotent() {
+        let block = "NAV";
+        let once = apply_stack_block("body", block);
+        let twice = apply_stack_block(&once, block);
+        assert_eq!(once, twice);
+    }
+
+    #[tokio::test]
+    async fn annotate_prs_patches_only_changed_bodies() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let stack = stack_with_prs(&["feature/a", "feature/b"], &[7, 8]);
+
+        // PR #7 has no fj block yet -> must be patched. PR #8 already carries the
+        // exact block it would get -> must be left alone.
+        let body8 = apply_stack_block("", &render_stack_block(&stack, 1));
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/o/r/pulls"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                pull_value_body(7, "feature/a", ""),
+                pull_value_body(8, "feature/b", &body8),
+            ])))
+            .mount(&server)
+            .await;
+        // Only #7 should be PATCHed.
+        Mock::given(method("PATCH"))
+            .and(path("/api/v1/repos/o/r/pulls/7"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(pull_value_body(
+                7,
+                "feature/a",
+                "x",
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let c = client_for(&server);
+        let n = annotate_prs(&c, "o", "r", &stack).await.unwrap();
+        assert_eq!(n, 1);
+    }
+
     // ---- sync: mocked Forgejo API (ensure_pr) ----
 
     fn pull_value(number: u64, head: &str, state: &str, draft: bool) -> serde_json::Value {
@@ -2144,6 +2367,12 @@ mod tests {
             "created_at": "2026-06-01T00:00:00Z",
             "updated_at": "2026-06-01T00:00:00Z"
         })
+    }
+
+    fn pull_value_body(number: u64, head: &str, body: &str) -> serde_json::Value {
+        let mut v = pull_value(number, head, "open", false);
+        v["body"] = serde_json::Value::String(body.to_string());
+        v
     }
 
     fn client_for(server: &wiremock::MockServer) -> Client {

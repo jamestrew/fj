@@ -210,7 +210,11 @@ schema/repo/base/timestamps/issue/items, and won't clobber an existing stack
 without `--force`. `fj stack sync` pushes each branch to origin and
 creates/updates its PR, chaining bases (item _n_ targets item _n-1_'s branch,
 the first targets the stack base) and writing PR numbers/URLs back into the
-stack file; it's idempotent and `--draft`/`--ready` control PR state.
+stack file; it's idempotent and `--draft`/`--ready` control PR state. After the
+PRs exist it mirrors a navigation block (the whole stack, linked, with the
+current entry marked) into each PR description, wrapped in `fj-stack` markers so
+any hand-written body around it is preserved; the block is a convenience, never
+the source of truth, and `--no-annotate` skips it.
 `fj stack ship` merges the stack bottom-up: it pre-flights every PR (each must
 be approved and green unless `--force`), merges from the base up, re-points the
 next PR onto the trunk after each merge, and stops on the first failure with
