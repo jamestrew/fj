@@ -31,6 +31,16 @@ All notable changes will be recorded here. The format follows
   to `$(MANDIR)`, so `man fj` works out of the box. The top-level page gained a
   real description and examples instead of echoing the one-line summary.
 
+### Changed
+
+- **`fj auth login` first run**: an interactive run with no disambiguating
+  flags now opens a menu to choose between a Fjord Account (email + password)
+  and your own Forgejo server (access token), mirroring the mobile apps' first
+  screen. Explicit intent is unchanged and skips the menu: `--fjord` goes
+  straight to Fjord, and any PAT input (`--host`, `--token`, `--with-token`,
+  or `FJ_TOKEN`) goes straight to the token flow, so scripts and the
+  non-interactive paths behave exactly as before.
+
 ### Fixed
 
 - Following `Link: rel=next` pagination no longer errors on the `null` body some

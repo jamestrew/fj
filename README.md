@@ -71,7 +71,7 @@ Windows compiles but is untested. [File an issue](https://rasterhub.com/rasterst
 ## Quickstart
 
 ```sh
-fj auth login                            # paste a Forgejo token; stored in your OS keychain
+fj auth login                            # pick Fjord Account or a Forgejo token; stored in your OS keychain
 fj repo view                             # auto-detects the repo from your git remote
 fj pr list --state all -L 10             # latest 10 PRs
 fj issue create --title "..." --body "..."

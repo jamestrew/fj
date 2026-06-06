@@ -1,7 +1,7 @@
 //! `fj auth login` — PAT and Fjord Account sign-in flows.
 
 use anyhow::{anyhow, Context, Result};
-use dialoguer::Password;
+use dialoguer::{Password, Select};
 
 use crate::api;
 use crate::auth as token_store;
@@ -10,10 +10,72 @@ use crate::cli::auth_probe::{build_probe_client, probe_version, warn_on_old_forg
 use crate::config::hosts::{Host, Hosts};
 use crate::output;
 
-pub(crate) async fn login(args: LoginArgs) -> Result<()> {
+/// Which sign-in flow `fj auth login` runs. `Prompt` means "ask the user"
+/// (the mobile first-run screen): we only reach it interactively when nothing
+/// on the command line already disambiguates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoginMode {
+    Fjord,
+    Pat,
+    Prompt,
+}
+
+/// Decide the login flow from the flags alone, deferring to a menu only when
+/// the invocation is ambiguous AND we have a TTY to drive it. Explicit intent
+/// (`--fjord`, or any PAT input like `--host` / `--token` / `--with-token` /
+/// `FJ_TOKEN`) skips the menu so scripts and the documented non-interactive
+/// paths behave exactly as before. Kept pure so the branching is obvious.
+fn resolve_login_mode(args: &LoginArgs, stdin_is_tty: bool) -> LoginMode {
     if args.fjord {
-        return login_fjord(args).await;
+        return LoginMode::Fjord;
     }
+    // `--token` also binds FJ_TOKEN, so an env-provided token lands here too.
+    let pat_input_given = args.host.is_some() || args.token.is_some() || args.with_token;
+    if pat_input_given {
+        return LoginMode::Pat;
+    }
+    if stdin_is_tty {
+        LoginMode::Prompt
+    } else {
+        // No flags and no TTY: keep the historical default rather than block
+        // on a menu we can't render.
+        LoginMode::Pat
+    }
+}
+
+/// The mobile-style first screen: pick Fjord Account or your own Forgejo.
+fn prompt_login_mode() -> Result<LoginMode> {
+    let items = [
+        "Fjord Account (email + password)",
+        "Your own Forgejo server (access token)",
+    ];
+    let choice = Select::new()
+        .with_prompt("How do you want to sign in?")
+        .items(&items)
+        .default(0)
+        .interact()
+        .context("reading sign-in method")?;
+    Ok(if choice == 0 {
+        LoginMode::Fjord
+    } else {
+        LoginMode::Pat
+    })
+}
+
+pub(crate) async fn login(args: LoginArgs) -> Result<()> {
+    use std::io::IsTerminal;
+    let mode = match resolve_login_mode(&args, std::io::stdin().is_terminal()) {
+        LoginMode::Prompt => prompt_login_mode()?,
+        concrete => concrete,
+    };
+    match mode {
+        LoginMode::Fjord => login_fjord(args).await,
+        LoginMode::Pat => login_pat(args).await,
+        LoginMode::Prompt => unreachable!("Prompt is resolved to a concrete mode above"),
+    }
+}
+
+async fn login_pat(args: LoginArgs) -> Result<()> {
     let hostname = match args.host.clone() {
         Some(h) => h,
         None => prompt_hostname()?,
