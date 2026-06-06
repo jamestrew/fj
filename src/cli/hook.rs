@@ -5,6 +5,7 @@ use clap::{Args, Subcommand};
 
 use crate::api::hook::{self, CreateHook};
 use crate::cli::context::{resolve_repo, RepoFlag};
+use crate::cli::editor;
 use crate::output;
 
 #[derive(Debug, Args)]
@@ -22,7 +23,7 @@ pub enum HookSub {
     /// Delete a webhook by id.
     Delete(DeleteArgs),
     /// Send a test delivery to an existing webhook.
-    Test(DeleteArgs),
+    Test(HookIdArgs),
 }
 
 #[derive(Debug, Args)]
@@ -56,6 +57,17 @@ pub struct CreateArgs {
 
 #[derive(Debug, Args)]
 pub struct DeleteArgs {
+    #[command(flatten)]
+    pub r: RepoFlag,
+    /// Webhook id
+    pub id: u64,
+    /// Skip the confirmation prompt.
+    #[arg(long)]
+    pub yes: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct HookIdArgs {
     #[command(flatten)]
     pub r: RepoFlag,
     /// Webhook id
@@ -137,12 +149,23 @@ async fn create(args: CreateArgs, host: Option<&str>) -> Result<()> {
 
 async fn delete(args: DeleteArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
+    if !args.yes {
+        let ans = editor::prompt_line(&format!(
+            "Delete webhook #{} from {}? Type the id to confirm",
+            args.id,
+            ctx.slug()
+        ))?;
+        if ans.trim() != args.id.to_string() {
+            println!("aborted");
+            return Ok(());
+        }
+    }
     hook::delete(&ctx.client, &ctx.owner, &ctx.name, args.id).await?;
     println!("✓ Deleted webhook #{}", args.id);
     Ok(())
 }
 
-async fn test(args: DeleteArgs, host: Option<&str>) -> Result<()> {
+async fn test(args: HookIdArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     hook::test(&ctx.client, &ctx.owner, &ctx.name, args.id).await?;
     println!("✓ Triggered test delivery for webhook #{}", args.id);

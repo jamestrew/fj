@@ -5,6 +5,7 @@ use clap::{Args, Subcommand};
 
 use crate::api::protect::{self, CreateBranchProtection};
 use crate::cli::context::{resolve_repo, RepoFlag};
+use crate::cli::editor;
 use crate::output;
 
 #[derive(Debug, Args)]
@@ -22,7 +23,7 @@ pub enum ProtectSub {
     /// Create or update a rule.
     Set(SetArgs),
     /// Delete a rule.
-    Delete(BranchArgs),
+    Delete(DeleteArgs),
 }
 
 #[derive(Debug, Args)]
@@ -43,6 +44,17 @@ pub struct BranchArgs {
     /// Emit JSON instead of a table
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct DeleteArgs {
+    #[command(flatten)]
+    pub r: RepoFlag,
+    /// Branch name (or pattern)
+    pub branch: String,
+    /// Skip the confirmation prompt.
+    #[arg(long)]
+    pub yes: bool,
 }
 
 #[derive(Debug, Args)]
@@ -162,8 +174,19 @@ async fn set(args: SetArgs, host: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-async fn delete(args: BranchArgs, host: Option<&str>) -> Result<()> {
+async fn delete(args: DeleteArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
+    if !args.yes {
+        let ans = editor::prompt_line(&format!(
+            "Delete branch protection '{}' from {}? Type the branch name to confirm",
+            args.branch,
+            ctx.slug()
+        ))?;
+        if ans.trim() != args.branch {
+            println!("aborted");
+            return Ok(());
+        }
+    }
     protect::delete(&ctx.client, &ctx.owner, &ctx.name, &args.branch).await?;
     println!("✓ Removed protection on {}", args.branch);
     Ok(())

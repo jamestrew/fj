@@ -221,7 +221,9 @@ fn web_run_url(
 ) -> Result<String> {
     let origin = client.base().join("/")?;
     Ok(format!(
-        "{origin}{owner}/{name}/actions/runs/{run}/jobs/{job}/attempt/{attempt}"
+        "{origin}{}/{}/actions/runs/{run}/jobs/{job}/attempt/{attempt}",
+        crate::api::path_segment(owner),
+        crate::api::path_segment(name)
     ))
 }
 

@@ -91,8 +91,9 @@ pub async fn dispatch(
     inputs: std::collections::BTreeMap<String, String>,
 ) -> Result<()> {
     let path = format!(
-        "{}/actions/workflows/{workflow}/dispatches",
-        crate::api::repo_path(owner, name)
+        "{}/actions/workflows/{}/dispatches",
+        crate::api::repo_path(owner, name),
+        crate::api::path_segment(workflow)
     );
     let body = DispatchBody { ref_, inputs };
     let res = client
@@ -143,7 +144,11 @@ pub async fn list_artifacts(
     run: u64,
 ) -> Result<Vec<Artifact>> {
     let origin = client.base().join("/")?;
-    let url = format!("{origin}{owner}/{name}/actions/runs/{run}/artifacts");
+    let url = format!(
+        "{origin}{}/{}/actions/runs/{run}/artifacts",
+        crate::api::path_segment(owner),
+        crate::api::path_segment(name)
+    );
     let res = client.request(Method::GET, &url, &[], None).await?;
     let status = res.status();
     if !status.is_success() {
@@ -172,8 +177,12 @@ pub async fn download_artifact(
     artifact: &str,
 ) -> Result<Vec<u8>> {
     let origin = client.base().join("/")?;
-    let enc = crate::api::urlencode_path_segment(artifact);
-    let url = format!("{origin}{owner}/{name}/actions/runs/{run}/artifacts/{enc}");
+    let url = format!(
+        "{origin}{}/{}/actions/runs/{run}/artifacts/{}",
+        crate::api::path_segment(owner),
+        crate::api::path_segment(name),
+        crate::api::path_segment(artifact)
+    );
     let res = client.request(Method::GET, &url, &[], None).await?;
     let status = res.status();
     if !status.is_success() {
@@ -259,7 +268,11 @@ async fn post_run_action(
     action: &str,
 ) -> Result<()> {
     let origin = client.base().join("/")?;
-    let run_url = format!("{origin}{owner}/{name}/actions/runs/{run}");
+    let run_url = format!(
+        "{origin}{}/{}/actions/runs/{run}",
+        crate::api::path_segment(owner),
+        crate::api::path_segment(name)
+    );
     let res = client
         .request(Method::POST, &format!("{run_url}/{action}"), &[], None)
         .await?;

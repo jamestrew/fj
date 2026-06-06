@@ -42,7 +42,11 @@ pub async fn list(client: &Client, owner: &str, name: &str, limit: u32) -> Resul
 }
 
 pub async fn get_by_tag(client: &Client, owner: &str, name: &str, tag: &str) -> Result<Release> {
-    let path = format!("{}/releases/tags/{tag}", crate::api::repo_path(owner, name));
+    let path = format!(
+        "{}/releases/tags/{}",
+        crate::api::repo_path(owner, name),
+        crate::api::path_segment(tag)
+    );
     client.json(Method::GET, &path, &[], None::<&()>).await
 }
 

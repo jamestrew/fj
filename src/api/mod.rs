@@ -38,15 +38,15 @@ pub fn split_repo(repo: &str) -> Result<(&str, &str)> {
 pub fn repo_path(owner: &str, name: &str) -> String {
     format!(
         "/api/v1/repos/{}/{}",
-        urlencode_path_segment(owner),
-        urlencode_path_segment(name)
+        path_segment(owner),
+        path_segment(name)
     )
 }
 
 /// Percent-encode a string for use as a single URL path segment. Keeps the
 /// RFC 3986 unreserved set; encodes everything else (including `/`) so a name
 /// can't break out of its segment.
-pub fn urlencode_path_segment(s: &str) -> String {
+pub fn path_segment(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
@@ -56,6 +56,10 @@ pub fn urlencode_path_segment(s: &str) -> String {
         }
     }
     out
+}
+
+pub fn urlencode_path_segment(s: &str) -> String {
+    path_segment(s)
 }
 
 #[cfg(test)]
@@ -95,5 +99,11 @@ mod tests {
             repo_path("space owner", "repo/name"),
             "/api/v1/repos/space%20owner/repo%2Fname"
         );
+    }
+
+    #[test]
+    fn path_segment_encodes_reserved_and_utf8_bytes() {
+        assert_eq!(path_segment("feature/a b"), "feature%2Fa%20b");
+        assert_eq!(path_segment("é"), "%C3%A9");
     }
 }

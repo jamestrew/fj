@@ -46,14 +46,22 @@ pub async fn unwatch(client: &Client, owner: &str, name: &str) -> Result<()> {
 }
 
 pub async fn star(client: &Client, owner: &str, name: &str) -> Result<()> {
-    let path = format!("/api/v1/user/starred/{owner}/{name}");
+    let path = format!(
+        "/api/v1/user/starred/{}/{}",
+        crate::api::path_segment(owner),
+        crate::api::path_segment(name)
+    );
     let res = client.request(Method::PUT, &path, &[], None).await?;
     res.error_for_status()?;
     Ok(())
 }
 
 pub async fn unstar(client: &Client, owner: &str, name: &str) -> Result<()> {
-    let path = format!("/api/v1/user/starred/{owner}/{name}");
+    let path = format!(
+        "/api/v1/user/starred/{}/{}",
+        crate::api::path_segment(owner),
+        crate::api::path_segment(name)
+    );
     let res = client.request(Method::DELETE, &path, &[], None).await?;
     res.error_for_status()?;
     Ok(())

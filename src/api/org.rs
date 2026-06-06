@@ -24,7 +24,7 @@ pub async fn list_for_user(client: &Client) -> Result<Vec<Organization>> {
 }
 
 pub async fn get(client: &Client, org: &str) -> Result<Organization> {
-    let path = format!("/api/v1/orgs/{org}");
+    let path = format!("/api/v1/orgs/{}", crate::api::path_segment(org));
     client.json(Method::GET, &path, &[], None::<&()>).await
 }
 
@@ -39,6 +39,6 @@ pub struct Team {
 }
 
 pub async fn list_teams(client: &Client, org: &str) -> Result<Vec<Team>> {
-    let path = format!("/api/v1/orgs/{org}/teams");
+    let path = format!("/api/v1/orgs/{}/teams", crate::api::path_segment(org));
     client.json(Method::GET, &path, &[], None::<&()>).await
 }

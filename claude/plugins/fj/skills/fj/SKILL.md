@@ -17,10 +17,11 @@ search, notifications.
 ## Quick orientation
 
 ```
-fj auth login --host <host>      # one-time setup; token in keychain
+fj auth login --host <host>      # PAT setup; token in keychain
+fj auth login --fjord            # Fjord Account setup; then pick an instance
 fj auth status                   # which hosts you're signed in to
 fj --version
-fj --help                        # 25 top-level subcommands
+fj --help                        # 29 top-level subcommands
 ```
 
 Inside a clone, `fj` infers the repo from `git remote -v` (prefers
@@ -34,11 +35,11 @@ override.
 | `repo` | list, view, clone, create, fork, sync, edit, rename, archive, delete, branches, topics, mirror, watch, star, starred |
 | `issue` | list, view, create, edit, close, reopen, comment, edit-comment, delete-comment, develop |
 | `pr` | list, view, create, edit, diff, commits, files, checks, ready, review, request-review, status, checkout, merge, close |
-| `release` | list, view, create, edit, delete, upload, download |
+| `release` | list, view, create, edit, delete, upload, download, delete-asset |
 | `label` | list, create, edit, delete |
 | `milestone` | list, view, create, edit, close, delete, assign |
 | `run` / `secret` / `variable` | Forgejo Actions workflows + their config |
-| `search` | repos, issues, prs, users, code |
+| `search` | repos, issues, prs, users |
 | `browse` | open the current repo (or a path within it) in $BROWSER |
 | `status` | notifications inbox |
 | `protect` / `hook` | branch protection rules, webhooks |
@@ -48,7 +49,8 @@ override.
 
 - `--host <name>` or `FJ_HOST`: pick the host explicitly. When omitted
   fj uses (1) the host from the autodetected remote, then (2) the
-  configured default from `fj auth switch`.
+  configured default from `fj auth switch`. PAT hosts may be plain
+  hostnames or full URLs such as `http://localhost:3000/forgejo`.
 - `--debug` or `FJ_DEBUG=1`: log every HTTP request to stderr.
 - `--no-pager` or `FJ_NO_PAGER=1`: skip the pager.
 - `--json-fields foo,bar`: gh-style projection on top of `--json`. Dotted
@@ -143,7 +145,6 @@ fj release view v1.2.3 --json
 ### Search
 
 ```sh
-fj search code "use crate::foo" -R owner/name
 fj search issues "is:open label:bug"
 fj search repos "rust forgejo"
 ```
@@ -190,7 +191,7 @@ fj api /repos/foo/bar/branches --include            # response headers + body
   to start over.
 - "no host selected": pass `--host` or `fj auth switch <h>` to set a
   default.
-- Mysterious 404s on commands like `fj pr ready` or `fj search code`:
+- Mysterious 404s on commands like `fj pr ready`:
   the target server may be older than the Forgejo 7.x baseline. Check
   `fj api /version`. See [`docs/compatibility.md`](https://rasterhub.com/rasterstate/fj/src/branch/main/docs/compatibility.md).
 - Hangs in CI: probably waiting on `$EDITOR`. Always pass `--body`.

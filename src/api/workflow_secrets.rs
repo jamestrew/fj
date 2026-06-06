@@ -37,8 +37,9 @@ pub async fn set_secret(
     value: &str,
 ) -> Result<()> {
     let path = format!(
-        "{}/actions/secrets/{secret_name}",
-        crate::api::repo_path(owner, name)
+        "{}/actions/secrets/{}",
+        crate::api::repo_path(owner, name),
+        crate::api::path_segment(secret_name)
     );
     let res = client
         .request(
@@ -59,8 +60,9 @@ pub async fn delete_secret(
     secret_name: &str,
 ) -> Result<()> {
     let path = format!(
-        "{}/actions/secrets/{secret_name}",
-        crate::api::repo_path(owner, name)
+        "{}/actions/secrets/{}",
+        crate::api::repo_path(owner, name),
+        crate::api::path_segment(secret_name)
     );
     let res = client.request(Method::DELETE, &path, &[], None).await?;
     res.error_for_status()?;
@@ -96,8 +98,9 @@ pub async fn set_variable(
     value: &str,
 ) -> Result<()> {
     let path = format!(
-        "{}/actions/variables/{var_name}",
-        crate::api::repo_path(owner, name)
+        "{}/actions/variables/{}",
+        crate::api::repo_path(owner, name),
+        crate::api::path_segment(var_name)
     );
     let res = client
         .request(
@@ -118,8 +121,9 @@ pub async fn delete_variable(
     var_name: &str,
 ) -> Result<()> {
     let path = format!(
-        "{}/actions/variables/{var_name}",
-        crate::api::repo_path(owner, name)
+        "{}/actions/variables/{}",
+        crate::api::repo_path(owner, name),
+        crate::api::path_segment(var_name)
     );
     let res = client.request(Method::DELETE, &path, &[], None).await?;
     res.error_for_status()?;

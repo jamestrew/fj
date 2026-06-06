@@ -39,8 +39,9 @@ pub async fn combined_status(
     sha: &str,
 ) -> Result<CombinedStatus> {
     let path = format!(
-        "{}/commits/{sha}/status",
-        crate::api::repo_path(owner, name)
+        "{}/commits/{}/status",
+        crate::api::repo_path(owner, name),
+        crate::api::path_segment(sha)
     );
     client.json(Method::GET, &path, &[], None::<&()>).await
 }

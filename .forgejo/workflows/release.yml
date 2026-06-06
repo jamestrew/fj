@@ -129,11 +129,16 @@ jobs:
         run: |
           set -euo pipefail
           KEY_PATH="$RUNNER_TEMP/api-key.p8"
+          ZIP="$RUNNER_TEMP/fj-notary.zip"
+          cleanup_notary() {
+            rm -f "$KEY_PATH" "$ZIP"
+          }
+          trap cleanup_notary EXIT
+
           echo "$APPLE_API_KEY_BASE64" | base64 --decode > "$KEY_PATH"
           chmod 600 "$KEY_PATH"
 
           BIN="target/${{ matrix.target }}/release/fj"
-          ZIP="$RUNNER_TEMP/fj-notary.zip"
           (cd "$(dirname "$BIN")" && zip -q "$ZIP" "$(basename "$BIN")")
 
           out=$(xcrun notarytool submit "$ZIP" \
@@ -146,12 +151,10 @@ jobs:
           n_status=$(echo "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("status",""))')
           req_id=$(echo "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))')
 
-          rm -f "$KEY_PATH" "$ZIP"
-
           if [ "$n_status" != "Accepted" ]; then
             echo "::error::notarization failed: $n_status (request $req_id)"
             xcrun notarytool log "$req_id" \
-              --key "$RUNNER_TEMP/api-key.p8" \
+              --key "$KEY_PATH" \
               --key-id "$APPLE_API_KEY_ID" \
               --issuer "$APPLE_API_ISSUER" || true
             exit 1
@@ -244,6 +247,12 @@ jobs:
             end
 
             def install
+              target = if OS.mac?
+                Hardware::CPU.arm? ? "darwin-aarch64" : "darwin-x86_64"
+              else
+                "linux-x86_64"
+              end
+              cd "fj-#{version}-#{target}"
               bin.install "fj"
               pkgshare.install "README.md", "LICENSE", "CHANGELOG.md"
             end

@@ -116,7 +116,7 @@ pub async fn create_for_current_user(client: &Client, body: &CreateRepo<'_>) -> 
 }
 
 pub async fn create_for_org(client: &Client, org: &str, body: &CreateRepo<'_>) -> Result<Repo> {
-    let path = format!("/api/v1/orgs/{org}/repos");
+    let path = format!("/api/v1/orgs/{}/repos", crate::api::path_segment(org));
     client.json(Method::POST, &path, &[], Some(body)).await
 }
 

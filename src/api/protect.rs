@@ -45,8 +45,9 @@ pub async fn get(
     branch: &str,
 ) -> Result<BranchProtection> {
     let path = format!(
-        "{}/branch_protections/{branch}",
-        crate::api::repo_path(owner, name)
+        "{}/branch_protections/{}",
+        crate::api::repo_path(owner, name),
+        crate::api::path_segment(branch)
     );
     client.json(Method::GET, &path, &[], None::<&()>).await
 }
@@ -80,8 +81,9 @@ pub async fn create(
 
 pub async fn delete(client: &Client, owner: &str, name: &str, branch: &str) -> Result<()> {
     let path = format!(
-        "{}/branch_protections/{branch}",
-        crate::api::repo_path(owner, name)
+        "{}/branch_protections/{}",
+        crate::api::repo_path(owner, name),
+        crate::api::path_segment(branch)
     );
     let res = client.request(Method::DELETE, &path, &[], None).await?;
     res.error_for_status()?;
