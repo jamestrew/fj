@@ -219,7 +219,11 @@ rather than failing, matching gh.
   Construct test clients via `Client::for_base_url`.
 - **Live E2E** lives in `scripts/e2e-smoke.sh`, gated on `FJ_E2E=1`
   in the pre-push hook. It hits the real Forgejo at `rasterhub.com`
-  against `stephen/fj-cli-test`.
+  against `stephen/fj-cli-test` locally. CI runs it against
+  `rasterstate/fj` with an ephemeral `FJ_TOKEN`, so runner containers
+  do not need keychain setup. Admin-only checks, such as branch protection
+  listing, are opt-in with `FJ_E2E_ADMIN=1`.
 - **Remote CI** at `.forgejo/workflows/ci.yml` runs the same gate
-  (fmt, clippy `-D warnings`, test, release build) on every push and
-  PR. The local hook is no longer the only gate.
+  (fmt, clippy `-D warnings`, test, audit, release build, coverage,
+  and live smoke) on every push and PR. The local hook is no longer
+  the only gate.

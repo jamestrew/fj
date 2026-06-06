@@ -9,6 +9,7 @@ cd "$(git rev-parse --show-toplevel)"
 
 FJ="${FJ_BIN:-./target/release/fj}"
 TEST_REPO="${FJ_E2E_REPO:-stephen/fj-cli-test}"
+ADMIN="${FJ_E2E_ADMIN:-0}"
 
 run() {
   printf '  • %s\n' "$*"
@@ -49,10 +50,13 @@ echo "== labels / milestones =="
 run "$FJ" label list -R "$TEST_REPO"
 run "$FJ" milestone list -R "$TEST_REPO"
 
-echo "== branches / topics / protect =="
+echo "== branches / topics =="
 run "$FJ" repo branches "$TEST_REPO"
 run "$FJ" repo topics "$TEST_REPO"
-run "$FJ" protect list -R "$TEST_REPO"
+if [[ "$ADMIN" = "1" ]]; then
+  echo "== protect (admin) =="
+  run "$FJ" protect list -R "$TEST_REPO"
+fi
 
 echo "== actions =="
 run "$FJ" workflow list -R "$TEST_REPO"

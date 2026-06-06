@@ -67,8 +67,12 @@ docs/                  architecture, jq, gh-to-fj, faq, troubleshooting
 - `FJ_SKIP_PRECOMMIT=1` bypasses the fast hook for genuine emergencies only.
 - `FJ_E2E=1` enables the live API smoke against `stephen/fj-cli-test`.
   It read-exercises the command handlers that `COV_IGNORE` excludes from
-  unit coverage (label, milestone, protect, workflow, run, search, …), so
-  keep a read-only invocation there for any new excluded command surface.
+  unit coverage (label, milestone, workflow, run, search, …), so keep a
+  read-only invocation there for any new excluded command surface.
+  CI also runs this smoke against `rasterstate/fj` using `FJ_TOKEN` as an
+  ephemeral PAT fallback, which avoids keychain setup in containers.
+  Admin-only checks such as `fj protect list` are opt-in with
+  `FJ_E2E_ADMIN=1`.
 - `FJ_SKIP_PREPUSH=1` bypasses the hook for genuine emergencies only.
 
 ## Key conventions

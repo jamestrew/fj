@@ -13,6 +13,9 @@ The pre-commit hook runs quick preflight and fmt checks. The pre-push hook
 gates every push on secret preflight, fmt, clippy (warnings as errors), the
 full test suite, `cargo audit`, and a release build. Set `FJ_E2E=1` to
 additionally run the live API smoke (requires `fj auth login` already done).
+CI runs the same read-only live smoke against `rasterstate/fj` with an
+ephemeral `FJ_TOKEN`, so the normal PR gate covers command handlers that
+need a real Forgejo API.
 
 ## Workflow
 
@@ -33,7 +36,10 @@ additionally run the live API smoke (requires `fj auth login` already done).
   use a wiremock server. Construct test clients via
   `Client::for_base_url(base, token)`.
 - Live API tests live in `scripts/e2e-smoke.sh` and exercise read-only
-  operations against the configured Forgejo. Toggle with `FJ_E2E=1`.
+  operations against the configured Forgejo. Toggle locally with `FJ_E2E=1`.
+  In CI, `FJ_TOKEN` is used as an ephemeral PAT fallback so no keychain is
+  needed in the runner container. Admin-only coverage, such as branch
+  protection listing, is opt-in with `FJ_E2E_ADMIN=1`.
 
 ## Adding a subcommand
 

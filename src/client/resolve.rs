@@ -25,9 +25,15 @@ pub fn resolve(host_flag: Option<&str>) -> Result<ResolvedHost> {
         .cloned()
         .ok_or_else(|| anyhow!("host '{name}' not configured"))?;
     let token = match host_cfg.auth_kind {
-        AuthKind::Pat => auth::load_token(&name)?.ok_or_else(|| {
-            anyhow!("no token stored for host '{name}'. Run `fj auth login --host {name}`.")
-        })?,
+        AuthKind::Pat => match auth::env_token() {
+            Some(token) => token,
+            None => auth::load_token(&name)?.ok_or_else(|| {
+                anyhow!(
+                    "no token stored for host '{name}'. Run `fj auth login --host {name}` \
+                     or set FJ_TOKEN for this process."
+                )
+            })?,
+        },
         AuthKind::FjordAccount => {
             let fa = host_cfg.fjord_account.as_ref().ok_or_else(|| {
                 anyhow!(

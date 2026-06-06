@@ -44,6 +44,16 @@ pub fn load_token(host: &str) -> Result<Option<String>> {
     }
 }
 
+/// Return an ephemeral PAT from FJ_TOKEN when it is set to a non-empty value.
+/// This is intentionally process-scoped for scripted/CI use and avoids
+/// touching keychain services in headless containers.
+pub fn env_token() -> Option<String> {
+    std::env::var("FJ_TOKEN")
+        .ok()
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty())
+}
+
 pub fn delete_token(host: &str) -> Result<()> {
     let entry = entry(host)?;
     match entry.delete_credential() {
@@ -79,5 +89,15 @@ mod tests {
         assert!(k.contains("forgejo-site.pages.dev"));
         // Bare hostname keys and fjord keys can't collide.
         assert_ne!(k, "forgejo-site.pages.dev");
+    }
+
+    #[test]
+    fn env_token_trims_and_rejects_empty() {
+        std::env::set_var("FJ_TOKEN", "  abc  ");
+        assert_eq!(env_token().as_deref(), Some("abc"));
+        std::env::set_var("FJ_TOKEN", "   ");
+        assert_eq!(env_token(), None);
+        std::env::remove_var("FJ_TOKEN");
+        assert_eq!(env_token(), None);
     }
 }

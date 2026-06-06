@@ -226,7 +226,9 @@ async fn status(args: StatusArgs) -> Result<()> {
         };
         println!("{}{current_marker}", output::bold(name));
         let token_present = match host.auth_kind {
-            crate::config::hosts::AuthKind::Pat => token_store::load_token(name)?.is_some(),
+            crate::config::hosts::AuthKind::Pat => {
+                token_store::env_token().is_some() || token_store::load_token(name)?.is_some()
+            }
             crate::config::hosts::AuthKind::FjordAccount => host
                 .fjord_account
                 .as_ref()
@@ -267,7 +269,13 @@ async fn status(args: StatusArgs) -> Result<()> {
         println!(
             "  ✓ Token: {}",
             if token_present {
-                "present in keychain"
+                if matches!(host.auth_kind, crate::config::hosts::AuthKind::Pat)
+                    && token_store::env_token().is_some()
+                {
+                    "present in FJ_TOKEN"
+                } else {
+                    "present in keychain"
+                }
             } else {
                 "missing"
             }
@@ -281,7 +289,9 @@ async fn status(args: StatusArgs) -> Result<()> {
                 );
             } else {
                 let t = match host.auth_kind {
-                    crate::config::hosts::AuthKind::Pat => token_store::load_token(name)?,
+                    crate::config::hosts::AuthKind::Pat => {
+                        token_store::env_token().or(token_store::load_token(name)?)
+                    }
                     crate::config::hosts::AuthKind::FjordAccount => host
                         .fjord_account
                         .as_ref()
