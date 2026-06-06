@@ -18,6 +18,8 @@ use std::process::{Command, ExitCode};
 
 use clap::Parser;
 
+use crate::output::logo;
+
 #[tokio::main]
 async fn main() -> ExitCode {
     // Two pre-parse transformations, in order:
@@ -45,7 +47,10 @@ async fn main() -> ExitCode {
 }
 
 async fn run_cli(argv: Vec<String>) -> ExitCode {
-    let cli = cli::Cli::parse_from(argv);
+    let cli = match cli::Cli::try_parse_from(argv) {
+        Ok(cli) => cli,
+        Err(err) => return handle_parse_outcome(err),
+    };
     if let Err(err) = cli::run(cli).await {
         eprintln!("{} {err}", owo_colors::OwoColorize::red(&"error:"));
         let mut source = err.source();
@@ -56,6 +61,33 @@ async fn run_cli(argv: Vec<String>) -> ExitCode {
         return ExitCode::from(1);
     }
     ExitCode::SUCCESS
+}
+
+/// clap surfaces `--help`, `--version`, and the bare-`fj` help screen as
+/// `Err(..)` from `try_parse_from`. For those three (and only those), greet
+/// with the brand mark first, but only on an interactive stdout so piped
+/// `fj --help` / `fj --version` stay clean and parseable. Everything else is a
+/// real usage error: print it as clap formatted it and exit with its code.
+fn handle_parse_outcome(err: clap::Error) -> ExitCode {
+    use clap::error::ErrorKind;
+    use std::io::IsTerminal;
+
+    let show_logo = match err.kind() {
+        // `--version` always wears the mark: asking for the version is an
+        // explicit "show me fj" and we want it to read the same everywhere.
+        ErrorKind::DisplayVersion => true,
+        // The help screen (explicit `--help` or bare `fj`) only gets the mark
+        // on an interactive stdout, so piped help stays clean and parseable.
+        ErrorKind::DisplayHelp | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => {
+            std::io::stdout().is_terminal()
+        }
+        _ => false,
+    };
+    if show_logo {
+        print!("{}", logo::banner());
+    }
+    let _ = err.print();
+    ExitCode::from(err.exit_code() as u8)
 }
 
 /// Returns `Some(name)` if `argv[1]` is unrecognized by clap AND a `fj-<name>`

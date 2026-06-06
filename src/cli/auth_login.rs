@@ -65,7 +65,15 @@ fn prompt_login_mode() -> Result<LoginMode> {
 pub(crate) async fn login(args: LoginArgs) -> Result<()> {
     use std::io::IsTerminal;
     let mode = match resolve_login_mode(&args, std::io::stdin().is_terminal()) {
-        LoginMode::Prompt => prompt_login_mode()?,
+        LoginMode::Prompt => {
+            // The interactive first-run screen: greet with the brand mark
+            // above the sign-in menu. Gated on an interactive stdout so a
+            // redirected stream never collects the art.
+            if std::io::stdout().is_terminal() {
+                print!("{}", output::logo::banner());
+            }
+            prompt_login_mode()?
+        }
         concrete => concrete,
     };
     match mode {
