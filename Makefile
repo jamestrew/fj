@@ -20,7 +20,7 @@ SIGN_ID    ?= Developer ID Application: Raster & State LLC (62Y3FRM8PD)
 IDENTIFIER ?= fj-a88ab591fd97b299
 UNAME      := $(shell uname)
 
-.PHONY: build install man test lint coverage coverage-html coverage-strict coverage-strict-html release-preflight
+.PHONY: build install man test lint audit coverage coverage-html coverage-strict coverage-strict-html release-preflight
 
 # Files excluded from coverage so the number reflects what we actually
 # intend to unit-test, not glue we don't.
@@ -94,6 +94,9 @@ release-preflight:
 lint:
 	cargo clippy --all-targets --all-features -- -D warnings
 	cargo fmt --all -- --check
+
+audit:
+	cargo audit --ignore RUSTSEC-2024-0370 -D warnings
 
 # Line/region coverage over the surface we intend to unit-test (see
 # COV_IGNORE above). Needs cargo-llvm-cov: `cargo install cargo-llvm-cov`.

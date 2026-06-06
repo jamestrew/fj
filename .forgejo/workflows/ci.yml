@@ -45,6 +45,15 @@ jobs:
       - name: cargo test
         run: cargo test --all --locked --no-fail-fast
 
+      - name: install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: cargo audit
+        # RUSTSEC-2024-0370 is proc-macro-error being unmaintained. It is
+        # currently pulled transitively and tracked as known debt; new
+        # advisories, yanks, or warnings fail this gate.
+        run: cargo audit --ignore RUSTSEC-2024-0370 -D warnings
+
       - name: cargo build --release
         run: cargo build --release --locked
 

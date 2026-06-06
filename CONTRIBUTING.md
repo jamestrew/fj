@@ -5,20 +5,22 @@
 ```sh
 git clone ssh://git@rasterhub.com:2222/rasterstate/fj.git
 cd fj
-./scripts/install-hooks.sh         # symlinks hooks/pre-push into .git/hooks
+./scripts/install-hooks.sh         # symlinks repo hooks into .git/hooks
 cargo build --release              # 4 MB binary at target/release/fj
 ```
 
-The hook gates every push on fmt, clippy (warnings as errors), the full
-test suite, and a release build. Set `FJ_E2E=1` to additionally run the
-live API smoke (requires `fj auth login` already done).
+The pre-commit hook runs quick preflight and fmt checks. The pre-push hook
+gates every push on secret preflight, fmt, clippy (warnings as errors), the
+full test suite, `cargo audit`, and a release build. Set `FJ_E2E=1` to
+additionally run the live API smoke (requires `fj auth login` already done).
 
 ## Workflow
 
 1. Branch off `main`.
 2. Make changes. Keep commits focused.
 3. `cargo fmt --all` before committing.
-4. The pre-push hook runs the full bar; if it fails, fix the issue
+4. The pre-commit hook catches quick issues before the commit is created.
+5. The pre-push hook runs the full bar; if it fails, fix the issue
    rather than passing `FJ_SKIP_PREPUSH=1` unless you genuinely need
    to bypass.
 

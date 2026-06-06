@@ -29,6 +29,7 @@ src/
   output/              tables, colors, relative_time, state_pill, pager,
                        json_filter (--json-fields projection)
 .forgejo/workflows/    CI mirror of the pre-push hook
+hooks/pre-commit       fast local gate
 hooks/pre-push         local CI gate
 scripts/               install-hooks.sh, e2e-smoke.sh
 docs/                  architecture, jq, gh-to-fj, faq, troubleshooting
@@ -42,6 +43,10 @@ docs/                  architecture, jq, gh-to-fj, faq, troubleshooting
 - `cargo clippy --all-targets --all-features -- -D warnings` is the lint
   bar. Both the pre-push hook and `.forgejo/workflows/ci.yml` treat
   warnings as errors.
+- `cargo audit --ignore RUSTSEC-2024-0370 -D warnings` is the dependency
+  security gate. The ignored advisory is the known unmaintained
+  `proc-macro-error` transitive dependency; new warnings fail locally and
+  in CI.
 - `make coverage` reports line/region coverage (needs `cargo-llvm-cov`),
   scoped to the surface we intend to unit-test. The exclusion set lives
   in `COV_IGNORE` in the Makefile: entry/dispatch wiring, platform glue,
@@ -58,7 +63,8 @@ docs/                  architecture, jq, gh-to-fj, faq, troubleshooting
   handler, keep the attribute on it. CI enforces it: the `coverage` job in
   `.forgejo/workflows/ci.yml` runs `make coverage-strict COV_MIN=73`
   (raise the floor as coverage climbs).
-- `./scripts/install-hooks.sh` symlinks `hooks/pre-push` into `.git/hooks`.
+- `./scripts/install-hooks.sh` symlinks repo hooks into `.git/hooks`.
+- `FJ_SKIP_PRECOMMIT=1` bypasses the fast hook for genuine emergencies only.
 - `FJ_E2E=1` enables the live API smoke against `stephen/fj-cli-test`.
   It read-exercises the command handlers that `COV_IGNORE` excludes from
   unit coverage (label, milestone, protect, workflow, run, search, …), so

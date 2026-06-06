@@ -192,7 +192,7 @@ Run `fj --help` for the live list; every group has its own `--help`.
 git clone https://rasterhub.com/rasterstate/fj
 cd fj
 cargo build --release        # ~4 MB stripped binary at target/release/fj
-./scripts/install-hooks.sh   # pre-push gate: fmt, clippy -D warnings, tests, release build
+./scripts/install-hooks.sh   # local gates: fmt, clippy -D warnings, tests, audit, release build
 ```
 
 `make install` puts a signed copy on your PATH and installs the man pages.

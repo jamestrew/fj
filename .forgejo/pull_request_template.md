@@ -4,7 +4,8 @@ Thanks for the PR. Before you submit:
 1. `cargo fmt --all`
 2. `cargo clippy --all-targets --all-features -- -D warnings`
 3. `cargo test --all`
-4. If you added a new subcommand or API wrapper, see CONTRIBUTING.md
+4. `cargo audit --ignore RUSTSEC-2024-0370 -D warnings`
+5. If you added a new subcommand or API wrapper, see CONTRIBUTING.md
    for the walkthrough; also update README.md and docs/gh-to-fj.md if
    the user-facing surface changed.
 -->
@@ -27,6 +28,7 @@ should know about. Skippable for one-liners. -->
 - [ ] `cargo fmt --check`
 - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
 - [ ] `cargo test --all`
+- [ ] `cargo audit --ignore RUSTSEC-2024-0370 -D warnings`
 - [ ] New code has a test (or here's why not):
 
 ## Surface changes

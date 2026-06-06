@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# fj pre-commit hook - fast local gate.
+# Keep this quick: deeper checks live in hooks/pre-push and CI.
+
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+if [[ "${FJ_SKIP_PRECOMMIT:-0}" = "1" ]]; then
+  echo "fj pre-commit: skipped (FJ_SKIP_PRECOMMIT=1)"
+  exit 0
+fi
+
+export CARGO_TERM_COLOR=auto
+export CARGO_TERM_PROGRESS_WHEN=never
+
+step() {
+  printf '\n\033[1;34m== %s ==\033[0m\n' "$*" >&2
+}
+
+step "preflight quick (.env audit)"
+./scripts/preflight.sh --quick
+
+step "cargo fmt --check"
+cargo fmt --all -- --check
+
+printf '\n\033[1;32m✓ pre-commit checks passed\033[0m\n' >&2
