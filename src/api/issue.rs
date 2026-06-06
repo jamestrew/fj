@@ -91,7 +91,7 @@ pub async fn list(
     name: &str,
     opts: ListOptions<'_>,
 ) -> Result<Page<Issue>> {
-    let path = format!("/api/v1/repos/{owner}/{name}/issues");
+    let path = format!("{}/issues", crate::api::repo_path(owner, name));
     let mut query: Vec<(String, String)> = vec![
         ("state".into(), opts.state.as_str().into()),
         ("type".into(), "issues".into()),
@@ -117,7 +117,7 @@ pub async fn list(
 }
 
 pub async fn get(client: &Client, owner: &str, name: &str, number: u64) -> Result<Issue> {
-    let path = format!("/api/v1/repos/{owner}/{name}/issues/{number}");
+    let path = format!("{}/issues/{number}", crate::api::repo_path(owner, name));
     client.json(Method::GET, &path, &[], None::<&()>).await
 }
 
@@ -138,7 +138,7 @@ pub async fn create(
     name: &str,
     body: &CreateIssue<'_>,
 ) -> Result<Issue> {
-    let path = format!("/api/v1/repos/{owner}/{name}/issues");
+    let path = format!("{}/issues", crate::api::repo_path(owner, name));
     client.json(Method::POST, &path, &[], Some(body)).await
 }
 
@@ -159,7 +159,7 @@ pub async fn edit(
     number: u64,
     body: &EditIssue<'_>,
 ) -> Result<Issue> {
-    let path = format!("/api/v1/repos/{owner}/{name}/issues/{number}");
+    let path = format!("{}/issues/{number}", crate::api::repo_path(owner, name));
     client.json(Method::PATCH, &path, &[], Some(body)).await
 }
 
@@ -184,7 +184,10 @@ pub async fn comment(
     number: u64,
     body: &str,
 ) -> Result<Comment> {
-    let path = format!("/api/v1/repos/{owner}/{name}/issues/{number}/comments");
+    let path = format!(
+        "{}/issues/{number}/comments",
+        crate::api::repo_path(owner, name)
+    );
     let payload = CreateComment { body };
     client.json(Method::POST, &path, &[], Some(&payload)).await
 }
@@ -195,7 +198,10 @@ pub async fn list_comments(
     name: &str,
     number: u64,
 ) -> Result<Vec<Comment>> {
-    let path = format!("/api/v1/repos/{owner}/{name}/issues/{number}/comments");
+    let path = format!(
+        "{}/issues/{number}/comments",
+        crate::api::repo_path(owner, name)
+    );
     client.json(Method::GET, &path, &[], None::<&()>).await
 }
 
@@ -214,7 +220,10 @@ pub async fn edit_comment(
     comment_id: u64,
     body: &str,
 ) -> Result<Comment> {
-    let path = format!("/api/v1/repos/{owner}/{name}/issues/comments/{comment_id}");
+    let path = format!(
+        "{}/issues/comments/{comment_id}",
+        crate::api::repo_path(owner, name)
+    );
     client
         .json(Method::PATCH, &path, &[], Some(&EditComment { body }))
         .await
@@ -226,7 +235,10 @@ pub async fn delete_comment(
     name: &str,
     comment_id: u64,
 ) -> Result<()> {
-    let path = format!("/api/v1/repos/{owner}/{name}/issues/comments/{comment_id}");
+    let path = format!(
+        "{}/issues/comments/{comment_id}",
+        crate::api::repo_path(owner, name)
+    );
     let res = client.request(Method::DELETE, &path, &[], None).await?;
     res.error_for_status()?;
     Ok(())
@@ -234,7 +246,7 @@ pub async fn delete_comment(
 
 /// Permanently delete an issue. Requires admin on the repo.
 pub async fn delete(client: &Client, owner: &str, name: &str, number: u64) -> Result<()> {
-    let path = format!("/api/v1/repos/{owner}/{name}/issues/{number}");
+    let path = format!("{}/issues/{number}", crate::api::repo_path(owner, name));
     let res = client.request(Method::DELETE, &path, &[], None).await?;
     res.error_for_status()?;
     Ok(())
@@ -249,7 +261,7 @@ pub async fn set_pinned(
     number: u64,
     pinned: bool,
 ) -> Result<()> {
-    let path = format!("/api/v1/repos/{owner}/{name}/issues/{number}/pin");
+    let path = format!("{}/issues/{number}/pin", crate::api::repo_path(owner, name));
     let method = if pinned { Method::POST } else { Method::DELETE };
     let res = client.request(method, &path, &[], None).await?;
     res.error_for_status()?;

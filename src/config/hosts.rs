@@ -16,6 +16,10 @@ pub struct Host {
     /// Protocol used for git operations (`https` or `ssh`).
     #[serde(default = "default_git_protocol")]
     pub git_protocol: String,
+    /// Base URL of the Forgejo web origin for PAT-mode hosts. Defaults to
+    /// `https://<host key>` for older configs and simple hostname logins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_url: Option<String>,
     /// Optional API base path. Defaults to `/api/v1` when absent.
     pub api_base_path: Option<String>,
     /// How this host authenticates. `pat` (default) means the keychain
@@ -62,6 +66,10 @@ pub struct FjordAccount {
     /// can print it without re-fetching.
     pub default_instance_display_name: Option<String>,
     pub default_instance_slug: Option<String>,
+    /// Cached browser URL for the default instance. Used by `--web` shortcuts
+    /// that need the actual Forgejo origin rather than the Fjord platform URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_instance_public_url: Option<String>,
 }
 
 fn default_git_protocol() -> String {
@@ -162,6 +170,7 @@ mod tests {
         Host {
             user: Some(user.into()),
             git_protocol: "https".into(),
+            web_url: None,
             api_base_path: None,
             auth_kind: AuthKind::Pat,
             fjord_account: None,

@@ -406,9 +406,13 @@ async fn clone(args: CloneArgs, host: Option<&str>) -> Result<()> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn create(args: CreateArgs, host: Option<&str>) -> Result<()> {
     let client = Client::connect(host)?;
-    let (owner, name) = match args.repo.split_once('/') {
-        Some((o, n)) => (Some(o.to_string()), n.to_string()),
-        None => (None, args.repo.clone()),
+    let (owner, name) = match args.repo.matches('/').count() {
+        0 => (None, args.repo.clone()),
+        1 => {
+            let (o, n) = api::split_repo(&args.repo)?;
+            (Some(o.to_string()), n.to_string())
+        }
+        _ => return Err(anyhow!("expected '[owner/]name', got '{}'", args.repo)),
     };
     let body = api::repo::CreateRepo {
         name: &name,

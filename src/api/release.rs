@@ -33,7 +33,7 @@ pub struct Asset {
 }
 
 pub async fn list(client: &Client, owner: &str, name: &str, limit: u32) -> Result<Vec<Release>> {
-    let path = format!("/api/v1/repos/{owner}/{name}/releases");
+    let path = format!("{}/releases", crate::api::repo_path(owner, name));
     let query = vec![
         ("limit".into(), limit.clamp(1, 50).to_string()),
         ("page".into(), "1".into()),
@@ -42,7 +42,7 @@ pub async fn list(client: &Client, owner: &str, name: &str, limit: u32) -> Resul
 }
 
 pub async fn get_by_tag(client: &Client, owner: &str, name: &str, tag: &str) -> Result<Release> {
-    let path = format!("/api/v1/repos/{owner}/{name}/releases/tags/{tag}");
+    let path = format!("{}/releases/tags/{tag}", crate::api::repo_path(owner, name));
     client.json(Method::GET, &path, &[], None::<&()>).await
 }
 
@@ -67,7 +67,7 @@ pub async fn create(
     name: &str,
     body: &CreateRelease<'_>,
 ) -> Result<Release> {
-    let path = format!("/api/v1/repos/{owner}/{name}/releases");
+    let path = format!("{}/releases", crate::api::repo_path(owner, name));
     client.json(Method::POST, &path, &[], Some(body)).await
 }
 
@@ -92,12 +92,12 @@ pub async fn edit(
     id: u64,
     body: &EditRelease<'_>,
 ) -> Result<Release> {
-    let path = format!("/api/v1/repos/{owner}/{name}/releases/{id}");
+    let path = format!("{}/releases/{id}", crate::api::repo_path(owner, name));
     client.json(Method::PATCH, &path, &[], Some(body)).await
 }
 
 pub async fn delete(client: &Client, owner: &str, name: &str, id: u64) -> Result<()> {
-    let path = format!("/api/v1/repos/{owner}/{name}/releases/{id}");
+    let path = format!("{}/releases/{id}", crate::api::repo_path(owner, name));
     let res = client.request(Method::DELETE, &path, &[], None).await?;
     res.error_for_status()?;
     Ok(())
@@ -113,7 +113,8 @@ pub async fn upload_asset(
     bytes: Vec<u8>,
 ) -> Result<Asset> {
     let path = format!(
-        "/api/v1/repos/{owner}/{name}/releases/{release_id}/assets?name={}",
+        "{}/releases/{release_id}/assets?name={}",
+        crate::api::repo_path(owner, name),
         urlencode(asset_name)
     );
     // Build a multipart form with the file payload.
@@ -148,7 +149,10 @@ pub async fn delete_asset(
     release_id: u64,
     asset_id: u64,
 ) -> Result<()> {
-    let path = format!("/api/v1/repos/{owner}/{name}/releases/{release_id}/assets/{asset_id}");
+    let path = format!(
+        "{}/releases/{release_id}/assets/{asset_id}",
+        crate::api::repo_path(owner, name)
+    );
     let res = client.request(Method::DELETE, &path, &[], None).await?;
     res.error_for_status()?;
     Ok(())

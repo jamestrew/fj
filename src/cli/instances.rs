@@ -192,6 +192,7 @@ async fn use_instance(host_flag: Option<&str>, args: UseArgs) -> Result<()> {
     fa_mut.default_instance_id = Some(target.id.clone());
     fa_mut.default_instance_display_name = Some(target.display_name.clone());
     fa_mut.default_instance_slug = Some(target.slug.clone());
+    fa_mut.default_instance_public_url = target.public_url.clone();
     hosts.save()?;
 
     println!(

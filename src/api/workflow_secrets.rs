@@ -14,7 +14,7 @@ pub struct ActionSecret {
 }
 
 pub async fn list_secrets(client: &Client, owner: &str, name: &str) -> Result<Vec<ActionSecret>> {
-    let path = format!("/api/v1/repos/{owner}/{name}/actions/secrets");
+    let path = format!("{}/actions/secrets", crate::api::repo_path(owner, name));
     #[derive(Deserialize)]
     struct Envelope {
         #[serde(default)]
@@ -36,7 +36,10 @@ pub async fn set_secret(
     secret_name: &str,
     value: &str,
 ) -> Result<()> {
-    let path = format!("/api/v1/repos/{owner}/{name}/actions/secrets/{secret_name}");
+    let path = format!(
+        "{}/actions/secrets/{secret_name}",
+        crate::api::repo_path(owner, name)
+    );
     let res = client
         .request(
             Method::PUT,
@@ -55,7 +58,10 @@ pub async fn delete_secret(
     name: &str,
     secret_name: &str,
 ) -> Result<()> {
-    let path = format!("/api/v1/repos/{owner}/{name}/actions/secrets/{secret_name}");
+    let path = format!(
+        "{}/actions/secrets/{secret_name}",
+        crate::api::repo_path(owner, name)
+    );
     let res = client.request(Method::DELETE, &path, &[], None).await?;
     res.error_for_status()?;
     Ok(())
@@ -72,7 +78,7 @@ pub async fn list_variables(
     owner: &str,
     name: &str,
 ) -> Result<Vec<ActionVariable>> {
-    let path = format!("/api/v1/repos/{owner}/{name}/actions/variables");
+    let path = format!("{}/actions/variables", crate::api::repo_path(owner, name));
     #[derive(Deserialize)]
     struct Envelope {
         #[serde(default)]
@@ -89,7 +95,10 @@ pub async fn set_variable(
     var_name: &str,
     value: &str,
 ) -> Result<()> {
-    let path = format!("/api/v1/repos/{owner}/{name}/actions/variables/{var_name}");
+    let path = format!(
+        "{}/actions/variables/{var_name}",
+        crate::api::repo_path(owner, name)
+    );
     let res = client
         .request(
             Method::PUT,
@@ -108,7 +117,10 @@ pub async fn delete_variable(
     name: &str,
     var_name: &str,
 ) -> Result<()> {
-    let path = format!("/api/v1/repos/{owner}/{name}/actions/variables/{var_name}");
+    let path = format!(
+        "{}/actions/variables/{var_name}",
+        crate::api::repo_path(owner, name)
+    );
     let res = client.request(Method::DELETE, &path, &[], None).await?;
     res.error_for_status()?;
     Ok(())

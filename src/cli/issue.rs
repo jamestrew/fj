@@ -3,7 +3,7 @@ use clap::{Args, Subcommand, ValueEnum};
 
 use crate::api;
 use crate::api::issue::{CreateIssue, EditIssue, ListOptions, State};
-use crate::cli::context::{resolve_repo, RepoFlag};
+use crate::cli::context::{repo_web_url, resolve_repo, RepoFlag};
 use crate::cli::issue_comment::{self, CommentArgs, DeleteCommentArgs, EditCommentArgs};
 use crate::output;
 
@@ -201,10 +201,7 @@ pub async fn run(cmd: IssueCmd, host: Option<&str>) -> Result<()> {
 async fn list(args: ListArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     if args.web {
-        return web::open(&format!(
-            "https://{}/{}/{}/issues",
-            ctx.host, ctx.owner, ctx.name
-        ));
+        return web::open(&repo_web_url(&ctx, "issues")?);
     }
     let opts = ListOptions {
         state: args.state.into(),

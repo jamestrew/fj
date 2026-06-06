@@ -5,7 +5,7 @@ use clap::{Args, Subcommand};
 
 use crate::api;
 use crate::api::pull::{CreatePull, EditPull, ListOptions};
-use crate::cli::context::{resolve_repo, RepoFlag};
+use crate::cli::context::{repo_web_url, resolve_repo, RepoFlag};
 use crate::cli::pr_args::{MergeStyleArg, ReviewEventArg, StateFilter, UpdateStyle};
 use crate::cli::pr_status::StatusArgs;
 use crate::cli::{pr_inspect, pr_review, pr_status};
@@ -261,10 +261,7 @@ pub async fn run(cmd: PrCmd, host: Option<&str>) -> Result<()> {
 async fn list(args: ListArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     if args.web {
-        return web::open(&format!(
-            "https://{}/{}/{}/pulls",
-            ctx.host, ctx.owner, ctx.name
-        ));
+        return web::open(&repo_web_url(&ctx, "pulls")?);
     }
     let page = api::pull::list(
         &ctx.client,

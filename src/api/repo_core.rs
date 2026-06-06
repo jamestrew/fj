@@ -92,7 +92,7 @@ struct SearchResponse {
 pub type SearchHit = Repo;
 
 pub async fn get(client: &Client, owner: &str, name: &str) -> Result<Repo> {
-    let path = format!("/api/v1/repos/{owner}/{name}");
+    let path = crate::api::repo_path(owner, name);
     client.json(Method::GET, &path, &[], None::<&()>).await
 }
 
@@ -135,12 +135,12 @@ pub struct EditRepo<'a> {
 }
 
 pub async fn edit(client: &Client, owner: &str, name: &str, body: &EditRepo<'_>) -> Result<Repo> {
-    let path = format!("/api/v1/repos/{owner}/{name}");
+    let path = crate::api::repo_path(owner, name);
     client.json(Method::PATCH, &path, &[], Some(body)).await
 }
 
 pub async fn delete(client: &Client, owner: &str, name: &str) -> Result<()> {
-    let path = format!("/api/v1/repos/{owner}/{name}");
+    let path = crate::api::repo_path(owner, name);
     let res = client.request(Method::DELETE, &path, &[], None).await?;
     res.error_for_status()?;
     Ok(())
@@ -161,7 +161,7 @@ pub async fn fork(
     organization: Option<&str>,
     new_name: Option<&str>,
 ) -> Result<Repo> {
-    let path = format!("/api/v1/repos/{owner}/{name}/forks");
+    let path = format!("{}/forks", crate::api::repo_path(owner, name));
     client
         .json(
             Method::POST,
@@ -177,7 +177,7 @@ pub async fn fork(
 
 pub async fn rename(client: &Client, owner: &str, name: &str, new_name: &str) -> Result<()> {
     // Forgejo: PATCH /repos/{owner}/{name} with `name` field.
-    let path = format!("/api/v1/repos/{owner}/{name}");
+    let path = crate::api::repo_path(owner, name);
     #[derive(Serialize)]
     struct Body<'a> {
         name: &'a str,
@@ -205,7 +205,7 @@ pub async fn sync_with_upstream(
     name: &str,
     branch: &str,
 ) -> Result<()> {
-    let path = format!("/api/v1/repos/{owner}/{name}/merge-upstream");
+    let path = format!("{}/merge-upstream", crate::api::repo_path(owner, name));
     let res = client
         .request(
             Method::POST,
@@ -244,7 +244,7 @@ pub struct BranchCommit {
 }
 
 pub async fn list_branches(client: &Client, owner: &str, name: &str) -> Result<Vec<Branch>> {
-    let path = format!("/api/v1/repos/{owner}/{name}/branches");
+    let path = format!("{}/branches", crate::api::repo_path(owner, name));
     client.json(Method::GET, &path, &[], None::<&()>).await
 }
 
@@ -255,13 +255,13 @@ pub struct Topic {
 }
 
 pub async fn list_topics(client: &Client, owner: &str, name: &str) -> Result<Vec<String>> {
-    let path = format!("/api/v1/repos/{owner}/{name}/topics");
+    let path = format!("{}/topics", crate::api::repo_path(owner, name));
     let t: Topic = client.json(Method::GET, &path, &[], None::<&()>).await?;
     Ok(t.topics)
 }
 
 pub async fn set_topics(client: &Client, owner: &str, name: &str, topics: &[String]) -> Result<()> {
-    let path = format!("/api/v1/repos/{owner}/{name}/topics");
+    let path = format!("{}/topics", crate::api::repo_path(owner, name));
     let res = client
         .request(
             Method::PUT,
@@ -306,7 +306,7 @@ pub async fn migrate(client: &Client, body: &Migrate<'_>) -> Result<Repo> {
 }
 
 pub async fn mirror_sync(client: &Client, owner: &str, name: &str) -> Result<()> {
-    let path = format!("/api/v1/repos/{owner}/{name}/mirror-sync");
+    let path = format!("{}/mirror-sync", crate::api::repo_path(owner, name));
     let res = client.request(Method::POST, &path, &[], None).await?;
     res.error_for_status()?;
     Ok(())

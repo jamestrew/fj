@@ -22,12 +22,12 @@ pub struct Subscription {
 
 #[allow(dead_code)]
 pub async fn get_subscription(client: &Client, owner: &str, name: &str) -> Result<Subscription> {
-    let path = format!("/api/v1/repos/{owner}/{name}/subscription");
+    let path = format!("{}/subscription", crate::api::repo_path(owner, name));
     client.json(Method::GET, &path, &[], None::<&()>).await
 }
 
 pub async fn watch(client: &Client, owner: &str, name: &str) -> Result<Subscription> {
-    let path = format!("/api/v1/repos/{owner}/{name}/subscription");
+    let path = format!("{}/subscription", crate::api::repo_path(owner, name));
     client
         .json(
             Method::PUT,
@@ -39,7 +39,7 @@ pub async fn watch(client: &Client, owner: &str, name: &str) -> Result<Subscript
 }
 
 pub async fn unwatch(client: &Client, owner: &str, name: &str) -> Result<()> {
-    let path = format!("/api/v1/repos/{owner}/{name}/subscription");
+    let path = format!("{}/subscription", crate::api::repo_path(owner, name));
     let res = client.request(Method::DELETE, &path, &[], None).await?;
     res.error_for_status()?;
     Ok(())

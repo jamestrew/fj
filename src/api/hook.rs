@@ -20,7 +20,7 @@ pub struct Hook {
 }
 
 pub async fn list(client: &Client, owner: &str, name: &str) -> Result<Vec<Hook>> {
-    let path = format!("/api/v1/repos/{owner}/{name}/hooks");
+    let path = format!("{}/hooks", crate::api::repo_path(owner, name));
     client.json(Method::GET, &path, &[], None::<&()>).await
 }
 
@@ -39,19 +39,19 @@ pub async fn create(
     name: &str,
     body: &CreateHook<'_>,
 ) -> Result<Hook> {
-    let path = format!("/api/v1/repos/{owner}/{name}/hooks");
+    let path = format!("{}/hooks", crate::api::repo_path(owner, name));
     client.json(Method::POST, &path, &[], Some(body)).await
 }
 
 pub async fn delete(client: &Client, owner: &str, name: &str, id: u64) -> Result<()> {
-    let path = format!("/api/v1/repos/{owner}/{name}/hooks/{id}");
+    let path = format!("{}/hooks/{id}", crate::api::repo_path(owner, name));
     let res = client.request(Method::DELETE, &path, &[], None).await?;
     res.error_for_status()?;
     Ok(())
 }
 
 pub async fn test(client: &Client, owner: &str, name: &str, id: u64) -> Result<()> {
-    let path = format!("/api/v1/repos/{owner}/{name}/hooks/{id}/tests");
+    let path = format!("{}/hooks/{id}/tests", crate::api::repo_path(owner, name));
     let res = client.request(Method::POST, &path, &[], None).await?;
     res.error_for_status()?;
     Ok(())

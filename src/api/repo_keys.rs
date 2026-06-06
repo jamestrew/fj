@@ -20,7 +20,7 @@ pub struct DeployKey {
 }
 
 pub async fn list_keys(client: &Client, owner: &str, name: &str) -> Result<Vec<DeployKey>> {
-    let path = format!("/api/v1/repos/{owner}/{name}/keys");
+    let path = format!("{}/keys", crate::api::repo_path(owner, name));
     client.json(Method::GET, &path, &[], None::<&()>).await
 }
 
@@ -39,7 +39,7 @@ pub async fn add_key(
     key: &str,
     read_only: bool,
 ) -> Result<DeployKey> {
-    let path = format!("/api/v1/repos/{owner}/{name}/keys");
+    let path = format!("{}/keys", crate::api::repo_path(owner, name));
     let body = AddKeyBody {
         title,
         key,
@@ -49,7 +49,7 @@ pub async fn add_key(
 }
 
 pub async fn delete_key(client: &Client, owner: &str, name: &str, id: u64) -> Result<()> {
-    let path = format!("/api/v1/repos/{owner}/{name}/keys/{id}");
+    let path = format!("{}/keys/{id}", crate::api::repo_path(owner, name));
     let res = client.request(Method::DELETE, &path, &[], None).await?;
     res.error_for_status()?;
     Ok(())

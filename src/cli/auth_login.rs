@@ -76,11 +76,11 @@ pub(crate) async fn login(args: LoginArgs) -> Result<()> {
 }
 
 async fn login_pat(args: LoginArgs) -> Result<()> {
-    let hostname = match args.host.clone() {
+    let host_input = match args.host.clone() {
         Some(h) => h,
         None => prompt_hostname()?,
     };
-    let hostname = hostname.trim().to_string();
+    let (hostname, web_url) = normalize_pat_host(&host_input)?;
     if hostname.is_empty() {
         return Err(anyhow!("hostname is required"));
     }
@@ -96,6 +96,7 @@ async fn login_pat(args: LoginArgs) -> Result<()> {
     let provisional = Host {
         user: None,
         git_protocol: git_protocol.clone(),
+        web_url: web_url.clone(),
         api_base_path: None,
         auth_kind: crate::config::hosts::AuthKind::Pat,
         fjord_account: None,
@@ -117,6 +118,7 @@ async fn login_pat(args: LoginArgs) -> Result<()> {
     let host = Host {
         user: Some(me.login.clone()),
         git_protocol,
+        web_url,
         api_base_path: None,
         auth_kind: crate::config::hosts::AuthKind::Pat,
         fjord_account: None,
@@ -214,6 +216,7 @@ async fn login_fjord(args: LoginArgs) -> Result<()> {
     let host_entry = Host {
         user: Some(user_email.clone()),
         git_protocol: args.git_protocol.clone(),
+        web_url: None,
         api_base_path: None,
         auth_kind: AuthKind::FjordAccount,
         fjord_account: Some(FjordAccount {
@@ -221,6 +224,7 @@ async fn login_fjord(args: LoginArgs) -> Result<()> {
             default_instance_id: None,
             default_instance_display_name: None,
             default_instance_slug: None,
+            default_instance_public_url: None,
         }),
     };
     hosts.upsert(&platform_url, host_entry);
@@ -343,10 +347,57 @@ fn read_token(args: &LoginArgs) -> Result<String> {
 }
 
 fn prompt_hostname() -> Result<String> {
-    eprint!("Hostname (e.g. rasterhub.com): ");
+    eprint!("Hostname or URL (e.g. rasterhub.com or http://localhost:3000): ");
     use std::io::{stderr, stdin, Write};
     stderr().flush().ok();
     let mut buf = String::new();
     stdin().read_line(&mut buf).context("reading hostname")?;
     Ok(buf)
+}
+
+fn normalize_pat_host(raw: &str) -> Result<(String, Option<String>)> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err(anyhow!("hostname is required"));
+    }
+
+    let parse_candidate = if trimmed.contains("://") {
+        Some(trimmed.to_string())
+    } else if trimmed.contains('/') {
+        Some(format!("https://{trimmed}"))
+    } else {
+        None
+    };
+
+    let Some(candidate) = parse_candidate else {
+        return Ok((trimmed.to_string(), None));
+    };
+
+    let parsed =
+        url::Url::parse(&candidate).with_context(|| format!("invalid Forgejo host URL '{raw}'"))?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        other => {
+            return Err(anyhow!(
+                "Forgejo host URL must be http or https, got '{other}'"
+            ))
+        }
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow!("Forgejo host URL '{raw}' has no host"))?;
+    let mut key = host.to_string();
+    if let Some(port) = parsed.port() {
+        key.push(':');
+        key.push_str(&port.to_string());
+    }
+    let path = parsed.path().trim_end_matches('/');
+    if !path.is_empty() && path != "/" {
+        key.push_str(path);
+    }
+    let mut web = parsed;
+    web.set_query(None);
+    web.set_fragment(None);
+    let normalized = web.as_str().trim_end_matches('/').to_string();
+    Ok((key, Some(normalized)))
 }

@@ -26,9 +26,21 @@ use anyhow::{anyhow, Result};
 
 /// Split an `owner/name` slug. Returns a helpful error if the form is wrong.
 pub fn split_repo(repo: &str) -> Result<(&str, &str)> {
-    repo.split_once('/')
-        .filter(|(o, n)| !o.is_empty() && !n.is_empty())
-        .ok_or_else(|| anyhow!("expected '<owner>/<name>', got '{repo}'"))
+    let mut parts = repo.split('/');
+    let owner = parts.next().unwrap_or_default();
+    let name = parts.next().unwrap_or_default();
+    if owner.is_empty() || name.is_empty() || parts.next().is_some() {
+        return Err(anyhow!("expected '<owner>/<name>', got '{repo}'"));
+    }
+    Ok((owner, name))
+}
+
+pub fn repo_path(owner: &str, name: &str) -> String {
+    format!(
+        "/api/v1/repos/{}/{}",
+        urlencode_path_segment(owner),
+        urlencode_path_segment(name)
+    )
 }
 
 /// Percent-encode a string for use as a single URL path segment. Keeps the
@@ -70,5 +82,18 @@ mod tests {
     #[test]
     fn rejects_empty_name() {
         assert!(split_repo("rasterstate/").is_err());
+    }
+
+    #[test]
+    fn rejects_deep_repo_slug() {
+        assert!(split_repo("rasterstate/fj/extra").is_err());
+    }
+
+    #[test]
+    fn repo_path_encodes_owner_and_name_segments() {
+        assert_eq!(
+            repo_path("space owner", "repo/name"),
+            "/api/v1/repos/space%20owner/repo%2Fname"
+        );
     }
 }

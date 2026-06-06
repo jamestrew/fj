@@ -53,10 +53,12 @@ pub(crate) async fn mirror(args: MirrorArgs, host: Option<&str>) -> Result<()> {
     let client = Client::connect(host)?;
     let me = api::user::current(&client).await?;
     let (dest_owner, dest_name) = match args.dest.as_deref() {
-        Some(slug) => match slug.split_once('/') {
-            Some((o, n)) => (o.to_string(), n.to_string()),
-            None => (me.login.clone(), slug.to_string()),
-        },
+        Some(slug) if slug.matches('/').count() == 0 => (me.login.clone(), slug.to_string()),
+        Some(slug) if slug.matches('/').count() == 1 => {
+            let (o, n) = api::split_repo(slug)?;
+            (o.to_string(), n.to_string())
+        }
+        Some(slug) => return Err(anyhow!("expected '[owner/]name', got '{slug}'")),
         None => {
             let basename = std::path::Path::new(&args.source_url)
                 .file_stem()

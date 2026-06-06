@@ -5,7 +5,7 @@ pub mod pagination;
 mod resolve;
 
 use resolve::build_base_url;
-pub use resolve::{resolve, ResolvedHost};
+pub use resolve::{resolve, web_base_url, ResolvedHost};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;

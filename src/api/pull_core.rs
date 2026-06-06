@@ -120,7 +120,7 @@ pub async fn list(
     name: &str,
     opts: ListOptions,
 ) -> Result<Page<Pull>> {
-    let path = format!("/api/v1/repos/{owner}/{name}/pulls");
+    let path = format!("{}/pulls", crate::api::repo_path(owner, name));
     // When the caller wants more than the API's per-page cap, transparently
     // follow Link rel=next.
     if opts.limit > 50 {
@@ -139,7 +139,7 @@ pub async fn list(
 }
 
 pub async fn get(client: &Client, owner: &str, name: &str, number: u64) -> Result<Pull> {
-    let path = format!("/api/v1/repos/{owner}/{name}/pulls/{number}");
+    let path = format!("{}/pulls/{number}", crate::api::repo_path(owner, name));
     client.json(Method::GET, &path, &[], None::<&()>).await
 }
 
@@ -160,7 +160,7 @@ pub async fn create(
     name: &str,
     body: &CreatePull<'_>,
 ) -> Result<Pull> {
-    let path = format!("/api/v1/repos/{owner}/{name}/pulls");
+    let path = format!("{}/pulls", crate::api::repo_path(owner, name));
     client.json(Method::POST, &path, &[], Some(body)).await
 }
 
@@ -185,13 +185,13 @@ pub async fn edit(
     number: u64,
     body: &EditPull<'_>,
 ) -> Result<Pull> {
-    let path = format!("/api/v1/repos/{owner}/{name}/pulls/{number}");
+    let path = format!("{}/pulls/{number}", crate::api::repo_path(owner, name));
     client.json(Method::PATCH, &path, &[], Some(body)).await
 }
 
 /// Convert a draft PR to ready-for-review.
 pub async fn ready(client: &Client, owner: &str, name: &str, number: u64) -> Result<()> {
-    let path = format!("/api/v1/repos/{owner}/{name}/pulls/{number}");
+    let path = format!("{}/pulls/{number}", crate::api::repo_path(owner, name));
     // Forgejo accepts `allow_maintainer_edit` and the toggle for `draft` via
     // PATCH; the more reliable form is the dedicated endpoint when present,
     // but PATCH with `{ "draft": false }` works on 7.x.
@@ -215,7 +215,10 @@ pub async fn update_branch(
     number: u64,
     style: &str,
 ) -> Result<()> {
-    let path = format!("/api/v1/repos/{owner}/{name}/pulls/{number}/update");
+    let path = format!(
+        "{}/pulls/{number}/update",
+        crate::api::repo_path(owner, name)
+    );
     let q = vec![("style".to_string(), style.to_string())];
     let res = client.request(Method::POST, &path, &q, None).await?;
     res.error_for_status()?;
@@ -223,18 +226,24 @@ pub async fn update_branch(
 }
 
 pub async fn files(client: &Client, owner: &str, name: &str, number: u64) -> Result<Vec<PullFile>> {
-    let path = format!("/api/v1/repos/{owner}/{name}/pulls/{number}/files");
+    let path = format!(
+        "{}/pulls/{number}/files",
+        crate::api::repo_path(owner, name)
+    );
     client.json(Method::GET, &path, &[], None::<&()>).await
 }
 
 pub async fn commits(client: &Client, owner: &str, name: &str, number: u64) -> Result<Vec<Commit>> {
-    let path = format!("/api/v1/repos/{owner}/{name}/pulls/{number}/commits");
+    let path = format!(
+        "{}/pulls/{number}/commits",
+        crate::api::repo_path(owner, name)
+    );
     client.json(Method::GET, &path, &[], None::<&()>).await
 }
 
 /// Raw unified diff for a PR.
 pub async fn diff_text(client: &Client, owner: &str, name: &str, number: u64) -> Result<String> {
-    let path = format!("/api/v1/repos/{owner}/{name}/pulls/{number}.diff");
+    let path = format!("{}/pulls/{number}.diff", crate::api::repo_path(owner, name));
     let res = client.request(Method::GET, &path, &[], None).await?;
     let res = res.error_for_status()?;
     Ok(res.text().await?)
@@ -288,7 +297,10 @@ pub async fn merge(
     style: MergeStyle,
     opts: &MergeOptions<'_>,
 ) -> Result<()> {
-    let path = format!("/api/v1/repos/{owner}/{name}/pulls/{number}/merge");
+    let path = format!(
+        "{}/pulls/{number}/merge",
+        crate::api::repo_path(owner, name)
+    );
     let body = MergeBody {
         do_: style.as_str(),
         title: opts.title,

@@ -5,7 +5,7 @@ use clap::{Args, Subcommand};
 
 use crate::api;
 use crate::api::release::{CreateRelease, EditRelease};
-use crate::cli::context::{resolve_repo, RepoFlag};
+use crate::cli::context::{repo_web_url, resolve_repo, RepoFlag};
 use crate::output;
 
 use super::editor;
@@ -181,10 +181,7 @@ pub async fn run(cmd: ReleaseCmd, host: Option<&str>) -> Result<()> {
 async fn list(args: ListArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     if args.web {
-        return web::open(&format!(
-            "https://{}/{}/{}/releases",
-            ctx.host, ctx.owner, ctx.name
-        ));
+        return web::open(&repo_web_url(&ctx, "releases")?);
     }
     let items = api::release::list(&ctx.client, &ctx.owner, &ctx.name, args.limit).await?;
     if args.json {

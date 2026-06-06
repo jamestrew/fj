@@ -25,7 +25,7 @@ pub struct EditLabel<'a> {
 }
 
 pub async fn list(client: &Client, owner: &str, name: &str) -> Result<Vec<Label>> {
-    let path = format!("/api/v1/repos/{owner}/{name}/labels");
+    let path = format!("{}/labels", crate::api::repo_path(owner, name));
     client.json(Method::GET, &path, &[], None::<&()>).await
 }
 
@@ -35,7 +35,7 @@ pub async fn create(
     name: &str,
     body: &CreateLabel<'_>,
 ) -> Result<Label> {
-    let path = format!("/api/v1/repos/{owner}/{name}/labels");
+    let path = format!("{}/labels", crate::api::repo_path(owner, name));
     client.json(Method::POST, &path, &[], Some(body)).await
 }
 
@@ -46,12 +46,12 @@ pub async fn edit(
     id: u64,
     body: &EditLabel<'_>,
 ) -> Result<Label> {
-    let path = format!("/api/v1/repos/{owner}/{name}/labels/{id}");
+    let path = format!("{}/labels/{id}", crate::api::repo_path(owner, name));
     client.json(Method::PATCH, &path, &[], Some(body)).await
 }
 
 pub async fn delete(client: &Client, owner: &str, name: &str, id: u64) -> Result<()> {
-    let path = format!("/api/v1/repos/{owner}/{name}/labels/{id}");
+    let path = format!("{}/labels/{id}", crate::api::repo_path(owner, name));
     let res = client.request(Method::DELETE, &path, &[], None).await?;
     res.error_for_status()?;
     Ok(())
@@ -71,7 +71,10 @@ pub async fn add_to_issue(
     number: u64,
     label_ids: Vec<u64>,
 ) -> Result<Vec<Label>> {
-    let path = format!("/api/v1/repos/{owner}/{name}/issues/{number}/labels");
+    let path = format!(
+        "{}/issues/{number}/labels",
+        crate::api::repo_path(owner, name)
+    );
     client
         .json(
             Method::POST,
@@ -90,7 +93,10 @@ pub async fn remove_from_issue(
     number: u64,
     label_id: u64,
 ) -> Result<()> {
-    let path = format!("/api/v1/repos/{owner}/{name}/issues/{number}/labels/{label_id}");
+    let path = format!(
+        "{}/issues/{number}/labels/{label_id}",
+        crate::api::repo_path(owner, name)
+    );
     let res = client.request(Method::DELETE, &path, &[], None).await?;
     res.error_for_status()?;
     Ok(())

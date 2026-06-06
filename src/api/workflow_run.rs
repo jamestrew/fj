@@ -60,7 +60,7 @@ pub async fn list_runs(
     name: &str,
     limit: u32,
 ) -> Result<Vec<WorkflowRun>> {
-    let path = format!("/api/v1/repos/{owner}/{name}/actions/runs");
+    let path = format!("{}/actions/runs", crate::api::repo_path(owner, name));
     // Forgejo's actions/runs endpoint ignores `limit` unless `page` is also
     // present; without it the server returns every run regardless of `-L`.
     let q = vec![
@@ -90,7 +90,10 @@ pub async fn dispatch(
     ref_: &str,
     inputs: std::collections::BTreeMap<String, String>,
 ) -> Result<()> {
-    let path = format!("/api/v1/repos/{owner}/{name}/actions/workflows/{workflow}/dispatches");
+    let path = format!(
+        "{}/actions/workflows/{workflow}/dispatches",
+        crate::api::repo_path(owner, name)
+    );
     let body = DispatchBody { ref_, inputs };
     let res = client
         .request(Method::POST, &path, &[], Some(&serde_json::to_value(body)?))
@@ -209,7 +212,7 @@ pub async fn list_workflows(client: &Client, owner: &str, name: &str) -> Result<
     }
     let mut out: Vec<WorkflowFile> = Vec::new();
     for dir in [".forgejo/workflows", ".github/workflows"] {
-        let path = format!("/api/v1/repos/{owner}/{name}/contents/{dir}");
+        let path = format!("{}/contents/{dir}", crate::api::repo_path(owner, name));
         let res = client.request(Method::GET, &path, &[], None).await?;
         if !res.status().is_success() {
             // Missing directory -> 404; just skip it.

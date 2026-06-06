@@ -38,6 +38,9 @@ pub async fn combined_status(
     name: &str,
     sha: &str,
 ) -> Result<CombinedStatus> {
-    let path = format!("/api/v1/repos/{owner}/{name}/commits/{sha}/status");
+    let path = format!(
+        "{}/commits/{sha}/status",
+        crate::api::repo_path(owner, name)
+    );
     client.json(Method::GET, &path, &[], None::<&()>).await
 }

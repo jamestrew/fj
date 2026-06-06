@@ -4,11 +4,12 @@
 //! `--host`. When `-R` is omitted, we infer the repo from the current
 //! directory's git remotes, preferring `upstream` then `origin`.
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::Args;
+use url::Url;
 
 use crate::api;
-use crate::client::Client;
+use crate::client::{web_base_url, Client};
 use crate::config::hosts::Hosts;
 use crate::git;
 
@@ -27,6 +28,7 @@ pub struct RepoFlag {
 pub struct RepoContext {
     pub client: Client,
     pub host: String,
+    pub web_base: Option<Url>,
     pub owner: String,
     pub name: String,
 }
@@ -105,13 +107,37 @@ pub fn resolve_repo(
 
     let client = Client::connect(client_host.as_deref())?;
     let host = client_host.unwrap_or_else(|| client.host().to_string());
+    let web_base = Hosts::load().ok().and_then(|hosts| {
+        hosts
+            .hosts
+            .get(&host)
+            .and_then(|cfg| web_base_url(&host, cfg).ok().flatten())
+    });
 
     Ok(RepoContext {
         client,
         host,
+        web_base,
         owner,
         name,
     })
+}
+
+pub fn repo_web_url(ctx: &RepoContext, tail: &str) -> Result<String> {
+    let base = ctx.web_base.as_ref().ok_or_else(|| {
+        anyhow!(
+            "could not determine the Forgejo web URL for host '{}'. \
+             For Fjord Account hosts, run `fj instances use <id>` first.",
+            ctx.host
+        )
+    })?;
+    let path = format!(
+        "{}/{}/{}",
+        api::urlencode_path_segment(&ctx.owner),
+        api::urlencode_path_segment(&ctx.name),
+        tail.trim_start_matches('/')
+    );
+    Ok(base.join(&path)?.to_string())
 }
 
 #[cfg(test)]

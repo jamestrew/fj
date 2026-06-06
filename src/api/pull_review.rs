@@ -53,7 +53,10 @@ pub async fn submit_review(
     event: ReviewEvent,
     body: Option<&str>,
 ) -> Result<Review> {
-    let path = format!("/api/v1/repos/{owner}/{name}/pulls/{number}/reviews");
+    let path = format!(
+        "{}/pulls/{number}/reviews",
+        crate::api::repo_path(owner, name)
+    );
     client
         .json(
             Method::POST,
@@ -81,7 +84,10 @@ pub async fn request_reviewers(
     number: u64,
     reviewers: Vec<String>,
 ) -> Result<()> {
-    let path = format!("/api/v1/repos/{owner}/{name}/pulls/{number}/requested_reviewers");
+    let path = format!(
+        "{}/pulls/{number}/requested_reviewers",
+        crate::api::repo_path(owner, name)
+    );
     let res = client
         .request(
             Method::POST,
@@ -101,7 +107,10 @@ pub async fn unrequest_reviewers(
     number: u64,
     reviewers: Vec<String>,
 ) -> Result<()> {
-    let path = format!("/api/v1/repos/{owner}/{name}/pulls/{number}/requested_reviewers");
+    let path = format!(
+        "{}/pulls/{number}/requested_reviewers",
+        crate::api::repo_path(owner, name)
+    );
     let res = client
         .request(
             Method::DELETE,
@@ -120,7 +129,10 @@ pub async fn list_reviews(
     name: &str,
     number: u64,
 ) -> Result<Vec<Review>> {
-    let path = format!("/api/v1/repos/{owner}/{name}/pulls/{number}/reviews");
+    let path = format!(
+        "{}/pulls/{number}/reviews",
+        crate::api::repo_path(owner, name)
+    );
     client.json(Method::GET, &path, &[], None::<&()>).await
 }
 

@@ -25,13 +25,13 @@ pub struct Milestone {
 }
 
 pub async fn list(client: &Client, owner: &str, name: &str, state: &str) -> Result<Vec<Milestone>> {
-    let path = format!("/api/v1/repos/{owner}/{name}/milestones");
+    let path = format!("{}/milestones", crate::api::repo_path(owner, name));
     let q = vec![("state".into(), state.into())];
     client.json(Method::GET, &path, &q, None::<&()>).await
 }
 
 pub async fn get(client: &Client, owner: &str, name: &str, id: u64) -> Result<Milestone> {
-    let path = format!("/api/v1/repos/{owner}/{name}/milestones/{id}");
+    let path = format!("{}/milestones/{id}", crate::api::repo_path(owner, name));
     client.json(Method::GET, &path, &[], None::<&()>).await
 }
 
@@ -50,7 +50,7 @@ pub async fn create(
     name: &str,
     body: &CreateMilestone<'_>,
 ) -> Result<Milestone> {
-    let path = format!("/api/v1/repos/{owner}/{name}/milestones");
+    let path = format!("{}/milestones", crate::api::repo_path(owner, name));
     client.json(Method::POST, &path, &[], Some(body)).await
 }
 
@@ -73,12 +73,12 @@ pub async fn edit(
     id: u64,
     body: &EditMilestone<'_>,
 ) -> Result<Milestone> {
-    let path = format!("/api/v1/repos/{owner}/{name}/milestones/{id}");
+    let path = format!("{}/milestones/{id}", crate::api::repo_path(owner, name));
     client.json(Method::PATCH, &path, &[], Some(body)).await
 }
 
 pub async fn delete(client: &Client, owner: &str, name: &str, id: u64) -> Result<()> {
-    let path = format!("/api/v1/repos/{owner}/{name}/milestones/{id}");
+    let path = format!("{}/milestones/{id}", crate::api::repo_path(owner, name));
     let res = client.request(Method::DELETE, &path, &[], None).await?;
     res.error_for_status()?;
     Ok(())
@@ -92,7 +92,10 @@ pub async fn assign(
     issue_number: u64,
     milestone_id: Option<u64>,
 ) -> Result<()> {
-    let path = format!("/api/v1/repos/{owner}/{name}/issues/{issue_number}");
+    let path = format!(
+        "{}/issues/{issue_number}",
+        crate::api::repo_path(owner, name)
+    );
     let body = match milestone_id {
         Some(id) => serde_json::json!({ "milestone": id }),
         None => serde_json::json!({ "milestone": null }),

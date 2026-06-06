@@ -34,7 +34,7 @@ pub struct BranchProtection {
 }
 
 pub async fn list(client: &Client, owner: &str, name: &str) -> Result<Vec<BranchProtection>> {
-    let path = format!("/api/v1/repos/{owner}/{name}/branch_protections");
+    let path = format!("{}/branch_protections", crate::api::repo_path(owner, name));
     client.json(Method::GET, &path, &[], None::<&()>).await
 }
 
@@ -44,7 +44,10 @@ pub async fn get(
     name: &str,
     branch: &str,
 ) -> Result<BranchProtection> {
-    let path = format!("/api/v1/repos/{owner}/{name}/branch_protections/{branch}");
+    let path = format!(
+        "{}/branch_protections/{branch}",
+        crate::api::repo_path(owner, name)
+    );
     client.json(Method::GET, &path, &[], None::<&()>).await
 }
 
@@ -71,12 +74,15 @@ pub async fn create(
     name: &str,
     body: &CreateBranchProtection<'_>,
 ) -> Result<BranchProtection> {
-    let path = format!("/api/v1/repos/{owner}/{name}/branch_protections");
+    let path = format!("{}/branch_protections", crate::api::repo_path(owner, name));
     client.json(Method::POST, &path, &[], Some(body)).await
 }
 
 pub async fn delete(client: &Client, owner: &str, name: &str, branch: &str) -> Result<()> {
-    let path = format!("/api/v1/repos/{owner}/{name}/branch_protections/{branch}");
+    let path = format!(
+        "{}/branch_protections/{branch}",
+        crate::api::repo_path(owner, name)
+    );
     let res = client.request(Method::DELETE, &path, &[], None).await?;
     res.error_for_status()?;
     Ok(())
