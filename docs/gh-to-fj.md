@@ -60,7 +60,8 @@ called out.
 | `gh pr list`                      | `fj pr list`                      |                                                 |
 | `gh pr view N`                    | `fj pr view N`                    | `--comments` shows reviews + issue comments.    |
 | `gh pr create`                    | `fj pr create`                    | Head defaults to current branch.                |
-| `gh pr edit N`                    | `fj pr edit N`                    |                                                 |
+| `gh pr edit N`                    | `fj pr edit N`                    | `--attach FILE` uploads files and links them in the body. |
+| _(no equivalent)_                 | `fj pr attach N FILE...`          | Uploads attachments and appends links to the description. |
 | `gh pr diff N`                    | `fj pr diff N`                    | Raw unified diff.                               |
 | `gh pr checks N`                  | `fj pr checks N`                  |                                                 |
 | `gh pr ready N`                   | `fj pr ready N`                   |                                                 |

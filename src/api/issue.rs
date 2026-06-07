@@ -252,6 +252,55 @@ pub async fn delete(client: &Client, owner: &str, name: &str, number: u64) -> Re
     Ok(())
 }
 
+/// A file attached to an issue or PR. Forgejo stores attachments under the
+/// shared issue index, so this is also the upload path for PR-description
+/// files: a PR's number IS its issue index.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Attachment {
+    pub id: u64,
+    pub name: String,
+    pub size: u64,
+    pub browser_download_url: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Upload a file as an attachment on issue/PR `index`. Returns the stored
+/// attachment, whose `browser_download_url` can be spliced into the body
+/// markdown to render the file inline. Mirrors `release::upload_asset`: a
+/// single multipart `attachment` part, with auth pulled straight off the
+/// client so the right scheme (PAT vs Fjord bearer) is used. The display name
+/// rides as a `name` query param (reqwest percent-encodes it).
+pub async fn upload_asset(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    index: u64,
+    asset_name: &str,
+    bytes: Vec<u8>,
+) -> Result<Attachment> {
+    let path = format!(
+        "{}/issues/{index}/assets",
+        crate::api::repo_path(owner, name)
+    );
+    let url = client.url(&path)?;
+    let part = reqwest::multipart::Part::bytes(bytes)
+        .file_name(asset_name.to_string())
+        .mime_str("application/octet-stream")?;
+    let form = reqwest::multipart::Form::new().part("attachment", part);
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(reqwest::header::AUTHORIZATION, client.auth_header_value()?);
+    let res = client
+        .http()
+        .post(url)
+        .query(&[("name", asset_name)])
+        .headers(headers)
+        .multipart(form)
+        .send()
+        .await?;
+    let res = res.error_for_status()?;
+    Ok(res.json().await?)
+}
+
 /// Pin (`pinned = true`) or unpin an issue. Works for PRs too, since they
 /// share the issue index space.
 pub async fn set_pinned(

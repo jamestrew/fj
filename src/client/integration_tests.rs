@@ -735,6 +735,34 @@ async fn pr_update_branch_posts_update_with_style() {
 }
 
 #[tokio::test]
+async fn issue_upload_asset_posts_multipart_to_issue_index() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        // PRs share the issue index, so PR #7 uploads to issues/7/assets.
+        .and(path("/api/v1/repos/o/r/issues/7/assets"))
+        .and(query_param("name", "diagram.png"))
+        .and(header("authorization", "token test-token"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+            "id": 3,
+            "name": "diagram.png",
+            "size": 11,
+            "browser_download_url": "https://x/attachments/abc",
+            "created_at": "2026-06-07T00:00:00Z"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let att =
+        crate::api::issue::upload_asset(&c, "o", "r", 7, "diagram.png", b"hello world".to_vec())
+            .await
+            .expect("ok");
+    assert_eq!(att.id, 3);
+    assert_eq!(att.size, 11);
+    assert_eq!(att.browser_download_url, "https://x/attachments/abc");
+}
+
+#[tokio::test]
 async fn release_delete_asset_uses_release_scoped_path() {
     let server = MockServer::start().await;
     Mock::given(method("DELETE"))

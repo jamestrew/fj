@@ -1,6 +1,7 @@
 use std::io::Read;
+use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::{Args, Subcommand};
 
 use crate::api;
@@ -43,6 +44,8 @@ pub enum PrSub {
     Ready(SimpleArgs),
     /// Add a comment to a pull request.
     Comment(CommentArgs),
+    /// Upload file attachments and link them in the PR description.
+    Attach(AttachArgs),
     /// Update the PR branch by merging (or rebasing) its base branch in.
     UpdateBranch(UpdateBranchArgs),
     /// Submit a review (approve / request changes / comment).
@@ -117,6 +120,9 @@ pub struct CreateArgs {
     /// Body. Use `-` to read from stdin. Omit to open `$EDITOR`.
     #[arg(short = 'b', long)]
     pub body: Option<String>,
+    /// Attach a file and link it at the end of the body (repeatable).
+    #[arg(long = "attach", value_name = "FILE")]
+    pub attach: Vec<PathBuf>,
     /// Mark the PR as draft.
     #[arg(long)]
     pub draft: bool,
@@ -140,6 +146,20 @@ pub struct EditArgs {
     /// Open `$EDITOR` for the body (replaces the current body).
     #[arg(long)]
     pub body_editor: bool,
+    /// Attach a file and link it at the end of the body (repeatable).
+    #[arg(long = "attach", value_name = "FILE")]
+    pub attach: Vec<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct AttachArgs {
+    #[command(flatten)]
+    pub r: RepoFlag,
+    /// Pull request number
+    pub number: u64,
+    /// File(s) to upload and link in the PR description (repeatable).
+    #[arg(value_name = "FILE", required = true)]
+    pub files: Vec<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -245,6 +265,7 @@ pub async fn run(cmd: PrCmd, host: Option<&str>) -> Result<()> {
         PrSub::Checks(args) => pr_inspect::checks(args, host).await,
         PrSub::Ready(args) => ready(args, host).await,
         PrSub::Comment(args) => comment(args, host).await,
+        PrSub::Attach(args) => attach(args, host).await,
         PrSub::UpdateBranch(args) => update_branch(args, host).await,
         PrSub::Review(args) => pr_review::review(args, host).await,
         PrSub::RequestReview(args) => pr_review::request_reviewers(args, host).await,
@@ -409,6 +430,23 @@ async fn create(args: CreateArgs, host: Option<&str>) -> Result<()> {
     )
     .await?;
     println!("✓ Created PR #{}: {}", pr.number, pr.title);
+    if !args.attach.is_empty() {
+        let refs = upload_attachments(&ctx, pr.number, &args.attach).await?;
+        let new_body = append_attachments(&pr.body, &refs);
+        api::pull::edit(
+            &ctx.client,
+            &ctx.owner,
+            &ctx.name,
+            pr.number,
+            &EditPull {
+                title: None,
+                body: Some(&new_body),
+                state: None,
+                base: None,
+            },
+        )
+        .await?;
+    }
     println!("{}", pr.html_url);
     if args.web {
         web::open(&pr.html_url)?;
@@ -438,8 +476,108 @@ async fn edit(args: EditArgs, host: Option<&str>) -> Result<()> {
         },
     )
     .await?;
+    if !args.attach.is_empty() {
+        let refs = upload_attachments(&ctx, pr.number, &args.attach).await?;
+        let new_body = append_attachments(&pr.body, &refs);
+        api::pull::edit(
+            &ctx.client,
+            &ctx.owner,
+            &ctx.name,
+            pr.number,
+            &EditPull {
+                title: None,
+                body: Some(&new_body),
+                state: None,
+                base: None,
+            },
+        )
+        .await?;
+    }
     println!("✓ Updated PR #{}: {}", pr.number, pr.title);
     Ok(())
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn attach(args: AttachArgs, host: Option<&str>) -> Result<()> {
+    let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
+    let refs = upload_attachments(&ctx, args.number, &args.files).await?;
+    // Append the links to the live body so they land in the description.
+    let existing = api::pull::get(&ctx.client, &ctx.owner, &ctx.name, args.number).await?;
+    let new_body = append_attachments(&existing.body, &refs);
+    api::pull::edit(
+        &ctx.client,
+        &ctx.owner,
+        &ctx.name,
+        args.number,
+        &EditPull {
+            title: None,
+            body: Some(&new_body),
+            state: None,
+            base: None,
+        },
+    )
+    .await?;
+    println!(
+        "✓ Attached {} file(s) to PR #{}",
+        args.files.len(),
+        args.number
+    );
+    Ok(())
+}
+
+/// Upload each file as an attachment on PR `number`, returning a markdown
+/// reference for each in input order. Shared by `pr attach` and the `--attach`
+/// flag on create/edit.
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn upload_attachments(
+    ctx: &crate::cli::context::RepoContext,
+    number: u64,
+    files: &[PathBuf],
+) -> Result<Vec<String>> {
+    let mut refs = Vec::with_capacity(files.len());
+    for path in files {
+        let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| anyhow!("attachment has no usable filename: {}", path.display()))?;
+        let att = api::issue::upload_asset(&ctx.client, &ctx.owner, &ctx.name, number, name, bytes)
+            .await?;
+        println!("✓ Uploaded {} ({} bytes)", name, att.size);
+        refs.push(attachment_markdown(name, &att.browser_download_url));
+    }
+    Ok(refs)
+}
+
+/// A markdown reference for an uploaded attachment: an inline image embed for
+/// image extensions, a plain link otherwise.
+fn attachment_markdown(name: &str, url: &str) -> String {
+    const IMG_EXTS: &[&str] = &[
+        "png", "apng", "jpg", "jpeg", "gif", "webp", "avif", "svg", "bmp",
+    ];
+    let is_image = Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| IMG_EXTS.contains(&e.to_ascii_lowercase().as_str()));
+    if is_image {
+        format!("![{name}]({url})")
+    } else {
+        format!("[{name}]({url})")
+    }
+}
+
+/// Append attachment references to a body as a trailing block, separated by a
+/// blank line. An empty body just becomes the references.
+fn append_attachments(body: &str, refs: &[String]) -> String {
+    if refs.is_empty() {
+        return body.to_string();
+    }
+    let block = refs.join("\n");
+    if body.trim().is_empty() {
+        block
+    } else {
+        format!("{}\n\n{}", body.trim_end(), block)
+    }
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -634,6 +772,69 @@ mod tests {
         {
             assert!(!a.delete_branch);
             assert!(matches!(a.style, MergeStyleArg::Merge));
+        }
+    }
+
+    #[test]
+    fn attachment_markdown_embeds_images_links_others() {
+        assert_eq!(
+            attachment_markdown("diagram.PNG", "https://x/a"),
+            "![diagram.PNG](https://x/a)"
+        );
+        assert_eq!(
+            attachment_markdown("notes.pdf", "https://x/b"),
+            "[notes.pdf](https://x/b)"
+        );
+        // No extension -> treated as a plain link.
+        assert_eq!(
+            attachment_markdown("LICENSE", "https://x/c"),
+            "[LICENSE](https://x/c)"
+        );
+    }
+
+    #[test]
+    fn append_attachments_separates_and_handles_empties() {
+        let refs = vec!["![a](u1)".to_string(), "[b](u2)".to_string()];
+        assert_eq!(
+            append_attachments("Fixes the thing.", &refs),
+            "Fixes the thing.\n\n![a](u1)\n[b](u2)"
+        );
+        // Empty body becomes just the block.
+        assert_eq!(append_attachments("   ", &refs), "![a](u1)\n[b](u2)");
+        // No refs leaves the body untouched.
+        assert_eq!(append_attachments("body", &[]), "body");
+    }
+
+    #[test]
+    fn attach_parses_number_and_multiple_files() {
+        use crate::cli::{Cli, Command};
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["fj", "pr", "attach", "9", "a.png", "b.txt"])
+            .expect("should parse");
+        match cli.command {
+            Command::Pr(PrCmd {
+                command: PrSub::Attach(a),
+            }) => {
+                assert_eq!(a.number, 9);
+                assert_eq!(a.files.len(), 2);
+            }
+            other => panic!("expected pr attach, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_collects_repeated_attach_flags() {
+        use crate::cli::{Cli, Command};
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "fj", "pr", "create", "--title", "t", "--attach", "a.png", "--attach", "b.png",
+        ])
+        .expect("should parse");
+        match cli.command {
+            Command::Pr(PrCmd {
+                command: PrSub::Create(a),
+            }) => assert_eq!(a.attach.len(), 2),
+            other => panic!("expected pr create, got {other:?}"),
         }
     }
 }

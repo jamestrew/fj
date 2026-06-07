@@ -8,6 +8,12 @@ All notable changes will be recorded here. The format follows
 
 ### Added
 
+- **`fj pr attach` / `pr create --attach` / `pr edit --attach`**: upload file
+  attachments to a pull request and link them in the description. PRs share the
+  issue index, so files post to `issues/{number}/assets`; image extensions are
+  embedded with `![]()` and everything else is linked. `pr attach N FILE...`
+  appends to an existing PR's body; the `--attach` flag on create/edit does the
+  upload-and-splice in one step.
 - **`fj stack split`**: turn a single-branch stack into one stacked entry per
   commit. The N commits ahead of the base become chained branches
   `<handle>/<slug>-1..N`; it moves local refs only (no push, no API), so it's
