@@ -132,11 +132,19 @@ pub fn expand_argv(argv: Vec<String>) -> Vec<String> {
     };
     let mut out = Vec::with_capacity(argv.len() + 4);
     out.push(argv[0].clone());
-    for tok in expansion.split_whitespace() {
-        out.push(tok.to_string());
-    }
+    out.extend(tokenize_expansion(expansion));
     out.extend(argv.into_iter().skip(2));
     out
+}
+
+/// Split an alias expansion into argv tokens the way a shell would, so a
+/// quoted argument stays one token (e.g. `issue create --label "needs triage"`
+/// keeps `needs triage` together). `shlex::split` returns `None` on malformed
+/// quoting; fall back to whitespace splitting so a broken alias degrades to the
+/// old behaviour rather than disappearing entirely.
+fn tokenize_expansion(expansion: &str) -> Vec<String> {
+    shlex::split(expansion)
+        .unwrap_or_else(|| expansion.split_whitespace().map(str::to_string).collect())
 }
 
 #[cfg(test)]
@@ -148,6 +156,34 @@ mod tests {
     fn expand_no_alias_passthrough() {
         let argv = vec!["fj".into(), "pr".into(), "list".into()];
         assert_eq!(expand_argv(argv.clone()), argv);
+    }
+
+    #[test]
+    fn tokenize_keeps_quoted_arguments_together() {
+        assert_eq!(
+            tokenize_expansion(r#"issue create --label "needs triage""#),
+            vec!["issue", "create", "--label", "needs triage"]
+        );
+        assert_eq!(
+            tokenize_expansion("issue create --title 'two words'"),
+            vec!["issue", "create", "--title", "two words"]
+        );
+    }
+
+    #[test]
+    fn tokenize_plain_expansion_matches_whitespace_split() {
+        assert_eq!(tokenize_expansion("pr checkout"), vec!["pr", "checkout"]);
+        assert_eq!(tokenize_expansion("  pr   status  "), vec!["pr", "status"]);
+    }
+
+    #[test]
+    fn tokenize_malformed_quoting_falls_back() {
+        // Unbalanced quote: shlex returns None, so we degrade to whitespace
+        // splitting rather than dropping the alias.
+        assert_eq!(
+            tokenize_expansion(r#"issue create --title "oops"#),
+            vec!["issue", "create", "--title", "\"oops"]
+        );
     }
 
     #[test]

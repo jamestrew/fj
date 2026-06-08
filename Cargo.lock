@@ -455,6 +455,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "shlex",
  "supports-color 3.0.2",
  "tabled",
  "tempfile",
