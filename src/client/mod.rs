@@ -510,13 +510,22 @@ fn log_request(
         if is_sensitive_path(url.path()) {
             eprintln!("  body: [redacted: sensitive endpoint]");
         } else if let Ok(text) = serde_json::to_string(b) {
-            let preview = if text.len() > 200 {
-                format!("{}…", &text[..200])
-            } else {
-                text
-            };
-            eprintln!("  body: {preview}");
+            eprintln!("  body: {}", truncate_preview(&text));
         }
+    }
+}
+
+/// Cap a debug body preview at 200 characters, appending an ellipsis when
+/// truncated. Counts by `char`, not byte: slicing `&text[..200]` would panic
+/// when byte 200 lands inside a multi-byte UTF-8 sequence (e.g. an emoji or
+/// accented character in an issue title straddling the cut).
+fn truncate_preview(text: &str) -> String {
+    let mut chars = text.chars();
+    let head: String = chars.by_ref().take(200).collect();
+    if chars.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
     }
 }
 
@@ -595,6 +604,24 @@ mod trust_tests {
 
     fn client(base: &str) -> Client {
         Client::for_base_url(Url::parse(base).unwrap(), "tok".into()).unwrap()
+    }
+
+    #[test]
+    fn truncate_preview_does_not_split_multibyte_chars() {
+        // A multi-byte char straddling byte offset 200 must not panic.
+        // 198 ASCII bytes then crabs: byte 200 lands mid-emoji.
+        let text = format!("{}{}", "a".repeat(198), "🦀🦀🦀");
+        let preview = truncate_preview(&text);
+        assert!(preview.ends_with('…'), "should be truncated with ellipsis");
+        // 200 chars kept + the ellipsis.
+        assert_eq!(preview.chars().count(), 201);
+    }
+
+    #[test]
+    fn truncate_preview_passes_short_text_through() {
+        assert_eq!(truncate_preview("hello"), "hello");
+        let exactly_200: String = "x".repeat(200);
+        assert_eq!(truncate_preview(&exactly_200), exactly_200);
     }
 
     #[test]
