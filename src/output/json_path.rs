@@ -73,6 +73,17 @@ fn apply_segments(value: &Value, segments: &[String]) -> Result<Value> {
     }
 
     if let Ok(idx) = raw_str.parse::<usize>() {
+        // A bare numeric segment normally indexes an array, but it can also be
+        // an object key that happens to be all digits (Forgejo emits some
+        // map-shaped payloads keyed by numeric strings). On an object, look the
+        // key up as a string; otherwise treat it as an array index. The bracket
+        // form `[N]` stays array-only and is unaffected.
+        if value.is_object() {
+            let next = value
+                .get(raw_str)
+                .ok_or_else(|| anyhow!("no field '{raw_str}'"))?;
+            return apply_segments(next, rest);
+        }
         let next = value
             .get(idx)
             .ok_or_else(|| anyhow!("index {idx} out of range"))?;
@@ -141,6 +152,25 @@ mod tests {
     fn extract_array_index_dotted() {
         let v = json!({"data": [{"name": "first"}, {"name": "second"}]});
         assert_eq!(extract_path(&v, ".data.1.name").unwrap(), json!("second"));
+    }
+
+    #[test]
+    fn extract_numeric_string_object_key() {
+        // A digit-only key on an object is reachable via a dotted numeric
+        // segment (previously this errored as "index N out of range").
+        let v = json!({"123": "ok", "nested": {"2024": 42}});
+        assert_eq!(extract_path(&v, ".123").unwrap(), json!("ok"));
+        assert_eq!(extract_path(&v, ".nested.2024").unwrap(), json!(42));
+    }
+
+    #[test]
+    fn numeric_segment_still_indexes_arrays() {
+        // The numeric-key fix must not regress array indexing.
+        let v = json!({"data": [10, 20, 30]});
+        assert_eq!(extract_path(&v, ".data.0").unwrap(), json!(10));
+        assert_eq!(extract_path(&v, ".data.2").unwrap(), json!(30));
+        // A missing object numeric key errors (so --json-fields maps it to null).
+        assert!(extract_path(&json!({"a": 1}), ".7").is_err());
     }
 
     #[test]
