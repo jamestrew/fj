@@ -127,7 +127,16 @@ fn split_path(host: &str, path: &str) -> Result<RemoteRepo> {
     let Some((owner, name)) = path.split_once('/') else {
         return Err(anyhow!("remote path '{path}' is not 'owner/name'"));
     };
-    if owner.is_empty() || name.is_empty() || name.contains('/') {
+    // A colon in owner/name means the scp-form split left a stray segment in
+    // the path (e.g. `git@host:2222:owner/name` splits on the first colon, so
+    // `owner` would silently become `2222:owner`). Reject it instead of
+    // targeting the wrong repository; a real owner or name never contains ':'.
+    if owner.is_empty()
+        || name.is_empty()
+        || name.contains('/')
+        || owner.contains(':')
+        || name.contains(':')
+    {
         return Err(anyhow!("remote path '{path}' is not 'owner/name'"));
     }
     Ok(RemoteRepo {
@@ -178,5 +187,12 @@ mod tests {
     #[test]
     fn rejects_deep_path() {
         assert!(parse_remote("https://example.com/a/b/c").is_err());
+    }
+
+    #[test]
+    fn rejects_scp_with_stray_colon() {
+        // The scp split is on the first colon, so a stray `:port:` would leave
+        // a colon in the owner. Reject rather than target `2222:rasterstate/fj`.
+        assert!(parse_remote("git@rasterhub.com:2222:rasterstate/fj.git").is_err());
     }
 }
