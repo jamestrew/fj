@@ -378,6 +378,12 @@ fn normalize_pat_host(raw: &str) -> Result<(String, Option<String>)> {
     };
 
     let Some(candidate) = parse_candidate else {
+        // Bare host (no scheme, no path), e.g. `rasterhub.com` or
+        // `localhost:3000`. Validate it through the same keystone check
+        // `setup-git` uses, so a malformed or '-'-leading host can never be
+        // stored as a host key and later interpolated into the credential
+        // helper. (The URL branches below already go through `url::Url`.)
+        super::auth_setup_git::validate_hostname(trimmed)?;
         return Ok((trimmed.to_string(), None));
     };
 

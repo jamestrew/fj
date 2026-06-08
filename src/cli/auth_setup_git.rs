@@ -82,7 +82,7 @@ fn credential_helper_value(host: &str) -> String {
 /// A hostname must look like a DNS name (optionally with a port). This is the
 /// keystone of `setup-git`'s safety: if the host is shell-safe, the
 /// credential-helper interpolation below is too. Reject anything else.
-fn validate_hostname(host: &str) -> Result<()> {
+pub(crate) fn validate_hostname(host: &str) -> Result<()> {
     if host.is_empty() || host.len() > 253 {
         return Err(anyhow!("invalid hostname '{host}'"));
     }
@@ -92,6 +92,18 @@ fn validate_hostname(host: &str) -> Result<()> {
     if !ok {
         return Err(anyhow!(
             "hostname '{host}' contains characters that are not allowed in a DNS name"
+        ));
+    }
+    // A real DNS name or `host:port` never starts or ends with a separator. A
+    // leading '-' is the dangerous case: the host is interpolated into
+    // `fj auth token --host <host>` inside the shell credential helper, where a
+    // '-'-leading value is parsed as a flag, not a hostname. That is the
+    // argument-injection class the rest of the CLI guards against, so reject it
+    // here (the keystone validation) rather than let it reach the helper.
+    let separator = |c: char| matches!(c, '-' | '.' | ':');
+    if host.starts_with(separator) || host.ends_with(separator) {
+        return Err(anyhow!(
+            "invalid hostname '{host}': must not start or end with '-', '.', or ':'"
         ));
     }
     Ok(())
@@ -132,6 +144,22 @@ mod setup_git_tests {
         assert!(validate_hostname("rasterhub.com").is_ok());
         assert!(validate_hostname("git.example.org:2222").is_ok());
         assert!(validate_hostname("forgejo-1.internal").is_ok());
+    }
+
+    #[test]
+    fn rejects_leading_or_trailing_separator() {
+        // A leading '-' would be parsed as a flag when interpolated into
+        // `fj auth token --host <host>` in the credential helper.
+        assert!(validate_hostname("--data-dir=x").is_err());
+        assert!(validate_hostname("-h").is_err());
+        // Other malformed edges.
+        assert!(validate_hostname("h-").is_err());
+        assert!(validate_hostname(".example.com").is_err());
+        assert!(validate_hostname("example.com.").is_err());
+        assert!(validate_hostname(":8080").is_err());
+        assert!(validate_hostname("host:").is_err());
+        // Mid-string separators stay valid.
+        assert!(validate_hostname("a-b.example.com:443").is_ok());
     }
 
     #[test]
