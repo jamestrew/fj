@@ -175,7 +175,11 @@ Run `fj --help` for the live list; every group has its own `--help`.
 | Preview         | `work`, `stack`, `agent`                                        |
 
 **Global flags** (work on every command): `--host` / `FJ_HOST`, `--debug`,
-`--json`, `--json-fields`, `--no-pager`, and `--web` on list/view commands.
+`--no-pager`, and `--json-fields`.
+
+`--json` applies to data-returning commands such as `list`, `view`, and other
+commands that document JSON output. `--web` applies to list/view commands that
+can open results in the browser.
 
 ## Configuration
 
