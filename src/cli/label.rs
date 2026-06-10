@@ -206,11 +206,7 @@ async fn create(args: CreateArgs, host: Option<&str>) -> Result<()> {
 
 async fn edit(args: EditArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
-    let existing = label::list(&ctx.client, &ctx.owner, &ctx.name)
-        .await?
-        .into_iter()
-        .find(|l| l.name == args.name)
-        .ok_or_else(|| anyhow::anyhow!("no label named '{}'", args.name))?;
+    let existing = label::get_by_name(&ctx.client, &ctx.owner, &ctx.name, &args.name).await?;
     let color = args
         .color
         .as_ref()
@@ -233,11 +229,7 @@ async fn edit(args: EditArgs, host: Option<&str>) -> Result<()> {
 
 async fn delete(args: DeleteArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
-    let existing = label::list(&ctx.client, &ctx.owner, &ctx.name)
-        .await?
-        .into_iter()
-        .find(|l| l.name == args.name)
-        .ok_or_else(|| anyhow::anyhow!("no label named '{}'", args.name))?;
+    let existing = label::get_by_name(&ctx.client, &ctx.owner, &ctx.name, &args.name).await?;
     if !args.yes {
         let answer = crate::cli::editor::prompt_line(&format!(
             "Delete label '{}'? Type the name to confirm",

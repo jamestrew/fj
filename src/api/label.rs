@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +27,38 @@ pub struct EditLabel<'a> {
 pub async fn list(client: &Client, owner: &str, name: &str) -> Result<Vec<Label>> {
     let path = format!("{}/labels", crate::api::repo_path(owner, name));
     client.json(Method::GET, &path, &[], None::<&()>).await
+}
+
+pub async fn get_by_name(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    label_name: &str,
+) -> Result<Label> {
+    list(client, owner, name)
+        .await?
+        .into_iter()
+        .find(|l| l.name == label_name)
+        .ok_or_else(|| anyhow!("no label named '{label_name}'"))
+}
+
+pub async fn resolve_names_to_ids(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    label_names: &[String],
+) -> Result<Vec<u64>> {
+    let labels = list(client, owner, name).await?;
+    let mut ids = Vec::with_capacity(label_names.len());
+    for label_name in label_names {
+        let id = labels
+            .iter()
+            .find(|l| l.name == *label_name)
+            .map(|l| l.id)
+            .ok_or_else(|| anyhow!("no label named '{label_name}'"))?;
+        ids.push(id);
+    }
+    Ok(ids)
 }
 
 pub async fn create(
