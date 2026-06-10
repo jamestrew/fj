@@ -227,14 +227,69 @@ fn web_run_url(
     ))
 }
 
+fn missing_logs_error() -> anyhow::Error {
+    anyhow::anyhow!(
+        "no logs for that run/job/attempt. Check the run number against \
+         `fj run list`, and that the job index (`--job`) exists in the run."
+    )
+}
+
+fn private_log_auth_error(run: u64) -> anyhow::Error {
+    anyhow::anyhow!(
+        "cannot read logs for run #{run}: the Forgejo web log route rejected API token auth. \
+         Log retrieval on private repos needs a browser session (cookie/CSRF); an API token \
+         is not accepted by this route. Open the run in the Forgejo web UI for logs; see \
+         rasterstate/fj#103."
+    )
+}
+
+async fn token_list_contains_run(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    run: u64,
+) -> Result<bool> {
+    let runs = crate::api::workflow_run::list_runs(client, owner, name, 50).await?;
+    Ok(runs.iter().any(|r| r.run_number == run))
+}
+
+async fn web_summary_has_run(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    run: u64,
+) -> Result<Option<RunView>> {
+    let url = web_run_url(client, owner, name, run, 0, 1)?;
+    let body = serde_json::json!({ "logCursors": [] });
+    let res = client.request(Method::POST, &url, &[], Some(&body)).await?;
+    if res.status().is_success() {
+        return res.json().await.context("decoding run view JSON").map(Some);
+    }
+    Ok(None)
+}
+
 /// Map a failed web-route response to a message that explains itself, instead
 /// of leaking the raw "Not found." / "resource does not exist" web body.
-fn log_route_error(status: StatusCode, body: &str) -> anyhow::Error {
+async fn log_route_error(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    run: u64,
+    job: usize,
+    status: StatusCode,
+    body: &str,
+) -> anyhow::Error {
     if status == StatusCode::NOT_FOUND {
-        anyhow::anyhow!(
-            "no logs for that run/job/attempt. Check the run number against \
-             `fj run list`, and that the job index (`--job`) exists in the run."
-        )
+        if job != 0 {
+            if let Ok(Some(_summary)) = web_summary_has_run(client, owner, name, run).await {
+                return missing_logs_error();
+            }
+        }
+
+        match token_list_contains_run(client, owner, name, run).await {
+            Ok(true) => private_log_auth_error(run),
+            Ok(false) | Err(_) => missing_logs_error(),
+        }
     } else if body.contains("resource does not exist") {
         anyhow::anyhow!(
             "logs are no longer available for this run. Forgejo prunes Actions \
@@ -262,7 +317,7 @@ pub async fn fetch_run_view(
     let status = res.status();
     if !status.is_success() {
         let body = res.text().await.unwrap_or_default();
-        return Err(log_route_error(status, &body));
+        return Err(log_route_error(client, owner, name, run, job, status, &body).await);
     }
     res.json().await.context("decoding run view JSON")
 }
@@ -377,29 +432,20 @@ mod tests {
     }
 
     #[test]
-    fn log_route_error_404_is_friendly() {
-        let err = log_route_error(StatusCode::NOT_FOUND, "Not found.");
+    fn missing_logs_error_is_friendly() {
+        let err = missing_logs_error();
         let msg = err.to_string();
         assert!(msg.contains("no logs for that run/job/attempt"), "{msg}");
         assert!(msg.contains("fj run list"), "{msg}");
     }
 
     #[test]
-    fn log_route_error_pruned_run_is_friendly() {
-        let err = log_route_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "{\"error\":\"resource does not exist\"}",
-        );
+    fn private_log_auth_error_is_actionable() {
+        let err = private_log_auth_error(395);
         let msg = err.to_string();
-        assert!(msg.contains("no longer available"), "{msg}");
-        assert!(msg.contains("prunes Actions"), "{msg}");
-    }
-
-    #[test]
-    fn log_route_error_other_status_reports_code() {
-        let err = log_route_error(StatusCode::BAD_GATEWAY, "upstream is sad");
-        let msg = err.to_string();
-        assert!(msg.contains("could not fetch logs"), "{msg}");
-        assert!(msg.contains("502"), "{msg}");
+        assert!(msg.contains("run #395"), "{msg}");
+        assert!(msg.contains("rejected API token auth"), "{msg}");
+        assert!(msg.contains("cookie/CSRF"), "{msg}");
+        assert!(msg.contains("rasterstate/fj#103"), "{msg}");
     }
 }

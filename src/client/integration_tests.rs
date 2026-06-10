@@ -660,6 +660,75 @@ async fn run_logs_pruned_run_is_friendly() {
 }
 
 #[tokio::test]
+async fn run_logs_private_repo_404_reports_token_auth_rejection() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/o/r/actions/runs/395/jobs/0/attempt/1"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("Not found."))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/runs"))
+        .and(query_param("page", "1"))
+        .and(query_param("limit", "50"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "total_count": 1,
+            "workflow_runs": [{ "id": 44, "status": "failure", "run_number": 395 }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let c = client_for(&server).await;
+    let err = crate::api::workflow::fetch_run_summary(&c, "o", "r", 395)
+        .await
+        .expect_err("private web-route 404 should be classified via run list");
+    let msg = err.to_string();
+    assert!(msg.contains("rejected API token auth"), "got: {msg}");
+    assert!(msg.contains("cookie/CSRF"), "got: {msg}");
+    assert!(msg.contains("rasterstate/fj#103"), "got: {msg}");
+    assert!(
+        !msg.contains("no logs for that run/job/attempt"),
+        "got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn run_logs_missing_run_404_keeps_missing_message() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/o/r/actions/runs/404/jobs/0/attempt/1"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("Not found."))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/runs"))
+        .and(query_param("page", "1"))
+        .and(query_param("limit", "50"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "total_count": 0,
+            "workflow_runs": []
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let c = client_for(&server).await;
+    let err = crate::api::workflow::fetch_run_summary(&c, "o", "r", 404)
+        .await
+        .expect_err("missing run should stay a missing-log error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("no logs for that run/job/attempt"),
+        "got: {msg}"
+    );
+    assert!(msg.contains("fj run list"), "got: {msg}");
+    assert!(!msg.contains("rejected API token auth"), "got: {msg}");
+}
+
+#[tokio::test]
 async fn run_summary_reads_run_level_state() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
