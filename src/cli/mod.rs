@@ -343,6 +343,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn readme_global_flags_match_clap_globals() {
+        use std::collections::BTreeSet;
+        use std::fs;
+
+        let clap_globals: BTreeSet<String> = Cli::command()
+            .get_arguments()
+            .filter(|arg| arg.is_global_set())
+            .filter_map(|arg| arg.get_long().map(|long| format!("--{long}")))
+            .collect();
+
+        let readme = fs::read_to_string(format!("{}/README.md", env!("CARGO_MANIFEST_DIR")))
+            .expect("read README.md");
+        let paragraph = readme
+            .split("\n\n")
+            .find(|paragraph| paragraph.starts_with("**Global flags**"))
+            .expect("README.md global flags paragraph");
+        let readme_globals = markdown_flags(paragraph);
+
+        assert_eq!(
+            readme_globals, clap_globals,
+            "README.md global flags paragraph must match clap global=true args"
+        );
+    }
+
+    fn markdown_flags(markdown: &str) -> std::collections::BTreeSet<String> {
+        markdown
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|code| code.starts_with("--"))
+            .map(ToString::to_string)
+            .collect()
+    }
+
     /// Keep the coverage scope honest: the `COV_IGNORE` list in the Makefile
     /// must stay in sync with reality. A `cli/*.rs` with no `#[cfg(test)]`
     /// module is glue we don't unit-test and must be excluded; one that has
