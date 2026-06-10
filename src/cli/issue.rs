@@ -22,7 +22,7 @@ pub enum IssueSub {
     List(ListArgs),
     /// View an issue by number.
     View(ViewArgs),
-    /// Create an issue.
+    /// Create an issue with optional labels and assignees.
     Create(CreateArgs),
     /// Edit an issue's title, body, labels, or assignees.
     Edit(EditArgs),
@@ -120,6 +120,22 @@ pub struct CreateArgs {
     /// Body. Use `-` to read from stdin. Omit to open `$EDITOR`.
     #[arg(short = 'b', long)]
     pub body: Option<String>,
+    /// Label name to add. Repeat or use commas for multiple labels.
+    #[arg(
+        short = 'l',
+        long = "label",
+        value_name = "NAME",
+        value_delimiter = ','
+    )]
+    pub label: Vec<String>,
+    /// Username to assign. Repeat or use commas for multiple assignees.
+    #[arg(
+        short = 'a',
+        long = "assignee",
+        value_name = "USERNAME",
+        value_delimiter = ','
+    )]
+    pub assignee: Vec<String>,
     /// Open the new issue in your browser after creating.
     #[arg(long)]
     pub web: bool,
@@ -306,11 +322,22 @@ async fn create(args: CreateArgs, host: Option<&str>) -> Result<()> {
         return Err(anyhow!("title is required"));
     }
     let body = editor::resolve_body(args.body.as_deref(), "ISSUE_BODY.md", "")?;
+    let label_names = clean_csv_values(args.label);
+    let labels = if label_names.is_empty() {
+        None
+    } else {
+        Some(
+            api::label::resolve_names_to_ids(&ctx.client, &ctx.owner, &ctx.name, &label_names)
+                .await?,
+        )
+    };
+    let assignees = clean_csv_values(args.assignee);
+    let assignees = (!assignees.is_empty()).then_some(assignees);
     let payload = CreateIssue {
         title: &title,
         body: body.as_deref(),
-        assignees: None,
-        labels: None,
+        assignees,
+        labels,
     };
     let issue = api::issue::create(&ctx.client, &ctx.owner, &ctx.name, &payload).await?;
     println!("✓ Created issue #{}: {}", issue.number, issue.title);
@@ -322,6 +349,14 @@ async fn create(args: CreateArgs, host: Option<&str>) -> Result<()> {
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
+fn clean_csv_values(values: Vec<String>) -> Vec<String> {
+    values
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
 async fn edit(args: EditArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     let body = if args.body_editor {

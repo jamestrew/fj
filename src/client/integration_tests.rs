@@ -2109,6 +2109,32 @@ async fn label_list_decodes_rows() {
 }
 
 #[tokio::test]
+async fn label_resolve_names_to_ids_returns_ids_and_errors_on_unknown() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "id": 10, "name": "bug", "color": "ee0000" },
+            { "id": 11, "name": "help wanted", "color": "00ee00" }
+        ])))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let names = vec!["bug".to_string(), "help wanted".to_string()];
+    let ids = crate::api::label::resolve_names_to_ids(&c, "o", "r", &names)
+        .await
+        .expect("resolve");
+    assert_eq!(ids, vec![10, 11]);
+
+    let missing = vec!["missing".to_string()];
+    let err = crate::api::label::resolve_names_to_ids(&c, "o", "r", &missing)
+        .await
+        .expect_err("unknown label should error");
+    assert!(err.to_string().contains("no label named 'missing'"));
+}
+
+#[tokio::test]
 async fn label_create_posts_color_and_skips_none_description() {
     use crate::api::label::CreateLabel;
     let server = MockServer::start().await;
@@ -2587,6 +2613,34 @@ async fn issue_create_skips_none_fields() {
         body: None,
         assignees: None,
         labels: None,
+    };
+    let i = crate::api::issue::create(&c, "o", "r", &body)
+        .await
+        .expect("create");
+    assert_eq!(i.number, 4);
+}
+
+#[tokio::test]
+async fn issue_create_posts_resolved_label_ids_and_assignees() {
+    use crate::api::issue::CreateIssue;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/issues"))
+        .and(body_json(json!({
+            "title": "new",
+            "assignees": ["alice", "bob"],
+            "labels": [10, 11]
+        })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(issue_json(4, "new", "open")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let body = CreateIssue {
+        title: "new",
+        body: None,
+        assignees: Some(vec!["alice".to_string(), "bob".to_string()]),
+        labels: Some(vec![10, 11]),
     };
     let i = crate::api::issue::create(&c, "o", "r", &body)
         .await
