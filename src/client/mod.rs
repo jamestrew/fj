@@ -17,7 +17,7 @@ pub fn set_debug(on: bool) {
     DEBUG.store(on, Ordering::Relaxed);
 }
 
-fn debug_enabled() -> bool {
+pub(crate) fn debug_enabled() -> bool {
     DEBUG.load(Ordering::Relaxed)
 }
 
