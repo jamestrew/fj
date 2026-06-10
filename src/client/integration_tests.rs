@@ -2198,6 +2198,35 @@ async fn label_delete_succeeds_on_204() {
         .expect("delete");
 }
 
+#[tokio::test]
+async fn issue_labels_add_and_remove_use_issue_label_endpoints() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/issues/3/labels"))
+        .and(body_json(json!({ "labels": [10, 11] })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "id": 10, "name": "bug", "color": "ee0000" },
+            { "id": 11, "name": "help wanted", "color": "00ee00" }
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/repos/o/r/issues/3/labels/10"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let labels = crate::api::label::add_to_issue(&c, "o", "r", 3, vec![10, 11])
+        .await
+        .expect("add labels");
+    assert_eq!(labels.len(), 2);
+    crate::api::label::remove_from_issue(&c, "o", "r", 3, 10)
+        .await
+        .expect("remove label");
+}
+
 // ---- milestones ----
 
 fn milestone_json(id: u64, title: &str, state: &str) -> serde_json::Value {
@@ -2668,6 +2697,40 @@ async fn issue_edit_can_close() {
         .await
         .expect("edit");
     assert_eq!(i.state, "closed");
+}
+
+#[tokio::test]
+async fn issue_assignees_add_and_remove_use_issue_assignees_endpoint() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/issues/3/assignees"))
+        .and(body_json(json!({ "assignees": ["alice", "bob"] })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issue_json(3, "a bug", "open")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/repos/o/r/issues/3/assignees"))
+        .and(body_json(json!({ "assignees": ["bob"] })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issue_json(3, "a bug", "open")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let i = crate::api::issue::add_assignees(
+        &c,
+        "o",
+        "r",
+        3,
+        vec!["alice".to_string(), "bob".to_string()],
+    )
+    .await
+    .expect("add assignees");
+    assert_eq!(i.number, 3);
+    let i = crate::api::issue::remove_assignees(&c, "o", "r", 3, vec!["bob".to_string()])
+        .await
+        .expect("remove assignees");
+    assert_eq!(i.number, 3);
 }
 
 #[tokio::test]

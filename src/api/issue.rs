@@ -163,6 +163,48 @@ pub async fn edit(
     client.json(Method::PATCH, &path, &[], Some(body)).await
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct AssigneesBody {
+    assignees: Vec<String>,
+}
+
+pub async fn add_assignees(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    number: u64,
+    assignees: Vec<String>,
+) -> Result<Issue> {
+    let path = format!(
+        "{}/issues/{number}/assignees",
+        crate::api::repo_path(owner, name)
+    );
+    client
+        .json(Method::POST, &path, &[], Some(&AssigneesBody { assignees }))
+        .await
+}
+
+pub async fn remove_assignees(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    number: u64,
+    assignees: Vec<String>,
+) -> Result<Issue> {
+    let path = format!(
+        "{}/issues/{number}/assignees",
+        crate::api::repo_path(owner, name)
+    );
+    client
+        .json(
+            Method::DELETE,
+            &path,
+            &[],
+            Some(&AssigneesBody { assignees }),
+        )
+        .await
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Comment {
     pub id: u64,
