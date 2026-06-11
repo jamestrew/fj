@@ -9,7 +9,7 @@ pub use crate::cli::workflow_run::*;
 pub use crate::cli::workflow_secret::*;
 pub use crate::cli::workflow_variable::*;
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use clap::{Args, Subcommand};
 
 use crate::api;
@@ -41,20 +41,6 @@ pub struct WorkflowListArgs {
     pub json: bool,
 }
 
-#[derive(Debug, Args)]
-pub struct DispatchArgs {
-    #[command(flatten)]
-    pub r: RepoFlag,
-    /// Workflow file name, e.g. `ci.yml`.
-    pub workflow: String,
-    /// Git ref (branch or tag) to run on. Defaults to the repo's default branch.
-    #[arg(long = "ref")]
-    pub ref_: Option<String>,
-    /// Workflow input as `key=value` (repeatable).
-    #[arg(short = 'f', long = "field")]
-    pub fields: Vec<String>,
-}
-
 pub async fn run_workflow(cmd: WorkflowCmd, host: Option<&str>) -> Result<()> {
     match cmd.command {
         WorkflowSub::List(args) => list_workflows(args, host).await,
@@ -77,35 +63,5 @@ async fn list_workflows(args: WorkflowListArgs, host: Option<&str>) -> Result<()
         .map(|f| vec![f.name.clone(), output::dim(&f.path)])
         .collect();
     print!("{}", output::render_table(&["WORKFLOW", "PATH"], &rows));
-    Ok(())
-}
-
-async fn dispatch(args: DispatchArgs, host: Option<&str>) -> Result<()> {
-    let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
-    let ref_ = match args.ref_ {
-        Some(r) => r,
-        None => {
-            api::repo::get(&ctx.client, &ctx.owner, &ctx.name)
-                .await?
-                .default_branch
-        }
-    };
-    let mut inputs = std::collections::BTreeMap::new();
-    for f in &args.fields {
-        let (k, v) = f
-            .split_once('=')
-            .ok_or_else(|| anyhow!("invalid --field '{f}', expected key=value"))?;
-        inputs.insert(k.to_string(), v.to_string());
-    }
-    api::workflow::dispatch(
-        &ctx.client,
-        &ctx.owner,
-        &ctx.name,
-        &args.workflow,
-        &ref_,
-        inputs,
-    )
-    .await?;
-    println!("✓ Dispatched {} on {}", args.workflow, ref_);
     Ok(())
 }
