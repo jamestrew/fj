@@ -68,6 +68,9 @@ pub struct ViewArgs {
     /// Emit JSON instead of a table
     #[arg(long)]
     pub json: bool,
+    /// Exit with status 1 unless the run conclusion is success or skipped.
+    #[arg(long)]
+    pub exit_status: bool,
 }
 
 #[derive(Debug, Args)]
@@ -85,6 +88,9 @@ pub struct WatchArgs {
     /// Seconds between polls while the job is running.
     #[arg(short = 'i', long, default_value_t = 3)]
     pub interval: u64,
+    /// Exit with status 1 unless the run conclusion is success or skipped.
+    #[arg(long)]
+    pub exit_status: bool,
 }
 
 #[derive(Debug, Args)]
@@ -185,12 +191,13 @@ async fn view(args: ViewArgs, host: Option<&str>) -> Result<()> {
                         "No failed jobs in this run."
                     };
                     println!("{}", output::dim(note));
-                    return Ok(());
+                    return ensure_exit_status(&summary.state.run.status, args.exit_status);
                 }
                 sel
             }
         };
 
+        let mut run_status = None;
         let multi = targets.len() > 1;
         for (i, &job) in targets.iter().enumerate() {
             let attempt = match args.attempt {
@@ -220,8 +227,9 @@ async fn view(args: ViewArgs, host: Option<&str>) -> Result<()> {
                 println!();
             }
             print_logs(&view, args.log_failed);
+            run_status = Some(view.state.run.status.clone());
         }
-        return Ok(());
+        return ensure_exit_status(run_status.as_deref().unwrap_or(""), args.exit_status);
     }
 
     let view =
@@ -247,7 +255,8 @@ async fn view(args: ViewArgs, host: Option<&str>) -> Result<()> {
             "url": url,
             "jobs": jobs,
         });
-        return output::print_json(&value);
+        output::print_json(&value)?;
+        return ensure_exit_status(&run.status, args.exit_status);
     }
 
     println!("Run #{}: {}", args.run_id, run.title);
@@ -275,7 +284,7 @@ async fn view(args: ViewArgs, host: Option<&str>) -> Result<()> {
         println!("{}", table.trim_end());
         println!("{}", output::dim("Use --log to see step output."));
     }
-    Ok(())
+    ensure_exit_status(&run.status, args.exit_status)
 }
 
 /// Render a fully-fetched job view. With `failed_only`, skip steps that
@@ -413,10 +422,23 @@ async fn watch(args: WatchArgs, host: Option<&str>) -> Result<()> {
                 output::bold("run finished:"),
                 output::action_status(&view.state.run.status),
             );
-            return Ok(());
+            return ensure_exit_status(&view.state.run.status, args.exit_status);
         }
         tokio::time::sleep(Duration::from_secs(args.interval.max(1))).await;
     }
+}
+
+fn ensure_exit_status(status: &str, exit_status: bool) -> Result<()> {
+    if !exit_status || run_status_succeeded(status) {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "workflow run concluded with status `{status}` (expected success or skipped)"
+    ))
+}
+
+fn run_status_succeeded(status: &str) -> bool {
+    matches!(status, "success" | "skipped")
 }
 
 /// Which job indices `view --log` should fetch when `--job` is omitted.
@@ -526,6 +548,53 @@ mod tests {
 
     fn statuses(ss: &[&str]) -> Vec<String> {
         ss.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn ensure_exit_status_ignores_failed_runs_without_flag() {
+        assert!(ensure_exit_status("failure", false).is_ok());
+    }
+
+    #[test]
+    fn ensure_exit_status_accepts_success_and_skipped() {
+        assert!(ensure_exit_status("success", true).is_ok());
+        assert!(ensure_exit_status("skipped", true).is_ok());
+    }
+
+    #[test]
+    fn ensure_exit_status_rejects_failed_and_cancelled_runs() {
+        assert!(ensure_exit_status("failure", true).is_err());
+        assert!(ensure_exit_status("cancelled", true).is_err());
+    }
+
+    #[test]
+    fn run_view_exit_status_flag_parses() {
+        use clap::Parser;
+
+        let cli = crate::cli::Cli::try_parse_from(["fj", "run", "view", "42", "--exit-status"])
+            .expect("should parse");
+        let crate::cli::Command::Run(RunCmd {
+            command: RunSub::View(args),
+        }) = cli.command
+        else {
+            panic!("expected run view command");
+        };
+        assert!(args.exit_status);
+    }
+
+    #[test]
+    fn run_watch_exit_status_flag_parses() {
+        use clap::Parser;
+
+        let cli = crate::cli::Cli::try_parse_from(["fj", "run", "watch", "42", "--exit-status"])
+            .expect("should parse");
+        let crate::cli::Command::Run(RunCmd {
+            command: RunSub::Watch(args),
+        }) = cli.command
+        else {
+            panic!("expected run watch command");
+        };
+        assert!(args.exit_status);
     }
 
     #[test]

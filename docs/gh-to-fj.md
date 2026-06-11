@@ -108,9 +108,11 @@ called out.
 | --------------------------------- | --------------------------------- | ----------------------------------------------- |
 | `gh run list`                     | `fj run list`                     | Forgejo Actions.                                |
 | `gh run view N`                   | `fj run view N`                   | `N` is the run number from `fj run list`.       |
+| `gh run view N --exit-status`     | `fj run view N --exit-status`     | Exits 1 unless the conclusion is success/skipped. |
 | `gh run view N --log`             | `fj run view N --log`             | Logs come from Forgejo web routes, not the API. |
 | `gh run view N --log-failed`      | `fj run view N --log-failed`      | Only steps that did not succeed.                |
 | `gh run watch N`                  | `fj run watch N`                  | Streams logs live until the job finishes.       |
+| `gh run watch N --exit-status`    | `fj run watch N --exit-status`    | Exits 1 unless the conclusion is success/skipped. |
 | `gh run download N`               | `fj run download N`               | Web route; `--list` to list, `-n` to pick one.  |
 | `gh run rerun N`                  | `fj run rerun N`                  | No API; web action rejects token POST. Prints run URL. |
 | `gh run cancel N`                 | `fj run cancel N`                 | Same: no API, falls back to the run URL.        |
