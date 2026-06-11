@@ -64,23 +64,19 @@ fn store_token_with_entry_and_file_path(
 ) -> Result<TokenStoreLocation> {
     let entry = match entry {
         Ok(entry) => entry,
-        Err(err) if is_keychain_unavailable(&err) => {
+        Err(err) => {
             log_keychain_unavailable_from_error(host, "opening keychain entry", &err);
             store_file_token(file_path, host, token)?;
             return Ok(TokenStoreLocation::File(file_path.to_path_buf()));
         }
-        Err(err) => {
-            return Err(err).with_context(|| format!("opening keychain entry for {host}"));
-        }
     };
     match entry.set_password(token) {
         Ok(()) => Ok(TokenStoreLocation::Keychain),
-        Err(err) if is_keychain_unavailable(&err) => {
+        Err(err) => {
             log_keychain_unavailable_from_error(host, "writing token to keychain", &err);
             store_file_token(file_path, host, token)?;
             Ok(TokenStoreLocation::File(file_path.to_path_buf()))
         }
-        Err(err) => Err(err).with_context(|| format!("writing token for {host} to keychain")),
     }
 }
 
@@ -376,6 +372,64 @@ mod tests {
             let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
         }
+    }
+
+    #[test]
+    fn store_token_writes_file_when_keychain_entry_has_no_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokens.toml");
+
+        let location = store_token_with_entry_and_file_path(
+            "example.test",
+            "file-token",
+            Err(keyring::Error::NoEntry),
+            &path,
+        )
+        .expect("no keychain entry should write file store");
+
+        assert_eq!(location, TokenStoreLocation::File(path.clone()));
+        assert_eq!(
+            load_file_token(&path, "example.test").unwrap().as_deref(),
+            Some("file-token")
+        );
+    }
+
+    #[test]
+    fn store_token_writes_file_when_keychain_set_password_has_no_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokens.toml");
+        let entry = Entry::new_with_credential(Box::<keyring::mock::MockCredential>::default());
+        let mock = entry
+            .get_credential()
+            .downcast_ref::<keyring::mock::MockCredential>()
+            .unwrap();
+        mock.set_error(keyring::Error::NoEntry);
+
+        let location =
+            store_token_with_entry_and_file_path("example.test", "file-token", Ok(entry), &path)
+                .expect("set_password NoEntry should write file store");
+
+        assert_eq!(location, TokenStoreLocation::File(path.clone()));
+        assert_eq!(
+            load_file_token(&path, "example.test").unwrap().as_deref(),
+            Some("file-token")
+        );
+    }
+
+    #[test]
+    fn load_token_uses_file_when_entry_creation_has_no_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokens.toml");
+        store_file_token(&path, "example.test", "file-token").unwrap();
+
+        let loaded = load_persisted_token_from_entry_and_file_path(
+            "example.test",
+            Err(keyring::Error::NoEntry),
+            &path,
+        )
+        .expect("missing keychain entry should fall through to file store");
+
+        assert_eq!(loaded.as_deref(), Some("file-token"));
     }
 
     #[test]
