@@ -567,6 +567,13 @@ async fn fjord_client_routes_through_gateway_with_bearer() {
     assert_eq!(res["login"], "alice");
 }
 
+fn workflow_runs_payload(runs: serde_json::Value) -> serde_json::Value {
+    json!({
+        "total_count": runs.as_array().map_or(0, Vec::len),
+        "workflow_runs": runs,
+    })
+}
+
 #[tokio::test]
 async fn run_list_tolerates_inconsistent_forgejo_rows() {
     // This Forgejo emits inconsistent run rows: workflow_id as a file
@@ -617,6 +624,293 @@ async fn run_list_tolerates_inconsistent_forgejo_rows() {
     assert_eq!(runs[2].status, "waiting");
     assert!(runs[2].updated_at.is_none());
     assert_eq!(runs[2].run_number, 790);
+}
+
+#[tokio::test]
+async fn run_list_status_filter_is_sent_and_applied_client_side() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/runs"))
+        .and(query_param("page", "1"))
+        .and(query_param("limit", "50"))
+        .and(query_param("status", "failure"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(workflow_runs_payload(json!([
+            { "id": 1, "status": "failure", "workflow_id": "ci.yml", "run_number": 1 },
+            { "id": 2, "status": "completed", "conclusion": "failure", "workflow_id": "ci.yml", "run_number": 2 },
+            { "id": 3, "status": "success", "workflow_id": "ci.yml", "run_number": 3 }
+        ]))))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let c = client_for(&server).await;
+    let runs = crate::api::workflow::list_runs_filtered(
+        &c,
+        "o",
+        "r",
+        50,
+        false,
+        &crate::api::workflow::RunListFilters {
+            status: Some("failure".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("filtered list");
+
+    assert_eq!(runs.len(), 2);
+    assert_eq!(
+        runs.iter().map(|run| run.run_number).collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+}
+
+#[tokio::test]
+async fn run_list_branch_filter_is_sent_and_applied_client_side() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/runs"))
+        .and(query_param("branch", "main"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(workflow_runs_payload(json!([
+            { "id": 1, "status": "success", "head_branch": "main", "workflow_id": "ci.yml", "run_number": 10 },
+            { "id": 2, "status": "success", "head_branch": "feature/x", "workflow_id": "ci.yml", "run_number": 11 }
+        ]))))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let c = client_for(&server).await;
+    let runs = crate::api::workflow::list_runs_filtered(
+        &c,
+        "o",
+        "r",
+        20,
+        false,
+        &crate::api::workflow::RunListFilters {
+            branch: Some("main".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("filtered list");
+
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].run_number, 10);
+}
+
+#[tokio::test]
+async fn run_list_event_filter_is_sent_and_applied_client_side() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/runs"))
+        .and(query_param("event", "pull_request"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(workflow_runs_payload(json!([
+            { "id": 1, "status": "success", "event": "pull_request", "workflow_id": "ci.yml", "run_number": 20 },
+            { "id": 2, "status": "success", "event": "push", "workflow_id": "ci.yml", "run_number": 21 }
+        ]))))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let c = client_for(&server).await;
+    let runs = crate::api::workflow::list_runs_filtered(
+        &c,
+        "o",
+        "r",
+        20,
+        false,
+        &crate::api::workflow::RunListFilters {
+            event: Some("pull_request".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("filtered list");
+
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].run_number, 20);
+}
+
+#[tokio::test]
+async fn run_list_workflow_filter_is_sent_and_applied_client_side() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/runs"))
+        .and(query_param("workflow", "ci.yml"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(workflow_runs_payload(json!([
+            { "id": 1, "status": "success", "workflow_id": ".forgejo/workflows/ci.yml", "run_number": 30 },
+            { "id": 2, "status": "success", "workflow_id": "deploy.yml", "run_number": 31 }
+        ]))))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let c = client_for(&server).await;
+    let runs = crate::api::workflow::list_runs_filtered(
+        &c,
+        "o",
+        "r",
+        20,
+        false,
+        &crate::api::workflow::RunListFilters {
+            workflow: Some("ci.yml".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("filtered list");
+
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].run_number, 30);
+}
+
+#[tokio::test]
+async fn run_list_combines_filters_with_and() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/runs"))
+        .and(query_param("status", "failure"))
+        .and(query_param("branch", "main"))
+        .and(query_param("event", "push"))
+        .and(query_param("workflow", "ci.yml"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(workflow_runs_payload(json!([
+            { "id": 1, "status": "failure", "head_branch": "main", "event": "push", "workflow_id": "ci.yml", "run_number": 40 },
+            { "id": 2, "status": "success", "head_branch": "main", "event": "push", "workflow_id": "ci.yml", "run_number": 41 },
+            { "id": 3, "status": "failure", "head_branch": "feature/x", "event": "push", "workflow_id": "ci.yml", "run_number": 42 },
+            { "id": 4, "status": "failure", "head_branch": "main", "event": "pull_request", "workflow_id": "ci.yml", "run_number": 43 },
+            { "id": 5, "status": "failure", "head_branch": "main", "event": "push", "workflow_id": "deploy.yml", "run_number": 44 }
+        ]))))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let c = client_for(&server).await;
+    let runs = crate::api::workflow::list_runs_filtered(
+        &c,
+        "o",
+        "r",
+        20,
+        false,
+        &crate::api::workflow::RunListFilters {
+            status: Some("failure".into()),
+            branch: Some("main".into()),
+            event: Some("push".into()),
+            workflow: Some("ci.yml".into()),
+        },
+    )
+    .await
+    .expect("filtered list");
+
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].run_number, 40);
+}
+
+#[tokio::test]
+async fn run_list_paginate_keeps_filters_across_pages() {
+    let server = MockServer::start().await;
+    let next_url = format!(
+        "{}/api/v1/repos/o/r/actions/runs?page=2&limit=50&status=success",
+        server.uri()
+    );
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/runs"))
+        .and(query_param("page", "1"))
+        .and(query_param("limit", "50"))
+        .and(query_param("status", "success"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(workflow_runs_payload(json!([
+                    { "id": 1, "status": "success", "workflow_id": "ci.yml", "run_number": 60 },
+                    { "id": 2, "status": "failure", "workflow_id": "ci.yml", "run_number": 61 }
+                ])))
+                .insert_header("Link", format!(r#"<{next_url}>; rel="next""#).as_str()),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/runs"))
+        .and(query_param("page", "2"))
+        .and(query_param("limit", "50"))
+        .and(query_param("status", "success"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(workflow_runs_payload(json!([
+                { "id": 3, "status": "success", "workflow_id": "ci.yml", "run_number": 62 },
+                { "id": 4, "status": "cancelled", "workflow_id": "ci.yml", "run_number": 63 }
+            ]))),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let c = client_for(&server).await;
+    let runs = crate::api::workflow::list_runs_filtered(
+        &c,
+        "o",
+        "r",
+        20,
+        true,
+        &crate::api::workflow::RunListFilters {
+            status: Some("success".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("paginated filtered list");
+
+    assert_eq!(
+        runs.iter().map(|run| run.run_number).collect::<Vec<_>>(),
+        vec![60, 62]
+    );
+}
+
+#[tokio::test]
+async fn run_list_unknown_filter_value_errors_after_unfiltered_check() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/runs"))
+        .and(query_param("status", "typo"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(workflow_runs_payload(json!([
+                { "id": 1, "status": "success", "workflow_id": "ci.yml", "run_number": 50 }
+            ]))),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/runs"))
+        .and(query_param_is_missing("status"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(workflow_runs_payload(json!([
+                { "id": 1, "status": "success", "workflow_id": "ci.yml", "run_number": 50 }
+            ]))),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let c = client_for(&server).await;
+    let err = crate::api::workflow::list_runs_filtered(
+        &c,
+        "o",
+        "r",
+        20,
+        false,
+        &crate::api::workflow::RunListFilters {
+            status: Some("typo".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect_err("unknown filter should error");
+
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("unknown workflow run filter value"),
+        "got: {msg}"
+    );
+    assert!(msg.contains("status `typo`"), "got: {msg}");
 }
 
 // ── Run logs (web routes, not /api/v1) ───────────────────────────────────────

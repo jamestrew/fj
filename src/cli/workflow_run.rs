@@ -41,6 +41,21 @@ pub struct ListArgs {
     /// Maximum number of runs to fetch
     #[arg(short = 'L', long, default_value_t = 20)]
     pub limit: u32,
+    /// Fetch every available page
+    #[arg(long)]
+    pub paginate: bool,
+    /// Filter by run status or conclusion
+    #[arg(long)]
+    pub status: Option<String>,
+    /// Filter by source branch
+    #[arg(long)]
+    pub branch: Option<String>,
+    /// Filter by triggering event
+    #[arg(long)]
+    pub event: Option<String>,
+    /// Filter by workflow file
+    #[arg(long)]
+    pub workflow: Option<String>,
     /// Emit JSON instead of a table
     #[arg(long)]
     pub json: bool,
@@ -116,7 +131,21 @@ pub async fn run(cmd: RunCmd, host: Option<&str>) -> Result<()> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn list(args: ListArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
-    let runs = api::workflow::list_runs(&ctx.client, &ctx.owner, &ctx.name, args.limit).await?;
+    let filters = api::workflow::RunListFilters {
+        status: args.status,
+        branch: args.branch,
+        event: args.event,
+        workflow: args.workflow,
+    };
+    let runs = api::workflow::list_runs_filtered(
+        &ctx.client,
+        &ctx.owner,
+        &ctx.name,
+        args.limit,
+        args.paginate,
+        &filters,
+    )
+    .await?;
     if args.json {
         return output::print_json(&serde_json::to_value(&runs)?);
     }
@@ -565,6 +594,38 @@ mod tests {
     fn ensure_exit_status_rejects_failed_and_cancelled_runs() {
         assert!(ensure_exit_status("failure", true).is_err());
         assert!(ensure_exit_status("cancelled", true).is_err());
+    }
+
+    #[test]
+    fn run_list_filter_flags_parse() {
+        use clap::Parser;
+
+        let cli = crate::cli::Cli::try_parse_from([
+            "fj",
+            "run",
+            "list",
+            "--paginate",
+            "--status",
+            "failure",
+            "--branch",
+            "main",
+            "--event",
+            "push",
+            "--workflow",
+            "ci.yml",
+        ])
+        .expect("should parse");
+        let crate::cli::Command::Run(RunCmd {
+            command: RunSub::List(args),
+        }) = cli.command
+        else {
+            panic!("expected run list command");
+        };
+        assert!(args.paginate);
+        assert_eq!(args.status.as_deref(), Some("failure"));
+        assert_eq!(args.branch.as_deref(), Some("main"));
+        assert_eq!(args.event.as_deref(), Some("push"));
+        assert_eq!(args.workflow.as_deref(), Some("ci.yml"));
     }
 
     #[test]
