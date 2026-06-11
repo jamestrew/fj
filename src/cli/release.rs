@@ -82,6 +82,9 @@ pub struct CreateArgs {
     /// Release notes (use - for stdin, omit to open $EDITOR)
     #[arg(short = 'b', long)]
     pub body: Option<String>,
+    /// Read release notes from file (use `-` for stdin).
+    #[arg(short = 'F', long = "body-file", value_name = "FILE")]
+    pub body_file: Option<String>,
     /// Target commitish (branch or SHA). Defaults to default branch.
     #[arg(long)]
     pub target: Option<String>,
@@ -288,7 +291,11 @@ async fn view(args: ViewArgs, host: Option<&str>) -> Result<()> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn create(args: CreateArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
-    let body = editor::resolve_body(args.body.as_deref(), "RELEASE_BODY.md", "")?;
+    let body = editor::resolve_body_input(
+        args.body.as_deref(),
+        args.body_file.as_deref(),
+        Some(("RELEASE_BODY.md", "")),
+    )?;
     let payload = CreateRelease {
         tag_name: &args.tag,
         name: args.title.as_deref(),

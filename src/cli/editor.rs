@@ -4,6 +4,7 @@
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
+use std::path::Path;
 use std::process::Command;
 
 use anyhow::{anyhow, Context, Result};
@@ -113,6 +114,36 @@ pub fn read_body(flag: Option<&str>) -> Result<Option<String>> {
     }
 }
 
+/// Resolve mutually-exclusive `--body` and `--body-file` flags. `-` reads
+/// from stdin for either flag. When `editor_template` is present and neither
+/// flag was passed, open the editor using the supplied template name and seed.
+pub fn resolve_body_input(
+    body: Option<&str>,
+    body_file: Option<&str>,
+    editor_template: Option<(&str, &str)>,
+) -> Result<Option<String>> {
+    match (body, body_file) {
+        (Some(_), Some(_)) => Err(anyhow!("--body and --body-file are mutually exclusive")),
+        (Some(s), None) => read_body(Some(s)),
+        (None, Some("-")) => {
+            let mut buf = String::new();
+            std::io::stdin().read_to_string(&mut buf)?;
+            Ok(Some(buf.trim_end().to_string()))
+        }
+        (None, Some(path)) => {
+            let buf = fs::read_to_string(Path::new(path))
+                .with_context(|| format!("reading body from {path}"))?;
+            Ok(Some(buf.trim_end().to_string()))
+        }
+        (None, None) => match editor_template {
+            Some((template_name, template_initial)) => {
+                resolve_body(None, template_name, template_initial)
+            }
+            None => Ok(None),
+        },
+    }
+}
+
 /// Prompt for a single line on stderr, returning a trimmed string.
 pub fn prompt_line(label: &str) -> Result<String> {
     use std::io::{stderr, stdin};
@@ -188,5 +219,22 @@ mod tests {
         let r = read_body(Some("hello")).unwrap();
         assert_eq!(r.as_deref(), Some("hello"));
         assert!(read_body(None).unwrap().is_none());
+    }
+
+    #[test]
+    fn resolve_body_input_reads_file_and_trims_trailing_newline() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"hello from file\n\n").unwrap();
+
+        let r = resolve_body_input(None, Some(file.path().to_str().unwrap()), None).unwrap();
+        assert_eq!(r.as_deref(), Some("hello from file"));
+    }
+
+    #[test]
+    fn resolve_body_input_rejects_body_and_body_file() {
+        let err = resolve_body_input(Some("literal"), Some("body.md"), None).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("--body and --body-file are mutually exclusive"));
     }
 }
