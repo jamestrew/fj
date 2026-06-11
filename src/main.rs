@@ -73,14 +73,12 @@ fn handle_parse_outcome(err: clap::Error) -> ExitCode {
     use std::io::IsTerminal;
 
     let show_logo = match err.kind() {
-        // `--version` always wears the mark: asking for the version is an
-        // explicit "show me fj" and we want it to read the same everywhere.
-        ErrorKind::DisplayVersion => true,
-        // The help screen (explicit `--help` or bare `fj`) only gets the mark
-        // on an interactive stdout, so piped help stays clean and parseable.
-        ErrorKind::DisplayHelp | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => {
-            std::io::stdout().is_terminal()
-        }
+        // The version line, explicit help screen, and bare-`fj` help screen
+        // only get the mark on an interactive stdout, so piped output stays
+        // clean and parseable.
+        ErrorKind::DisplayVersion
+        | ErrorKind::DisplayHelp
+        | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => std::io::stdout().is_terminal(),
         _ => false,
     };
     if show_logo {
