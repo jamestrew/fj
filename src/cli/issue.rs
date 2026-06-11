@@ -24,7 +24,7 @@ pub enum IssueSub {
     View(ViewArgs),
     /// Create an issue with optional labels and assignees.
     Create(CreateArgs),
-    /// Edit an issue's title, body, labels, or assignees.
+    /// Edit an issue's title/body or add/remove labels and assignees.
     Edit(EditArgs),
     /// Close an issue.
     Close(NumberOnly),
@@ -156,6 +156,22 @@ pub struct EditArgs {
     /// Open `$EDITOR` to edit the body inline (overrides `--body`).
     #[arg(long)]
     pub body_editor: bool,
+    /// Label name to add. Repeat or use commas for multiple labels.
+    #[arg(long = "add-label", value_name = "NAME", value_delimiter = ',')]
+    pub add_label: Vec<String>,
+    /// Label name to remove. Repeat or use commas for multiple labels.
+    #[arg(long = "remove-label", value_name = "NAME", value_delimiter = ',')]
+    pub remove_label: Vec<String>,
+    /// Username to assign. Repeat or use commas for multiple assignees.
+    #[arg(long = "add-assignee", value_name = "USERNAME", value_delimiter = ',')]
+    pub add_assignee: Vec<String>,
+    /// Username to unassign. Repeat or use commas for multiple assignees.
+    #[arg(
+        long = "remove-assignee",
+        value_name = "USERNAME",
+        value_delimiter = ','
+    )]
+    pub remove_assignee: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -359,19 +375,87 @@ fn clean_csv_values(values: Vec<String>) -> Vec<String> {
 
 async fn edit(args: EditArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
-    let body = if args.body_editor {
-        let existing = api::issue::get(&ctx.client, &ctx.owner, &ctx.name, args.number).await?;
-        Some(editor::edit_text("ISSUE_BODY.md", &existing.body)?)
+    let add_labels = clean_csv_values(args.add_label);
+    let remove_labels = clean_csv_values(args.remove_label);
+    let add_assignees = clean_csv_values(args.add_assignee);
+    let remove_assignees = clean_csv_values(args.remove_assignee);
+    let has_additive_edits = !add_labels.is_empty()
+        || !remove_labels.is_empty()
+        || !add_assignees.is_empty()
+        || !remove_assignees.is_empty();
+    let should_patch =
+        args.title.is_some() || args.body.is_some() || args.body_editor || !has_additive_edits;
+
+    let mut updated_issue = None;
+    if should_patch {
+        let body = if args.body_editor {
+            let existing = api::issue::get(&ctx.client, &ctx.owner, &ctx.name, args.number).await?;
+            Some(editor::edit_text("ISSUE_BODY.md", &existing.body)?)
+        } else {
+            editor::read_body(args.body.as_deref())?
+        };
+        let patch = EditIssue {
+            title: args.title.as_deref(),
+            body: body.as_deref(),
+            state: None,
+        };
+        let issue =
+            api::issue::edit(&ctx.client, &ctx.owner, &ctx.name, args.number, &patch).await?;
+        updated_issue = Some(issue);
+    }
+
+    if !add_labels.is_empty() {
+        let label_ids =
+            api::label::resolve_names_to_ids(&ctx.client, &ctx.owner, &ctx.name, &add_labels)
+                .await?;
+        api::label::add_to_issue(&ctx.client, &ctx.owner, &ctx.name, args.number, label_ids)
+            .await?;
+    }
+    if !remove_labels.is_empty() {
+        let label_ids =
+            api::label::resolve_names_to_ids(&ctx.client, &ctx.owner, &ctx.name, &remove_labels)
+                .await?;
+        for label_id in label_ids {
+            api::label::remove_from_issue(
+                &ctx.client,
+                &ctx.owner,
+                &ctx.name,
+                args.number,
+                label_id,
+            )
+            .await?;
+        }
+    }
+    if !add_assignees.is_empty() {
+        updated_issue = Some(
+            api::issue::add_assignees(
+                &ctx.client,
+                &ctx.owner,
+                &ctx.name,
+                args.number,
+                add_assignees,
+            )
+            .await?,
+        );
+    }
+    if !remove_assignees.is_empty() {
+        updated_issue = Some(
+            api::issue::remove_assignees(
+                &ctx.client,
+                &ctx.owner,
+                &ctx.name,
+                args.number,
+                remove_assignees,
+            )
+            .await?,
+        );
+    }
+
+    if let Some(issue) = updated_issue {
+        println!("✓ Updated #{}: {}", issue.number, issue.title);
     } else {
-        editor::read_body(args.body.as_deref())?
-    };
-    let patch = EditIssue {
-        title: args.title.as_deref(),
-        body: body.as_deref(),
-        state: None,
-    };
-    let issue = api::issue::edit(&ctx.client, &ctx.owner, &ctx.name, args.number, &patch).await?;
-    println!("✓ Updated #{}: {}", issue.number, issue.title);
+        println!("✓ Updated #{}", args.number);
+    }
     Ok(())
 }
 
