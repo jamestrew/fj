@@ -3,11 +3,12 @@
 //! Hosts the shared `SecretListArgs` / `SecretSetArgs` / `SecretDeleteArgs`
 //! and `read_value`, reused by the variable group in `workflow_variable`.
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use clap::{Args, Subcommand};
 
 use crate::api;
-use crate::cli::context::{resolve_repo, RepoFlag};
+use crate::cli::context::{resolve_repo, RepoContext, RepoFlag};
+use crate::client::Client;
 use crate::output;
 
 #[derive(Debug, Args)]
@@ -30,6 +31,9 @@ pub enum SecretSub {
 pub struct SecretListArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Organization scope for shared Actions secrets/variables.
+    #[arg(long, value_name = "ORG", conflicts_with = "repo")]
+    pub org: Option<String>,
     /// Emit JSON instead of a table
     #[arg(long)]
     pub json: bool,
@@ -39,6 +43,9 @@ pub struct SecretListArgs {
 pub struct SecretSetArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Organization scope for shared Actions secrets/variables.
+    #[arg(long, value_name = "ORG", conflicts_with = "repo")]
+    pub org: Option<String>,
     /// Secret name
     pub name: String,
     /// Value (raw string). For multi-line secrets, prefer `--from-file -` and pipe stdin.
@@ -53,11 +60,37 @@ pub struct SecretSetArgs {
 pub struct SecretDeleteArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Organization scope for shared Actions secrets/variables.
+    #[arg(long, value_name = "ORG", conflicts_with = "repo")]
+    pub org: Option<String>,
     /// Secret name
     pub name: String,
     /// Skip the confirmation prompt
     #[arg(short = 'y', long)]
     pub yes: bool,
+}
+
+pub(crate) enum WorkflowScope {
+    Repo(RepoContext),
+    Org { client: Client, org: String },
+}
+
+pub(crate) fn resolve_workflow_scope(
+    repo: Option<&str>,
+    org: Option<&str>,
+    host: Option<&str>,
+) -> Result<WorkflowScope> {
+    if let Some(org) = org {
+        if repo.is_some() {
+            bail!("--org cannot be used with --repo/-R");
+        }
+        return Ok(WorkflowScope::Org {
+            client: Client::connect(host)?,
+            org: org.to_string(),
+        });
+    }
+
+    Ok(WorkflowScope::Repo(resolve_repo(repo, host)?))
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -71,8 +104,13 @@ pub async fn run_secret(cmd: SecretCmd, host: Option<&str>) -> Result<()> {
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn secret_list(args: SecretListArgs, host: Option<&str>) -> Result<()> {
-    let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
-    let s = api::workflow::list_secrets(&ctx.client, &ctx.owner, &ctx.name).await?;
+    let scope = resolve_workflow_scope(args.r.repo.as_deref(), args.org.as_deref(), host)?;
+    let s = match &scope {
+        WorkflowScope::Repo(ctx) => {
+            api::workflow::list_secrets(&ctx.client, &ctx.owner, &ctx.name).await?
+        }
+        WorkflowScope::Org { client, org } => api::workflow::list_org_secrets(client, org).await?,
+    };
     if args.json {
         return output::print_json(&serde_json::to_value(&s)?);
     }
@@ -95,16 +133,24 @@ async fn secret_list(args: SecretListArgs, host: Option<&str>) -> Result<()> {
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn secret_set(args: SecretSetArgs, host: Option<&str>) -> Result<()> {
-    let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
+    let scope = resolve_workflow_scope(args.r.repo.as_deref(), args.org.as_deref(), host)?;
     let value = read_value(args.value.as_deref(), args.from_file.as_deref())?;
-    api::workflow::set_secret(&ctx.client, &ctx.owner, &ctx.name, &args.name, &value).await?;
+    match &scope {
+        WorkflowScope::Repo(ctx) => {
+            api::workflow::set_secret(&ctx.client, &ctx.owner, &ctx.name, &args.name, &value)
+                .await?
+        }
+        WorkflowScope::Org { client, org } => {
+            api::workflow::set_org_secret(client, org, &args.name, &value).await?
+        }
+    }
     println!("✓ Set secret {}", args.name);
     Ok(())
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn secret_delete(args: SecretDeleteArgs, host: Option<&str>) -> Result<()> {
-    let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
+    let scope = resolve_workflow_scope(args.r.repo.as_deref(), args.org.as_deref(), host)?;
     if !args.yes {
         let ans = crate::cli::editor::prompt_line(&format!(
             "Delete secret '{}'? Type name to confirm",
@@ -114,7 +160,14 @@ async fn secret_delete(args: SecretDeleteArgs, host: Option<&str>) -> Result<()>
             return Err(anyhow::anyhow!("aborted"));
         }
     }
-    api::workflow::delete_secret(&ctx.client, &ctx.owner, &ctx.name, &args.name).await?;
+    match &scope {
+        WorkflowScope::Repo(ctx) => {
+            api::workflow::delete_secret(&ctx.client, &ctx.owner, &ctx.name, &args.name).await?
+        }
+        WorkflowScope::Org { client, org } => {
+            api::workflow::delete_org_secret(client, org, &args.name).await?
+        }
+    }
     println!("✓ Deleted secret {}", args.name);
     Ok(())
 }
@@ -166,5 +219,38 @@ mod tests {
     fn read_value_prefers_inline_over_file() {
         let got = read_value(Some("inline"), Some("/nonexistent/path")).unwrap();
         assert_eq!(got, "inline");
+    }
+
+    #[test]
+    fn org_scope_rejects_repo_scope() {
+        let err = match resolve_workflow_scope(Some("o/r"), Some("team"), Some("example.com")) {
+            Ok(_) => panic!("org and repo are exclusive"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("--org cannot be used"));
+    }
+
+    #[test]
+    fn secret_org_scope_parses_and_conflicts_with_repo() {
+        use clap::Parser;
+
+        assert!(crate::cli::Cli::try_parse_from(["fj", "secret", "list", "--org", "team"]).is_ok());
+        assert!(crate::cli::Cli::try_parse_from([
+            "fj", "secret", "list", "--org", "team", "-R", "o/r",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn variable_org_scope_parses_and_conflicts_with_repo() {
+        use clap::Parser;
+
+        assert!(
+            crate::cli::Cli::try_parse_from(["fj", "variable", "list", "--org", "team"]).is_ok()
+        );
+        assert!(crate::cli::Cli::try_parse_from([
+            "fj", "variable", "list", "--org", "team", "-R", "o/r",
+        ])
+        .is_err());
     }
 }
