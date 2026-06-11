@@ -7,7 +7,7 @@
 <p align="center">
   <strong>A native CLI for <a href="https://forgejo.org">Forgejo</a> and Gitea-compatible forges.</strong><br>
   Open PRs, triage issues, ship releases, and tail Actions logs from the terminal,<br>
-  all from a single binary. Tokens stay in your OS keychain. Multi-host from day one.
+  all from a single binary. Tokens prefer your OS keychain, with a 0600 file fallback for headless hosts. Multi-host from day one.
 </p>
 
 <p align="center">
@@ -29,9 +29,11 @@ the web UI. `tea` exists but lags Forgejo features and ships no signed release.
 
 `fj` is the piece in the middle: a single binary that tracks the Forgejo
 `/api/v1` surface, ships **signed and notarized** macOS builds (no Gatekeeper
-warnings), a Linux binary, and a Homebrew tap. Tokens never touch disk. They
-live in the macOS Keychain, the Linux Secret Service, or the Windows
-Credential Manager.
+warnings), a Linux binary, and a Homebrew tap. Tokens prefer the
+macOS Keychain, the Linux Secret Service, or the Windows Credential Manager.
+On headless systems without a usable keychain, fj falls back to a 0600
+`tokens.toml` in its XDG config directory. `FJ_TOKEN` is always checked first
+and overrides persistent storage for that process.
 
 What you get over hand-rolled scripts:
 
@@ -71,7 +73,7 @@ Windows compiles but is untested. [File an issue](https://rasterhub.com/rasterst
 ## Quickstart
 
 ```sh
-fj auth login                            # pick Fjord Account or a Forgejo token; stored in your OS keychain
+fj auth login                            # pick Fjord Account or a Forgejo token; stored in keychain or 0600 file fallback
 fj repo view                             # auto-detects the repo from your git remote
 fj pr list --state all -L 10             # latest 10 PRs
 fj issue create --title "..." --body "..."
@@ -188,7 +190,9 @@ can open results in the browser.
 | `$XDG_CONFIG_HOME/fj/hosts.toml` (`~/Library/Application Support/fj/hosts.toml` on macOS) | host registry + current default |
 | `$XDG_CONFIG_HOME/fj/aliases.toml` | user-defined command shortcuts |
 | `$XDG_CONFIG_HOME/fj/config.toml` | editor / pager / browser preferences |
-| OS keychain, service `fj`, key = hostname | API tokens (never on disk) |
+| OS keychain, service `fj`, key = hostname | Preferred persistent API token store |
+| `$XDG_CONFIG_HOME/fj/tokens.toml` | 0600 fallback token store when the OS keychain is unavailable |
+| `FJ_TOKEN` | Process-scoped token override for headless/CI jobs; checked before persistent stores |
 
 ## Contributing
 

@@ -133,7 +133,8 @@ async fn login_pat(args: LoginArgs) -> Result<()> {
     };
     hosts.upsert(&hostname, host);
     hosts.save()?;
-    token_store::store_token(&hostname, &token)?;
+    let storage = token_store::store_token(&hostname, &token)?;
+    print_file_store_notice(&storage);
 
     println!(
         "{} Logged in to {} as {}{}",
@@ -237,7 +238,8 @@ async fn login_fjord(args: LoginArgs) -> Result<()> {
     };
     hosts.upsert(&platform_url, host_entry);
     hosts.save()?;
-    token_store::store_fjord_bearer(&platform_url, &access_token)?;
+    let storage = token_store::store_fjord_bearer(&platform_url, &access_token)?;
+    print_file_store_notice(&storage);
 
     println!(
         "{} Signed in to {} as {}",
@@ -250,6 +252,16 @@ async fn login_fjord(args: LoginArgs) -> Result<()> {
         output::dim("Next: `fj instances list` to see your Forgejo instances, then `fj instances use <id>`.")
     );
     Ok(())
+}
+
+fn print_file_store_notice(storage: &token_store::TokenStoreLocation) {
+    if let token_store::TokenStoreLocation::File(path) = storage {
+        println!(
+            "{} Keychain unavailable; stored token in {}",
+            output::bold("!"),
+            path.display()
+        );
+    }
 }
 
 enum TotpInput {

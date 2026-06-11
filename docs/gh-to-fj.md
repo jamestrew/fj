@@ -9,7 +9,7 @@ called out.
 | `gh`                     | `fj`                        | Notes                                                |
 | ------------------------ | --------------------------- | ---------------------------------------------------- |
 | `gh auth login`          | `fj auth login`             | Multi-host; first run asks Fjord Account vs. server. |
-| `gh auth status`         | `fj auth status`            | Tokens stored in OS keychain, never on disk.         |
+| `gh auth status`         | `fj auth status`            | Tokens prefer OS keychain; headless fallback is a 0600 XDG file. |
 | `gh auth logout`         | `fj auth logout`            |                                                      |
 | `gh auth refresh`        | `fj auth refresh`           | Re-verifies (or replaces) the stored token.          |
 | `gh auth token`          | `fj auth token`             | Refuses to write to a TTY without `--force`.         |

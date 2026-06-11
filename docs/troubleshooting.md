@@ -17,6 +17,15 @@ modal dialog you can't see (the binary doesn't have a TTY). Bring the
 Keychain Access prompt to the foreground and approve it, or run
 `fj auth status` from a regular terminal first to surface the prompt.
 
+
+## Linux says the keychain or Secret Service is unavailable
+
+Headless Linux hosts often do not have an unlocked Secret Service collection.
+For CI, set `FJ_TOKEN` so fj never touches persistent token storage for that
+process. For long-lived headless machines, run `fj auth login`; when the OS
+keychain cannot be opened, fj writes the verified token to
+`$XDG_CONFIG_HOME/fj/tokens.toml` with mode 0600 and prints that path.
+
 ## `error: HTTP 401 ... authentication failed`
 
 The stored token is invalid or revoked. Re-authenticate:

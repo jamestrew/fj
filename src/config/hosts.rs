@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use super::hosts_path;
 
 /// A single Forgejo host entry. The auth token is intentionally NOT serialized
-/// here: tokens live in the OS keychain via the `auth` module.
+/// here: tokens live in the `auth` module stores, not hosts.toml.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Host {
     /// Username (login) of the authenticated user on this host. For Fjord
@@ -22,9 +22,9 @@ pub struct Host {
     pub web_url: Option<String>,
     /// Optional API base path. Defaults to `/api/v1` when absent.
     pub api_base_path: Option<String>,
-    /// How this host authenticates. `pat` (default) means the keychain
+    /// How this host authenticates. `pat` (default) means the auth token store
     /// holds a Forgejo personal access token and requests go direct to
-    /// the host. `fjord_account` means the keychain holds a Fjord
+    /// the host. `fjord_account` means the auth token store holds a Fjord
     /// Account bearer and requests are routed through the
     /// fjord-platform gateway.
     #[serde(default, skip_serializing_if = "AuthKind::is_default")]

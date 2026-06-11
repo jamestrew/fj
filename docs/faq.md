@@ -9,9 +9,13 @@ prompt you to paste it.
 
 ## Where are my tokens stored?
 
-In your OS keychain (macOS Keychain, Linux Secret Service, Windows
-Credential Manager) under the service name `fj`, keyed by hostname.
-Never on disk in `hosts.toml`.
+fj checks `FJ_TOKEN` first; when it is set to a non-empty value, that
+process uses it instead of any persistent store. Otherwise tokens are stored
+in your OS keychain (macOS Keychain, Linux Secret Service, Windows Credential
+Manager) under the service name `fj`, keyed by hostname. If the keychain is
+unavailable, such as on headless Linux without Secret Service, `fj auth login`
+falls back to `$XDG_CONFIG_HOME/fj/tokens.toml` with file mode 0600. Tokens
+are never written to `hosts.toml`.
 
 ## How do I add a second host?
 
@@ -40,7 +44,8 @@ next rebuild. See `troubleshooting.md`.
 
 ## How do I make `fj` work in a non-interactive script?
 
-- Set `FJ_TOKEN` env var to avoid `fj auth login` prompting.
+- Set `FJ_TOKEN` for an explicit process-scoped token override. This is the recommended path for CI jobs.
+- On headless hosts where a per-shell env var is inconvenient, run `fj auth login`; if the OS keychain is unavailable, fj stores the token in `$XDG_CONFIG_HOME/fj/tokens.toml` with mode 0600.
 - Set `FJ_HOST` to pin the host.
 - Always pass `--body "..."` or `--body -` so `fj` never opens
   `$EDITOR`.
