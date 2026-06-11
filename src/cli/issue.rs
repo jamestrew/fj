@@ -5,6 +5,7 @@ use crate::api;
 use crate::api::issue::{CreateIssue, EditIssue, ListOptions, State};
 use crate::cli::context::{repo_web_url, resolve_repo, RepoFlag};
 use crate::cli::issue_comment::{self, CommentArgs, DeleteCommentArgs, EditCommentArgs};
+use crate::cli::list as list_output;
 use crate::output;
 
 use super::editor;
@@ -70,9 +71,12 @@ pub struct ListArgs {
     /// Filter by state
     #[arg(short = 's', long, value_enum, default_value_t = StateFilter::Open)]
     pub state: StateFilter,
-    /// Maximum number of issues to fetch
+    /// Maximum number of issues to fetch (default 30; results may be capped unless --paginate)
     #[arg(short = 'L', long, default_value_t = 30)]
     pub limit: u32,
+    /// Fetch all pages instead of stopping at --limit
+    #[arg(long)]
+    pub paginate: bool,
     /// Page of results to fetch
     #[arg(long, default_value_t = 1)]
     pub page: u32,
@@ -239,13 +243,14 @@ async fn list(args: ListArgs, host: Option<&str>) -> Result<()> {
         state: args.state.into(),
         limit: args.limit,
         page: args.page,
+        paginate: args.paginate,
         labels: args.label.as_deref(),
         assignee: args.assignee.as_deref(),
         query: args.query.as_deref(),
     };
     let page = api::issue::list(&ctx.client, &ctx.owner, &ctx.name, opts).await?;
     if args.json {
-        return output::print_json(&serde_json::to_value(&page.items)?);
+        return list_output::print_json(&page);
     }
     if page.items.is_empty() {
         println!("(no issues)");
@@ -275,6 +280,9 @@ async fn list(args: ListArgs, host: Option<&str>) -> Result<()> {
         "{}",
         output::render_table(&["", "STATE", "TITLE", "LABELS", "💬", "UPDATED"], &rows)
     );
+    if !args.paginate {
+        list_output::print_truncation_footer(&page, args.limit);
+    }
     Ok(())
 }
 

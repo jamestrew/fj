@@ -102,6 +102,7 @@ pub struct ListOptions {
     pub state: State,
     pub limit: u32,
     pub page: u32,
+    pub paginate: bool,
 }
 
 impl Default for ListOptions {
@@ -110,6 +111,7 @@ impl Default for ListOptions {
             state: State::Open,
             limit: 30,
             page: 1,
+            paginate: false,
         }
     }
 }
@@ -121,14 +123,15 @@ pub async fn list(
     opts: ListOptions,
 ) -> Result<Page<Pull>> {
     let path = format!("{}/pulls", crate::api::repo_path(owner, name));
-    // When the caller wants more than the API's per-page cap, transparently
-    // follow Link rel=next.
-    if opts.limit > 50 {
-        let query: Vec<(String, String)> = vec![("state".into(), opts.state.as_str().into())];
-        let items = client
-            .get_all::<Pull>(&path, &query, opts.limit as usize)
-            .await?;
-        return Ok(Page::single(items));
+    if opts.paginate || opts.limit > 50 {
+        let mut query: Vec<(String, String)> = vec![("state".into(), opts.state.as_str().into())];
+        if opts.paginate {
+            query.push(("page".into(), opts.page.max(1).to_string()));
+            return client.get_all_page::<Pull>(&path, &query, None).await;
+        }
+        return client
+            .get_all_page::<Pull>(&path, &query, Some(opts.limit as usize))
+            .await;
     }
     let query: Vec<(String, String)> = vec![
         ("state".into(), opts.state.as_str().into()),

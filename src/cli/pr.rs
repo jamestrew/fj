@@ -9,7 +9,7 @@ use crate::api::pull::{CreatePull, EditPull, ListOptions};
 use crate::cli::context::{repo_web_url, resolve_repo, RepoFlag};
 use crate::cli::pr_args::{MergeStyleArg, ReviewEventArg, StateFilter, UpdateStyle};
 use crate::cli::pr_status::StatusArgs;
-use crate::cli::{pr_inspect, pr_review, pr_status};
+use crate::cli::{list as list_output, pr_inspect, pr_review, pr_status};
 use crate::git;
 use crate::output;
 
@@ -73,9 +73,12 @@ pub struct ListArgs {
     /// Filter by state
     #[arg(short = 's', long, value_enum, default_value_t = StateFilter::Open)]
     pub state: StateFilter,
-    /// Maximum number of pull requests to fetch
+    /// Maximum number of pull requests to fetch (default 30; results may be capped unless --paginate)
     #[arg(short = 'L', long, default_value_t = 30)]
     pub limit: u32,
+    /// Fetch all pages instead of stopping at --limit
+    #[arg(long)]
+    pub paginate: bool,
     /// Page of results to fetch
     #[arg(long, default_value_t = 1)]
     pub page: u32,
@@ -292,11 +295,12 @@ async fn list(args: ListArgs, host: Option<&str>) -> Result<()> {
             state: args.state.into(),
             limit: args.limit,
             page: args.page,
+            paginate: args.paginate,
         },
     )
     .await?;
     if args.json {
-        return output::print_json(&serde_json::to_value(&page.items)?);
+        return list_output::print_json(&page);
     }
     if page.items.is_empty() {
         println!("(no pull requests)");
@@ -323,6 +327,9 @@ async fn list(args: ListArgs, host: Option<&str>) -> Result<()> {
         "{}",
         output::render_table(&["", "STATE", "TITLE", "BRANCHES", "UPDATED"], &rows)
     );
+    if !args.paginate {
+        list_output::print_truncation_footer(&page, args.limit);
+    }
     Ok(())
 }
 

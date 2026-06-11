@@ -390,15 +390,31 @@ impl Client {
     /// GET that follows `Link: rel=next` until either `total_limit` items have
     /// been collected or there are no more pages. Use this when the caller's
     /// requested limit exceeds Forgejo's per-page cap (50).
+    #[cfg(test)]
     pub async fn get_all<T: DeserializeOwned>(
         &self,
         path: &str,
         base_query: &[(String, String)],
         total_limit: usize,
     ) -> Result<Vec<T>> {
+        Ok(self
+            .get_all_page(path, base_query, Some(total_limit))
+            .await?
+            .items)
+    }
+
+    /// GET that follows `Link: rel=next` and returns the collected items along
+    /// with pagination metadata from the first page, including `X-Total-Count`.
+    pub async fn get_all_page<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        base_query: &[(String, String)],
+        total_limit: Option<usize>,
+    ) -> Result<Page<T>> {
         let mut out: Vec<T> = Vec::new();
         let mut current_path: String = path.to_string();
         let mut current_query: Vec<(String, String)> = base_query.to_vec();
+        let mut first_page: Option<Page<()>> = None;
         // Make sure per-page is set to the API's max so we don't make extra
         // round-trips.
         if !current_query.iter().any(|(k, _)| k == "limit") {
@@ -418,6 +434,9 @@ impl Client {
             let res = ensure_success(res).await?;
             let headers = res.headers().clone();
             let text = res.text().await.context("reading list response body")?;
+            if first_page.is_none() {
+                first_page = Some(Page::from_headers(Vec::new(), &headers));
+            }
             // Some Forgejo list endpoints answer an empty collection with a
             // `null` (or empty) body rather than `[]`. Normalize it exactly as
             // `get_page` does, so a large-`--limit` walk doesn't error where a
@@ -426,12 +445,14 @@ impl Client {
             if items.is_empty() {
                 break;
             }
-            let need = total_limit.saturating_sub(out.len());
-            if items.len() > need {
-                items.truncate(need);
+            if let Some(total_limit) = total_limit {
+                let need = total_limit.saturating_sub(out.len());
+                if items.len() > need {
+                    items.truncate(need);
+                }
             }
             out.append(&mut items);
-            if out.len() >= total_limit {
+            if total_limit.is_some_and(|limit| out.len() >= limit) {
                 break;
             }
             // Find Link: rel=next.
@@ -454,7 +475,15 @@ impl Client {
                 .map(|(k, v)| (k.into_owned(), v.into_owned()))
                 .collect();
         }
-        Ok(out)
+        let meta = first_page.unwrap_or_else(|| Page::single(Vec::new()));
+        Ok(Page {
+            items: out,
+            next: meta.next,
+            prev: meta.prev,
+            last: meta.last,
+            first: meta.first,
+            total: meta.total,
+        })
     }
 }
 

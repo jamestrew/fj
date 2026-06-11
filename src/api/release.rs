@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
 
-use crate::client::Client;
+use crate::client::{Client, Page};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Release {
@@ -32,13 +32,44 @@ pub struct Asset {
     pub created_at: DateTime<Utc>,
 }
 
-pub async fn list(client: &Client, owner: &str, name: &str, limit: u32) -> Result<Vec<Release>> {
+#[derive(Debug, Clone, Copy)]
+pub struct ListOptions {
+    pub limit: u32,
+    pub page: u32,
+    pub paginate: bool,
+}
+
+impl Default for ListOptions {
+    fn default() -> Self {
+        Self {
+            limit: 30,
+            page: 1,
+            paginate: false,
+        }
+    }
+}
+
+pub async fn list(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    opts: ListOptions,
+) -> Result<Page<Release>> {
     let path = format!("{}/releases", crate::api::repo_path(owner, name));
+    if opts.paginate || opts.limit > 50 {
+        if opts.paginate {
+            let query = vec![("page".into(), opts.page.max(1).to_string())];
+            return client.get_all_page::<Release>(&path, &query, None).await;
+        }
+        return client
+            .get_all_page::<Release>(&path, &[], Some(opts.limit as usize))
+            .await;
+    }
     let query = vec![
-        ("limit".into(), limit.clamp(1, 50).to_string()),
-        ("page".into(), "1".into()),
+        ("limit".into(), opts.limit.clamp(1, 50).to_string()),
+        ("page".into(), opts.page.max(1).to_string()),
     ];
-    client.json(Method::GET, &path, &query, None::<&()>).await
+    client.get_page::<Release>(&path, &query).await
 }
 
 pub async fn get_by_tag(client: &Client, owner: &str, name: &str, tag: &str) -> Result<Release> {

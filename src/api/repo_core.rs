@@ -44,15 +44,21 @@ pub struct Repo {
 pub struct ListOptions<'a> {
     pub limit: u32,
     pub page: u32,
+    pub paginate: bool,
     pub query: Option<&'a str>,
 }
 
 pub async fn list_for_user(client: &Client, opts: ListOptions<'_>) -> Result<Page<Repo>> {
-    if opts.limit > 50 {
-        let items = client
-            .get_all::<Repo>("/api/v1/user/repos", &[], opts.limit as usize)
-            .await?;
-        return Ok(Page::single(items));
+    if opts.paginate || opts.limit > 50 {
+        if opts.paginate {
+            let query = vec![("page".into(), opts.page.max(1).to_string())];
+            return client
+                .get_all_page::<Repo>("/api/v1/user/repos", &query, None)
+                .await;
+        }
+        return client
+            .get_all_page::<Repo>("/api/v1/user/repos", &[], Some(opts.limit as usize))
+            .await;
     }
     let limit = opts.limit.clamp(1, 50);
     let page = opts.page.max(1);

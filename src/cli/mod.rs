@@ -19,6 +19,7 @@ pub mod issue;
 mod issue_comment;
 pub mod key;
 pub mod label;
+mod list;
 pub mod milestone;
 pub mod org;
 pub mod pr;

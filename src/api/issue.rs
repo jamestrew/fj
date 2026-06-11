@@ -67,6 +67,7 @@ pub struct ListOptions<'a> {
     pub state: State,
     pub limit: u32,
     pub page: u32,
+    pub paginate: bool,
     pub labels: Option<&'a str>,
     pub assignee: Option<&'a str>,
     pub query: Option<&'a str>,
@@ -78,6 +79,7 @@ impl Default for ListOptions<'_> {
             state: State::Open,
             limit: 30,
             page: 1,
+            paginate: false,
             labels: None,
             assignee: None,
             query: None,
@@ -105,11 +107,14 @@ pub async fn list(
     if let Some(q) = opts.query {
         query.push(("q".into(), q.into()));
     }
-    if opts.limit > 50 {
-        let items = client
-            .get_all::<Issue>(&path, &query, opts.limit as usize)
-            .await?;
-        return Ok(Page::single(items));
+    if opts.paginate || opts.limit > 50 {
+        if opts.paginate {
+            query.push(("page".into(), opts.page.max(1).to_string()));
+            return client.get_all_page::<Issue>(&path, &query, None).await;
+        }
+        return client
+            .get_all_page::<Issue>(&path, &query, Some(opts.limit as usize))
+            .await;
     }
     query.push(("limit".into(), opts.limit.clamp(1, 50).to_string()));
     query.push(("page".into(), opts.page.max(1).to_string()));

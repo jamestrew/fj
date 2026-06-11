@@ -6,7 +6,7 @@ use crate::cli::context::resolve_repo;
 use crate::cli::repo_deploy_key::DeployKeyCmd;
 use crate::cli::repo_mirror::{MirrorArgs, MirrorSyncArgs};
 use crate::cli::repo_social::{SimpleRepoArgs, StarredArgs};
-use crate::cli::{repo_deploy_key, repo_mirror, repo_social};
+use crate::cli::{list as list_output, repo_deploy_key, repo_mirror, repo_social};
 use crate::client::Client;
 use crate::config::hosts::Hosts;
 use crate::git;
@@ -83,9 +83,12 @@ pub struct SetDefaultArgs {
 
 #[derive(Debug, Args)]
 pub struct ListArgs {
-    /// Maximum number of repositories to fetch
+    /// Maximum number of repositories to fetch (default 30; results may be capped unless --paginate)
     #[arg(short = 'L', long, default_value_t = 30)]
     pub limit: u32,
+    /// Fetch all pages instead of stopping at --limit
+    #[arg(long)]
+    pub paginate: bool,
     /// Page of results to fetch
     #[arg(long, default_value_t = 1)]
     pub page: u32,
@@ -311,6 +314,7 @@ async fn list(args: ListArgs, host: Option<&str>) -> Result<()> {
     let opts = api::repo::ListOptions {
         limit: args.limit,
         page: args.page,
+        paginate: args.paginate,
         query: args.search.as_deref(),
     };
     let page = if args.search.is_some() {
@@ -319,8 +323,7 @@ async fn list(args: ListArgs, host: Option<&str>) -> Result<()> {
         api::repo::list_for_user(&client, opts).await?
     };
     if args.json {
-        let v = serde_json::to_value(&page.items)?;
-        return output::print_json(&v);
+        return list_output::print_json(&page);
     }
     if page.items.is_empty() {
         println!("(no repositories)");
@@ -343,6 +346,9 @@ async fn list(args: ListArgs, host: Option<&str>) -> Result<()> {
         "{}",
         output::render_table(&["NAME", "DESCRIPTION", "VISIBILITY", "UPDATED"], &rows)
     );
+    if !args.paginate {
+        list_output::print_truncation_footer(&page, args.limit);
+    }
     Ok(())
 }
 
