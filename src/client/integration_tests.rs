@@ -3061,6 +3061,131 @@ async fn issue_edit_and_delete_comment_by_id() {
         .expect("delete");
 }
 
+fn comment_by(id: u64, login: &str) -> serde_json::Value {
+    json!({
+        "id": id, "body": "x",
+        "user": { "id": id, "login": login },
+        "html_url": format!("https://x/c/{id}"),
+        "created_at": "2026-01-01T00:00:00Z"
+    })
+}
+
+// `pr comment --edit-last` is "fetch my login, list the PR's comments, pick my
+// newest, PATCH it" — PRs reuse the issue comment endpoints. This drives that
+// full sequence against the mock and asserts the selection lands on the
+// caller's most recent comment, not someone else's later one.
+#[tokio::test]
+async fn pr_comment_edit_last_selects_callers_newest_comment() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/user"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "id": 1, "login": "alice" })),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/issues/7/comments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            comment_by(11, "alice"),
+            comment_by(12, "bob"),
+            comment_by(14, "alice"),
+            comment_by(15, "bob"),
+        ])))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/repos/o/r/issues/comments/14"))
+        .and(body_json(json!({ "body": "build green" })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(comment_json(14, "build green")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let me = crate::api::user::current(&c).await.expect("current user");
+    let comments = crate::api::issue::list_comments(&c, "o", "r", 7)
+        .await
+        .expect("list");
+    let target = crate::cli::pr_comment::last_own_comment(&comments, &me.login)
+        .expect("alice has a comment");
+    assert_eq!(target.id, 14, "newest comment by the caller wins");
+    let edited = crate::api::issue::edit_comment(&c, "o", "r", target.id, "build green")
+        .await
+        .expect("edit");
+    assert_eq!(edited.body, "build green");
+}
+
+// `--create-if-none` / `--create-or-edit`: when the caller has no comment yet,
+// the selection returns None and the command falls through to POST a new one.
+#[tokio::test]
+async fn pr_comment_create_if_none_posts_when_caller_has_no_comment() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/user"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "id": 1, "login": "alice" })),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/issues/7/comments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([comment_by(12, "bob")])))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/issues/7/comments"))
+        .and(body_json(json!({ "body": "build running" })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(comment_json(20, "build running")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let me = crate::api::user::current(&c).await.expect("current user");
+    let comments = crate::api::issue::list_comments(&c, "o", "r", 7)
+        .await
+        .expect("list");
+    assert!(
+        crate::cli::pr_comment::last_own_comment(&comments, &me.login).is_none(),
+        "alice has no comment to edit"
+    );
+    let made = crate::api::issue::comment(&c, "o", "r", 7, "build running")
+        .await
+        .expect("create");
+    assert_eq!(made.id, 20);
+}
+
+// A bare comment id that does not exist surfaces the API 404 rather than a
+// silent success, for both edit and delete.
+#[tokio::test]
+async fn pr_comment_edit_and_delete_missing_id_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/repos/o/r/issues/comments/999"))
+        .respond_with(
+            ResponseTemplate::new(404)
+                .set_body_json(json!({ "message": "comment does not exist" })),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/repos/o/r/issues/comments/999"))
+        .respond_with(
+            ResponseTemplate::new(404)
+                .set_body_json(json!({ "message": "comment does not exist" })),
+        )
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let edit_err = crate::api::issue::edit_comment(&c, "o", "r", 999, "x")
+        .await
+        .expect_err("missing comment should error");
+    assert!(edit_err.to_string().contains("404"));
+    let del_err = crate::api::issue::delete_comment(&c, "o", "r", 999)
+        .await
+        .expect_err("missing comment should error");
+    assert!(del_err.to_string().contains("404"));
+}
+
 #[tokio::test]
 async fn issue_delete_and_pin_use_right_verbs() {
     let server = MockServer::start().await;

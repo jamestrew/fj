@@ -65,7 +65,7 @@ called out.
 | `gh pr diff N`                    | `fj pr diff N`                    | Raw unified diff.                               |
 | `gh pr checks N`                  | `fj pr checks N`                  |                                                 |
 | `gh pr ready N`                   | `fj pr ready N`                   |                                                 |
-| `gh pr comment N --body B`        | `fj pr comment N --body B`        | PRs are issues; uses the issue comment endpoint. |
+| `gh pr comment N --body B`        | `fj pr comment N --body B`        | Also `fj pr comment edit ID` / `delete ID`, and `--edit-last` / `--create-or-edit` for idempotent status comments. |
 | `gh pr update-branch N`           | `fj pr update-branch N`           | `--style merge` (default) or `rebase`.          |
 | `gh pr review N --approve`        | `fj pr review N --event approve`  |                                                 |
 | `gh pr review N --request-changes`| `fj pr review N --event request-changes` |                                          |
