@@ -123,6 +123,22 @@ pub struct CreateArgs {
     /// Attach a file and link it at the end of the body (repeatable).
     #[arg(long = "attach", value_name = "FILE")]
     pub attach: Vec<PathBuf>,
+    /// Label name to add. Repeat or use commas for multiple labels.
+    #[arg(
+        short = 'l',
+        long = "label",
+        value_name = "NAME",
+        value_delimiter = ','
+    )]
+    pub label: Vec<String>,
+    /// Username to assign. Repeat or use commas for multiple assignees.
+    #[arg(
+        short = 'a',
+        long = "assignee",
+        value_name = "USERNAME",
+        value_delimiter = ','
+    )]
+    pub assignee: Vec<String>,
     /// Mark the PR as draft.
     #[arg(long)]
     pub draft: bool,
@@ -149,6 +165,22 @@ pub struct EditArgs {
     /// Attach a file and link it at the end of the body (repeatable).
     #[arg(long = "attach", value_name = "FILE")]
     pub attach: Vec<PathBuf>,
+    /// Label name to add. Repeat or use commas for multiple labels.
+    #[arg(long = "add-label", value_name = "NAME", value_delimiter = ',')]
+    pub add_label: Vec<String>,
+    /// Label name to remove. Repeat or use commas for multiple labels.
+    #[arg(long = "remove-label", value_name = "NAME", value_delimiter = ',')]
+    pub remove_label: Vec<String>,
+    /// Username to assign. Repeat or use commas for multiple assignees.
+    #[arg(long = "add-assignee", value_name = "USERNAME", value_delimiter = ',')]
+    pub add_assignee: Vec<String>,
+    /// Username to unassign. Repeat or use commas for multiple assignees.
+    #[arg(
+        long = "remove-assignee",
+        value_name = "USERNAME",
+        value_delimiter = ','
+    )]
+    pub remove_assignee: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -416,6 +448,16 @@ async fn create(args: CreateArgs, host: Option<&str>) -> Result<()> {
         return Err(anyhow!("title is required"));
     }
     let body = editor::resolve_body(args.body.as_deref(), "PR_BODY.md", "")?;
+    let label_names = clean_csv_values(args.label);
+    let label_ids = if label_names.is_empty() {
+        None
+    } else {
+        Some(
+            api::label::resolve_names_to_ids(&ctx.client, &ctx.owner, &ctx.name, &label_names)
+                .await?,
+        )
+    };
+    let assignees = clean_csv_values(args.assignee);
     let pr = api::pull::create(
         &ctx.client,
         &ctx.owner,
@@ -430,6 +472,12 @@ async fn create(args: CreateArgs, host: Option<&str>) -> Result<()> {
     )
     .await?;
     println!("✓ Created PR #{}: {}", pr.number, pr.title);
+    if let Some(label_ids) = label_ids {
+        api::label::add_to_issue(&ctx.client, &ctx.owner, &ctx.name, pr.number, label_ids).await?;
+    }
+    if !assignees.is_empty() {
+        api::issue::add_assignees(&ctx.client, &ctx.owner, &ctx.name, pr.number, assignees).await?;
+    }
     if !args.attach.is_empty() {
         let refs = upload_attachments(&ctx, pr.number, &args.attach).await?;
         let new_body = append_attachments(&pr.body, &refs);
@@ -457,29 +505,51 @@ async fn create(args: CreateArgs, host: Option<&str>) -> Result<()> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn edit(args: EditArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
-    let body = if args.body_editor {
-        let existing = api::pull::get(&ctx.client, &ctx.owner, &ctx.name, args.number).await?;
-        Some(editor::edit_text("PR_BODY.md", &existing.body)?)
-    } else {
-        editor::read_body(args.body.as_deref())?
-    };
-    let pr = api::pull::edit(
-        &ctx.client,
-        &ctx.owner,
-        &ctx.name,
-        args.number,
-        &EditPull {
-            title: args.title.as_deref(),
-            body: body.as_deref(),
-            state: None,
-            base: None,
-        },
-    )
-    .await?;
+    let add_labels = clean_csv_values(args.add_label);
+    let remove_labels = clean_csv_values(args.remove_label);
+    let add_assignees = clean_csv_values(args.add_assignee);
+    let remove_assignees = clean_csv_values(args.remove_assignee);
+    let has_additive_edits = !add_labels.is_empty()
+        || !remove_labels.is_empty()
+        || !add_assignees.is_empty()
+        || !remove_assignees.is_empty();
+    let should_patch = args.title.is_some()
+        || args.body.is_some()
+        || args.body_editor
+        || !args.attach.is_empty()
+        || !has_additive_edits;
+
+    let mut updated_pr = None;
+    if should_patch {
+        let body = if args.body_editor {
+            let existing = api::pull::get(&ctx.client, &ctx.owner, &ctx.name, args.number).await?;
+            Some(editor::edit_text("PR_BODY.md", &existing.body)?)
+        } else {
+            editor::read_body(args.body.as_deref())?
+        };
+        let pr = api::pull::edit(
+            &ctx.client,
+            &ctx.owner,
+            &ctx.name,
+            args.number,
+            &EditPull {
+                title: args.title.as_deref(),
+                body: body.as_deref(),
+                state: None,
+                base: None,
+            },
+        )
+        .await?;
+        updated_pr = Some(pr);
+    }
     if !args.attach.is_empty() {
+        let pr = match updated_pr.as_ref() {
+            Some(pr) => pr.clone(),
+            None => api::pull::get(&ctx.client, &ctx.owner, &ctx.name, args.number).await?,
+        };
         let refs = upload_attachments(&ctx, pr.number, &args.attach).await?;
         let new_body = append_attachments(&pr.body, &refs);
-        api::pull::edit(
+        let pr = api::pull::edit(
             &ctx.client,
             &ctx.owner,
             &ctx.name,
@@ -492,9 +562,65 @@ async fn edit(args: EditArgs, host: Option<&str>) -> Result<()> {
             },
         )
         .await?;
+        updated_pr = Some(pr);
     }
-    println!("✓ Updated PR #{}: {}", pr.number, pr.title);
+    if !add_labels.is_empty() {
+        let label_ids =
+            api::label::resolve_names_to_ids(&ctx.client, &ctx.owner, &ctx.name, &add_labels)
+                .await?;
+        api::label::add_to_issue(&ctx.client, &ctx.owner, &ctx.name, args.number, label_ids)
+            .await?;
+    }
+    if !remove_labels.is_empty() {
+        let label_ids =
+            api::label::resolve_names_to_ids(&ctx.client, &ctx.owner, &ctx.name, &remove_labels)
+                .await?;
+        for label_id in label_ids {
+            api::label::remove_from_issue(
+                &ctx.client,
+                &ctx.owner,
+                &ctx.name,
+                args.number,
+                label_id,
+            )
+            .await?;
+        }
+    }
+    if !add_assignees.is_empty() {
+        api::issue::add_assignees(
+            &ctx.client,
+            &ctx.owner,
+            &ctx.name,
+            args.number,
+            add_assignees,
+        )
+        .await?;
+    }
+    if !remove_assignees.is_empty() {
+        api::issue::remove_assignees(
+            &ctx.client,
+            &ctx.owner,
+            &ctx.name,
+            args.number,
+            remove_assignees,
+        )
+        .await?;
+    }
+    if let Some(pr) = updated_pr {
+        println!("✓ Updated PR #{}: {}", pr.number, pr.title);
+    } else {
+        println!("✓ Updated PR #{}", args.number);
+    }
     Ok(())
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn clean_csv_values(values: Vec<String>) -> Vec<String> {
+    values
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect()
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -835,6 +961,68 @@ mod tests {
                 command: PrSub::Create(a),
             }) => assert_eq!(a.attach.len(), 2),
             other => panic!("expected pr create, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_parses_labels_and_assignees() {
+        use crate::cli::{Cli, Command};
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "fj",
+            "pr",
+            "create",
+            "--title",
+            "t",
+            "--label",
+            "area/api,needs-review",
+            "--label",
+            "wip",
+            "--assignee",
+            "alice,bob",
+        ])
+        .expect("should parse");
+        match cli.command {
+            Command::Pr(PrCmd {
+                command: PrSub::Create(a),
+            }) => {
+                assert_eq!(a.label, vec!["area/api", "needs-review", "wip"]);
+                assert_eq!(a.assignee, vec!["alice", "bob"]);
+            }
+            other => panic!("expected pr create, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn edit_parses_label_and_assignee_mutations() {
+        use crate::cli::{Cli, Command};
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "fj",
+            "pr",
+            "edit",
+            "12",
+            "--add-label",
+            "needs-review",
+            "--remove-label",
+            "wip,blocked",
+            "--add-assignee",
+            "alice",
+            "--remove-assignee",
+            "bob,carol",
+        ])
+        .expect("should parse");
+        match cli.command {
+            Command::Pr(PrCmd {
+                command: PrSub::Edit(a),
+            }) => {
+                assert_eq!(a.number, 12);
+                assert_eq!(a.add_label, vec!["needs-review"]);
+                assert_eq!(a.remove_label, vec!["wip", "blocked"]);
+                assert_eq!(a.add_assignee, vec!["alice"]);
+                assert_eq!(a.remove_assignee, vec!["bob", "carol"]);
+            }
+            other => panic!("expected pr edit, got {other:?}"),
         }
     }
 }
