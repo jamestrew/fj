@@ -4,6 +4,7 @@ use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 use crate::client::Client;
 
@@ -33,6 +34,8 @@ pub struct WorkflowRun {
     // Int row id on older builds, workflow file path ("ci.yml") on newer.
     #[serde(default, deserialize_with = "crate::api::serde_util::string_or_number")]
     pub workflow_id: String,
+    #[serde(default, alias = "event_name")]
+    pub event: String,
     #[serde(default)]
     pub html_url: String,
     // Newer: `created`/`updated`; older: `created_at`/`updated_at`.
@@ -43,6 +46,88 @@ pub struct WorkflowRun {
     // Newer: `index_in_repo` (per-repo run number); older: `run_number`.
     #[serde(default, alias = "index_in_repo")]
     pub run_number: u64,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct RunListFilters {
+    pub status: Option<String>,
+    pub branch: Option<String>,
+    pub event: Option<String>,
+    pub workflow: Option<String>,
+}
+
+impl RunListFilters {
+    pub fn is_empty(&self) -> bool {
+        self.status.is_none()
+            && self.branch.is_none()
+            && self.event.is_none()
+            && self.workflow.is_none()
+    }
+
+    fn query_params(&self) -> Vec<(String, String)> {
+        let mut q = Vec::new();
+        if let Some(status) = &self.status {
+            q.push(("status".into(), status.clone()));
+        }
+        if let Some(branch) = &self.branch {
+            q.push(("branch".into(), branch.clone()));
+        }
+        if let Some(event) = &self.event {
+            q.push(("event".into(), event.clone()));
+        }
+        if let Some(workflow) = &self.workflow {
+            q.push(("workflow".into(), workflow.clone()));
+        }
+        q
+    }
+
+    fn matches(&self, run: &WorkflowRun) -> bool {
+        self.status
+            .as_deref()
+            .is_none_or(|status| run.status == status || run.conclusion.as_deref() == Some(status))
+            && self
+                .branch
+                .as_deref()
+                .is_none_or(|branch| run.head_branch == branch)
+            && self.event.as_deref().is_none_or(|event| run.event == event)
+            && self
+                .workflow
+                .as_deref()
+                .is_none_or(|workflow| workflow_matches(&run.workflow_id, workflow))
+    }
+
+    fn unknown_values(&self, runs: &[WorkflowRun]) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(status) = &self.status {
+            let known = runs
+                .iter()
+                .any(|run| run.status == *status || run.conclusion.as_deref() == Some(status));
+            if !known {
+                out.push(format!("status `{status}`"));
+            }
+        }
+        if let Some(branch) = &self.branch {
+            let known = runs.iter().any(|run| run.head_branch == *branch);
+            if !known {
+                out.push(format!("branch `{branch}`"));
+            }
+        }
+        if let Some(event) = &self.event {
+            let known = runs.iter().any(|run| run.event == *event);
+            if !known {
+                out.push(format!("event `{event}`"));
+            }
+        }
+        if let Some(workflow) = &self.workflow {
+            let known = runs
+                .iter()
+                .any(|run| workflow_matches(&run.workflow_id, workflow));
+            if !known {
+                out.push(format!("workflow `{workflow}`"));
+            }
+        }
+        out
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -60,15 +145,149 @@ pub async fn list_runs(
     name: &str,
     limit: u32,
 ) -> Result<Vec<WorkflowRun>> {
+    list_runs_filtered(
+        client,
+        owner,
+        name,
+        limit,
+        false,
+        &RunListFilters::default(),
+    )
+    .await
+}
+
+pub async fn list_runs_filtered(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    limit: u32,
+    paginate: bool,
+    filters: &RunListFilters,
+) -> Result<Vec<WorkflowRun>> {
+    let runs = fetch_runs(client, owner, name, limit, paginate, filters).await?;
+    if filters.is_empty() {
+        return Ok(runs);
+    }
+
+    let filtered: Vec<WorkflowRun> = runs
+        .iter()
+        .filter(|run| filters.matches(run))
+        .cloned()
+        .collect();
+    if !filtered.is_empty() {
+        return Ok(filtered);
+    }
+
+    let unfiltered = fetch_runs(
+        client,
+        owner,
+        name,
+        limit,
+        paginate,
+        &RunListFilters::default(),
+    )
+    .await?;
+    if unfiltered.is_empty() {
+        return Ok(Vec::new());
+    }
+    let unknown = filters.unknown_values(&unfiltered);
+    if !unknown.is_empty() {
+        return Err(anyhow!(
+            "unknown workflow run filter value: {}",
+            unknown.join(", ")
+        ));
+    }
+
+    Ok(unfiltered
+        .into_iter()
+        .filter(|run| filters.matches(run))
+        .collect())
+}
+
+async fn fetch_runs(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    limit: u32,
+    paginate: bool,
+    filters: &RunListFilters,
+) -> Result<Vec<WorkflowRun>> {
     let path = format!("{}/actions/runs", crate::api::repo_path(owner, name));
+    if paginate {
+        return fetch_all_run_pages(client, &path, filters).await;
+    }
+
     // Forgejo's actions/runs endpoint ignores `limit` unless `page` is also
     // present; without it the server returns every run regardless of `-L`.
-    let q = vec![
-        ("page".into(), "1".to_string()),
-        ("limit".into(), limit.clamp(1, 50).to_string()),
-    ];
+    let q = run_list_query(1, limit.clamp(1, 50), filters);
     let list: RunList = client.json(Method::GET, &path, &q, None::<&()>).await?;
     Ok(list.workflow_runs)
+}
+
+async fn fetch_all_run_pages(
+    client: &Client,
+    path: &str,
+    filters: &RunListFilters,
+) -> Result<Vec<WorkflowRun>> {
+    const MAX_PAGES: u32 = 100;
+
+    let mut out = Vec::new();
+    let mut current_path = path.to_string();
+    let mut current_query = run_list_query(1, 50, filters);
+    for _ in 0..MAX_PAGES {
+        let res = client
+            .request(Method::GET, &current_path, &current_query, None)
+            .await?;
+        let status = res.status();
+        if !status.is_success() {
+            let body = res.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "could not list workflow runs (HTTP {}): {}",
+                status.as_u16(),
+                body.trim()
+            ));
+        }
+
+        let headers = res.headers().clone();
+        let list: RunList = res.json().await.context("decoding workflow runs JSON")?;
+        if list.workflow_runs.is_empty() {
+            break;
+        }
+        out.extend(list.workflow_runs);
+
+        let Some(next) = headers
+            .get(reqwest::header::LINK)
+            .and_then(|link| link.to_str().ok())
+            .map(crate::client::pagination::parse_link_header)
+            .and_then(|links| {
+                links
+                    .into_iter()
+                    .find_map(|(url, rel)| (rel == "next").then_some(url))
+            })
+        else {
+            break;
+        };
+        let parsed = Url::parse(&next)?;
+        current_path = parsed.path().to_string();
+        current_query = parsed
+            .query_pairs()
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect();
+    }
+    Ok(out)
+}
+
+fn run_list_query(page: u32, limit: u32, filters: &RunListFilters) -> Vec<(String, String)> {
+    let mut q = vec![
+        ("page".into(), page.max(1).to_string()),
+        ("limit".into(), limit.clamp(1, 50).to_string()),
+    ];
+    q.extend(filters.query_params());
+    q
+}
+
+fn workflow_matches(actual: &str, wanted: &str) -> bool {
+    actual == wanted || actual.rsplit('/').next() == Some(wanted)
 }
 
 #[derive(Debug, Serialize)]
