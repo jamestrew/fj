@@ -4,8 +4,9 @@ use anyhow::{anyhow, Result};
 use clap::{Args, Subcommand};
 
 use crate::api;
-use crate::api::release::{CreateRelease, EditRelease};
+use crate::api::release::{CreateRelease, EditRelease, ListOptions};
 use crate::cli::context::{repo_web_url, resolve_repo, RepoFlag};
+use crate::cli::list as list_output;
 use crate::output;
 
 use super::editor;
@@ -41,9 +42,12 @@ pub enum ReleaseSub {
 pub struct ListArgs {
     #[command(flatten)]
     pub r: RepoFlag,
-    /// Maximum number of releases to fetch
+    /// Maximum number of releases to fetch (default 30; results may be capped unless --paginate)
     #[arg(short = 'L', long, default_value_t = 30)]
     pub limit: u32,
+    /// Fetch all pages instead of stopping at --limit
+    #[arg(long)]
+    pub paginate: bool,
     /// Emit JSON instead of a table
     #[arg(long)]
     pub json: bool,
@@ -183,15 +187,26 @@ async fn list(args: ListArgs, host: Option<&str>) -> Result<()> {
     if args.web {
         return web::open(&repo_web_url(&ctx, "releases")?);
     }
-    let items = api::release::list(&ctx.client, &ctx.owner, &ctx.name, args.limit).await?;
+    let page = api::release::list(
+        &ctx.client,
+        &ctx.owner,
+        &ctx.name,
+        ListOptions {
+            limit: args.limit,
+            page: 1,
+            paginate: args.paginate,
+        },
+    )
+    .await?;
     if args.json {
-        return output::print_json(&serde_json::to_value(&items)?);
+        return list_output::print_json(&page);
     }
-    if items.is_empty() {
+    if page.items.is_empty() {
         println!("(no releases)");
         return Ok(());
     }
-    let rows: Vec<Vec<String>> = items
+    let rows: Vec<Vec<String>> = page
+        .items
         .iter()
         .map(|r| {
             let when = r
@@ -217,6 +232,9 @@ async fn list(args: ListArgs, host: Option<&str>) -> Result<()> {
         "{}",
         output::render_table(&["TAG", "TITLE", "KIND", "PUBLISHED"], &rows)
     );
+    if !args.paginate {
+        list_output::print_truncation_footer(&page, args.limit);
+    }
     Ok(())
 }
 

@@ -1390,17 +1390,21 @@ async fn pull_list_decodes_and_sends_state_limit() {
         .and(path("/api/v1/repos/o/r/pulls"))
         .and(query_param("state", "open"))
         .and(query_param("limit", "30"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-            {
-                "id": 1, "number": 12, "title": "Add feature",
-                "state": "open", "user": { "id": 1, "login": "alice" },
-                "html_url": "https://x/o/r/pulls/12",
-                "head": { "ref": "feature", "sha": "aaa" },
-                "base": { "ref": "main", "sha": "bbb" },
-                "created_at": "2026-05-30T00:00:00Z",
-                "updated_at": "2026-05-30T00:01:00Z"
-            }
-        ])))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!([
+                    {
+                        "id": 1, "number": 12, "title": "Add feature",
+                        "state": "open", "user": { "id": 1, "login": "alice" },
+                        "html_url": "https://x/o/r/pulls/12",
+                        "head": { "ref": "feature", "sha": "aaa" },
+                        "base": { "ref": "main", "sha": "bbb" },
+                        "created_at": "2026-05-30T00:00:00Z",
+                        "updated_at": "2026-05-30T00:01:00Z"
+                    }
+                ]))
+                .insert_header("X-Total-Count", "104"),
+        )
         .expect(1)
         .mount(&server)
         .await;
@@ -1412,6 +1416,51 @@ async fn pull_list_decodes_and_sends_state_limit() {
     assert_eq!(page.items[0].number, 12);
     assert_eq!(page.items[0].head.ref_, "feature");
     assert_eq!(page.items[0].base.ref_, "main");
+    assert_eq!(page.total, Some(104));
+}
+
+#[tokio::test]
+async fn pull_list_paginate_follows_next_and_keeps_total() {
+    let server = MockServer::start().await;
+    let page1 = json!([pull_json(1, "open")]);
+    let page2 = json!([pull_json(2, "open")]);
+    let next_url = format!("{}/api/v1/repos/o/r/pulls?page=2&limit=50", server.uri());
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/pulls"))
+        .and(query_param("page", "2"))
+        .and(query_param("limit", "50"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(page2))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/pulls"))
+        .and(query_param("state", "open"))
+        .and(query_param("page", "1"))
+        .and(query_param("limit", "50"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(page1)
+                .insert_header("X-Total-Count", "2")
+                .insert_header("Link", format!(r#"<{next_url}>; rel="next""#).as_str()),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let page = crate::api::pull::list(
+        &c,
+        "o",
+        "r",
+        crate::api::pull::ListOptions {
+            paginate: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("paginated list");
+    assert_eq!(page.items.len(), 2);
+    assert_eq!(page.total, Some(2));
 }
 
 #[tokio::test]
@@ -1903,11 +1952,19 @@ async fn release_list_sends_limit_and_page() {
         .mount(&server)
         .await;
     let c = client_for(&server).await;
-    let rels = crate::api::release::list(&c, "o", "r", 30)
-        .await
-        .expect("list");
-    assert_eq!(rels.len(), 1);
-    assert_eq!(rels[0].tag_name, "v1.0.0");
+    let rels = crate::api::release::list(
+        &c,
+        "o",
+        "r",
+        crate::api::release::ListOptions {
+            limit: 30,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("list");
+    assert_eq!(rels.items.len(), 1);
+    assert_eq!(rels.items[0].tag_name, "v1.0.0");
 }
 
 #[tokio::test]
@@ -2078,6 +2135,7 @@ async fn repo_list_for_user_pages_with_limit_and_page() {
         ListOptions {
             limit: 10,
             page: 2,
+            paginate: false,
             query: None,
         },
     )
@@ -3296,6 +3354,7 @@ async fn repo_search_unwraps_envelope_and_pages() {
         ListOptions {
             limit: 10,
             page: 1,
+            paginate: false,
             query: Some("fj"),
         },
     )

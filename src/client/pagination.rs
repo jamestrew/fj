@@ -5,15 +5,10 @@ use reqwest::header::HeaderMap;
 /// `X-Total-Count`.
 pub struct Page<T> {
     pub items: Vec<T>,
-    #[allow(dead_code)]
     pub next: Option<String>,
-    #[allow(dead_code)]
     pub prev: Option<String>,
-    #[allow(dead_code)]
     pub last: Option<String>,
-    #[allow(dead_code)]
     pub first: Option<String>,
-    #[allow(dead_code)]
     pub total: Option<u64>,
 }
 
