@@ -1,3 +1,5 @@
+use std::io::{self, Read};
+
 use anyhow::{anyhow, Context, Result};
 use clap::Args;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -37,7 +39,8 @@ pub struct ApiArgs {
     #[arg(short = 'q', long = "jq")]
     pub jq: Option<String>,
 
-    /// Send a literal JSON request body. Conflicts with `-f` / `-F`.
+    /// Send a JSON request body. Use `-` for stdin or `@file` for a file.
+    /// Conflicts with `-f` / `-F`.
     #[arg(long, conflicts_with_all = ["fields", "raw_fields"])]
     pub input: Option<String>,
 
@@ -135,8 +138,17 @@ fn pick_method(args: &ApiArgs) -> Result<Method> {
 type QueryAndBody = (Vec<(String, String)>, Option<Value>);
 
 fn build_query_or_body(args: &ApiArgs, method: &Method) -> Result<QueryAndBody> {
+    let mut stdin = io::stdin();
+    build_query_or_body_with_reader(args, method, &mut stdin)
+}
+
+fn build_query_or_body_with_reader<R: Read>(
+    args: &ApiArgs,
+    method: &Method,
+    input_reader: &mut R,
+) -> Result<QueryAndBody> {
     if let Some(input) = &args.input {
-        let body: Value = serde_json::from_str(input).context("--input must be valid JSON")?;
+        let body = read_input_body(input, input_reader)?;
         return Ok((Vec::new(), Some(body)));
     }
 
@@ -165,6 +177,24 @@ fn build_query_or_body(args: &ApiArgs, method: &Method) -> Result<QueryAndBody> 
         obj.insert(k.to_string(), parsed);
     }
     Ok((Vec::new(), Some(Value::Object(obj))))
+}
+
+fn read_input_body<R: Read>(input: &str, input_reader: &mut R) -> Result<Value> {
+    let text = match input {
+        "-" | "@-" => {
+            let mut buf = String::new();
+            input_reader
+                .read_to_string(&mut buf)
+                .context("reading --input from stdin")?;
+            buf
+        }
+        path if path.starts_with('@') => {
+            let path = &path[1..];
+            std::fs::read_to_string(path).with_context(|| format!("reading --input file {path}"))?
+        }
+        literal => literal.to_string(),
+    };
+    serde_json::from_str(&text).context("--input must be valid JSON")
 }
 
 fn parse_headers(items: &[String]) -> Result<HeaderMap> {
@@ -380,6 +410,60 @@ mod tests {
         let (query, body) = build_query_or_body(&a, &Method::POST).unwrap();
         assert!(query.is_empty());
         assert_eq!(body.unwrap()["a"], 1);
+    }
+
+    #[test]
+    fn build_query_or_body_input_reads_stdin() {
+        let mut a = base_args();
+        a.input = Some("-".into());
+        let mut input = std::io::Cursor::new(r#"{"a":2}"#);
+        let (query, body) = build_query_or_body_with_reader(&a, &Method::POST, &mut input).unwrap();
+        assert!(query.is_empty());
+        assert_eq!(body.unwrap()["a"], 2);
+    }
+
+    #[test]
+    fn build_query_or_body_input_reads_at_stdin() {
+        let mut a = base_args();
+        a.input = Some("@-".into());
+        let mut input = std::io::Cursor::new(r#"{"a":3}"#);
+        let (query, body) = build_query_or_body_with_reader(&a, &Method::POST, &mut input).unwrap();
+        assert!(query.is_empty());
+        assert_eq!(body.unwrap()["a"], 3);
+    }
+
+    #[test]
+    fn build_query_or_body_input_reads_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("body.json");
+        std::fs::write(&path, r#"{"a":4}"#).unwrap();
+        let mut a = base_args();
+        a.input = Some(format!("@{}", path.display()));
+        let mut input = std::io::Cursor::new("");
+        let (query, body) = build_query_or_body_with_reader(&a, &Method::POST, &mut input).unwrap();
+        assert!(query.is_empty());
+        assert_eq!(body.unwrap()["a"], 4);
+    }
+
+    #[test]
+    fn build_query_or_body_input_keeps_bare_file_path_literal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("body.json");
+        std::fs::write(&path, r#"{"a":5}"#).unwrap();
+        let mut a = base_args();
+        a.input = Some(path.display().to_string());
+        let mut input = std::io::Cursor::new("");
+        let err = build_query_or_body_with_reader(&a, &Method::POST, &mut input).unwrap_err();
+        assert!(format!("{err:#}").contains("--input must be valid JSON"));
+    }
+
+    #[test]
+    fn build_query_or_body_rejects_invalid_stdin_input_json() {
+        let mut a = base_args();
+        a.input = Some("-".into());
+        let mut input = std::io::Cursor::new("{bad");
+        let err = build_query_or_body_with_reader(&a, &Method::POST, &mut input).unwrap_err();
+        assert!(format!("{err:#}").contains("--input must be valid JSON"));
     }
 
     #[test]
