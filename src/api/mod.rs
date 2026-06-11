@@ -16,6 +16,7 @@ mod repo_keys;
 mod repo_social;
 pub mod search;
 pub(crate) mod serde_util;
+pub mod tag;
 pub mod user;
 pub mod workflow;
 mod workflow_run;
