@@ -16,7 +16,7 @@ pub struct AuthCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum AuthSub {
-    /// Authenticate with a Forgejo host. Stores the token in your OS keychain.
+    /// Authenticate with a Forgejo host. Stores the token in your OS keychain, or a 0600 file fallback.
     Login(LoginArgs),
     /// Show which hosts you're signed in to.
     Status(StatusArgs),
@@ -204,7 +204,10 @@ async fn refresh(args: RefreshArgs) -> Result<()> {
         .context("verifying token against /api/v1/user")?;
 
     if new_token.is_some() {
-        token_store::store_token(&host, &token)?;
+        let storage = token_store::store_token(&host, &token)?;
+        if let token_store::TokenStoreLocation::File(path) = storage {
+            println!("! Keychain unavailable; stored token in {}", path.display());
+        }
         println!("✓ Replaced token for {host} (verified as {})", me.login);
     } else {
         println!("✓ Token for {host} is still valid (user: {})", me.login);
@@ -274,7 +277,7 @@ async fn status(args: StatusArgs) -> Result<()> {
                 {
                     "present in FJ_TOKEN"
                 } else {
-                    "present in keychain"
+                    "present in token store"
                 }
             } else {
                 "missing"

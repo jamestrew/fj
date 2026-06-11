@@ -55,7 +55,7 @@ typed wrapper per API resource, one HTTP client funnel for everything.
   `api::release::upload_asset`, which goes through `client.http()` but
   still uses `client.token()` for auth).
 - `config::*` is the on-disk shape of `hosts.toml`. Tokens are NOT
-  stored here. They live in the OS keychain via `auth::*`.
+  stored here. They live in the auth token stores via `auth::*`: OS keychain first, with a 0600 XDG file fallback when the keychain is unavailable.
 - `git::*` shells out to the `git` binary. The only place we call git.
 
 ## Repo resolution

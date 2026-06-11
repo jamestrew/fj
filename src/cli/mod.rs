@@ -59,7 +59,7 @@ use clap::{Parser, Subcommand};
     version,
     about = "Command-line tool for Forgejo",
     long_about = "fj is a command-line tool for Forgejo, in the spirit of GitHub's gh. It spans \
-multiple hosts, stores tokens in your OS keychain, and mirrors the gh command surface for what \
+multiple hosts, stores tokens in your OS keychain or a 0600 file fallback, and mirrors the gh command surface for what \
 Forgejo exposes: repositories, issues, pull requests, releases, and Actions (runs, workflows, \
 secrets, variables), plus stacked-PR and working-session helpers.\n\
 \n\
