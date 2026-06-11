@@ -1,4 +1,3 @@
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
@@ -9,7 +8,7 @@ use crate::api::pull::{CreatePull, EditPull, ListOptions};
 use crate::cli::context::{repo_web_url, resolve_repo, RepoFlag};
 use crate::cli::pr_args::{MergeStyleArg, ReviewEventArg, StateFilter, UpdateStyle};
 use crate::cli::pr_status::StatusArgs;
-use crate::cli::{list as list_output, pr_inspect, pr_review, pr_status};
+use crate::cli::{list as list_output, pr_comment, pr_inspect, pr_review, pr_status};
 use crate::git;
 use crate::output;
 
@@ -43,8 +42,8 @@ pub enum PrSub {
     Checks(InspectArgs),
     /// Convert a draft pull request to ready-for-review.
     Ready(SimpleArgs),
-    /// Add a comment to a pull request.
-    Comment(CommentArgs),
+    /// Add, edit, or delete a comment on a pull request.
+    Comment(pr_comment::CommentCmd),
     /// Upload file attachments and link them in the PR description.
     Attach(AttachArgs),
     /// Update the PR branch by merging (or rebasing) its base branch in.
@@ -292,17 +291,6 @@ pub struct InspectArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct CommentArgs {
-    #[command(flatten)]
-    pub r: RepoFlag,
-    /// Pull request number
-    pub number: u64,
-    /// Comment body. Use `-` to read from stdin. Omit to open `$EDITOR`.
-    #[arg(short = 'b', long)]
-    pub body: Option<String>,
-}
-
-#[derive(Debug, Args)]
 pub struct UpdateBranchArgs {
     #[command(flatten)]
     pub r: RepoFlag,
@@ -325,7 +313,7 @@ pub async fn run(cmd: PrCmd, host: Option<&str>) -> Result<()> {
         PrSub::Files(args) => pr_inspect::files(args, host).await,
         PrSub::Checks(args) => pr_inspect::checks(args, host).await,
         PrSub::Ready(args) => ready(args, host).await,
-        PrSub::Comment(args) => comment(args, host).await,
+        PrSub::Comment(args) => pr_comment::run(args, host).await,
         PrSub::Attach(args) => attach(args, host).await,
         PrSub::UpdateBranch(args) => update_branch(args, host).await,
         PrSub::Review(args) => pr_review::review(args, host).await,
@@ -763,27 +751,6 @@ async fn ready(args: SimpleArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     api::pull::ready(&ctx.client, &ctx.owner, &ctx.name, args.number).await?;
     println!("✓ PR #{} is ready for review", args.number);
-    Ok(())
-}
-
-#[cfg_attr(coverage_nightly, coverage(off))]
-async fn comment(args: CommentArgs, host: Option<&str>) -> Result<()> {
-    let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
-    let body = match args.body.as_deref() {
-        Some("-") => {
-            let mut buf = String::new();
-            std::io::stdin().read_to_string(&mut buf)?;
-            buf
-        }
-        Some(s) => s.to_string(),
-        None => editor::edit_text("PR_COMMENT.md", "")?,
-    };
-    if body.trim().is_empty() {
-        return Err(anyhow!("comment body is empty"));
-    }
-    // PRs are issues in Forgejo, so the comment endpoint is the issue one.
-    let c = api::issue::comment(&ctx.client, &ctx.owner, &ctx.name, args.number, &body).await?;
-    println!("✓ Commented on #{} ({})", args.number, c.html_url);
     Ok(())
 }
 
