@@ -35,6 +35,9 @@ pub async fn run_variable(cmd: VariableCmd, host: Option<&str>) -> Result<()> {
 async fn var_list(args: SecretListArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     let v = api::workflow::list_variables(&ctx.client, &ctx.owner, &ctx.name).await?;
+    if args.json {
+        return output::print_json(&serde_json::to_value(&v)?);
+    }
     if v.is_empty() {
         println!("(no variables)");
         return Ok(());

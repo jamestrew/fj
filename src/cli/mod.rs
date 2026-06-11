@@ -314,6 +314,70 @@ mod tests {
         walk(&mut Cli::command());
     }
 
+    /// Automation scripts the read-only surface (`view` / `list` / inspect
+    /// commands) and expects `--json`. Walk the whole tree and assert every
+    /// leaf subcommand whose name marks it as a read/inspect/list surface
+    /// either accepts `--json` or is explicitly allow-listed as text-only, so
+    /// the surface can't silently regress (the `pr view` / rest-of-`pr` trap
+    /// that motivated rasterstate/fj#112).
+    #[test]
+    fn read_surface_subcommands_accept_json_or_are_text_only() {
+        // Leaf names that denote a structured read/inspect/list surface.
+        const READ_SURFACE: &[&str] = &[
+            "view", "list", "diff", "files", "commits", "checks", "status",
+        ];
+        // Full `fj <...>` paths intentionally kept text-only. Add here only
+        // with a reason; everything else in READ_SURFACE must accept --json.
+        const TEXT_ONLY: &[&str] = &[
+            // `auth status` reports the active host/token as prose, not a
+            // queryable record set.
+            "fj auth status",
+            // Local host/credential and config listings that have no JSON
+            // branch today. Surfacing them is out of scope for #112; listed
+            // here so the guard reflects reality without silently passing.
+            "fj auth list",
+            "fj alias list",
+            "fj config list",
+            "fj extension list",
+            // `fj instances` exposes `--json` on the parent command; the bare
+            // `list` leaf delegates to it rather than redefining the flag.
+            "fj instances list",
+        ];
+
+        fn accepts_json(cmd: &clap::Command) -> bool {
+            cmd.get_arguments().any(|a| a.get_long() == Some("json"))
+        }
+
+        fn walk(cmd: &mut clap::Command, path: &str, offenders: &mut Vec<String>) {
+            let names: Vec<String> = cmd
+                .get_subcommands()
+                .map(|s| s.get_name().to_string())
+                .collect();
+            for name in names {
+                let child_path = format!("{path} {name}");
+                if let Some(sub) = cmd.find_subcommand_mut(&name) {
+                    let is_leaf = sub.get_subcommands().next().is_none();
+                    if is_leaf
+                        && READ_SURFACE.contains(&name.as_str())
+                        && !accepts_json(sub)
+                        && !TEXT_ONLY.contains(&child_path.as_str())
+                    {
+                        offenders.push(child_path.clone());
+                    }
+                    walk(sub, &child_path, offenders);
+                }
+            }
+        }
+
+        let mut offenders = Vec::new();
+        walk(&mut Cli::command(), "fj", &mut offenders);
+        assert!(
+            offenders.is_empty(),
+            "read-only subcommands missing `--json` (add the flag, or allow-list \
+             as text-only in TEXT_ONLY with a reason): {offenders:?}"
+        );
+    }
+
     /// `KNOWN_SUBCOMMANDS` in `main.rs` is a hand-maintained allowlist that
     /// `detect_plugin` consults so a `fj-<name>` binary on PATH can't shadow a
     /// real subcommand. It must match the derived command tree exactly; a

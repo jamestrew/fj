@@ -32,14 +32,15 @@ pub enum PrSub {
     Create(CreateArgs),
     /// Edit a pull request.
     Edit(EditArgs),
-    /// Show the unified diff for a pull request.
-    Diff(SimpleArgs),
+    /// Show the unified diff for a pull request. With `--json` the diff text
+    /// is wrapped as `{ "diff": "..." }`.
+    Diff(InspectArgs),
     /// List commits in a pull request.
-    Commits(SimpleArgs),
+    Commits(InspectArgs),
     /// Show the file change list for a pull request.
-    Files(SimpleArgs),
+    Files(InspectArgs),
     /// Show CI / commit status checks for a pull request's head SHA.
-    Checks(SimpleArgs),
+    Checks(InspectArgs),
     /// Convert a draft pull request to ready-for-review.
     Ready(SimpleArgs),
     /// Add a comment to a pull request.
@@ -260,6 +261,20 @@ pub struct SimpleArgs {
     pub r: RepoFlag,
     /// Pull request number
     pub number: u64,
+}
+
+/// Args for the read-only inspect subcommands (diff / commits / files /
+/// checks). Identical to `SimpleArgs` but carries `--json` so automation can
+/// route the already-typed structs through `output::print_json`.
+#[derive(Debug, Args)]
+pub struct InspectArgs {
+    #[command(flatten)]
+    pub r: RepoFlag,
+    /// Pull request number
+    pub number: u64,
+    /// Emit JSON instead of a table
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]

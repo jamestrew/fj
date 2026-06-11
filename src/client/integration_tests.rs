@@ -3304,3 +3304,165 @@ async fn repo_search_unwraps_envelope_and_pages() {
     assert_eq!(page.items.len(), 1);
     assert_eq!(page.items[0].name, "fj");
 }
+
+// --- `--json` paths for the read-only inspect/list surface (rasterstate/fj#112) ---
+//
+// These assert the exact path the new `--json` branches take: fetch the typed
+// struct over the wire, then `serde_json::to_value` it — the same value the CLI
+// hands to `output::print_json`. We also run the resulting value through the
+// `--json-fields` projector so the gh-style field selection is covered against
+// each new shape.
+
+/// Project `value` through `--json-fields spec`, mirroring `output::print_json`
+/// when the global selector is set.
+fn project_fields(value: &serde_json::Value, spec: &str) -> serde_json::Value {
+    let fields = crate::output::json_filter::parse_fields(spec);
+    crate::output::json_filter::project(value, &fields)
+}
+
+#[tokio::test]
+async fn pr_checks_json_shape_and_projection() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/commits/deadbeef/status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "state": "success",
+            "sha": "deadbeef",
+            "total_count": 1,
+            "statuses": [{
+                "status": "success",
+                "context": "ci/build",
+                "description": "all good",
+                "target_url": "https://ci.example/1",
+                "updated_at": "2024-01-01T00:00:00Z"
+            }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let cs = crate::api::pull::combined_status(&c, "o", "r", "deadbeef")
+        .await
+        .expect("combined status");
+    let v = serde_json::to_value(&cs).expect("serialize");
+    assert_eq!(v["state"], "success");
+    assert_eq!(v["total_count"], 1);
+    assert_eq!(v["statuses"][0]["context"], "ci/build");
+    // `fj pr checks --json --json-fields state` is the merge-gate query.
+    let projected = project_fields(&v, "state");
+    assert_eq!(projected, json!({ "state": "success" }));
+}
+
+#[tokio::test]
+async fn pr_files_json_shape_and_projection() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/pulls/7/files"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "filename": "src/lib.rs", "status": "modified", "additions": 3, "deletions": 1 },
+            { "filename": "README.md", "status": "added", "additions": 10, "deletions": 0 }
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let files = crate::api::pull::files(&c, "o", "r", 7)
+        .await
+        .expect("files");
+    let v = serde_json::to_value(&files).expect("serialize");
+    assert_eq!(v[0]["filename"], "src/lib.rs");
+    assert_eq!(v[0]["status"], "modified");
+    assert_eq!(v[0]["additions"], 3);
+    // Projection over an array projects each element independently.
+    let projected = project_fields(&v, "filename,status");
+    assert_eq!(
+        projected,
+        json!([
+            { "filename": "src/lib.rs", "status": "modified" },
+            { "filename": "README.md", "status": "added" }
+        ])
+    );
+}
+
+#[tokio::test]
+async fn pr_commits_json_shape_and_projection() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/pulls/7/commits"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+            "sha": "abc1234def",
+            "commit": {
+                "message": "Fix the thing\n\nbody",
+                "author": { "name": "Ada", "email": "ada@example.com" }
+            }
+        }])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let commits = crate::api::pull::commits(&c, "o", "r", 7)
+        .await
+        .expect("commits");
+    let v = serde_json::to_value(&commits).expect("serialize");
+    assert_eq!(v[0]["sha"], "abc1234def");
+    assert_eq!(v[0]["commit"]["author"]["name"], "Ada");
+    // Dotted-path projection reaches into the nested commit metadata.
+    let projected = project_fields(&v, "sha,commit.author.name");
+    assert_eq!(
+        projected,
+        json!([{ "sha": "abc1234def", "commit.author.name": "Ada" }])
+    );
+}
+
+#[tokio::test]
+async fn secret_list_json_shape_and_projection() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/secrets"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "secrets": [
+                { "name": "TOKEN", "created_at": "2024-01-01T00:00:00Z" },
+                { "name": "API_KEY", "created_at": "2024-02-01T00:00:00Z" }
+            ]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let secrets = crate::api::workflow::list_secrets(&c, "o", "r")
+        .await
+        .expect("secrets");
+    let v = serde_json::to_value(&secrets).expect("serialize");
+    assert_eq!(v[0]["name"], "TOKEN");
+    assert!(v[0]["created_at"].is_string());
+    let projected = project_fields(&v, "name");
+    assert_eq!(
+        projected,
+        json!([{ "name": "TOKEN" }, { "name": "API_KEY" }])
+    );
+}
+
+#[tokio::test]
+async fn variable_list_json_shape_and_projection() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/variables"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "variables": [
+                { "name": "REGION", "data": "us-east" },
+                { "name": "TIER", "data": "prod" }
+            ]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let vars = crate::api::workflow::list_variables(&c, "o", "r")
+        .await
+        .expect("variables");
+    let v = serde_json::to_value(&vars).expect("serialize");
+    assert_eq!(v[0]["name"], "REGION");
+    assert_eq!(v[0]["data"], "us-east");
+    let projected = project_fields(&v, "name");
+    assert_eq!(projected, json!([{ "name": "REGION" }, { "name": "TIER" }]));
+}

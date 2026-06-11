@@ -30,6 +30,9 @@ pub enum SecretSub {
 pub struct SecretListArgs {
     #[command(flatten)]
     pub r: RepoFlag,
+    /// Emit JSON instead of a table
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -70,6 +73,9 @@ pub async fn run_secret(cmd: SecretCmd, host: Option<&str>) -> Result<()> {
 async fn secret_list(args: SecretListArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     let s = api::workflow::list_secrets(&ctx.client, &ctx.owner, &ctx.name).await?;
+    if args.json {
+        return output::print_json(&serde_json::to_value(&s)?);
+    }
     if s.is_empty() {
         println!("(no secrets)");
         return Ok(());
