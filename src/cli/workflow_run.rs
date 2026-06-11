@@ -1,5 +1,6 @@
 //! `fj run` — Forgejo Actions run management (list/view/watch/download/rerun/cancel).
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::time::Duration;
 
@@ -7,7 +8,7 @@ use anyhow::{anyhow, Result};
 use clap::{Args, Subcommand};
 
 use crate::api;
-use crate::cli::context::{resolve_repo, RepoFlag};
+use crate::cli::context::{resolve_repo, RepoContext, RepoFlag};
 use crate::cli::workflow_artifact::{self, DownloadArgs};
 use crate::client::AuthScheme;
 use crate::output;
@@ -109,6 +110,35 @@ pub struct WatchArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct DispatchArgs {
+    #[command(flatten)]
+    pub r: RepoFlag,
+    /// Workflow file name, e.g. `ci.yml`.
+    pub workflow: String,
+    /// Git ref (branch or tag) to run on. Defaults to the repo's default branch.
+    #[arg(long = "ref")]
+    pub ref_: Option<String>,
+    /// Workflow input as `key=value` (repeatable).
+    #[arg(short = 'f', long = "field")]
+    pub fields: Vec<String>,
+    /// Emit JSON describing the triggered run.
+    #[arg(long)]
+    pub json: bool,
+    /// Stream the triggered run's logs live until it finishes.
+    #[arg(long)]
+    pub watch: bool,
+    /// Job index within the run to watch (0-based).
+    #[arg(short = 'j', long, default_value_t = 0, requires = "watch")]
+    pub job: usize,
+    /// Seconds between polls while the job is running.
+    #[arg(short = 'i', long, default_value_t = 3, requires = "watch")]
+    pub interval: u64,
+    /// Exit with status 1 unless the run conclusion is success or skipped.
+    #[arg(long, requires = "watch")]
+    pub exit_status: bool,
+}
+
+#[derive(Debug, Args)]
 pub struct IdArgs {
     #[command(flatten)]
     pub r: RepoFlag,
@@ -126,6 +156,55 @@ pub async fn run(cmd: RunCmd, host: Option<&str>) -> Result<()> {
         RunSub::Rerun(args) => rerun(args, host).await,
         RunSub::Cancel(args) => cancel(args, host).await,
     }
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+pub async fn dispatch(args: DispatchArgs, host: Option<&str>) -> Result<()> {
+    let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
+    let ref_ = match args.ref_ {
+        Some(r) => r,
+        None => {
+            api::repo::get(&ctx.client, &ctx.owner, &ctx.name)
+                .await?
+                .default_branch
+        }
+    };
+    let inputs = parse_dispatch_fields(&args.fields)?;
+    let seen = dispatch_run_keys(&ctx, &args.workflow, &ref_).await?;
+    api::workflow::dispatch(
+        &ctx.client,
+        &ctx.owner,
+        &ctx.name,
+        &args.workflow,
+        &ref_,
+        inputs,
+    )
+    .await?;
+    let run = wait_for_dispatched_run(&ctx, &args.workflow, &ref_, &seen).await?;
+    let handle = DispatchRunHandle::from_run(&ctx, &run);
+
+    if args.json {
+        output::print_json(&serde_json::to_value(&handle)?)?;
+    } else {
+        println!("✓ Dispatched {} on {}", args.workflow, ref_);
+        println!("Run #{}: {}", handle.run_number, handle.url);
+    }
+
+    if args.watch {
+        return watch_resolved(
+            &ctx,
+            WatchOptions {
+                run_id: handle.run_number,
+                job: args.job,
+                attempt: None,
+                interval: args.interval,
+                exit_status: args.exit_status,
+            },
+        )
+        .await;
+    }
+
+    Ok(())
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -367,6 +446,30 @@ fn print_logs(view: &api::workflow::RunView, failed_only: bool) {
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn watch(args: WatchArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
+    watch_resolved(
+        &ctx,
+        WatchOptions {
+            run_id: args.run_id,
+            job: args.job,
+            attempt: args.attempt,
+            interval: args.interval,
+            exit_status: args.exit_status,
+        },
+    )
+    .await
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WatchOptions {
+    run_id: u64,
+    job: usize,
+    attempt: Option<u32>,
+    interval: u64,
+    exit_status: bool,
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn watch_resolved(ctx: &RepoContext, args: WatchOptions) -> Result<()> {
     guard_web_routes(&ctx.client)?;
     let (owner, name) = (ctx.owner.as_str(), ctx.name.as_str());
     let attempt = match args.attempt {
@@ -455,6 +558,134 @@ async fn watch(args: WatchArgs, host: Option<&str>) -> Result<()> {
         }
         tokio::time::sleep(Duration::from_secs(args.interval.max(1))).await;
     }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct DispatchRunHandle {
+    id: u64,
+    run_number: u64,
+    workflow: String,
+    status: String,
+    conclusion: Option<String>,
+    url: String,
+}
+
+impl DispatchRunHandle {
+    fn from_run(ctx: &RepoContext, run: &api::workflow::WorkflowRun) -> Self {
+        Self {
+            id: run.id,
+            run_number: run.run_number,
+            workflow: run.workflow_id.clone(),
+            status: run.status.clone(),
+            conclusion: run.conclusion.clone(),
+            url: run_url(ctx, run),
+        }
+    }
+}
+
+fn parse_dispatch_fields(fields: &[String]) -> Result<BTreeMap<String, String>> {
+    let mut inputs = BTreeMap::new();
+    for f in fields {
+        let (k, v) = f
+            .split_once('=')
+            .ok_or_else(|| anyhow!("invalid --field '{f}', expected key=value"))?;
+        inputs.insert(k.to_string(), v.to_string());
+    }
+    Ok(inputs)
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn dispatch_run_keys(
+    ctx: &RepoContext,
+    workflow: &str,
+    ref_: &str,
+) -> Result<BTreeSet<RunKey>> {
+    Ok(dispatch_matching_runs(ctx, workflow, ref_)
+        .await?
+        .iter()
+        .map(RunKey::from)
+        .collect())
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn wait_for_dispatched_run(
+    ctx: &RepoContext,
+    workflow: &str,
+    ref_: &str,
+    seen: &BTreeSet<RunKey>,
+) -> Result<api::workflow::WorkflowRun> {
+    for _ in 0..30 {
+        let runs = dispatch_matching_runs(ctx, workflow, ref_).await?;
+        if let Some(run) = find_new_dispatch_run(&runs, seen) {
+            return Ok(run.clone());
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    Err(anyhow!(
+        "dispatched `{workflow}` on `{ref_}`, but could not find the triggered run"
+    ))
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn dispatch_matching_runs(
+    ctx: &RepoContext,
+    workflow: &str,
+    ref_: &str,
+) -> Result<Vec<api::workflow::WorkflowRun>> {
+    let runs = api::workflow::list_runs(&ctx.client, &ctx.owner, &ctx.name, 50).await?;
+    Ok(runs
+        .into_iter()
+        .filter(|run| run_matches_dispatch(run, workflow, ref_))
+        .collect())
+}
+
+fn run_matches_dispatch(run: &api::workflow::WorkflowRun, workflow: &str, ref_: &str) -> bool {
+    workflow_matches_dispatch(&run.workflow_id, workflow)
+        && run.head_branch == normalize_dispatch_ref(ref_)
+        && run.event == "workflow_dispatch"
+}
+
+fn workflow_matches_dispatch(actual: &str, wanted: &str) -> bool {
+    actual == wanted || actual.rsplit('/').next() == Some(wanted)
+}
+
+fn normalize_dispatch_ref(ref_: &str) -> String {
+    ref_.strip_prefix("refs/heads/").unwrap_or(ref_).to_string()
+}
+
+fn find_new_dispatch_run<'a>(
+    runs: &'a [api::workflow::WorkflowRun],
+    seen: &BTreeSet<RunKey>,
+) -> Option<&'a api::workflow::WorkflowRun> {
+    runs.iter().find(|run| !seen.contains(&RunKey::from(*run)))
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
+struct RunKey {
+    id: u64,
+    run_number: u64,
+}
+
+impl From<&api::workflow::WorkflowRun> for RunKey {
+    fn from(run: &api::workflow::WorkflowRun) -> Self {
+        Self {
+            id: run.id,
+            run_number: run.run_number,
+        }
+    }
+}
+
+fn run_url(ctx: &RepoContext, run: &api::workflow::WorkflowRun) -> String {
+    if !run.html_url.is_empty() {
+        return absolutize(&ctx.client, &run.html_url);
+    }
+    let link = format!(
+        "/{}/{}/actions/runs/{}",
+        api::path_segment(&ctx.owner),
+        api::path_segment(&ctx.name),
+        run.run_number
+    );
+    absolutize(&ctx.client, &link)
 }
 
 fn ensure_exit_status(status: &str, exit_status: bool) -> Result<()> {
@@ -626,6 +857,116 @@ mod tests {
         assert_eq!(args.branch.as_deref(), Some("main"));
         assert_eq!(args.event.as_deref(), Some("push"));
         assert_eq!(args.workflow.as_deref(), Some("ci.yml"));
+    }
+
+    #[test]
+    fn workflow_run_handle_flags_parse() {
+        use clap::Parser;
+
+        let cli = crate::cli::Cli::try_parse_from([
+            "fj",
+            "workflow",
+            "run",
+            "ci.yml",
+            "--ref",
+            "main",
+            "--field",
+            "deploy=true",
+            "--json",
+            "--watch",
+            "--exit-status",
+            "--job",
+            "1",
+            "--interval",
+            "2",
+        ])
+        .expect("should parse");
+        let crate::cli::Command::Workflow(crate::cli::workflow::WorkflowCmd {
+            command: crate::cli::workflow::WorkflowSub::Run(args),
+        }) = cli.command
+        else {
+            panic!("expected workflow run command");
+        };
+        assert_eq!(args.workflow, "ci.yml");
+        assert_eq!(args.ref_.as_deref(), Some("main"));
+        assert_eq!(args.fields, vec!["deploy=true"]);
+        assert!(args.json);
+        assert!(args.watch);
+        assert!(args.exit_status);
+        assert_eq!(args.job, 1);
+        assert_eq!(args.interval, 2);
+    }
+
+    #[test]
+    fn workflow_run_exit_status_requires_watch() {
+        use clap::Parser;
+
+        let err =
+            crate::cli::Cli::try_parse_from(["fj", "workflow", "run", "ci.yml", "--exit-status"])
+                .expect_err("--exit-status without --watch should fail");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn parse_dispatch_fields_accepts_key_value_pairs() {
+        let fields = vec!["env=prod".to_string(), "dry_run=false".to_string()];
+        let parsed = parse_dispatch_fields(&fields).expect("fields should parse");
+        assert_eq!(parsed.get("env").map(String::as_str), Some("prod"));
+        assert_eq!(parsed.get("dry_run").map(String::as_str), Some("false"));
+    }
+
+    #[test]
+    fn parse_dispatch_fields_rejects_missing_equals() {
+        let fields = vec!["env".to_string()];
+        assert!(parse_dispatch_fields(&fields).is_err());
+    }
+
+    #[test]
+    fn run_matches_dispatch_accepts_matching_workflow_ref_and_event() {
+        let run = workflow_run(10, 20);
+        assert!(run_matches_dispatch(&run, "ci.yml", "refs/heads/main"));
+    }
+
+    #[test]
+    fn run_matches_dispatch_rejects_other_events() {
+        let mut run = workflow_run(10, 20);
+        run.event = "push".to_string();
+        assert!(!run_matches_dispatch(&run, "ci.yml", "main"));
+    }
+
+    #[test]
+    fn dispatch_ref_normalization_strips_refs_heads_prefix() {
+        assert_eq!(normalize_dispatch_ref("refs/heads/main"), "main");
+        assert_eq!(normalize_dispatch_ref("main"), "main");
+    }
+
+    fn workflow_run(id: u64, run_number: u64) -> api::workflow::WorkflowRun {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "run_number": run_number,
+            "workflow_id": "ci.yml",
+            "head_branch": "main",
+            "event": "workflow_dispatch",
+            "status": "queued"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn find_new_dispatch_run_skips_seen_runs() {
+        let old = workflow_run(10, 20);
+        let new = workflow_run(11, 21);
+        let seen = [RunKey::from(&old)].into_iter().collect();
+        let runs = vec![old, new];
+        let found = find_new_dispatch_run(&runs, &seen).expect("new run should be selected");
+        assert_eq!(found.run_number, 21);
+    }
+
+    #[test]
+    fn find_new_dispatch_run_returns_none_when_every_run_is_seen() {
+        let old = workflow_run(10, 20);
+        let seen = [RunKey::from(&old)].into_iter().collect();
+        assert!(find_new_dispatch_run(&[old], &seen).is_none());
     }
 
     #[test]
