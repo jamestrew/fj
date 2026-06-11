@@ -90,12 +90,10 @@ pub async fn delete(client: &Client, owner: &str, name: &str, id: u64) -> Result
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(dead_code)]
 pub struct AddLabelsBody {
     pub labels: Vec<u64>,
 }
 
-#[allow(dead_code)]
 pub async fn add_to_issue(
     client: &Client,
     owner: &str,
@@ -117,7 +115,6 @@ pub async fn add_to_issue(
         .await
 }
 
-#[allow(dead_code)]
 pub async fn remove_from_issue(
     client: &Client,
     owner: &str,

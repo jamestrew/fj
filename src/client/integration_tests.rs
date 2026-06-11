@@ -1411,6 +1411,91 @@ async fn pull_create_posts_title_head_base() {
 }
 
 #[tokio::test]
+async fn pull_create_can_be_followed_by_label_and_assignee_calls() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/pulls"))
+        .and(body_json(json!({
+            "title": "Add feature", "head": "feature", "base": "main",
+            "body": "details", "draft": false
+        })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "id": 1, "number": 12, "title": "Add feature",
+            "state": "open", "user": { "id": 1, "login": "alice" },
+            "html_url": "https://x/o/r/pulls/12",
+            "head": { "ref": "feature", "sha": "aaa" },
+            "base": { "ref": "main", "sha": "bbb" },
+            "created_at": "2026-05-30T00:00:00Z",
+            "updated_at": "2026-05-30T00:01:00Z"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "id": 10, "name": "area/api", "color": "ee0000" },
+            { "id": 11, "name": "needs-review", "color": "00ee00" }
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/issues/12/labels"))
+        .and(body_json(json!({ "labels": [10, 11] })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "id": 10, "name": "area/api", "color": "ee0000" },
+            { "id": 11, "name": "needs-review", "color": "00ee00" }
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/issues/12/assignees"))
+        .and(body_json(json!({ "assignees": ["alice", "bob"] })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issue_json(
+            12,
+            "Add feature",
+            "open",
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let c = client_for(&server).await;
+    let pr = crate::api::pull::create(
+        &c,
+        "o",
+        "r",
+        &crate::api::pull::CreatePull {
+            title: "Add feature",
+            head: "feature",
+            base: "main",
+            body: Some("details"),
+            draft: false,
+        },
+    )
+    .await
+    .expect("create");
+    let names = vec!["area/api".to_string(), "needs-review".to_string()];
+    let label_ids = crate::api::label::resolve_names_to_ids(&c, "o", "r", &names)
+        .await
+        .expect("resolve labels");
+    crate::api::label::add_to_issue(&c, "o", "r", pr.number, label_ids)
+        .await
+        .expect("add labels to pr");
+    crate::api::issue::add_assignees(
+        &c,
+        "o",
+        "r",
+        pr.number,
+        vec!["alice".to_string(), "bob".to_string()],
+    )
+    .await
+    .expect("add assignees to pr");
+}
+
+#[tokio::test]
 async fn pull_merge_posts_do_and_squash_fields() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -2922,6 +3007,75 @@ async fn pull_edit_can_close() {
         .await
         .expect("edit");
     assert_eq!(pr.state, "closed");
+}
+
+#[tokio::test]
+async fn pull_label_and_assignee_mutations_use_backing_issue_endpoints() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "id": 10, "name": "needs-review", "color": "ee0000" },
+            { "id": 11, "name": "wip", "color": "00ee00" }
+        ])))
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/issues/12/labels"))
+        .and(body_json(json!({ "labels": [10] })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "id": 10, "name": "needs-review", "color": "ee0000" }
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/repos/o/r/issues/12/labels/11"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/issues/12/assignees"))
+        .and(body_json(json!({ "assignees": ["alice"] })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issue_json(12, "A PR", "open")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/repos/o/r/issues/12/assignees"))
+        .and(body_json(json!({ "assignees": ["bob"] })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issue_json(12, "A PR", "open")))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let c = client_for(&server).await;
+    let add_names = vec!["needs-review".to_string()];
+    let add_ids = crate::api::label::resolve_names_to_ids(&c, "o", "r", &add_names)
+        .await
+        .expect("resolve add labels");
+    crate::api::label::add_to_issue(&c, "o", "r", 12, add_ids)
+        .await
+        .expect("add labels to pr");
+
+    let remove_names = vec!["wip".to_string()];
+    let remove_ids = crate::api::label::resolve_names_to_ids(&c, "o", "r", &remove_names)
+        .await
+        .expect("resolve remove labels");
+    for label_id in remove_ids {
+        crate::api::label::remove_from_issue(&c, "o", "r", 12, label_id)
+            .await
+            .expect("remove label from pr");
+    }
+
+    crate::api::issue::add_assignees(&c, "o", "r", 12, vec!["alice".to_string()])
+        .await
+        .expect("add assignee to pr");
+    crate::api::issue::remove_assignees(&c, "o", "r", 12, vec!["bob".to_string()])
+        .await
+        .expect("remove assignee from pr");
 }
 
 #[tokio::test]
