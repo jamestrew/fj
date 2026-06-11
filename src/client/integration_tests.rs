@@ -3604,7 +3604,10 @@ async fn pr_comment_create_if_none_posts_when_caller_has_no_comment() {
 }
 
 // A bare comment id that does not exist surfaces the API 404 rather than a
-// silent success, for both edit and delete.
+// silent success, for both edit and delete. The client wraps 404s in a
+// friendly `not found: {resource}` context, so the status code lives in the
+// error's source chain; assert against the full chain (`{:#}`) rather than the
+// outermost message that `to_string()` returns.
 #[tokio::test]
 async fn pr_comment_edit_and_delete_missing_id_error() {
     let server = MockServer::start().await;
@@ -3628,11 +3631,11 @@ async fn pr_comment_edit_and_delete_missing_id_error() {
     let edit_err = crate::api::issue::edit_comment(&c, "o", "r", 999, "x")
         .await
         .expect_err("missing comment should error");
-    assert!(edit_err.to_string().contains("404"));
+    assert!(format!("{edit_err:#}").contains("404"));
     let del_err = crate::api::issue::delete_comment(&c, "o", "r", 999)
         .await
         .expect_err("missing comment should error");
-    assert!(del_err.to_string().contains("404"));
+    assert!(format!("{del_err:#}").contains("404"));
 }
 
 #[tokio::test]
