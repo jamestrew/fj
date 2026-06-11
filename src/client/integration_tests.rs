@@ -7,7 +7,7 @@
 use reqwest::Method;
 use serde_json::json;
 use url::Url;
-use wiremock::matchers::{body_json, header, method, path, query_param};
+use wiremock::matchers::{body_json, header, method, path, query_param, query_param_is_missing};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::Client;
@@ -1417,6 +1417,67 @@ async fn pull_list_decodes_and_sends_state_limit() {
     assert_eq!(page.items[0].head.ref_, "feature");
     assert_eq!(page.items[0].base.ref_, "main");
     assert_eq!(page.total, Some(104));
+}
+
+#[tokio::test]
+async fn pull_list_sends_label_ids_and_poster() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/pulls"))
+        .and(query_param("state", "open"))
+        .and(query_param("labels", "920,921"))
+        .and(query_param("poster", "alice"))
+        .and(query_param("limit", "30"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([pull_json(12, "open")])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let page = crate::api::pull::list(
+        &c,
+        "o",
+        "r",
+        crate::api::pull::ListOptions {
+            labels: Some(vec![920, 921]),
+            author: Some("alice".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("filtered list");
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].number, 12);
+}
+
+#[tokio::test]
+async fn pull_list_omits_filter_params_when_unset() {
+    let server = MockServer::start().await;
+    // Empty label set must not emit a `labels` param; the mock only matches
+    // when state/limit are present and nothing else is required.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/pulls"))
+        .and(query_param("state", "open"))
+        .and(query_param("limit", "30"))
+        .and(query_param_is_missing("labels"))
+        .and(query_param_is_missing("poster"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([pull_json(12, "open")])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let page = crate::api::pull::list(
+        &c,
+        "o",
+        "r",
+        crate::api::pull::ListOptions {
+            labels: Some(vec![]),
+            author: None,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("unfiltered list");
+    assert_eq!(page.items.len(), 1);
 }
 
 #[tokio::test]

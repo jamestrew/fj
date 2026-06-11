@@ -103,6 +103,11 @@ pub struct ListOptions {
     pub limit: u32,
     pub page: u32,
     pub paginate: bool,
+    /// Forgejo's `/pulls` endpoint filters labels by ID, not name; the CLI
+    /// resolves names up front. Empty/None adds no filter.
+    pub labels: Option<Vec<u64>>,
+    /// Author (`poster`) login. Forgejo 400s on an unknown user.
+    pub author: Option<String>,
 }
 
 impl Default for ListOptions {
@@ -112,6 +117,8 @@ impl Default for ListOptions {
             limit: 30,
             page: 1,
             paginate: false,
+            labels: None,
+            author: None,
         }
     }
 }
@@ -123,8 +130,17 @@ pub async fn list(
     opts: ListOptions,
 ) -> Result<Page<Pull>> {
     let path = format!("{}/pulls", crate::api::repo_path(owner, name));
+    let mut query: Vec<(String, String)> = vec![("state".into(), opts.state.as_str().into())];
+    if let Some(ids) = opts.labels.as_deref() {
+        if !ids.is_empty() {
+            let joined = ids.iter().map(u64::to_string).collect::<Vec<_>>().join(",");
+            query.push(("labels".into(), joined));
+        }
+    }
+    if let Some(author) = opts.author.as_deref() {
+        query.push(("poster".into(), author.into()));
+    }
     if opts.paginate || opts.limit > 50 {
-        let mut query: Vec<(String, String)> = vec![("state".into(), opts.state.as_str().into())];
         if opts.paginate {
             query.push(("page".into(), opts.page.max(1).to_string()));
             return client.get_all_page::<Pull>(&path, &query, None).await;
@@ -133,11 +149,8 @@ pub async fn list(
             .get_all_page::<Pull>(&path, &query, Some(opts.limit as usize))
             .await;
     }
-    let query: Vec<(String, String)> = vec![
-        ("state".into(), opts.state.as_str().into()),
-        ("limit".into(), opts.limit.clamp(1, 50).to_string()),
-        ("page".into(), opts.page.max(1).to_string()),
-    ];
+    query.push(("limit".into(), opts.limit.clamp(1, 50).to_string()));
+    query.push(("page".into(), opts.page.max(1).to_string()));
     client.get_page::<Pull>(&path, &query).await
 }
 

@@ -83,6 +83,17 @@ pub struct ListArgs {
     /// Page of results to fetch
     #[arg(long, default_value_t = 1)]
     pub page: u32,
+    /// Filter by label. Repeat or use commas for multiple (matches any).
+    #[arg(
+        short = 'l',
+        long = "label",
+        value_name = "NAME",
+        value_delimiter = ','
+    )]
+    pub label: Vec<String>,
+    /// Filter by author (PR creator) login.
+    #[arg(short = 'A', long = "author", value_name = "USERNAME")]
+    pub author: Option<String>,
     /// Emit JSON instead of a table
     #[arg(long)]
     pub json: bool,
@@ -334,6 +345,23 @@ async fn list(args: ListArgs, host: Option<&str>) -> Result<()> {
     if args.web {
         return web::open(&repo_web_url(&ctx, "pulls")?);
     }
+    // Forgejo's /pulls endpoint filters labels by ID, so resolve names first;
+    // an unknown name surfaces a clear "no label named ..." error here.
+    let label_names = clean_csv_values(args.label);
+    let labels = if label_names.is_empty() {
+        None
+    } else {
+        Some(
+            api::label::resolve_names_to_ids(&ctx.client, &ctx.owner, &ctx.name, &label_names)
+                .await?,
+        )
+    };
+    let author = args
+        .author
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
     let page = api::pull::list(
         &ctx.client,
         &ctx.owner,
@@ -343,6 +371,8 @@ async fn list(args: ListArgs, host: Option<&str>) -> Result<()> {
             limit: args.limit,
             page: args.page,
             paginate: args.paginate,
+            labels,
+            author,
         },
     )
     .await?;
@@ -983,6 +1013,42 @@ mod tests {
                 command: PrSub::Create(a),
             }) => assert_eq!(a.attach.len(), 2),
             other => panic!("expected pr create, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_parses_label_and_author_filters() {
+        use crate::cli::{Cli, Command};
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "fj",
+            "pr",
+            "list",
+            "--label",
+            "needs-review,p1",
+            "--label",
+            "blocked",
+            "--author",
+            "alice",
+        ])
+        .expect("should parse");
+        match cli.command {
+            Command::Pr(PrCmd {
+                command: PrSub::List(a),
+            }) => {
+                assert_eq!(a.label, vec!["needs-review", "p1", "blocked"]);
+                assert_eq!(a.author.as_deref(), Some("alice"));
+            }
+            other => panic!("expected pr list, got {other:?}"),
+        }
+        // Filters are optional: bare `pr list` leaves them empty.
+        let cli = Cli::try_parse_from(["fj", "pr", "list"]).expect("should parse");
+        if let Command::Pr(PrCmd {
+            command: PrSub::List(a),
+        }) = cli.command
+        {
+            assert!(a.label.is_empty());
+            assert!(a.author.is_none());
         }
     }
 
