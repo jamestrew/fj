@@ -4072,3 +4072,183 @@ async fn variable_list_json_shape_and_projection() {
     let projected = project_fields(&v, "name");
     assert_eq!(projected, json!([{ "name": "REGION" }, { "name": "TIER" }]));
 }
+
+#[tokio::test]
+async fn tag_crud_uses_refs_api_paths() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/tags"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {
+                "name": "v1.0.0",
+                "message": "release",
+                "commit": { "sha": "abcdef1234567890" },
+                "tarball_url": "https://example.test/tar.gz",
+                "zipball_url": "https://example.test/zip"
+            }
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/tags/v1.0.0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "name": "v1.0.0",
+            "message": "release",
+            "commit": { "sha": "abcdef1234567890" }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/tags"))
+        .and(body_json(json!({
+            "tag_name": "v1.0.1",
+            "target": "main",
+            "message": "next"
+        })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "name": "v1.0.1",
+            "message": "next",
+            "commit": { "sha": "1234567890abcdef" }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/repos/o/r/tags/feature%2Fx"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let c = client_for(&server).await;
+    let tags = crate::api::tag::list(&c, "o", "r").await.expect("list");
+    assert_eq!(tags[0].name, "v1.0.0");
+    assert_eq!(tags[0].commit.sha, "abcdef1234567890");
+
+    let tag = crate::api::tag::get(&c, "o", "r", "v1.0.0")
+        .await
+        .expect("get");
+    assert_eq!(tag.message, "release");
+
+    let created = crate::api::tag::create(
+        &c,
+        "o",
+        "r",
+        &crate::api::tag::CreateTag {
+            tag_name: "v1.0.1",
+            target: Some("main"),
+            message: Some("next"),
+        },
+    )
+    .await
+    .expect("create");
+    assert_eq!(created.name, "v1.0.1");
+
+    crate::api::tag::delete(&c, "o", "r", "feature/x")
+        .await
+        .expect("delete");
+}
+
+#[tokio::test]
+async fn branch_create_delete_uses_refs_api_paths() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/branches"))
+        .and(body_json(json!({
+            "new_branch_name": "feature/x",
+            "old_branch_name": "main"
+        })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "name": "feature/x",
+            "protected": false,
+            "commit": { "id": "abcdef1234567890", "message": "init" }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/repos/o/r/branches/feature%2Fx"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let c = client_for(&server).await;
+    let branch = crate::api::repo::create_branch(
+        &c,
+        "o",
+        "r",
+        &crate::api::repo::CreateBranch {
+            new_branch_name: "feature/x",
+            old_branch_name: Some("main"),
+        },
+    )
+    .await
+    .expect("create");
+    assert_eq!(branch.name, "feature/x");
+
+    crate::api::repo::delete_branch(&c, "o", "r", "feature/x")
+        .await
+        .expect("delete");
+}
+
+#[tokio::test]
+async fn ref_mutation_errors_are_clear() {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/repos/o/r/branches/missing"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "message": "branch does not exist"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/repos/o/r/tags/v1"))
+        .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+            "message": "tag is protected"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/tags"))
+        .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+            "message": "tag already exists"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let c = client_for(&server).await;
+    let missing = crate::api::repo::delete_branch(&c, "o", "r", "missing")
+        .await
+        .expect_err("missing branch should fail")
+        .to_string();
+    assert!(missing.contains("branch 'missing' not found"), "{missing}");
+
+    let conflict = crate::api::tag::delete(&c, "o", "r", "v1")
+        .await
+        .expect_err("protected tag should fail")
+        .to_string();
+    assert!(conflict.contains("could not delete tag 'v1'"), "{conflict}");
+    assert!(conflict.contains("tag is protected"), "{conflict}");
+
+    let create_conflict = crate::api::tag::create(
+        &c,
+        "o",
+        "r",
+        &crate::api::tag::CreateTag {
+            tag_name: "v1",
+            target: None,
+            message: None,
+        },
+    )
+    .await
+    .expect_err("duplicate tag should fail");
+    let text = format!("{create_conflict:#}");
+    assert!(text.contains("409 Conflict"), "{text}");
+    assert!(text.contains("tag already exists"), "{text}");
+}

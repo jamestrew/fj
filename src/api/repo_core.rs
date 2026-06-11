@@ -1,9 +1,9 @@
 //! Core repository operations: list, search, get, create, edit, delete,
 //! fork, rename, sync, migrate, mirror, branches, and topics.
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
-use reqwest::Method;
+use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 
 use crate::client::{Client, Page};
@@ -252,6 +252,56 @@ pub struct BranchCommit {
 pub async fn list_branches(client: &Client, owner: &str, name: &str) -> Result<Vec<Branch>> {
     let path = format!("{}/branches", crate::api::repo_path(owner, name));
     client.json(Method::GET, &path, &[], None::<&()>).await
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CreateBranch<'a> {
+    pub new_branch_name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_branch_name: Option<&'a str>,
+}
+
+pub async fn create_branch(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    body: &CreateBranch<'_>,
+) -> Result<Branch> {
+    let path = format!("{}/branches", crate::api::repo_path(owner, name));
+    client.json(Method::POST, &path, &[], Some(body)).await
+}
+
+pub async fn delete_branch(client: &Client, owner: &str, name: &str, branch: &str) -> Result<()> {
+    let path = format!(
+        "{}/branches/{}",
+        crate::api::repo_path(owner, name),
+        crate::api::path_segment(branch)
+    );
+    let res = client.request(Method::DELETE, &path, &[], None).await?;
+    let status = res.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let message = api_error_message(res).await;
+    match status {
+        StatusCode::NOT_FOUND => Err(anyhow!("branch '{branch}' not found")),
+        StatusCode::CONFLICT => Err(anyhow!("could not delete branch '{branch}': {message}")),
+        _ => Err(anyhow!("HTTP {status}: {message}")),
+    }
+}
+
+async fn api_error_message(res: reqwest::Response) -> String {
+    let text = res.text().await.unwrap_or_default();
+    serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|v| {
+            v.get("message")
+                .or_else(|| v.get("error"))
+                .and_then(|m| m.as_str())
+                .map(ToString::to_string)
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or(text)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

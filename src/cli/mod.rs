@@ -8,6 +8,7 @@ pub mod auth;
 mod auth_login;
 mod auth_probe;
 mod auth_setup_git;
+pub mod branch;
 pub mod browse;
 pub mod config;
 pub mod context;
@@ -38,6 +39,7 @@ pub mod search;
 pub mod stack;
 mod stack_state;
 pub mod status;
+pub mod tag;
 pub mod web;
 pub mod work;
 mod work_session;
@@ -122,6 +124,12 @@ pub enum Command {
     Label(label::LabelCmd),
     /// Work with milestones.
     Milestone(milestone::MilestoneCmd),
+    /// Manage git tags.
+    Tag(tag::TagCmd),
+    /// Create a branch on Forgejo.
+    BranchCreate(branch::BranchCreateArgs),
+    /// Delete a branch on Forgejo.
+    BranchDelete(branch::BranchDeleteArgs),
     /// Manage workflow runs (Forgejo Actions).
     Run(workflow::RunCmd),
     /// Manage workflow definitions (trigger a `workflow_dispatch`).
@@ -197,6 +205,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         | Command::Status(_)
         | Command::Label(_)
         | Command::Milestone(_)
+        | Command::Tag(_)
         | Command::Run(_)
         | Command::Api(_) => crate::output::pager::maybe_start(cli.no_pager),
         _ => None,
@@ -227,6 +236,9 @@ async fn dispatch(command: Command, host: Option<&str>) -> Result<()> {
         Command::Release(cmd) => release::run(cmd, host).await,
         Command::Label(cmd) => label::run(cmd, host).await,
         Command::Milestone(cmd) => milestone::run(cmd, host).await,
+        Command::Tag(cmd) => tag::run(cmd, host).await,
+        Command::BranchCreate(args) => branch::create(args, host).await,
+        Command::BranchDelete(args) => branch::delete(args, host).await,
         Command::Run(cmd) => workflow_run::run(cmd, host).await,
         Command::Workflow(cmd) => workflow::run_workflow(cmd, host).await,
         Command::Secret(cmd) => workflow_secret::run_secret(cmd, host).await,
