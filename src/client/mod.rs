@@ -591,6 +591,7 @@ async fn ensure_success(res: Response) -> Result<Response> {
         return Ok(res);
     }
     let url = res.url().clone();
+    let retry_after = (status == StatusCode::TOO_MANY_REQUESTS).then(|| parse_retry_after(&res));
     let text = res.text().await.unwrap_or_default();
     let message = parse_error_message(&text).unwrap_or_else(|| text.clone());
     let err = ApiError {
@@ -599,11 +600,46 @@ async fn ensure_success(res: Response) -> Result<Response> {
         message,
         body: text,
     };
-    if status == StatusCode::UNAUTHORIZED {
-        Err(anyhow::Error::new(err)
-            .context("authentication failed (HTTP 401). Token may be invalid or revoked"))
-    } else {
-        Err(anyhow::Error::new(err))
+    match friendly_http_error(status, &url, retry_after.flatten()) {
+        Some(context) => Err(anyhow::Error::new(err).context(context)),
+        None => Err(anyhow::Error::new(err)),
+    }
+}
+
+fn friendly_http_error(
+    status: StatusCode,
+    url: &Url,
+    retry_after: Option<Duration>,
+) -> Option<String> {
+    let resource = api_resource_label(url).unwrap_or_else(|| "requested resource".to_string());
+    match status {
+        StatusCode::UNAUTHORIZED => {
+            Some("authentication failed (HTTP 401). Token may be invalid or revoked".to_string())
+        }
+        StatusCode::FORBIDDEN => Some(format!(
+            "forbidden: {resource} (token lacks scope or access)"
+        )),
+        StatusCode::NOT_FOUND => Some(format!("not found: {resource}")),
+        StatusCode::TOO_MANY_REQUESTS => match retry_after {
+            Some(wait) => Some(format!("rate limited: retry after {} s", wait.as_secs())),
+            None => Some("rate limited: retry later".to_string()),
+        },
+        _ => None,
+    }
+}
+
+fn api_resource_label(url: &Url) -> Option<String> {
+    let segments: Vec<&str> = url.path_segments()?.collect();
+    let repos = segments.iter().position(|segment| *segment == "repos")?;
+    let owner = segments.get(repos + 1)?;
+    let repo = segments.get(repos + 2)?;
+    let repo_label = format!("{owner}/{repo}");
+    match segments.get(repos + 3).copied() {
+        Some("issues" | "pulls") => match segments.get(repos + 4) {
+            Some(number) => Some(format!("{repo_label} #{number}")),
+            None => Some(repo_label),
+        },
+        _ => Some(repo_label),
     }
 }
 

@@ -14,6 +14,7 @@
   scripting, plugins.
 - [`troubleshooting.md`](troubleshooting.md): keychain prompts, hangs,
   401 errors, `--debug`, pager opt-out, alias precedence, hook bypass.
+- [`exit-codes.md`](exit-codes.md): stable process exit codes for scripts.
 
 For build/test workflow see [`../CONTRIBUTING.md`](../CONTRIBUTING.md).
 For project conventions see [`../CLAUDE.md`](../CLAUDE.md).
