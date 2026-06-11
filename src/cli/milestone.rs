@@ -68,6 +68,9 @@ pub struct CreateArgs {
     /// Description (use - for stdin, omit to open $EDITOR)
     #[arg(short = 'b', long)]
     pub body: Option<String>,
+    /// Read description from file (use `-` for stdin).
+    #[arg(short = 'F', long = "body-file", value_name = "FILE")]
+    pub body_file: Option<String>,
     /// Due date in ISO-8601 (e.g. 2026-06-01T00:00:00Z).
     #[arg(long)]
     pub due_on: Option<String>,
@@ -85,6 +88,9 @@ pub struct EditArgs {
     /// Description (use - for stdin, omit to open $EDITOR)
     #[arg(short = 'b', long)]
     pub body: Option<String>,
+    /// Read description from file (use `-` for stdin).
+    #[arg(short = 'F', long = "body-file", value_name = "FILE")]
+    pub body_file: Option<String>,
     /// Due date (YYYY-MM-DD)
     #[arg(long)]
     pub due_on: Option<String>,
@@ -190,7 +196,7 @@ async fn view(args: IdArgs, host: Option<&str>) -> Result<()> {
 
 async fn create(args: CreateArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
-    let body = editor::read_body(args.body.as_deref())?;
+    let body = editor::resolve_body_input(args.body.as_deref(), args.body_file.as_deref(), None)?;
     let m = api::milestone::create(
         &ctx.client,
         &ctx.owner,
@@ -215,7 +221,7 @@ async fn edit(args: EditArgs, host: Option<&str>) -> Result<()> {
             &existing.description,
         )?)
     } else {
-        args.body
+        editor::resolve_body_input(args.body.as_deref(), args.body_file.as_deref(), None)?
     };
     let m = api::milestone::edit(
         &ctx.client,

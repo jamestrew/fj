@@ -124,6 +124,9 @@ pub struct CreateArgs {
     /// Body. Use `-` to read from stdin. Omit to open `$EDITOR`.
     #[arg(short = 'b', long)]
     pub body: Option<String>,
+    /// Read body from file (use `-` for stdin).
+    #[arg(short = 'F', long = "body-file", value_name = "FILE")]
+    pub body_file: Option<String>,
     /// Label name to add. Repeat or use commas for multiple labels.
     #[arg(
         short = 'l',
@@ -157,6 +160,9 @@ pub struct EditArgs {
     /// New body. Use `-` to read from stdin. Pass `--body-editor` to open `$EDITOR`.
     #[arg(short = 'b', long)]
     pub body: Option<String>,
+    /// Read body from file (use `-` for stdin).
+    #[arg(short = 'F', long = "body-file", value_name = "FILE")]
+    pub body_file: Option<String>,
     /// Open `$EDITOR` to edit the body inline (overrides `--body`).
     #[arg(long)]
     pub body_editor: bool,
@@ -345,7 +351,11 @@ async fn create(args: CreateArgs, host: Option<&str>) -> Result<()> {
     if title.trim().is_empty() {
         return Err(anyhow!("title is required"));
     }
-    let body = editor::resolve_body(args.body.as_deref(), "ISSUE_BODY.md", "")?;
+    let body = editor::resolve_body_input(
+        args.body.as_deref(),
+        args.body_file.as_deref(),
+        Some(("ISSUE_BODY.md", "")),
+    )?;
     let label_names = clean_csv_values(args.label);
     let labels = if label_names.is_empty() {
         None
@@ -391,8 +401,11 @@ async fn edit(args: EditArgs, host: Option<&str>) -> Result<()> {
         || !remove_labels.is_empty()
         || !add_assignees.is_empty()
         || !remove_assignees.is_empty();
-    let should_patch =
-        args.title.is_some() || args.body.is_some() || args.body_editor || !has_additive_edits;
+    let should_patch = args.title.is_some()
+        || args.body.is_some()
+        || args.body_file.is_some()
+        || args.body_editor
+        || !has_additive_edits;
 
     let mut updated_issue = None;
     if should_patch {
@@ -400,7 +413,7 @@ async fn edit(args: EditArgs, host: Option<&str>) -> Result<()> {
             let existing = api::issue::get(&ctx.client, &ctx.owner, &ctx.name, args.number).await?;
             Some(editor::edit_text("ISSUE_BODY.md", &existing.body)?)
         } else {
-            editor::read_body(args.body.as_deref())?
+            editor::resolve_body_input(args.body.as_deref(), args.body_file.as_deref(), None)?
         };
         let patch = EditIssue {
             title: args.title.as_deref(),

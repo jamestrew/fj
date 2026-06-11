@@ -293,7 +293,7 @@ fn write_man_for(cmd: &clap::Command, file_name: &str, dir: &std::path::Path) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::CommandFactory;
+    use clap::{CommandFactory, Parser};
 
     /// Walk the whole derived command tree and assert it is internally
     /// consistent: no duplicate short flags, conflicting args, bad value
@@ -305,6 +305,83 @@ mod tests {
     #[test]
     fn command_tree_is_internally_consistent() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn body_file_flags_parse_on_body_taking_commands() {
+        let cli = Cli::try_parse_from([
+            "fj",
+            "issue",
+            "create",
+            "--title",
+            "t",
+            "--body-file",
+            "body.md",
+        ])
+        .expect("issue create parses");
+        match cli.command {
+            Command::Issue(issue::IssueCmd {
+                command: issue::IssueSub::Create(args),
+            }) => assert_eq!(args.body_file.as_deref(), Some("body.md")),
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["fj", "issue", "edit", "1", "-F", "-"])
+            .expect("issue edit parses");
+        match cli.command {
+            Command::Issue(issue::IssueCmd {
+                command: issue::IssueSub::Edit(args),
+            }) => assert_eq!(args.body_file.as_deref(), Some("-")),
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "fj", "pr", "create", "--title", "t", "--head", "h", "-F", "-",
+        ])
+        .expect("pr create parses");
+        match cli.command {
+            Command::Pr(pr::PrCmd {
+                command: pr::PrSub::Create(args),
+            }) => assert_eq!(args.body_file.as_deref(), Some("-")),
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["fj", "pr", "edit", "1", "--body-file", "body.md"])
+            .expect("pr edit parses");
+        match cli.command {
+            Command::Pr(pr::PrCmd {
+                command: pr::PrSub::Edit(args),
+            }) => assert_eq!(args.body_file.as_deref(), Some("body.md")),
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["fj", "release", "create", "v1", "-F", "body.md"])
+            .expect("release create parses");
+        match cli.command {
+            Command::Release(release::ReleaseCmd {
+                command: release::ReleaseSub::Create(args),
+            }) => assert_eq!(args.body_file.as_deref(), Some("body.md")),
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let cli =
+            Cli::try_parse_from(["fj", "milestone", "create", "v1", "--body-file", "body.md"])
+                .expect("milestone create parses");
+        match cli.command {
+            Command::Milestone(milestone::MilestoneCmd {
+                command: milestone::MilestoneSub::Create(args),
+            }) => assert_eq!(args.body_file.as_deref(), Some("body.md")),
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["fj", "milestone", "edit", "1", "-F", "-"])
+            .expect("milestone edit parses");
+        match cli.command {
+            Command::Milestone(milestone::MilestoneCmd {
+                command: milestone::MilestoneSub::Edit(args),
+            }) => assert_eq!(args.body_file.as_deref(), Some("-")),
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 
     /// Every subcommand (and nested subcommand) must render its help and
