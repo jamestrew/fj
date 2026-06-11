@@ -4,7 +4,7 @@
 
 #![cfg(test)]
 
-use reqwest::Method;
+use reqwest::{Method, StatusCode};
 use serde_json::json;
 use url::Url;
 use wiremock::matchers::{body_json, header, method, path, query_param};
@@ -97,6 +97,73 @@ async fn maps_401_to_friendly_error() {
         text.to_lowercase().contains("authentication") || text.to_lowercase().contains("token"),
         "got: {text}"
     );
+}
+
+#[tokio::test]
+async fn maps_403_to_friendly_error_and_exit_code() {
+    let err = api_error_for_status(
+        StatusCode::FORBIDDEN,
+        Method::GET,
+        "/api/v1/repos/o/r/pulls/12",
+        json!({"message": "token lacks scope"}),
+    )
+    .await;
+    let headline = err.to_string();
+    assert!(headline.contains("forbidden: o/r #12"), "got: {headline}");
+    assert!(!headline.contains("/api/v1"), "got: {headline}");
+    assert_eq!(crate::error_exit_code(&err), crate::EXIT_AUTH_FORBIDDEN);
+}
+
+#[tokio::test]
+async fn maps_404_to_friendly_error_and_exit_code() {
+    let err = api_error_for_status(
+        StatusCode::NOT_FOUND,
+        Method::GET,
+        "/api/v1/repos/o/missing",
+        json!({"message": "not found"}),
+    )
+    .await;
+    let headline = err.to_string();
+    assert_eq!(headline, "not found: o/missing");
+    assert!(!headline.contains("/api/v1"), "got: {headline}");
+    assert_eq!(crate::error_exit_code(&err), crate::EXIT_NOT_FOUND);
+}
+
+#[tokio::test]
+async fn maps_429_to_friendly_error_and_exit_code() {
+    let err = api_error_for_status(
+        StatusCode::TOO_MANY_REQUESTS,
+        Method::POST,
+        "/api/v1/repos/o/r/issues/7",
+        json!({"message": "slow down"}),
+    )
+    .await;
+    let headline = err.to_string();
+    assert_eq!(headline, "rate limited: retry later");
+    assert!(!headline.contains("/api/v1"), "got: {headline}");
+    assert_eq!(
+        crate::error_exit_code(&err),
+        crate::EXIT_RATE_LIMIT_TRANSIENT
+    );
+}
+
+async fn api_error_for_status(
+    status: StatusCode,
+    request_method: Method,
+    request_path: &str,
+    body: serde_json::Value,
+) -> anyhow::Error {
+    let server = MockServer::start().await;
+    Mock::given(method(request_method.as_str()))
+        .and(path(request_path))
+        .respond_with(ResponseTemplate::new(status.as_u16()).set_body_json(body))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    c.json::<serde_json::Value, _>(request_method, request_path, &[], Some(&json!({})))
+        .await
+        .expect_err("status should fail")
 }
 
 #[tokio::test]

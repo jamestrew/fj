@@ -16,6 +16,8 @@ mod output;
 
 use std::process::{Command, ExitCode};
 
+use reqwest::StatusCode;
+
 use clap::Parser;
 
 use crate::output::logo;
@@ -53,14 +55,34 @@ async fn run_cli(argv: Vec<String>) -> ExitCode {
     };
     if let Err(err) = cli::run(cli).await {
         eprintln!("{} {err}", owo_colors::OwoColorize::red(&"error:"));
-        let mut source = err.source();
-        while let Some(cause) = source {
-            eprintln!("  caused by: {cause}");
-            source = cause.source();
+        if client::debug_enabled() {
+            let mut source = err.source();
+            while let Some(cause) = source {
+                eprintln!("  caused by: {cause}");
+                source = cause.source();
+            }
         }
-        return ExitCode::from(1);
+        return ExitCode::from(error_exit_code(&err));
     }
     ExitCode::SUCCESS
+}
+
+const EXIT_GENERIC: u8 = 1;
+const EXIT_NOT_FOUND: u8 = 3;
+const EXIT_AUTH_FORBIDDEN: u8 = 4;
+const EXIT_RATE_LIMIT_TRANSIENT: u8 = 5;
+
+fn error_exit_code(err: &anyhow::Error) -> u8 {
+    let api = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<client::ApiError>());
+    match api.map(|err| err.status) {
+        Some(StatusCode::NOT_FOUND) => EXIT_NOT_FOUND,
+        Some(StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) => EXIT_AUTH_FORBIDDEN,
+        Some(StatusCode::TOO_MANY_REQUESTS) => EXIT_RATE_LIMIT_TRANSIENT,
+        Some(status) if status.is_server_error() => EXIT_RATE_LIMIT_TRANSIENT,
+        _ => EXIT_GENERIC,
+    }
 }
 
 /// clap surfaces `--help`, `--version`, and the bare-`fj` help screen as
