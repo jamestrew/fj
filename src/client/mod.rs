@@ -630,17 +630,22 @@ fn friendly_http_error(
 
 fn api_resource_label(url: &Url) -> Option<String> {
     let segments: Vec<&str> = url.path_segments()?.collect();
-    let repos = segments.iter().position(|segment| *segment == "repos")?;
-    let owner = segments.get(repos + 1)?;
-    let repo = segments.get(repos + 2)?;
-    let repo_label = format!("{owner}/{repo}");
-    match segments.get(repos + 3).copied() {
-        Some("issues" | "pulls") => match segments.get(repos + 4) {
-            Some(number) => Some(format!("{repo_label} #{number}")),
-            None => Some(repo_label),
-        },
-        _ => Some(repo_label),
+    if let Some(repos) = segments.iter().position(|segment| *segment == "repos") {
+        let owner = segments.get(repos + 1)?;
+        let repo = segments.get(repos + 2)?;
+        let repo_label = format!("{owner}/{repo}");
+        return match segments.get(repos + 3).copied() {
+            Some("issues" | "pulls") => match segments.get(repos + 4) {
+                Some(number) => Some(format!("{repo_label} #{number}")),
+                None => Some(repo_label),
+            },
+            _ => Some(repo_label),
+        };
     }
+
+    let orgs = segments.iter().position(|segment| *segment == "orgs")?;
+    let org = segments.get(orgs + 1)?;
+    Some(format!("org {org}"))
 }
 
 fn parse_error_message(text: &str) -> Option<String> {

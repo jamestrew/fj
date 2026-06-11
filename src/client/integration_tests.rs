@@ -347,6 +347,94 @@ async fn protect_get_tolerates_null_arrays() {
     assert!(p.push_whitelist_usernames.is_empty());
 }
 
+#[tokio::test]
+async fn workflow_org_secrets_and_variables_use_org_actions_paths() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/orgs/team/actions/secrets"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "secrets": [{
+                "name": "REGISTRY_TOKEN",
+                "created_at": "2026-06-01T00:00:00Z"
+            }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v1/orgs/team/actions/secrets/REGISTRY_TOKEN"))
+        .and(body_json(json!({"data": "example-value"})))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/orgs/team/actions/secrets/REGISTRY_TOKEN"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/orgs/team/actions/variables"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "variables": [{"name": "IMAGE", "data": "registry.example/app"}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v1/orgs/team/actions/variables/IMAGE"))
+        .and(body_json(json!({"value": "registry.example/app"})))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/orgs/team/actions/variables/IMAGE"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let c = client_for(&server).await;
+    let secrets = crate::api::workflow::list_org_secrets(&c, "team")
+        .await
+        .expect("org secrets list");
+    assert_eq!(secrets[0].name, "REGISTRY_TOKEN");
+    crate::api::workflow::set_org_secret(&c, "team", "REGISTRY_TOKEN", "example-value")
+        .await
+        .expect("org secret set");
+    crate::api::workflow::delete_org_secret(&c, "team", "REGISTRY_TOKEN")
+        .await
+        .expect("org secret delete");
+
+    let variables = crate::api::workflow::list_org_variables(&c, "team")
+        .await
+        .expect("org variables list");
+    assert_eq!(variables[0].data, "registry.example/app");
+    crate::api::workflow::set_org_variable(&c, "team", "IMAGE", "registry.example/app")
+        .await
+        .expect("org variable set");
+    crate::api::workflow::delete_org_variable(&c, "team", "IMAGE")
+        .await
+        .expect("org variable delete");
+}
+
+#[tokio::test]
+async fn maps_org_403_to_clear_error() {
+    let err = api_error_for_status(
+        StatusCode::FORBIDDEN,
+        Method::GET,
+        "/api/v1/orgs/team/actions/secrets",
+        json!({"message": "token lacks scope"}),
+    )
+    .await;
+    let headline = err.to_string();
+    assert!(headline.contains("forbidden: org team"), "got: {headline}");
+    assert!(!headline.contains("/api/v1"), "got: {headline}");
+}
+
 // --- Fjord Account (Phase 6) flows ---
 
 /// `POST /api/v1/sign-in` happy path: the platform returns `kind:success`
