@@ -106,6 +106,14 @@ pub async fn checks(args: InspectArgs, host: Option<&str>) -> Result<()> {
     if let Some(line) = crate::cli::pr_merge_check::mergeable_line(&pr) {
         println!("{line}");
     }
+    // Best-effort scheduled auto-merge indicator (timeline-only on Forgejo).
+    if !pr.merged && pr.state == "open" {
+        if let Ok(true) =
+            api::pull::auto_merge_pending(&ctx.client, &ctx.owner, &ctx.name, args.number).await
+        {
+            println!("Auto-merge: scheduled");
+        }
+    }
     if cs.statuses.is_empty() {
         println!("(no per-check statuses reported)");
         return Ok(());
