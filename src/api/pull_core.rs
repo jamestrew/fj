@@ -338,14 +338,22 @@ struct MergeBody<'a> {
     /// Delete the head branch after a successful merge (Forgejo-side).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     delete_branch_after_merge: bool,
+    /// Schedule the merge to run server-side once all required checks pass.
+    /// When the PR is already green the server merges immediately instead.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    merge_when_checks_succeed: bool,
 }
 
-/// Optional knobs for [`merge`]. Defaults: auto title/message, keep branch.
+/// Optional knobs for [`merge`]. Defaults: auto title/message, keep branch,
+/// merge now.
 #[derive(Debug, Clone, Default)]
 pub struct MergeOptions<'a> {
     pub title: Option<&'a str>,
     pub message: Option<&'a str>,
     pub delete_branch: bool,
+    /// Schedule the merge for when required checks pass rather than merging
+    /// now (the `--auto` flag). An already-green PR still merges immediately.
+    pub auto: bool,
 }
 
 pub async fn merge(
@@ -365,9 +373,85 @@ pub async fn merge(
         title: opts.title,
         message: opts.message,
         delete_branch_after_merge: opts.delete_branch,
+        merge_when_checks_succeed: opts.auto,
     };
     client.send(Method::POST, &path, &[], Some(&body)).await?;
     Ok(())
+}
+
+/// Cancel a pending scheduled auto-merge (the `DELETE …/merge` endpoint).
+/// Returns the API's 404 as-is when nothing is scheduled, so the caller can
+/// turn it into a friendly "no scheduled auto-merge" message.
+pub async fn cancel_auto_merge(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    number: u64,
+) -> Result<()> {
+    let path = format!(
+        "{}/pulls/{number}/merge",
+        crate::api::repo_path(owner, name)
+    );
+    client.send(Method::DELETE, &path, &[], None::<&()>).await?;
+    Ok(())
+}
+
+/// A single issue/PR timeline entry. We only decode the discriminant `type`
+/// so a scheduled auto-merge can be detected; everything else is ignored.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TimelineEvent {
+    #[serde(default, rename = "type")]
+    pub type_: String,
+}
+
+/// Forgejo timeline `type` for a scheduled auto-merge.
+const TL_SCHEDULED: &str = "pull_scheduled_merge";
+/// Forgejo timeline `type` for a cancelled scheduled auto-merge.
+const TL_CANCELLED: &str = "pull_cancel_scheduled_merge";
+/// Forgejo timeline `type` for a completed merge.
+const TL_MERGED: &str = "merge_pull";
+
+/// True when the most recent auto-merge-related timeline event is a schedule
+/// with no later cancel or merge, i.e. an auto-merge is still pending. Events
+/// arrive oldest-first, so the last relevant one wins. Pure for unit testing.
+pub fn has_pending_auto_merge(events: &[TimelineEvent]) -> bool {
+    events
+        .iter()
+        .rev()
+        .find_map(|e| match e.type_.as_str() {
+            TL_SCHEDULED => Some(true),
+            TL_CANCELLED | TL_MERGED => Some(false),
+            _ => None,
+        })
+        .unwrap_or(false)
+}
+
+/// Whether PR `number` currently has a scheduled auto-merge pending.
+///
+/// Forgejo does not expose the scheduled state on the PR object, so this reads
+/// the issue timeline. A scheduled merge that is still pending is, by
+/// definition, not followed by a cancel or merge, so it lands among the most
+/// recent events; we scan the last timeline page to keep this to one or two
+/// GETs rather than walking the whole history on every `pr view`.
+pub async fn auto_merge_pending(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    number: u64,
+) -> Result<bool> {
+    let path = format!(
+        "{}/issues/{number}/timeline",
+        crate::api::repo_path(owner, name)
+    );
+    let q = vec![("limit".to_string(), "50".to_string())];
+    let first = client.get_page::<TimelineEvent>(&path, &q).await?;
+    let events = match &first.last {
+        // Multi-page: the tail (where a pending schedule must be) is the last
+        // page. The `last` URL already carries its own query string.
+        Some(last_url) => client.get_page::<TimelineEvent>(last_url, &[]).await?.items,
+        None => first.items,
+    };
+    Ok(has_pending_auto_merge(&events))
 }
 
 #[cfg(test)]
@@ -380,5 +464,74 @@ mod tests {
         assert_eq!(MergeStyle::Rebase.as_str(), "rebase");
         assert_eq!(MergeStyle::RebaseMerge.as_str(), "rebase-merge");
         assert_eq!(MergeStyle::Squash.as_str(), "squash");
+    }
+
+    fn ev(type_: &str) -> TimelineEvent {
+        TimelineEvent {
+            type_: type_.to_string(),
+        }
+    }
+
+    #[test]
+    fn merge_body_omits_auto_field_when_not_scheduling() {
+        let body = MergeBody {
+            do_: "merge",
+            title: None,
+            message: None,
+            delete_branch_after_merge: false,
+            merge_when_checks_succeed: false,
+        };
+        let v = serde_json::to_value(&body).unwrap();
+        assert_eq!(v, serde_json::json!({ "Do": "merge" }));
+    }
+
+    #[test]
+    fn merge_body_sets_auto_field_when_scheduling() {
+        let body = MergeBody {
+            do_: "squash",
+            title: None,
+            message: None,
+            delete_branch_after_merge: false,
+            merge_when_checks_succeed: true,
+        };
+        let v = serde_json::to_value(&body).unwrap();
+        assert_eq!(v["merge_when_checks_succeed"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn pending_when_last_event_is_a_schedule() {
+        let events = vec![ev("pull_push"), ev("pull_scheduled_merge")];
+        assert!(has_pending_auto_merge(&events));
+    }
+
+    #[test]
+    fn not_pending_after_cancel() {
+        let events = vec![
+            ev("pull_scheduled_merge"),
+            ev("pull_cancel_scheduled_merge"),
+        ];
+        assert!(!has_pending_auto_merge(&events));
+    }
+
+    #[test]
+    fn not_pending_after_merge() {
+        let events = vec![ev("pull_scheduled_merge"), ev("merge_pull")];
+        assert!(!has_pending_auto_merge(&events));
+    }
+
+    #[test]
+    fn reschedule_after_cancel_is_pending() {
+        let events = vec![
+            ev("pull_scheduled_merge"),
+            ev("pull_cancel_scheduled_merge"),
+            ev("pull_scheduled_merge"),
+        ];
+        assert!(has_pending_auto_merge(&events));
+    }
+
+    #[test]
+    fn no_auto_merge_events_is_not_pending() {
+        let events = vec![ev("comment"), ev("pull_push"), ev("label")];
+        assert!(!has_pending_auto_merge(&events));
     }
 }

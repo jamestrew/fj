@@ -2244,6 +2244,7 @@ async fn pull_merge_posts_do_and_squash_fields() {
             title: Some("Squashed"),
             message: Some("all the things"),
             delete_branch: false,
+            auto: false,
         },
     )
     .await
@@ -2303,6 +2304,106 @@ async fn pull_merge_surfaces_forgejo_message_on_405() {
     .await
     .expect_err("merge should fail");
     assert!(err.to_string().contains("can not be merged"), "got: {err}");
+}
+
+#[tokio::test]
+async fn pull_merge_auto_posts_merge_when_checks_succeed() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/pulls/12/merge"))
+        .and(body_json(json!({
+            "Do": "squash",
+            "merge_when_checks_succeed": true
+        })))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    crate::api::pull::merge(
+        &c,
+        "o",
+        "r",
+        12,
+        crate::api::pull::MergeStyle::Squash,
+        &crate::api::pull::MergeOptions {
+            auto: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("schedule auto-merge");
+}
+
+#[tokio::test]
+async fn pull_cancel_auto_merge_deletes_merge_endpoint() {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/repos/o/r/pulls/7/merge"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    crate::api::pull::cancel_auto_merge(&c, "o", "r", 7)
+        .await
+        .expect("cancel");
+}
+
+#[tokio::test]
+async fn pull_cancel_auto_merge_404_is_surfaced() {
+    // No schedule exists: the endpoint 404s. The error must carry the status so
+    // the CLI can turn it into a friendly "nothing to cancel" message.
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/repos/o/r/pulls/7/merge"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "message": "auto merge not scheduled"
+        })))
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let err = crate::api::pull::cancel_auto_merge(&c, "o", "r", 7)
+        .await
+        .expect_err("should 404");
+    let api_err = err
+        .downcast_ref::<crate::client::ApiError>()
+        .expect("ApiError in chain");
+    assert_eq!(api_err.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn auto_merge_pending_reads_single_timeline_page() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/issues/4/timeline"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "type": "pull_push" },
+            { "type": "pull_scheduled_merge" }
+        ])))
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    assert!(crate::api::pull::auto_merge_pending(&c, "o", "r", 4)
+        .await
+        .expect("timeline"));
+}
+
+#[tokio::test]
+async fn auto_merge_pending_false_after_cancel() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/issues/5/timeline"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "type": "pull_scheduled_merge" },
+            { "type": "pull_cancel_scheduled_merge" }
+        ])))
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    assert!(!crate::api::pull::auto_merge_pending(&c, "o", "r", 5)
+        .await
+        .expect("timeline"));
 }
 
 // ── pr merge failure diagnosis (cli::pr_merge_check) ──

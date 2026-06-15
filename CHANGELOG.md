@@ -15,6 +15,14 @@ All notable changes will be recorded here. The format follows
   body. `--fill-first` uses only the first (oldest) commit. It reads `git log`
   locally with no extra API call, and an explicit `--title` / `--body` / `-F`
   still overrides the filled value.
+- **`fj pr merge --auto`**: schedule a merge the server completes once all
+  required checks pass, instead of polling and merging by hand. An already-green
+  PR merges immediately; `--auto` honors `--style` / `--title` / `--message` /
+  `--delete-branch`. `--disable-auto` cancels a pending schedule. `pr view` and
+  `pr checks` show `Auto-merge: scheduled` while one is pending (Forgejo records
+  the schedule on the timeline only, so the chosen style is not shown there). On
+  a host build without scheduled-merge support the merge falls back to the #162
+  diagnosis with a note that `--auto` did not schedule.
 - **`fj pr attach` / `pr create --attach` / `pr edit --attach`**: upload file
   attachments to a pull request and link them in the description. PRs share the
   issue index, so files post to `issues/{number}/assets`; image extensions are

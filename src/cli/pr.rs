@@ -296,6 +296,14 @@ pub struct MergeArgs {
     /// Delete the head branch after the merge succeeds.
     #[arg(long)]
     pub delete_branch: bool,
+    /// Schedule the merge to run once all required checks pass. Merges
+    /// immediately if the PR is already green. Honors --style / --title /
+    /// --message / --delete-branch.
+    #[arg(long, conflicts_with = "disable_auto")]
+    pub auto: bool,
+    /// Cancel a previously scheduled auto-merge on this PR.
+    #[arg(long)]
+    pub disable_auto: bool,
 }
 
 #[derive(Debug, Args)]
@@ -475,6 +483,16 @@ async fn view(args: ViewArgs, host: Option<&str>) -> Result<()> {
     }
     if let Some(line) = pr_merge_check::mergeable_line(&pr) {
         println!("{line}");
+    }
+    // Best-effort: Forgejo exposes the scheduled state only on the timeline,
+    // not the PR object, and never the chosen style. A failed lookup just omits
+    // the line rather than aborting the view.
+    if !pr.merged && pr.state == "open" {
+        if let Ok(true) =
+            api::pull::auto_merge_pending(&ctx.client, &ctx.owner, &ctx.name, args.number).await
+        {
+            println!("Auto-merge: scheduled");
+        }
     }
     if !pr.body.is_empty() {
         println!();
@@ -855,6 +873,28 @@ async fn checkout(args: CheckoutArgs, host: Option<&str>) -> Result<()> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn merge(args: MergeArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
+
+    // `--disable-auto` only cancels a pending schedule; style/title are ignored.
+    if args.disable_auto {
+        return match api::pull::cancel_auto_merge(&ctx.client, &ctx.owner, &ctx.name, args.number)
+            .await
+        {
+            Ok(()) => {
+                println!("✓ Cancelled scheduled auto-merge for PR #{}", args.number);
+                Ok(())
+            }
+            // The endpoint 404s when nothing is scheduled; say so plainly
+            // rather than surfacing a bare "not found".
+            Err(e) => match e.downcast_ref::<crate::client::ApiError>() {
+                Some(api_err) if api_err.status == reqwest::StatusCode::NOT_FOUND => Err(anyhow!(
+                    "PR #{} has no scheduled auto-merge to cancel.",
+                    args.number
+                )),
+                _ => Err(e),
+            },
+        };
+    }
+
     let style: api::pull::MergeStyle = args.style.into();
     let res = api::pull::merge(
         &ctx.client,
@@ -866,10 +906,30 @@ async fn merge(args: MergeArgs, host: Option<&str>) -> Result<()> {
             title: args.title.as_deref(),
             message: args.message.as_deref(),
             delete_branch: args.delete_branch,
+            auto: args.auto,
         },
     )
     .await;
     match res {
+        // With --auto the same 200 covers "merged now" (already green) and
+        // "scheduled" (checks still pending); re-read the PR to report which.
+        Ok(()) if args.auto => {
+            let merged_now = api::pull::get(&ctx.client, &ctx.owner, &ctx.name, args.number)
+                .await
+                .map(|pr| pr.merged)
+                .unwrap_or(false);
+            if merged_now {
+                println!("✓ Merged PR #{} (already green)", args.number);
+            } else {
+                println!(
+                    "✓ Auto-merge scheduled for PR #{} ({}); it will merge once required checks pass.\n  Cancel with: fj pr merge {} --disable-auto",
+                    args.number,
+                    style.as_str(),
+                    args.number,
+                );
+            }
+            Ok(())
+        }
         Ok(()) => {
             println!("✓ Merged PR #{}", args.number);
             Ok(())
@@ -888,7 +948,16 @@ async fn merge(args: MergeArgs, host: Option<&str>) -> Result<()> {
                 )
                 .await
                 {
-                    return Err(anyhow::anyhow!("{reason}"));
+                    // A host without scheduled-merge support silently ignores
+                    // the flag and rejects a not-yet-green PR with the same
+                    // opaque error a normal merge would (a supported host would
+                    // have scheduled it and returned success). Flag that case.
+                    if args.auto && reason.contains("required check") {
+                        return Err(anyhow!(
+                            "{reason}\n  note: --auto did not schedule. This host build may not support scheduled auto-merge; merge once checks pass instead."
+                        ));
+                    }
+                    return Err(anyhow!("{reason}"));
                 }
             }
             Err(e)
@@ -1036,6 +1105,43 @@ mod tests {
             assert!(!a.delete_branch);
             assert!(matches!(a.style, MergeStyleArg::Merge));
         }
+    }
+
+    #[test]
+    fn merge_parses_auto_and_disable_auto() {
+        use crate::cli::{Cli, Command};
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["fj", "pr", "merge", "12", "--auto", "--style", "squash"])
+            .expect("should parse");
+        match cli.command {
+            Command::Pr(PrCmd {
+                command: PrSub::Merge(a),
+            }) => {
+                assert!(a.auto);
+                assert!(!a.disable_auto);
+                assert!(matches!(a.style, MergeStyleArg::Squash));
+            }
+            other => panic!("expected pr merge, got {other:?}"),
+        }
+        let cli = Cli::try_parse_from(["fj", "pr", "merge", "12", "--disable-auto"])
+            .expect("should parse");
+        if let Command::Pr(PrCmd {
+            command: PrSub::Merge(a),
+        }) = cli.command
+        {
+            assert!(a.disable_auto);
+            assert!(!a.auto);
+        }
+    }
+
+    #[test]
+    fn merge_auto_and_disable_auto_conflict() {
+        use crate::cli::Cli;
+        use clap::Parser;
+        // The two flags are mutually exclusive.
+        assert!(
+            Cli::try_parse_from(["fj", "pr", "merge", "12", "--auto", "--disable-auto"]).is_err()
+        );
     }
 
     #[test]

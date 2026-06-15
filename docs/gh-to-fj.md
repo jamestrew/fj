@@ -73,6 +73,8 @@ called out.
 | `gh pr status`                    | `fj pr status`                    |                                                 |
 | `gh pr checkout N`                | `fj pr checkout N`                |                                                 |
 | `gh pr merge N`                   | `fj pr merge N`                   | `--style merge|rebase|rebase-merge|squash`.     |
+| `gh pr merge N --auto`            | `fj pr merge N --auto`            | Schedules a server-side merge once required checks pass; merges now if already green. Honors `--style` / `--title` / `--message` / `--delete-branch`. |
+| `gh pr merge N --disable-auto`    | `fj pr merge N --disable-auto`    | Cancels a pending scheduled merge.              |
 | `gh pr close N`                   | `fj pr close N`                   |                                                 |
 | `gh pr reopen N`                  | `fj pr reopen N`                  |                                                 |
 | (n/a in gh)                       | `fj pr request-review N USER USER` | New: assign specific reviewers.               |
