@@ -4109,6 +4109,41 @@ async fn issue_assignees_add_and_remove_patch_merged_set() {
 }
 
 #[tokio::test]
+async fn issue_lock_and_unlock_use_shared_issue_endpoint() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v1/repos/o/r/issues/3/lock"))
+        .and(body_json(json!({ "lock_reason": "too-heated" })))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v1/repos/o/r/issues/4/lock"))
+        .and(body_json(json!({})))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/repos/o/r/issues/3/lock"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    crate::api::issue::lock(&c, "o", "r", 3, Some("too-heated"))
+        .await
+        .expect("lock with reason");
+    crate::api::issue::lock(&c, "o", "r", 4, None)
+        .await
+        .expect("lock without reason");
+    crate::api::issue::unlock(&c, "o", "r", 3)
+        .await
+        .expect("unlock");
+}
+
+#[tokio::test]
 async fn issue_comment_roundtrip() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

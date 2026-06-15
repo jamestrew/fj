@@ -54,7 +54,8 @@ no-`/api/v1` capability we looked at:
 | Workflow **list** (`workflow list`) | n/a, read the files via the contents API | yes | ✅ implemented |
 | Run rerun / cancel | yes (write) | **no**, 404s a token POST | degrades, prints run URL |
 | Run delete, workflow enable/disable | write | no | not offered |
-| Issue/PR lock/unlock, issue transfer, pr revert | write | no | not offered |
+| Issue/PR lock/unlock | yes (write) | yes | ✅ implemented |
+| Issue transfer, pr revert | write | no | not offered |
 | Code search / commit search | web route returns **HTML only**, indexer-gated | scrape-only | not offered (fragile) |
 | Actions cache list/delete | **no web route** (404) and no API | n/a | not offered |
 | Gist / snippets | no entity at all (a GitLab feature, not Forgejo) | n/a | removed |

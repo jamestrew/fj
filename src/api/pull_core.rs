@@ -45,6 +45,8 @@ pub struct Pull {
     pub updated_at: DateTime<Utc>,
     #[serde(default)]
     pub comments: u64,
+    #[serde(default)]
+    pub is_locked: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
