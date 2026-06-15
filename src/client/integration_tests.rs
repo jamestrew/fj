@@ -1932,6 +1932,59 @@ async fn pull_list_sends_label_ids_and_poster() {
 }
 
 #[tokio::test]
+async fn pull_list_filters_base_head_and_draft_locally() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/pulls"))
+        .and(query_param("state", "open"))
+        .and(query_param("limit", "50"))
+        .and(query_param_is_missing("base"))
+        .and(query_param_is_missing("head"))
+        .and(query_param_is_missing("draft"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {
+                "id": 1, "number": 12, "title": "Add feature",
+                "state": "open", "user": { "id": 1, "login": "alice" },
+                "html_url": "https://x/o/r/pulls/12",
+                "head": { "label": "feature", "ref": "feature", "sha": "aaa" },
+                "base": { "label": "main", "ref": "main", "sha": "bbb" },
+                "draft": true,
+                "created_at": "2026-05-30T00:00:00Z",
+                "updated_at": "2026-05-30T00:01:00Z"
+            },
+            {
+                "id": 2, "number": 13, "title": "Other feature",
+                "state": "open", "user": { "id": 1, "login": "alice" },
+                "html_url": "https://x/o/r/pulls/13",
+                "head": { "label": "other", "ref": "other", "sha": "ccc" },
+                "base": { "label": "develop", "ref": "develop", "sha": "ddd" },
+                "draft": false,
+                "created_at": "2026-05-30T00:00:00Z",
+                "updated_at": "2026-05-30T00:01:00Z"
+            }
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let page = crate::api::pull::list(
+        &c,
+        "o",
+        "r",
+        crate::api::pull::ListOptions {
+            base: Some("main".into()),
+            head: Some("feature".into()),
+            draft: Some(true),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("filtered list");
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].number, 12);
+}
+
+#[tokio::test]
 async fn pull_list_omits_filter_params_when_unset() {
     let server = MockServer::start().await;
     // Empty label set must not emit a `labels` param; the mock only matches
@@ -3598,6 +3651,41 @@ fn comment_json(id: u64, body: &str) -> serde_json::Value {
         "html_url": format!("https://x/c/{id}"),
         "created_at": "2026-01-01T00:00:00Z"
     })
+}
+
+#[tokio::test]
+async fn issue_list_sends_milestone_and_mentioned_filters() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/issues"))
+        .and(query_param("state", "open"))
+        .and(query_param("type", "issues"))
+        .and(query_param("milestones", "v1"))
+        .and(query_param("mentioned_by", "alice"))
+        .and(query_param("limit", "30"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([issue_json(
+            3,
+            "mentioned in v1",
+            "open"
+        )])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let page = crate::api::issue::list(
+        &c,
+        "o",
+        "r",
+        crate::api::issue::ListOptions {
+            milestone: Some("v1"),
+            mentioned: Some("alice"),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("filtered list");
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].number, 3);
 }
 
 #[tokio::test]

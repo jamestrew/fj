@@ -42,7 +42,7 @@ called out.
 
 | `gh`                              | `fj`                              | Notes                                           |
 | --------------------------------- | --------------------------------- | ----------------------------------------------- |
-| `gh issue list`                   | `fj issue list`                   |                                                 |
+| `gh issue list`                   | `fj issue list`                   | Supports `--milestone` and `--mentioned`.       |
 | `gh issue view N`                 | `fj issue view N`                 |                                                 |
 | `gh issue create`                 | `fj issue create`                 | Omit `--body` to open `$EDITOR`.                |
 | `gh issue edit N`                 | `fj issue edit N`                 |                                                 |
@@ -57,7 +57,7 @@ called out.
 
 | `gh`                              | `fj`                              | Notes                                           |
 | --------------------------------- | --------------------------------- | ----------------------------------------------- |
-| `gh pr list`                      | `fj pr list`                      |                                                 |
+| `gh pr list`                      | `fj pr list`                      | Supports `--base`, `--head`, `--draft`, `--no-draft`. |
 | `gh pr view N`                    | `fj pr view N`                    | `--comments` shows reviews + issue comments.    |
 | `gh pr create`                    | `fj pr create`                    | Head defaults to current branch.                |
 | `gh pr create --fill`             | `fj pr create --fill`             | Title and body from the commits in `base..head`; `--fill-first` uses only the first commit. `--title` / `--body` / `-F` override. |

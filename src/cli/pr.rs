@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
-use clap::{Args, Subcommand};
+use clap::{ArgAction, Args, Subcommand};
 
 use crate::api;
 use crate::api::pull::{CreatePull, EditPull, ListOptions};
@@ -96,6 +96,18 @@ pub struct ListArgs {
     /// Filter by author (PR creator) login.
     #[arg(short = 'A', long = "author", value_name = "USERNAME")]
     pub author: Option<String>,
+    /// Filter by base branch.
+    #[arg(short = 'B', long = "base", value_name = "BRANCH")]
+    pub base: Option<String>,
+    /// Filter by head branch.
+    #[arg(short = 'H', long = "head", value_name = "BRANCH")]
+    pub head: Option<String>,
+    /// Filter to draft pull requests.
+    #[arg(long, action = ArgAction::SetTrue, conflicts_with = "no_draft")]
+    pub draft: bool,
+    /// Filter to ready pull requests.
+    #[arg(long = "no-draft", action = ArgAction::SetTrue)]
+    pub no_draft: bool,
     /// Emit JSON instead of a table
     #[arg(long)]
     pub json: bool,
@@ -368,6 +380,13 @@ async fn list(args: ListArgs, host: Option<&str>) -> Result<()> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
+    let draft = if args.draft {
+        Some(true)
+    } else if args.no_draft {
+        Some(false)
+    } else {
+        None
+    };
     let page = api::pull::list(
         &ctx.client,
         &ctx.owner,
@@ -379,6 +398,9 @@ async fn list(args: ListArgs, host: Option<&str>) -> Result<()> {
             paginate: args.paginate,
             labels,
             author,
+            base: clean_optional(args.base),
+            head: clean_optional(args.head),
+            draft,
         },
     )
     .await?;
@@ -704,6 +726,13 @@ fn clean_csv_values(values: Vec<String>) -> Vec<String> {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .collect()
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn clean_optional(value: Option<String>) -> Option<String> {
+    value
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -1094,6 +1123,10 @@ mod tests {
             }) => {
                 assert_eq!(a.label, vec!["needs-review", "p1", "blocked"]);
                 assert_eq!(a.author.as_deref(), Some("alice"));
+                assert!(a.base.is_none());
+                assert!(a.head.is_none());
+                assert!(!a.draft);
+                assert!(!a.no_draft);
             }
             other => panic!("expected pr list, got {other:?}"),
         }
@@ -1105,6 +1138,38 @@ mod tests {
         {
             assert!(a.label.is_empty());
             assert!(a.author.is_none());
+        }
+    }
+
+    #[test]
+    fn list_parses_branch_and_draft_filters() {
+        use crate::cli::{Cli, Command};
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "fj", "pr", "list", "--base", "main", "--head", "feature", "--draft",
+        ])
+        .expect("should parse");
+        match cli.command {
+            Command::Pr(PrCmd {
+                command: PrSub::List(a),
+            }) => {
+                assert_eq!(a.base.as_deref(), Some("main"));
+                assert_eq!(a.head.as_deref(), Some("feature"));
+                assert!(a.draft);
+                assert!(!a.no_draft);
+            }
+            other => panic!("expected pr list, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["fj", "pr", "list", "--no-draft"]).expect("should parse");
+        match cli.command {
+            Command::Pr(PrCmd {
+                command: PrSub::List(a),
+            }) => {
+                assert!(!a.draft);
+                assert!(a.no_draft);
+            }
+            other => panic!("expected pr list, got {other:?}"),
         }
     }
 

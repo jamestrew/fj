@@ -1,7 +1,7 @@
 //! Pull request core: model types, list/get, create/edit, ready, update
 //! branch, files, commits, diff, and merge.
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
@@ -108,6 +108,12 @@ pub struct ListOptions {
     pub labels: Option<Vec<u64>>,
     /// Author (`poster`) login. Forgejo 400s on an unknown user.
     pub author: Option<String>,
+    /// Client-side filter: this Forgejo host does not honor `base` on `/pulls`.
+    pub base: Option<String>,
+    /// Client-side filter: this Forgejo host does not honor `head` on `/pulls`.
+    pub head: Option<String>,
+    /// Client-side filter: this Forgejo host does not honor `draft` on `/pulls`.
+    pub draft: Option<bool>,
 }
 
 impl Default for ListOptions {
@@ -119,6 +125,9 @@ impl Default for ListOptions {
             paginate: false,
             labels: None,
             author: None,
+            base: None,
+            head: None,
+            draft: None,
         }
     }
 }
@@ -140,6 +149,23 @@ pub async fn list(
     if let Some(author) = opts.author.as_deref() {
         query.push(("poster".into(), author.into()));
     }
+
+    let needs_local_filter = opts.base.is_some() || opts.head.is_some() || opts.draft.is_some();
+    if needs_local_filter {
+        let mut page = client.get_all_page::<Pull>(&path, &query, None).await?;
+        let limit = usize::try_from(opts.limit).map_err(|_| anyhow!("--limit is too large"))?;
+        page.items = filter_pulls(page.items, &opts);
+        if !opts.paginate && page.items.len() > limit {
+            page.items.truncate(limit);
+        }
+        page.total = Some(page.items.len() as u64);
+        page.next = None;
+        page.prev = None;
+        page.last = None;
+        page.first = None;
+        return Ok(page);
+    }
+
     if opts.paginate || opts.limit > 50 {
         if opts.paginate {
             query.push(("page".into(), opts.page.max(1).to_string()));
@@ -152,6 +178,24 @@ pub async fn list(
     query.push(("limit".into(), opts.limit.clamp(1, 50).to_string()));
     query.push(("page".into(), opts.page.max(1).to_string()));
     client.get_page::<Pull>(&path, &query).await
+}
+
+fn filter_pulls(mut pulls: Vec<Pull>, opts: &ListOptions) -> Vec<Pull> {
+    pulls.retain(|p| {
+        opts.base
+            .as_deref()
+            .is_none_or(|base| branch_matches(&p.base, base))
+            && opts
+                .head
+                .as_deref()
+                .is_none_or(|head| branch_matches(&p.head, head))
+            && opts.draft.is_none_or(|draft| p.draft == draft)
+    });
+    pulls
+}
+
+fn branch_matches(branch: &Branch, value: &str) -> bool {
+    branch.label == value || branch.ref_ == value
 }
 
 pub async fn get(client: &Client, owner: &str, name: &str, number: u64) -> Result<Pull> {

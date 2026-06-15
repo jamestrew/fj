@@ -6,6 +6,7 @@ use crate::api::issue::{CreateIssue, EditIssue, ListOptions, State};
 use crate::cli::context::{repo_web_url, resolve_repo, RepoFlag};
 use crate::cli::issue_comment::{self, CommentArgs, DeleteCommentArgs, EditCommentArgs};
 use crate::cli::list as list_output;
+use crate::client::{ApiError, Page};
 use crate::output;
 
 use super::editor;
@@ -86,6 +87,12 @@ pub struct ListArgs {
     /// Filter by assignee
     #[arg(short = 'a', long)]
     pub assignee: Option<String>,
+    /// Filter by milestone name or id
+    #[arg(long)]
+    pub milestone: Option<String>,
+    /// Filter by mentioned user login
+    #[arg(long)]
+    pub mentioned: Option<String>,
     /// Search text to filter by
     #[arg(short = 'S', long = "search")]
     pub query: Option<String>,
@@ -245,6 +252,28 @@ async fn list(args: ListArgs, host: Option<&str>) -> Result<()> {
     if args.web {
         return web::open(&repo_web_url(&ctx, "issues")?);
     }
+    if let Some(milestone) = args
+        .milestone
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let milestones = api::milestone::list(&ctx.client, &ctx.owner, &ctx.name, "all").await?;
+        let known = milestones
+            .iter()
+            .any(|m| m.title == milestone || m.id.to_string() == milestone);
+        if !known {
+            if !args.json {
+                println!("(no issues: no milestone named '{milestone}')");
+            }
+            let page: Page<api::issue::Issue> = Page::single(Vec::new());
+            return if args.json {
+                list_output::print_json(&page)
+            } else {
+                Ok(())
+            };
+        }
+    }
     let opts = ListOptions {
         state: args.state.into(),
         limit: args.limit,
@@ -252,9 +281,26 @@ async fn list(args: ListArgs, host: Option<&str>) -> Result<()> {
         paginate: args.paginate,
         labels: args.label.as_deref(),
         assignee: args.assignee.as_deref(),
+        milestone: args.milestone.as_deref(),
+        mentioned: args.mentioned.as_deref(),
         query: args.query.as_deref(),
     };
-    let page = api::issue::list(&ctx.client, &ctx.owner, &ctx.name, opts).await?;
+    let page = match api::issue::list(&ctx.client, &ctx.owner, &ctx.name, opts).await {
+        Ok(page) => page,
+        Err(err)
+            if args.mentioned.is_some()
+                && err
+                    .downcast_ref::<ApiError>()
+                    .is_some_and(|e| e.status == reqwest::StatusCode::NOT_FOUND) =>
+        {
+            if !args.json {
+                let mentioned = args.mentioned.as_deref().unwrap_or_default();
+                println!("(no issues: no user named '{mentioned}')");
+            }
+            Page::single(Vec::new())
+        }
+        Err(err) => return Err(err),
+    };
     if args.json {
         return list_output::print_json(&page);
     }
@@ -581,6 +627,31 @@ fn slugify(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn list_parses_milestone_and_mentioned_filters() {
+        use crate::cli::{Cli, Command};
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "fj",
+            "issue",
+            "list",
+            "--milestone",
+            "v1",
+            "--mentioned",
+            "alice",
+        ])
+        .expect("should parse");
+        match cli.command {
+            Command::Issue(IssueCmd {
+                command: IssueSub::List(a),
+            }) => {
+                assert_eq!(a.milestone.as_deref(), Some("v1"));
+                assert_eq!(a.mentioned.as_deref(), Some("alice"));
+            }
+            other => panic!("expected issue list, got {other:?}"),
+        }
+    }
 
     #[test]
     fn slug_basic() {
