@@ -29,8 +29,8 @@ pub enum RunSub {
     Watch(WatchArgs),
     /// List or download a run's artifacts.
     Download(DownloadArgs),
-    /// Rerun a workflow run.
-    Rerun(IdArgs),
+    /// Rerun a workflow run, or just its failed/single jobs.
+    Rerun(RerunArgs),
     /// Cancel an in-progress workflow run.
     Cancel(IdArgs),
 }
@@ -144,6 +144,20 @@ pub struct IdArgs {
     pub r: RepoFlag,
     /// Workflow run id
     pub run_id: u64,
+}
+
+#[derive(Debug, Args)]
+pub struct RerunArgs {
+    #[command(flatten)]
+    pub r: RepoFlag,
+    /// Run number, as shown in the `#` column of `fj run list`.
+    pub run_id: u64,
+    /// Rerun only the jobs that did not succeed, instead of the whole run.
+    #[arg(long, conflicts_with = "job")]
+    pub failed: bool,
+    /// Rerun a single job by its index (the row order shown by `fj run view`).
+    #[arg(short = 'j', long)]
+    pub job: Option<usize>,
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -709,6 +723,13 @@ fn jobs_to_log(statuses: &[String], failed_only: bool) -> Vec<usize> {
     if !failed_only {
         return (0..statuses.len()).collect();
     }
+    failed_job_indices(statuses)
+}
+
+/// Indices of jobs that did not finish green (anything but `success` /
+/// `skipped`). Shared by `view --log-failed` and `rerun --failed` so both treat
+/// "failed" identically.
+fn failed_job_indices(statuses: &[String]) -> Vec<usize> {
     statuses
         .iter()
         .enumerate()
@@ -758,10 +779,56 @@ fn absolutize(client: &crate::client::Client, link: &str) -> String {
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
-async fn rerun(args: IdArgs, host: Option<&str>) -> Result<()> {
+async fn rerun(args: RerunArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     guard_web_routes(&ctx.client)?;
-    api::workflow::rerun(&ctx.client, &ctx.owner, &ctx.name, args.run_id).await?;
+    let (owner, name) = (ctx.owner.as_str(), ctx.name.as_str());
+
+    // `--job N` and `--failed` both target individual jobs through Forgejo's
+    // per-job rerun route; only the bare command reruns the whole run.
+    if let Some(job) = args.job {
+        // Validate the index against the run so a typo'd `--job` fails with a
+        // clear message instead of Forgejo's bare 404.
+        let summary =
+            api::workflow::fetch_run_summary(&ctx.client, owner, name, args.run_id).await?;
+        validate_job(&summary, job)?;
+        api::workflow::rerun_job(&ctx.client, owner, name, args.run_id, job).await?;
+        println!("✓ Re-ran job {job} of workflow run #{}", args.run_id);
+        return Ok(());
+    }
+
+    if args.failed {
+        let summary =
+            api::workflow::fetch_run_summary(&ctx.client, owner, name, args.run_id).await?;
+        let statuses: Vec<String> = summary
+            .state
+            .run
+            .jobs
+            .iter()
+            .map(|j| j.status.clone())
+            .collect();
+        let failed = failed_job_indices(&statuses);
+        if failed.is_empty() {
+            let note = if statuses.is_empty() {
+                "This run has no jobs."
+            } else {
+                "No failed jobs to rerun."
+            };
+            println!("{}", output::dim(note));
+            return Ok(());
+        }
+        for &job in &failed {
+            api::workflow::rerun_job(&ctx.client, owner, name, args.run_id, job).await?;
+        }
+        println!(
+            "✓ Re-ran {} failed job(s) of workflow run #{}",
+            failed.len(),
+            args.run_id
+        );
+        return Ok(());
+    }
+
+    api::workflow::rerun(&ctx.client, owner, name, args.run_id).await?;
     println!("✓ Re-ran workflow run #{}", args.run_id);
     Ok(())
 }
@@ -825,6 +892,85 @@ mod tests {
     fn ensure_exit_status_rejects_failed_and_cancelled_runs() {
         assert!(ensure_exit_status("failure", true).is_err());
         assert!(ensure_exit_status("cancelled", true).is_err());
+    }
+
+    #[test]
+    fn failed_job_indices_keeps_only_non_green_jobs() {
+        let ss = statuses(&["success", "failure", "skipped", "cancelled"]);
+        assert_eq!(failed_job_indices(&ss), vec![1, 3]);
+    }
+
+    #[test]
+    fn failed_job_indices_empty_when_all_green() {
+        let ss = statuses(&["success", "skipped"]);
+        assert!(failed_job_indices(&ss).is_empty());
+    }
+
+    #[test]
+    fn jobs_to_log_without_failed_only_spans_every_job() {
+        let ss = statuses(&["success", "failure", "success"]);
+        assert_eq!(jobs_to_log(&ss, false), vec![0, 1, 2]);
+        assert_eq!(jobs_to_log(&ss, true), vec![1]);
+    }
+
+    #[test]
+    fn rerun_failed_and_job_are_mutually_exclusive() {
+        use clap::Parser;
+
+        let err =
+            crate::cli::Cli::try_parse_from(["fj", "run", "rerun", "56", "--failed", "--job", "1"])
+                .expect_err("--failed and --job together should fail");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn rerun_job_flag_parses() {
+        use clap::Parser;
+
+        let cli = crate::cli::Cli::try_parse_from(["fj", "run", "rerun", "56", "--job", "2"])
+            .expect("should parse");
+        let crate::cli::Command::Run(RunCmd {
+            command: RunSub::Rerun(args),
+        }) = cli.command
+        else {
+            panic!("expected run rerun command");
+        };
+        assert_eq!(args.run_id, 56);
+        assert_eq!(args.job, Some(2));
+        assert!(!args.failed);
+    }
+
+    #[test]
+    fn rerun_failed_flag_parses() {
+        use clap::Parser;
+
+        let cli = crate::cli::Cli::try_parse_from(["fj", "run", "rerun", "56", "--failed"])
+            .expect("should parse");
+        let crate::cli::Command::Run(RunCmd {
+            command: RunSub::Rerun(args),
+        }) = cli.command
+        else {
+            panic!("expected run rerun command");
+        };
+        assert_eq!(args.run_id, 56);
+        assert!(args.failed);
+        assert_eq!(args.job, None);
+    }
+
+    #[test]
+    fn rerun_bare_leaves_flags_unset() {
+        use clap::Parser;
+
+        let cli =
+            crate::cli::Cli::try_parse_from(["fj", "run", "rerun", "56"]).expect("should parse");
+        let crate::cli::Command::Run(RunCmd {
+            command: RunSub::Rerun(args),
+        }) = cli.command
+        else {
+            panic!("expected run rerun command");
+        };
+        assert!(!args.failed);
+        assert_eq!(args.job, None);
     }
 
     #[test]

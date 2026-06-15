@@ -1252,6 +1252,61 @@ async fn run_summary_reads_run_level_state() {
     assert_eq!(run.jobs[0].status, "success");
 }
 
+// ── Rerun web actions (run-level and per-job) ────────────────────────────────
+// `rerun`/`cancel`/`rerun_job` POST the human-facing web routes (no `/api/v1`
+// prefix). These pin the exact paths so a per-job rerun targets
+// `/jobs/{job}/rerun` and the whole-run rerun stays at `/rerun`.
+
+#[tokio::test]
+async fn rerun_posts_run_level_web_route() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/o/r/actions/runs/56/rerun"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    crate::api::workflow::rerun(&c, "o", "r", 56)
+        .await
+        .expect("rerun should POST the run-level route");
+}
+
+#[tokio::test]
+async fn rerun_job_posts_per_job_web_route() {
+    let server = MockServer::start().await;
+    // Job index 0 is a real job, not a "rerun all" sentinel: it must still hit
+    // the /jobs/0/rerun route, not the run-level /rerun.
+    Mock::given(method("POST"))
+        .and(path("/o/r/actions/runs/56/jobs/0/rerun"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    crate::api::workflow::rerun_job(&c, "o", "r", 56, 0)
+        .await
+        .expect("rerun_job should POST the per-job route");
+}
+
+#[tokio::test]
+async fn rerun_token_404_points_at_web_ui() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/o/r/actions/runs/56/jobs/2/rerun"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("Not found."))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let err = crate::api::workflow::rerun_job(&c, "o", "r", 56, 2)
+        .await
+        .expect_err("a 404 should surface an actionable message");
+    let msg = err.to_string();
+    assert!(msg.contains("won't rerun run #56"), "got: {msg}");
+    assert!(msg.contains("actions/runs/56"), "got: {msg}");
+}
+
 // ── Parity batch: issue delete, pr update-branch, release delete-asset, workflow dispatch ──
 
 #[tokio::test]
