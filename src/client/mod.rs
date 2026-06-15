@@ -624,7 +624,8 @@ async fn ensure_success(res: Response) -> Result<Response> {
         message,
         body: text,
     };
-    match friendly_http_error(status, &url, retry_after.flatten()) {
+    let context = friendly_http_error(status, &url, &err.message, retry_after.flatten());
+    match context {
         Some(context) => Err(anyhow::Error::new(err).context(context)),
         None => Err(anyhow::Error::new(err)),
     }
@@ -633,6 +634,7 @@ async fn ensure_success(res: Response) -> Result<Response> {
 fn friendly_http_error(
     status: StatusCode,
     url: &Url,
+    message: &str,
     retry_after: Option<Duration>,
 ) -> Option<String> {
     let resource = api_resource_label(url).unwrap_or_else(|| "requested resource".to_string());
@@ -644,11 +646,32 @@ fn friendly_http_error(
             "forbidden: {resource} (token lacks scope or access)"
         )),
         StatusCode::NOT_FOUND => Some(format!("not found: {resource}")),
+        // 409/422 are request problems where the server's own message is the
+        // actionable detail ("branch already exists", a validation error), so we
+        // surface it in the headline instead of the raw /api/v1 URL. The full
+        // ApiError (with the URL) stays as the `caused by:` source for --debug.
+        StatusCode::CONFLICT => Some(detail_headline("conflict", &resource, message)),
+        StatusCode::UNPROCESSABLE_ENTITY => {
+            Some(detail_headline("invalid request", &resource, message))
+        }
         StatusCode::TOO_MANY_REQUESTS => match retry_after {
             Some(wait) => Some(format!("rate limited: retry after {} s", wait.as_secs())),
             None => Some("rate limited: retry later".to_string()),
         },
         _ => None,
+    }
+}
+
+/// Headline for statuses whose server message carries the actionable detail
+/// (409 conflict, 422 validation): `"<label>: <resource>: <message>"`, or just
+/// `"<label>: <resource>"` when the server sent no message. The message is
+/// length-capped so a verbose validation body can't blow up the headline.
+fn detail_headline(label: &str, resource: &str, message: &str) -> String {
+    let msg = message.trim();
+    if msg.is_empty() {
+        format!("{label}: {resource}")
+    } else {
+        format!("{label}: {resource}: {}", truncate_preview(msg))
     }
 }
 
