@@ -30,8 +30,8 @@ fn json_fields() -> Option<&'static [String]> {
         .map(|v| v.as_slice())
 }
 use owo_colors::{OwoColorize, Style};
-use tabled::settings::{Alignment, Modify, Padding, Style as TStyle, object::Columns};
-use tabled::{Table, builder::Builder};
+use tabled::settings::{object::Columns, Alignment, Modify, Padding, Style as TStyle};
+use tabled::{builder::Builder, Table};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
 pub enum ColorChoice {

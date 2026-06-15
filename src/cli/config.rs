@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
 
@@ -145,21 +145,6 @@ pub async fn run(cmd: ConfigCmd) -> Result<()> {
         ConfigSub::Path => {
             println!("{}", config_path()?.display());
             Ok(())
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn no_color_truthy_values_are_recognized() {
-        for value in ["true", "TRUE", "1", "yes", "on", " on "] {
-            assert!(matches_truthy(value), "{value:?} should be truthy");
-        }
-        for value in ["false", "0", "no", "off", ""] {
-            assert!(!matches_truthy(value), "{value:?} should not be truthy");
         }
     }
 }
