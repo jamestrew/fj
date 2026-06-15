@@ -26,6 +26,7 @@ pub mod org;
 pub mod pr;
 mod pr_args;
 pub(crate) mod pr_comment;
+pub(crate) mod pr_fill;
 mod pr_inspect;
 pub(crate) mod pr_merge_check;
 mod pr_review;

@@ -8,6 +8,13 @@ All notable changes will be recorded here. The format follows
 
 ### Added
 
+- **`fj pr create --fill` / `--fill-first`**: derive the PR title and body from
+  the commits in `base..head` instead of retyping them, mirroring `gh`. A single
+  commit fills the title from its subject and the body from its message; multiple
+  commits use the first subject as the title and a bullet list of subjects as the
+  body. `--fill-first` uses only the first (oldest) commit. It reads `git log`
+  locally with no extra API call, and an explicit `--title` / `--body` / `-F`
+  still overrides the filled value.
 - **`fj pr attach` / `pr create --attach` / `pr edit --attach`**: upload file
   attachments to a pull request and link them in the description. PRs share the
   issue index, so files post to `issues/{number}/assets`; image extensions are
