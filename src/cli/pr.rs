@@ -139,6 +139,12 @@ pub struct CreateArgs {
     /// Read body from file (use `-` for stdin).
     #[arg(short = 'F', long = "body-file", value_name = "FILE")]
     pub body_file: Option<String>,
+    /// Fill title and body from commits between base and head.
+    #[arg(long, conflicts_with = "fill_first")]
+    pub fill: bool,
+    /// Fill title and body from the first commit between base and head.
+    #[arg(long = "fill-first")]
+    pub fill_first: bool,
     /// Attach a file and link it at the end of the body (repeatable).
     #[arg(long = "attach", value_name = "FILE")]
     pub attach: Vec<PathBuf>,
@@ -491,17 +497,21 @@ async fn create(args: CreateArgs, host: Option<&str>) -> Result<()> {
         None => detect_current_branch()
             .ok_or_else(|| anyhow!("could not determine head branch; pass --head"))?,
     };
-    let title = match args.title {
-        Some(t) => t,
-        None => editor::prompt_line("Title")?,
+    let explicit_body = args.body.is_some() || args.body_file.is_some();
+    let needs_fill = (args.fill || args.fill_first) && (args.title.is_none() || !explicit_body);
+    let filled = if needs_fill {
+        Some(fill_from_git_log(&args.base, &head, args.fill_first)?)
+    } else {
+        None
     };
+    let title = resolve_create_title(args.title, filled.as_ref())?;
     if title.trim().is_empty() {
         return Err(anyhow!("title is required"));
     }
-    let body = editor::resolve_body_input(
+    let body = resolve_create_body(
         args.body.as_deref(),
         args.body_file.as_deref(),
-        Some(("PR_BODY.md", "")),
+        filled.as_ref(),
     )?;
     let label_names = clean_csv_values(args.label);
     let label_ids = if label_names.is_empty() {
@@ -677,6 +687,124 @@ fn clean_csv_values(values: Vec<String>) -> Vec<String> {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FilledCreateBody {
+    title: String,
+    body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CommitMessage {
+    subject: String,
+    body: String,
+}
+
+fn resolve_create_title(
+    explicit_title: Option<String>,
+    filled: Option<&FilledCreateBody>,
+) -> Result<String> {
+    match explicit_title {
+        Some(title) => Ok(title),
+        None => filled
+            .map(|filled| filled.title.clone())
+            .ok_or_else(|| anyhow!("missing title"))
+            .or_else(|_| editor::prompt_line("Title")),
+    }
+}
+
+fn resolve_create_body(
+    body: Option<&str>,
+    body_file: Option<&str>,
+    filled: Option<&FilledCreateBody>,
+) -> Result<Option<String>> {
+    match (body, body_file) {
+        (Some(_), Some(_)) => editor::resolve_body_input(body, body_file, None),
+        (Some(_), None) | (None, Some(_)) => editor::resolve_body_input(body, body_file, None),
+        (None, None) => {
+            if let Some(filled) = filled {
+                Ok(Some(filled.body.clone()))
+            } else {
+                editor::resolve_body_input(None, None, Some(("PR_BODY.md", "")))
+            }
+        }
+    }
+}
+
+fn fill_from_git_log(base: &str, head: &str, first_only: bool) -> Result<FilledCreateBody> {
+    let head_ref = local_head_ref(head);
+    reject_git_rev_arg("base", base)?;
+    reject_git_rev_arg("head", head_ref)?;
+    let range = format!("{base}..{head_ref}");
+    let raw = git::output(&[
+        "log",
+        "--reverse",
+        "--format=%x1f%s%x1f%b%x1e",
+        range.as_str(),
+    ])?;
+    let commits = parse_commit_messages(&raw);
+    fill_from_commits(&commits, first_only)
+        .ok_or_else(|| anyhow!("no commits between {base} and {head_ref}"))
+}
+
+fn local_head_ref(head: &str) -> &str {
+    head.split_once(':')
+        .map(|(_, branch)| branch)
+        .unwrap_or(head)
+}
+
+fn reject_git_rev_arg(label: &str, value: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        return Err(anyhow!("{label} is required"));
+    }
+    if value.starts_with('-') {
+        return Err(anyhow!("{label} must not start with '-'"));
+    }
+    Ok(())
+}
+
+fn parse_commit_messages(raw: &str) -> Vec<CommitMessage> {
+    raw.split('\x1e')
+        .filter_map(|record| {
+            let record = record.trim_matches('\n');
+            if record.is_empty() {
+                return None;
+            }
+            let mut parts = record.splitn(3, '\x1f');
+            parts.next();
+            let subject = parts.next()?.trim().to_string();
+            if subject.is_empty() {
+                return None;
+            }
+            let body = parts.next().unwrap_or("").trim().to_string();
+            Some(CommitMessage { subject, body })
+        })
+        .collect()
+}
+
+fn fill_from_commits(commits: &[CommitMessage], first_only: bool) -> Option<FilledCreateBody> {
+    let first = commits.first()?;
+    if first_only || commits.len() == 1 {
+        let body = if first.body.is_empty() {
+            first.subject.clone()
+        } else {
+            format!("{}\n\n{}", first.subject, first.body)
+        };
+        return Some(FilledCreateBody {
+            title: first.subject.clone(),
+            body,
+        });
+    }
+
+    Some(FilledCreateBody {
+        title: first.subject.clone(),
+        body: commits
+            .iter()
+            .map(|commit| format!("- {}", commit.subject))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    })
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -1005,6 +1133,144 @@ mod tests {
             }
             other => panic!("expected pr attach, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn create_parses_fill_flags() {
+        use crate::cli::{Cli, Command};
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["fj", "pr", "create", "--fill"]).expect("should parse");
+        match cli.command {
+            Command::Pr(PrCmd {
+                command: PrSub::Create(a),
+            }) => {
+                assert!(a.fill);
+                assert!(!a.fill_first);
+            }
+            other => panic!("expected pr create, got {other:?}"),
+        }
+
+        let cli =
+            Cli::try_parse_from(["fj", "pr", "create", "--fill-first"]).expect("should parse");
+        match cli.command {
+            Command::Pr(PrCmd {
+                command: PrSub::Create(a),
+            }) => {
+                assert!(!a.fill);
+                assert!(a.fill_first);
+            }
+            other => panic!("expected pr create, got {other:?}"),
+        }
+
+        assert!(Cli::try_parse_from(["fj", "pr", "create", "--fill", "--fill-first"]).is_err());
+    }
+
+    #[test]
+    fn fill_single_commit_uses_subject_and_body() {
+        let commits = vec![CommitMessage {
+            subject: "Add fill support".into(),
+            body: "Use commit text for PRs.".into(),
+        }];
+
+        let filled = fill_from_commits(&commits, false).expect("filled body");
+
+        assert_eq!(filled.title, "Add fill support");
+        assert_eq!(filled.body, "Add fill support\n\nUse commit text for PRs.");
+    }
+
+    #[test]
+    fn fill_multi_commit_uses_first_title_and_subject_list() {
+        let commits = vec![
+            CommitMessage {
+                subject: "Add fill support".into(),
+                body: "Ignored in multi-fill.".into(),
+            },
+            CommitMessage {
+                subject: "Document fill support".into(),
+                body: String::new(),
+            },
+        ];
+
+        let filled = fill_from_commits(&commits, false).expect("filled body");
+
+        assert_eq!(filled.title, "Add fill support");
+        assert_eq!(filled.body, "- Add fill support\n- Document fill support");
+    }
+
+    #[test]
+    fn fill_first_uses_first_commit_only() {
+        let commits = vec![
+            CommitMessage {
+                subject: "First commit".into(),
+                body: "First body".into(),
+            },
+            CommitMessage {
+                subject: "Second commit".into(),
+                body: "Second body".into(),
+            },
+        ];
+
+        let filled = fill_from_commits(&commits, true).expect("filled body");
+
+        assert_eq!(filled.title, "First commit");
+        assert_eq!(filled.body, "First commit\n\nFirst body");
+    }
+
+    #[test]
+    fn parse_commit_messages_reads_git_log_records() {
+        let raw = "\x1fFirst subject\x1fFirst body\n\x1e\x1fSecond subject\x1f\x1e";
+
+        let commits = parse_commit_messages(raw);
+
+        assert_eq!(
+            commits,
+            vec![
+                CommitMessage {
+                    subject: "First subject".into(),
+                    body: "First body".into(),
+                },
+                CommitMessage {
+                    subject: "Second subject".into(),
+                    body: String::new(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn fill_returns_none_for_no_commits() {
+        assert_eq!(fill_from_commits(&[], false), None);
+    }
+
+    #[test]
+    fn explicit_create_inputs_override_fill() {
+        let filled = FilledCreateBody {
+            title: "filled title".into(),
+            body: "filled body".into(),
+        };
+
+        assert_eq!(
+            resolve_create_title(Some("explicit title".into()), Some(&filled)).unwrap(),
+            "explicit title"
+        );
+        assert_eq!(
+            resolve_create_body(Some("explicit body"), None, Some(&filled))
+                .unwrap()
+                .as_deref(),
+            Some("explicit body")
+        );
+        assert_eq!(
+            resolve_create_body(None, None, Some(&filled))
+                .unwrap()
+                .as_deref(),
+            Some("filled body")
+        );
+    }
+
+    #[test]
+    fn local_head_ref_strips_owner_prefix() {
+        assert_eq!(local_head_ref("alice:feature"), "feature");
+        assert_eq!(local_head_ref("feature"), "feature");
     }
 
     #[test]

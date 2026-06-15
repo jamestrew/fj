@@ -59,7 +59,7 @@ called out.
 | --------------------------------- | --------------------------------- | ----------------------------------------------- |
 | `gh pr list`                      | `fj pr list`                      |                                                 |
 | `gh pr view N`                    | `fj pr view N`                    | `--comments` shows reviews + issue comments.    |
-| `gh pr create`                    | `fj pr create`                    | Head defaults to current branch.                |
+| `gh pr create`                    | `fj pr create`                    | Head defaults to current branch. `--fill` and `--fill-first` derive title/body from local commits. |
 | `gh pr edit N`                    | `fj pr edit N`                    | `--attach FILE` uploads files and links them in the body. |
 | _(no equivalent)_                 | `fj pr attach N FILE...`          | Uploads attachments and appends links to the description. |
 | `gh pr diff N`                    | `fj pr diff N`                    | Raw unified diff.                               |
