@@ -34,6 +34,10 @@ pub enum IssueSub {
     Close(NumberOnly),
     /// Reopen a closed issue.
     Reopen(NumberOnly),
+    /// Lock an issue conversation.
+    Lock(LockArgs),
+    /// Unlock an issue conversation.
+    Unlock(NumberOnly),
     /// Delete an issue permanently (requires repo admin).
     Delete(DeleteArgs),
     /// Pin an issue to the top of the issue list.
@@ -205,6 +209,36 @@ pub struct NumberOnly {
 }
 
 #[derive(Debug, Args)]
+pub struct LockArgs {
+    #[command(flatten)]
+    pub r: RepoFlag,
+    /// Issue number
+    pub number: u64,
+    /// Reason for locking the conversation.
+    #[arg(long, value_enum)]
+    pub reason: Option<LockReasonArg>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum LockReasonArg {
+    OffTopic,
+    TooHeated,
+    Resolved,
+    Spam,
+}
+
+impl LockReasonArg {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LockReasonArg::OffTopic => "off-topic",
+            LockReasonArg::TooHeated => "too-heated",
+            LockReasonArg::Resolved => "resolved",
+            LockReasonArg::Spam => "spam",
+        }
+    }
+}
+
+#[derive(Debug, Args)]
 pub struct DeleteArgs {
     #[command(flatten)]
     pub r: RepoFlag,
@@ -241,6 +275,8 @@ pub async fn run(cmd: IssueCmd, host: Option<&str>) -> Result<()> {
         IssueSub::Edit(args) => edit(args, host).await,
         IssueSub::Close(args) => set_state(args, host, "closed").await,
         IssueSub::Reopen(args) => set_state(args, host, "open").await,
+        IssueSub::Lock(args) => lock(args, host).await,
+        IssueSub::Unlock(args) => unlock(args, host).await,
         IssueSub::Delete(args) => delete(args, host).await,
         IssueSub::Pin(args) => set_pinned(args, host, true).await,
         IssueSub::Unpin(args) => set_pinned(args, host, false).await,
@@ -562,6 +598,39 @@ async fn set_state(args: NumberOnly, host: Option<&str>, state: &str) -> Result<
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
+async fn lock(args: LockArgs, host: Option<&str>) -> Result<()> {
+    let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
+    let issue = api::issue::get(&ctx.client, &ctx.owner, &ctx.name, args.number).await?;
+    if issue.is_locked {
+        println!("Issue #{} is already locked", args.number);
+        return Ok(());
+    }
+    api::issue::lock(
+        &ctx.client,
+        &ctx.owner,
+        &ctx.name,
+        args.number,
+        args.reason.map(LockReasonArg::as_str),
+    )
+    .await?;
+    println!("✓ Locked issue #{}", args.number);
+    Ok(())
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn unlock(args: NumberOnly, host: Option<&str>) -> Result<()> {
+    let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
+    let issue = api::issue::get(&ctx.client, &ctx.owner, &ctx.name, args.number).await?;
+    if !issue.is_locked {
+        println!("Issue #{} is already unlocked", args.number);
+        return Ok(());
+    }
+    api::issue::unlock(&ctx.client, &ctx.owner, &ctx.name, args.number).await?;
+    println!("✓ Unlocked issue #{}", args.number);
+    Ok(())
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn delete(args: DeleteArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
     if !args.yes {
@@ -686,6 +755,31 @@ mod tests {
                 command: IssueSub::Create(a),
             }) => assert_eq!(a.template, Some(None)),
             other => panic!("expected issue create, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lock_and_unlock_parse() {
+        use crate::cli::{Cli, Command};
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["fj", "issue", "lock", "7", "--reason", "too-heated"])
+            .expect("should parse");
+        match cli.command {
+            Command::Issue(IssueCmd {
+                command: IssueSub::Lock(a),
+            }) => {
+                assert_eq!(a.number, 7);
+                assert!(matches!(a.reason, Some(LockReasonArg::TooHeated)));
+            }
+            other => panic!("expected issue lock, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["fj", "issue", "unlock", "7"]).expect("should parse");
+        match cli.command {
+            Command::Issue(IssueCmd {
+                command: IssueSub::Unlock(a),
+            }) => assert_eq!(a.number, 7),
+            other => panic!("expected issue unlock, got {other:?}"),
         }
     }
 

@@ -31,6 +31,8 @@ pub struct Issue {
     pub updated_at: DateTime<Utc>,
     #[serde(default)]
     pub comments: u64,
+    #[serde(default)]
+    pub is_locked: bool,
     /// Present only when the issue is actually a pull request.
     #[serde(default)]
     pub pull_request: Option<serde_json::Value>,
@@ -390,5 +392,38 @@ pub async fn set_pinned(
     let method = if pinned { Method::POST } else { Method::DELETE };
     let res = client.request(method, &path, &[], None).await?;
     res.error_for_status()?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LockIssueOption<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lock_reason: Option<&'a str>,
+}
+
+pub async fn lock(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    number: u64,
+    reason: Option<&str>,
+) -> Result<()> {
+    let path = format!(
+        "{}/issues/{number}/lock",
+        crate::api::repo_path(owner, name)
+    );
+    let body = LockIssueOption {
+        lock_reason: reason,
+    };
+    client.send(Method::PUT, &path, &[], Some(&body)).await?;
+    Ok(())
+}
+
+pub async fn unlock(client: &Client, owner: &str, name: &str, number: u64) -> Result<()> {
+    let path = format!(
+        "{}/issues/{number}/lock",
+        crate::api::repo_path(owner, name)
+    );
+    client.send(Method::DELETE, &path, &[], None::<&()>).await?;
     Ok(())
 }

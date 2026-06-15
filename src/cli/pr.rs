@@ -8,6 +8,7 @@ use crate::api::pull::{CreatePull, EditPull, ListOptions};
 use crate::api::template::TemplateKind;
 use crate::cli::context::{repo_web_url, resolve_repo, RepoFlag};
 use crate::cli::create_template;
+use crate::cli::issue::LockReasonArg;
 use crate::cli::pr_args::{MergeStyleArg, ReviewEventArg, StateFilter, UpdateStyle};
 use crate::cli::pr_fill::{self, FillMode};
 use crate::cli::pr_status::StatusArgs;
@@ -69,6 +70,10 @@ pub enum PrSub {
     Close(SimpleArgs),
     /// Reopen a closed pull request.
     Reopen(SimpleArgs),
+    /// Lock a pull request conversation.
+    Lock(LockArgs),
+    /// Unlock a pull request conversation.
+    Unlock(SimpleArgs),
 }
 
 #[derive(Debug, Args)]
@@ -319,6 +324,17 @@ pub struct SimpleArgs {
     pub number: u64,
 }
 
+#[derive(Debug, Args)]
+pub struct LockArgs {
+    #[command(flatten)]
+    pub r: RepoFlag,
+    /// Pull request number
+    pub number: u64,
+    /// Reason for locking the conversation.
+    #[arg(long, value_enum)]
+    pub reason: Option<LockReasonArg>,
+}
+
 /// Args for the read-only inspect subcommands (diff / commits / files /
 /// checks). Identical to `SimpleArgs` but carries `--json` so automation can
 /// route the already-typed structs through `output::print_json`.
@@ -367,6 +383,8 @@ pub async fn run(cmd: PrCmd, host: Option<&str>) -> Result<()> {
         PrSub::Merge(args) => merge(args, host).await,
         PrSub::Close(args) => set_state(args, host, "closed").await,
         PrSub::Reopen(args) => set_state(args, host, "open").await,
+        PrSub::Lock(args) => lock(args, host).await,
+        PrSub::Unlock(args) => unlock(args, host).await,
     }
 }
 
@@ -1002,6 +1020,39 @@ async fn set_state(args: SimpleArgs, host: Option<&str>, state: &str) -> Result<
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn lock(args: LockArgs, host: Option<&str>) -> Result<()> {
+    let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
+    let pr = api::pull::get(&ctx.client, &ctx.owner, &ctx.name, args.number).await?;
+    if pr.is_locked {
+        println!("PR #{} is already locked", args.number);
+        return Ok(());
+    }
+    api::issue::lock(
+        &ctx.client,
+        &ctx.owner,
+        &ctx.name,
+        args.number,
+        args.reason.map(LockReasonArg::as_str),
+    )
+    .await?;
+    println!("✓ Locked PR #{}", args.number);
+    Ok(())
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn unlock(args: SimpleArgs, host: Option<&str>) -> Result<()> {
+    let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
+    let pr = api::pull::get(&ctx.client, &ctx.owner, &ctx.name, args.number).await?;
+    if !pr.is_locked {
+        println!("PR #{} is already unlocked", args.number);
+        return Ok(());
+    }
+    api::issue::unlock(&ctx.client, &ctx.owner, &ctx.name, args.number).await?;
+    println!("✓ Unlocked PR #{}", args.number);
+    Ok(())
+}
+
 /// Render a branch name for display. Forgejo populates `head.ref` with
 /// `refs/pull/<n>/head` (the synthetic PR ref) when the source branch is gone
 /// or the PR comes from a fork; in that case the real name is in `label`.
@@ -1291,6 +1342,31 @@ mod tests {
                 assert!(a.no_draft);
             }
             other => panic!("expected pr list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lock_and_unlock_parse() {
+        use crate::cli::{Cli, Command};
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["fj", "pr", "lock", "9", "--reason", "spam"])
+            .expect("should parse");
+        match cli.command {
+            Command::Pr(PrCmd {
+                command: PrSub::Lock(a),
+            }) => {
+                assert_eq!(a.number, 9);
+                assert!(matches!(a.reason, Some(LockReasonArg::Spam)));
+            }
+            other => panic!("expected pr lock, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["fj", "pr", "unlock", "9"]).expect("should parse");
+        match cli.command {
+            Command::Pr(PrCmd {
+                command: PrSub::Unlock(a),
+            }) => assert_eq!(a.number, 9),
+            other => panic!("expected pr unlock, got {other:?}"),
         }
     }
 

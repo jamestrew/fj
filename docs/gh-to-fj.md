@@ -53,6 +53,7 @@ called out.
 | `gh issue reopen N`               | `fj issue reopen N`               |                                                 |
 | `gh issue delete N`               | `fj issue delete N`               | Requires repo admin. Confirm with `-y`.         |
 | `gh issue pin N` / `unpin N`      | `fj issue pin N` / `unpin N`      |                                                 |
+| `gh issue lock N` / `unlock N`     | `fj issue lock N` / `unlock N`    | `lock` accepts `--reason off-topic|too-heated|resolved|spam`. |
 | `gh issue comment N --body B`     | `fj issue comment N --body B`     | New: also `fj issue edit-comment ID`.           |
 | `gh issue develop N`              | `fj issue develop N`              | Branches off the default branch.                |
 
@@ -78,6 +79,7 @@ called out.
 | `gh pr merge N`                   | `fj pr merge N`                   | `--style merge|rebase|rebase-merge|squash`.     |
 | `gh pr merge N --auto`            | `fj pr merge N --auto`            | Schedules a server-side merge once required checks pass; merges now if already green. Honors `--style` / `--title` / `--message` / `--delete-branch`. |
 | `gh pr merge N --disable-auto`    | `fj pr merge N --disable-auto`    | Cancels a pending scheduled merge.              |
+| `gh pr lock N` / `unlock N`        | `fj pr lock N` / `unlock N`       | `lock` accepts `--reason off-topic|too-heated|resolved|spam`. |
 | `gh pr close N`                   | `fj pr close N`                   |                                                 |
 | `gh pr reopen N`                  | `fj pr reopen N`                  |                                                 |
 | (n/a in gh)                       | `fj pr request-review N USER USER` | New: assign specific reviewers.               |
