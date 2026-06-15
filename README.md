@@ -76,6 +76,8 @@ Windows compiles but is untested. [File an issue](https://rasterhub.com/rasterst
 fj auth login                            # pick Fjord Account or a Forgejo token; stored in keychain or 0600 file fallback
 fj repo view                             # auto-detects the repo from your git remote
 fj pr list --state all -L 10             # latest 10 PRs
+fj pr list --base main --no-draft        # branch/draft filters
+fj issue list --milestone v1 --mentioned alice
 fj issue create --title "..." --body "..."
 fj api /version                          # raw API escape hatch
 ```

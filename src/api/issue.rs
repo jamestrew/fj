@@ -70,6 +70,8 @@ pub struct ListOptions<'a> {
     pub paginate: bool,
     pub labels: Option<&'a str>,
     pub assignee: Option<&'a str>,
+    pub milestone: Option<&'a str>,
+    pub mentioned: Option<&'a str>,
     pub query: Option<&'a str>,
 }
 
@@ -82,6 +84,8 @@ impl Default for ListOptions<'_> {
             paginate: false,
             labels: None,
             assignee: None,
+            milestone: None,
+            mentioned: None,
             query: None,
         }
     }
@@ -103,6 +107,12 @@ pub async fn list(
     }
     if let Some(a) = opts.assignee {
         query.push(("assigned_by".into(), a.into()));
+    }
+    if let Some(m) = opts.milestone {
+        query.push(("milestones".into(), m.into()));
+    }
+    if let Some(u) = opts.mentioned {
+        query.push(("mentioned_by".into(), u.into()));
     }
     if let Some(q) = opts.query {
         query.push(("q".into(), q.into()));
