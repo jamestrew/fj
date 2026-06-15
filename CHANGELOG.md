@@ -58,6 +58,10 @@ All notable changes will be recorded here. The format follows
 - `fj api --jq` iteration (`.[]`) and the `-L` / `--limit` flag on `fj run list`.
 - The stack PR-annotation caption renders again: Forgejo's sanitizer drops the
   raw `<sub>` tag, so it is now plain markdown italics.
+- `fj issue edit --add-assignee` / `--remove-assignee` no longer error with a
+  spurious "not found". Forgejo has no `/issues/{n}/assignees` sub-resource, so
+  the assignee list is now read and PATCHed onto the issue as a merged set
+  (additive add, subtractive remove). Applies to `fj pr edit` too.
 
 ## [0.2.0] - 2026-06-02
 

@@ -2078,8 +2078,18 @@ async fn pull_create_can_be_followed_by_label_and_assignee_calls() {
         .expect(1)
         .mount(&server)
         .await;
-    Mock::given(method("POST"))
-        .and(path("/api/v1/repos/o/r/issues/12/assignees"))
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/issues/12"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issue_json(
+            12,
+            "Add feature",
+            "open",
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/repos/o/r/issues/12"))
         .and(body_json(json!({ "assignees": ["alice", "bob"] })))
         .respond_with(ResponseTemplate::new(200).set_body_json(issue_json(
             12,
@@ -3422,18 +3432,35 @@ async fn issue_edit_can_close() {
 }
 
 #[tokio::test]
-async fn issue_assignees_add_and_remove_use_issue_assignees_endpoint() {
+async fn issue_assignees_add_and_remove_patch_merged_set() {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/api/v1/repos/o/r/issues/3/assignees"))
+    // Forgejo has no /issues/{n}/assignees sub-resource: add/remove read the
+    // current assignees and PATCH the issue with the merged set.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/issues/3"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 3, "number": 3, "title": "a bug", "state": "open",
+            "user": { "id": 1, "login": "alice" },
+            "assignees": [{ "id": 1, "login": "alice" }, { "id": 2, "login": "bob" }],
+            "html_url": "https://x/o/r/issues/3",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z"
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+    // add ["alice","bob"]: both already assigned, so the merged set is unchanged.
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/repos/o/r/issues/3"))
         .and(body_json(json!({ "assignees": ["alice", "bob"] })))
         .respond_with(ResponseTemplate::new(200).set_body_json(issue_json(3, "a bug", "open")))
         .expect(1)
         .mount(&server)
         .await;
-    Mock::given(method("DELETE"))
-        .and(path("/api/v1/repos/o/r/issues/3/assignees"))
-        .and(body_json(json!({ "assignees": ["bob"] })))
+    // remove ["bob"]: drops bob, keeps alice.
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/repos/o/r/issues/3"))
+        .and(body_json(json!({ "assignees": ["alice"] })))
         .respond_with(ResponseTemplate::new(200).set_body_json(issue_json(3, "a bug", "open")))
         .expect(1)
         .mount(&server)
@@ -3801,16 +3828,31 @@ async fn pull_label_and_assignee_mutations_use_backing_issue_endpoints() {
         .expect(1)
         .mount(&server)
         .await;
-    Mock::given(method("POST"))
-        .and(path("/api/v1/repos/o/r/issues/12/assignees"))
-        .and(body_json(json!({ "assignees": ["alice"] })))
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/issues/12"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 12, "number": 12, "title": "A PR", "state": "open",
+            "user": { "id": 1, "login": "alice" },
+            "assignees": [{ "id": 2, "login": "bob" }],
+            "html_url": "https://x/o/r/issues/12",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z"
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+    // add ["alice"]: appended to the existing bob.
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/repos/o/r/issues/12"))
+        .and(body_json(json!({ "assignees": ["bob", "alice"] })))
         .respond_with(ResponseTemplate::new(200).set_body_json(issue_json(12, "A PR", "open")))
         .expect(1)
         .mount(&server)
         .await;
-    Mock::given(method("DELETE"))
-        .and(path("/api/v1/repos/o/r/issues/12/assignees"))
-        .and(body_json(json!({ "assignees": ["bob"] })))
+    // remove ["bob"]: clears the list.
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/repos/o/r/issues/12"))
+        .and(body_json(json!({ "assignees": [] })))
         .respond_with(ResponseTemplate::new(200).set_body_json(issue_json(12, "A PR", "open")))
         .expect(1)
         .mount(&server)

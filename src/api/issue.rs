@@ -173,6 +173,28 @@ struct AssigneesBody {
     assignees: Vec<String>,
 }
 
+/// Forgejo has no `/issues/{n}/assignees` sub-resource (unlike labels); the
+/// assignee list is set through the issue PATCH endpoint, which replaces it
+/// wholesale. So `add`/`remove` read the current assignees, apply the delta,
+/// and PATCH the merged set. Works for PRs too (they are issues here).
+async fn set_assignees(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    number: u64,
+    assignees: Vec<String>,
+) -> Result<Issue> {
+    let path = format!("{}/issues/{number}", crate::api::repo_path(owner, name));
+    client
+        .json(
+            Method::PATCH,
+            &path,
+            &[],
+            Some(&AssigneesBody { assignees }),
+        )
+        .await
+}
+
 pub async fn add_assignees(
     client: &Client,
     owner: &str,
@@ -180,13 +202,14 @@ pub async fn add_assignees(
     number: u64,
     assignees: Vec<String>,
 ) -> Result<Issue> {
-    let path = format!(
-        "{}/issues/{number}/assignees",
-        crate::api::repo_path(owner, name)
-    );
-    client
-        .json(Method::POST, &path, &[], Some(&AssigneesBody { assignees }))
-        .await
+    let current = get(client, owner, name, number).await?;
+    let mut merged: Vec<String> = current.assignees.iter().map(|u| u.login.clone()).collect();
+    for login in assignees {
+        if !merged.iter().any(|a| a.eq_ignore_ascii_case(&login)) {
+            merged.push(login);
+        }
+    }
+    set_assignees(client, owner, name, number, merged).await
 }
 
 pub async fn remove_assignees(
@@ -196,18 +219,14 @@ pub async fn remove_assignees(
     number: u64,
     assignees: Vec<String>,
 ) -> Result<Issue> {
-    let path = format!(
-        "{}/issues/{number}/assignees",
-        crate::api::repo_path(owner, name)
-    );
-    client
-        .json(
-            Method::DELETE,
-            &path,
-            &[],
-            Some(&AssigneesBody { assignees }),
-        )
-        .await
+    let current = get(client, owner, name, number).await?;
+    let merged: Vec<String> = current
+        .assignees
+        .iter()
+        .map(|u| u.login.clone())
+        .filter(|login| !assignees.iter().any(|r| r.eq_ignore_ascii_case(login)))
+        .collect();
+    set_assignees(client, owner, name, number, merged).await
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
