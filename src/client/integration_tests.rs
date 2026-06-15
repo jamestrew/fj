@@ -147,6 +147,39 @@ async fn maps_429_to_friendly_error_and_exit_code() {
     );
 }
 
+#[tokio::test]
+async fn maps_409_to_friendly_error_and_exit_code() {
+    // A conflict (e.g. branch already exists) surfaces the server's message,
+    // not the raw API URL. 409 is a request problem, so the exit code stays the
+    // generic 1 (not the not-found / auth / transient classes).
+    let err = api_error_for_status(
+        StatusCode::CONFLICT,
+        Method::POST,
+        "/api/v1/repos/o/r/branches",
+        json!({"message": "The branch already exists."}),
+    )
+    .await;
+    let headline = err.to_string();
+    assert_eq!(headline, "conflict: o/r: The branch already exists.");
+    assert!(!headline.contains("/api/v1"), "got: {headline}");
+    assert_eq!(crate::error_exit_code(&err), crate::EXIT_GENERIC);
+}
+
+#[tokio::test]
+async fn maps_422_to_friendly_error_and_exit_code() {
+    let err = api_error_for_status(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Method::POST,
+        "/api/v1/repos/o/r/pulls",
+        json!({"message": "head and base are the same"}),
+    )
+    .await;
+    let headline = err.to_string();
+    assert_eq!(headline, "invalid request: o/r: head and base are the same");
+    assert!(!headline.contains("/api/v1"), "got: {headline}");
+    assert_eq!(crate::error_exit_code(&err), crate::EXIT_GENERIC);
+}
+
 async fn api_error_for_status(
     status: StatusCode,
     request_method: Method,
