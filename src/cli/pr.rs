@@ -7,6 +7,7 @@ use crate::api;
 use crate::api::pull::{CreatePull, EditPull, ListOptions};
 use crate::cli::context::{repo_web_url, resolve_repo, RepoFlag};
 use crate::cli::pr_args::{MergeStyleArg, ReviewEventArg, StateFilter, UpdateStyle};
+use crate::cli::pr_fill::{self, FillMode};
 use crate::cli::pr_status::StatusArgs;
 use crate::cli::{
     list as list_output, pr_comment, pr_inspect, pr_merge_check, pr_review, pr_status,
@@ -139,6 +140,15 @@ pub struct CreateArgs {
     /// Read body from file (use `-` for stdin).
     #[arg(short = 'F', long = "body-file", value_name = "FILE")]
     pub body_file: Option<String>,
+    /// Fill title and body from the commits in `base..head` (no API call).
+    /// Single commit: its subject and message body. Multiple: the first
+    /// subject as the title, a bullet list of subjects as the body.
+    /// `--title` / `--body` / `--body-file` still override.
+    #[arg(long, conflicts_with = "fill_first")]
+    pub fill: bool,
+    /// Like `--fill`, but use only the first (oldest) commit's subject and body.
+    #[arg(long = "fill-first")]
+    pub fill_first: bool,
     /// Attach a file and link it at the end of the body (repeatable).
     #[arg(long = "attach", value_name = "FILE")]
     pub attach: Vec<PathBuf>,
@@ -491,18 +501,35 @@ async fn create(args: CreateArgs, host: Option<&str>) -> Result<()> {
         None => detect_current_branch()
             .ok_or_else(|| anyhow!("could not determine head branch; pass --head"))?,
     };
+    // Resolve --fill / --fill-first up front so both title and body can draw
+    // from the branch's commits. None when neither flag was passed.
+    let filled = match fill_mode(args.fill, args.fill_first) {
+        Some(mode) => {
+            let commits = git::log_commits(&args.base, &local_head_ref(&head))?;
+            Some(pr_fill::fill_from_commits(&commits, mode)?)
+        }
+        None => None,
+    };
     let title = match args.title {
         Some(t) => t,
-        None => editor::prompt_line("Title")?,
+        None => match &filled {
+            Some(f) => f.title.clone(),
+            None => editor::prompt_line("Title")?,
+        },
     };
     if title.trim().is_empty() {
         return Err(anyhow!("title is required"));
     }
-    let body = editor::resolve_body_input(
-        args.body.as_deref(),
-        args.body_file.as_deref(),
-        Some(("PR_BODY.md", "")),
-    )?;
+    // Body precedence: an explicit --body / --body-file wins; otherwise the
+    // filled body (if any); otherwise open the editor as before.
+    let body = match &filled {
+        Some(f) if args.body.is_none() && args.body_file.is_none() => f.body.clone(),
+        _ => editor::resolve_body_input(
+            args.body.as_deref(),
+            args.body_file.as_deref(),
+            Some(("PR_BODY.md", "")),
+        )?,
+    };
     let label_names = clean_csv_values(args.label);
     let label_ids = if label_names.is_empty() {
         None
@@ -877,6 +904,28 @@ fn branch_label(b: &crate::api::pull::Branch) -> String {
         .to_string()
 }
 
+/// The fill mode requested on `pr create`, if any. `--fill-first` and `--fill`
+/// are mutually exclusive at the clap layer, so checking first is unambiguous.
+fn fill_mode(fill: bool, fill_first: bool) -> Option<FillMode> {
+    if fill_first {
+        Some(FillMode::First)
+    } else if fill {
+        Some(FillMode::All)
+    } else {
+        None
+    }
+}
+
+/// The local ref to read commits from. A cross-repo head is passed as
+/// `owner:branch`, but its commits live under the bare branch name locally, so
+/// strip any `owner:` prefix before running `git log`.
+fn local_head_ref(head: &str) -> String {
+    head.rsplit_once(':')
+        .map(|(_, branch)| branch)
+        .unwrap_or(head)
+        .to_string()
+}
+
 fn detect_current_branch() -> Option<String> {
     use std::process::Command;
     let out = Command::new("git")
@@ -1086,6 +1135,60 @@ mod tests {
             }
             other => panic!("expected pr create, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn create_parses_fill_flags() {
+        use crate::cli::{Cli, Command};
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["fj", "pr", "create", "--fill"]).expect("should parse");
+        match cli.command {
+            Command::Pr(PrCmd {
+                command: PrSub::Create(a),
+            }) => {
+                assert!(a.fill);
+                assert!(!a.fill_first);
+                assert!(matches!(
+                    fill_mode(a.fill, a.fill_first),
+                    Some(FillMode::All)
+                ));
+            }
+            other => panic!("expected pr create, got {other:?}"),
+        }
+        let cli =
+            Cli::try_parse_from(["fj", "pr", "create", "--fill-first"]).expect("should parse");
+        if let Command::Pr(PrCmd {
+            command: PrSub::Create(a),
+        }) = cli.command
+        {
+            assert!(a.fill_first);
+            assert!(matches!(
+                fill_mode(a.fill, a.fill_first),
+                Some(FillMode::First)
+            ));
+        }
+        // Bare create requests no fill.
+        let cli = Cli::try_parse_from(["fj", "pr", "create"]).expect("should parse");
+        if let Command::Pr(PrCmd {
+            command: PrSub::Create(a),
+        }) = cli.command
+        {
+            assert!(fill_mode(a.fill, a.fill_first).is_none());
+        }
+    }
+
+    #[test]
+    fn create_rejects_both_fill_flags() {
+        use crate::cli::Cli;
+        use clap::Parser;
+        let err = Cli::try_parse_from(["fj", "pr", "create", "--fill", "--fill-first"]);
+        assert!(err.is_err(), "--fill and --fill-first must conflict");
+    }
+
+    #[test]
+    fn local_head_ref_strips_owner_prefix() {
+        assert_eq!(local_head_ref("feature/x"), "feature/x");
+        assert_eq!(local_head_ref("alice:feature/x"), "feature/x");
     }
 
     #[test]

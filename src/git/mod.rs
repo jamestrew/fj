@@ -248,6 +248,41 @@ pub fn commits_since(base: &str) -> Result<String> {
     output(&["log", "--reverse", "--format=%H%x1f%s", &range])
 }
 
+/// A commit's subject and message body, parsed from `git log`. `body` excludes
+/// the subject line and is trimmed; it may be empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Commit {
+    pub subject: String,
+    pub body: String,
+}
+
+/// Commits in `base..head`, oldest first, with each commit's subject and body
+/// split out. Errors if the range can't be resolved (e.g. an unknown ref) or
+/// git otherwise fails. Used by `pr create --fill` / `--fill-first`.
+pub fn log_commits(base: &str, head: &str) -> Result<Vec<Commit>> {
+    reject_dash_lead("base", base)?;
+    reject_dash_lead("head", head)?;
+    let range = format!("{base}..{head}");
+    // RS (0x1e) between commits, US (0x1f) between subject and body, so any
+    // byte inside a subject or body is safe to parse back.
+    let raw = output(&["log", "--reverse", "--format=%x1e%s%x1f%b", &range])?;
+    Ok(parse_log_records(&raw))
+}
+
+/// Parse the record-separated output of `log_commits`'s format string.
+fn parse_log_records(raw: &str) -> Vec<Commit> {
+    raw.split('\x1e')
+        .map(str::trim)
+        .filter(|record| !record.is_empty())
+        .map(|record| {
+            let mut parts = record.splitn(2, '\x1f');
+            let subject = parts.next().unwrap_or("").trim().to_string();
+            let body = parts.next().unwrap_or("").trim().to_string();
+            Commit { subject, body }
+        })
+        .collect()
+}
+
 /// Detach HEAD at its current commit (`git checkout --detach`). Used before
 /// re-pointing the checked-out branch, since git refuses to move a branch
 /// that is currently checked out.
@@ -432,7 +467,9 @@ fn reject_dash_lead(what: &str, value: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_left_right_count, parse_porcelain, reject_dash_lead};
+    use super::{
+        parse_left_right_count, parse_log_records, parse_porcelain, reject_dash_lead, Commit,
+    };
 
     #[test]
     fn rejects_dash_lead() {
@@ -468,5 +505,31 @@ mod tests {
         assert_eq!(parse_left_right_count("3 1"), Some((1, 3)));
         assert_eq!(parse_left_right_count(""), None);
         assert_eq!(parse_left_right_count("nope"), None);
+    }
+
+    #[test]
+    fn log_records_split_subject_and_multiline_body() {
+        // Two commits, oldest first; the second carries a multi-line body.
+        let raw = "\x1efix: typo\x1f\x1efeat: thing\x1fwhy it matters\n\nmore detail\n";
+        let commits = parse_log_records(raw);
+        assert_eq!(
+            commits,
+            vec![
+                Commit {
+                    subject: "fix: typo".into(),
+                    body: String::new(),
+                },
+                Commit {
+                    subject: "feat: thing".into(),
+                    body: "why it matters\n\nmore detail".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn log_records_empty_when_no_commits() {
+        assert!(parse_log_records("").is_empty());
+        assert!(parse_log_records("\n").is_empty());
     }
 }
