@@ -472,19 +472,46 @@ pub async fn list_workflows(client: &Client, owner: &str, name: &str) -> Result<
 // and, on the expected rejection, return an actionable message pointing at the
 // web UI. `run` is the per-repo run number, as in `run view` / `run list`.
 pub async fn rerun(client: &Client, owner: &str, name: &str, run: u64) -> Result<()> {
-    post_run_action(client, owner, name, run, "rerun").await
+    post_run_action(client, owner, name, run, "rerun", "rerun").await
+}
+
+/// Rerun a single job by its 0-based index within the run (the index shown by
+/// `fj run view`). Forgejo's run-level `/rerun` reruns every job; the per-job
+/// `/jobs/{job}/rerun` route reruns just that one. Index 0 is a real job here,
+/// not a "rerun all" sentinel: Forgejo keys "rerun all" off the absence of the
+/// `{job}` path segment, not off `job == 0`.
+pub async fn rerun_job(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    run: u64,
+    job: usize,
+) -> Result<()> {
+    post_run_action(
+        client,
+        owner,
+        name,
+        run,
+        &format!("jobs/{job}/rerun"),
+        "rerun",
+    )
+    .await
 }
 
 pub async fn cancel(client: &Client, owner: &str, name: &str, run: u64) -> Result<()> {
-    post_run_action(client, owner, name, run, "cancel").await
+    post_run_action(client, owner, name, run, "cancel", "cancel").await
 }
 
+/// POST a web action under a run. `path` is the route suffix appended to the
+/// run URL (`rerun`, `cancel`, `jobs/2/rerun`); `verb` is the bare word used in
+/// error messages so a per-job path still reads "won't rerun run #N".
 async fn post_run_action(
     client: &Client,
     owner: &str,
     name: &str,
     run: u64,
-    action: &str,
+    path: &str,
+    verb: &str,
 ) -> Result<()> {
     let origin = client.base().join("/")?;
     let run_url = format!(
@@ -493,18 +520,18 @@ async fn post_run_action(
         crate::api::path_segment(name)
     );
     let res = client
-        .request(Method::POST, &format!("{run_url}/{action}"), &[], None)
+        .request(Method::POST, &format!("{run_url}/{path}"), &[], None)
         .await?;
     let status = res.status();
     if !status.is_success() {
         let body = res.text().await.unwrap_or_default();
         return Err(if status == StatusCode::NOT_FOUND {
             anyhow!(
-                "this Forgejo won't {action} run #{run} via an API token: Forgejo has no \
+                "this Forgejo won't {verb} run #{run} via an API token: Forgejo has no \
                  rerun/cancel API, and its web action needs a browser session. Do it here:\n  {run_url}"
             )
         } else {
-            anyhow!("could not {action} run #{run}: {}", body.trim())
+            anyhow!("could not {verb} run #{run}: {}", body.trim())
         });
     }
     Ok(())

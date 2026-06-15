@@ -23,6 +23,11 @@ All notable changes will be recorded here. The format follows
   the schedule on the timeline only, so the chosen style is not shown there). On
   a host build without scheduled-merge support the merge falls back to the #162
   diagnosis with a note that `--auto` did not schedule.
+- **`fj run rerun --failed` / `--job J`**: rerun just part of a run instead of
+  the whole thing. `--failed` reruns only the jobs that did not finish green;
+  `--job J` reruns a single job, where `J` is the index shown by `fj run view`.
+  The two are mutually exclusive, and bare `fj run rerun N` still reruns the
+  whole run. Both go through Forgejo's per-job web rerun route.
 - **`fj pr attach` / `pr create --attach` / `pr edit --attach`**: upload file
   attachments to a pull request and link them in the description. PRs share the
   issue index, so files post to `issues/{number}/assets`; image extensions are
