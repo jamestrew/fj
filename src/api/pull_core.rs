@@ -392,9 +392,7 @@ pub async fn cancel_auto_merge(
         "{}/pulls/{number}/merge",
         crate::api::repo_path(owner, name)
     );
-    client
-        .send(Method::DELETE, &path, &[], None::<&()>)
-        .await?;
+    client.send(Method::DELETE, &path, &[], None::<&()>).await?;
     Ok(())
 }
 
@@ -508,7 +506,10 @@ mod tests {
 
     #[test]
     fn not_pending_after_cancel() {
-        let events = vec![ev("pull_scheduled_merge"), ev("pull_cancel_scheduled_merge")];
+        let events = vec![
+            ev("pull_scheduled_merge"),
+            ev("pull_cancel_scheduled_merge"),
+        ];
         assert!(!has_pending_auto_merge(&events));
     }
 

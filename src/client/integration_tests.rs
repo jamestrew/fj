@@ -2244,6 +2244,7 @@ async fn pull_merge_posts_do_and_squash_fields() {
             title: Some("Squashed"),
             message: Some("all the things"),
             delete_branch: false,
+            auto: false,
         },
     )
     .await

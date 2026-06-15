@@ -886,9 +886,10 @@ async fn merge(args: MergeArgs, host: Option<&str>) -> Result<()> {
             // The endpoint 404s when nothing is scheduled; say so plainly
             // rather than surfacing a bare "not found".
             Err(e) => match e.downcast_ref::<crate::client::ApiError>() {
-                Some(api_err) if api_err.status == reqwest::StatusCode::NOT_FOUND => Err(
-                    anyhow!("PR #{} has no scheduled auto-merge to cancel.", args.number),
-                ),
+                Some(api_err) if api_err.status == reqwest::StatusCode::NOT_FOUND => Err(anyhow!(
+                    "PR #{} has no scheduled auto-merge to cancel.",
+                    args.number
+                )),
                 _ => Err(e),
             },
         };
@@ -1122,8 +1123,8 @@ mod tests {
             }
             other => panic!("expected pr merge, got {other:?}"),
         }
-        let cli =
-            Cli::try_parse_from(["fj", "pr", "merge", "12", "--disable-auto"]).expect("should parse");
+        let cli = Cli::try_parse_from(["fj", "pr", "merge", "12", "--disable-auto"])
+            .expect("should parse");
         if let Command::Pr(PrCmd {
             command: PrSub::Merge(a),
         }) = cli.command
