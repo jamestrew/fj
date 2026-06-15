@@ -62,6 +62,13 @@ All notable changes will be recorded here. The format follows
   spurious "not found". Forgejo has no `/issues/{n}/assignees` sub-resource, so
   the assignee list is now read and PATCHed onto the issue as a merged set
   (additive add, subtractive remove). Applies to `fj pr edit` too.
+- `fj pr merge` no longer reports a bare `405 Method Not Allowed` (or `500`) for
+  every non-mergeable PR. On failure it inspects the PR's mergeability and prints
+  the specific reason: merge conflicts with the base, a disabled merge style
+  (naming the allowed ones), a failing required check, missing approvals, an
+  out-of-date branch, or an already-merged/closed PR. When nothing specific is
+  found it falls back to the raw Forgejo message, which is now surfaced instead
+  of swallowed. `fj pr view` and `fj pr checks` gained a `Mergeable:` line.
 
 ## [0.2.0] - 2026-06-02
 

@@ -31,6 +31,16 @@ pub struct Repo {
     pub ssh_url: String,
     #[serde(default)]
     pub default_branch: String,
+    /// Allowed merge styles for this repo. Forgejo rejects a `--style` that is
+    /// not enabled with an opaque 405; these let the CLI name the allowed set.
+    #[serde(default = "default_true")]
+    pub allow_merge_commits: bool,
+    #[serde(default = "default_true")]
+    pub allow_rebase: bool,
+    #[serde(default = "default_true")]
+    pub allow_rebase_explicit: bool,
+    #[serde(default = "default_true")]
+    pub allow_squash_merge: bool,
     #[serde(default)]
     pub stars_count: u64,
     #[serde(default)]
@@ -38,6 +48,45 @@ pub struct Repo {
     #[serde(default)]
     pub open_issues_count: u64,
     pub updated_at: DateTime<Utc>,
+}
+
+/// Forgejo enables every merge style by default; a response that omits the
+/// `allow_*` flags should be read as "allowed", not "disabled", so the CLI
+/// never reports a style as blocked on incomplete data.
+fn default_true() -> bool {
+    true
+}
+
+impl Repo {
+    /// Whether `style` (a [`MergeStyle::as_str`] value: `merge`, `rebase`,
+    /// `rebase-merge`, `squash`) is enabled for this repo.
+    pub fn allows_style(&self, style: &str) -> bool {
+        match style {
+            "merge" => self.allow_merge_commits,
+            "rebase" => self.allow_rebase,
+            "rebase-merge" => self.allow_rebase_explicit,
+            "squash" => self.allow_squash_merge,
+            _ => true,
+        }
+    }
+
+    /// The enabled merge styles, as `--style` values, for an error hint.
+    pub fn allowed_styles(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.allow_merge_commits {
+            out.push("merge");
+        }
+        if self.allow_rebase {
+            out.push("rebase");
+        }
+        if self.allow_rebase_explicit {
+            out.push("rebase-merge");
+        }
+        if self.allow_squash_merge {
+            out.push("squash");
+        }
+        out
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Default)]

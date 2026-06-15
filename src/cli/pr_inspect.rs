@@ -103,6 +103,9 @@ pub async fn checks(args: InspectArgs, host: Option<&str>) -> Result<()> {
             &pr.head.sha[..7.min(pr.head.sha.len())]
         )),
     );
+    if let Some(line) = crate::cli::pr_merge_check::mergeable_line(&pr) {
+        println!("{line}");
+    }
     if cs.statuses.is_empty() {
         println!("(no per-check statuses reported)");
         return Ok(());

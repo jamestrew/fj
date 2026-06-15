@@ -27,6 +27,7 @@ pub mod pr;
 mod pr_args;
 pub(crate) mod pr_comment;
 mod pr_inspect;
+pub(crate) mod pr_merge_check;
 mod pr_review;
 mod pr_status;
 pub mod protect;

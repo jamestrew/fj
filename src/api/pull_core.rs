@@ -236,8 +236,7 @@ pub async fn update_branch(
         crate::api::repo_path(owner, name)
     );
     let q = vec![("style".to_string(), style.to_string())];
-    let res = client.request(Method::POST, &path, &q, None).await?;
-    res.error_for_status()?;
+    client.send(Method::POST, &path, &q, None::<&()>).await?;
     Ok(())
 }
 
@@ -323,15 +322,7 @@ pub async fn merge(
         message: opts.message,
         delete_branch_after_merge: opts.delete_branch,
     };
-    let res = client
-        .request(
-            Method::POST,
-            &path,
-            &[],
-            Some(&serde_json::to_value(&body)?),
-        )
-        .await?;
-    res.error_for_status()?;
+    client.send(Method::POST, &path, &[], Some(&body)).await?;
     Ok(())
 }
 

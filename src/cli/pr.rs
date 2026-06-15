@@ -8,7 +8,9 @@ use crate::api::pull::{CreatePull, EditPull, ListOptions};
 use crate::cli::context::{repo_web_url, resolve_repo, RepoFlag};
 use crate::cli::pr_args::{MergeStyleArg, ReviewEventArg, StateFilter, UpdateStyle};
 use crate::cli::pr_status::StatusArgs;
-use crate::cli::{list as list_output, pr_comment, pr_inspect, pr_review, pr_status};
+use crate::cli::{
+    list as list_output, pr_comment, pr_inspect, pr_merge_check, pr_review, pr_status,
+};
 use crate::git;
 use crate::output;
 
@@ -439,6 +441,9 @@ async fn view(args: ViewArgs, host: Option<&str>) -> Result<()> {
     if pr.draft {
         println!("Draft:    yes");
     }
+    if let Some(line) = pr_merge_check::mergeable_line(&pr) {
+        println!("{line}");
+    }
     if !pr.body.is_empty() {
         println!();
         println!("{}", pr.body);
@@ -794,21 +799,45 @@ async fn checkout(args: CheckoutArgs, host: Option<&str>) -> Result<()> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn merge(args: MergeArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
-    api::pull::merge(
+    let style: api::pull::MergeStyle = args.style.into();
+    let res = api::pull::merge(
         &ctx.client,
         &ctx.owner,
         &ctx.name,
         args.number,
-        args.style.into(),
+        style,
         &api::pull::MergeOptions {
             title: args.title.as_deref(),
             message: args.message.as_deref(),
             delete_branch: args.delete_branch,
         },
     )
-    .await?;
-    println!("✓ Merged PR #{}", args.number);
-    Ok(())
+    .await;
+    match res {
+        Ok(()) => {
+            println!("✓ Merged PR #{}", args.number);
+            Ok(())
+        }
+        // Forgejo returns an opaque 405/500 for every non-mergeable cause.
+        // Inspect the PR's mergeability detail and report the specific reason;
+        // fall back to the raw API error when nothing specific is found.
+        Err(e) => {
+            if let Ok(pr) = api::pull::get(&ctx.client, &ctx.owner, &ctx.name, args.number).await {
+                if let Some(reason) = pr_merge_check::diagnose_merge_failure(
+                    &ctx.client,
+                    &ctx.owner,
+                    &ctx.name,
+                    &pr,
+                    style.as_str(),
+                )
+                .await
+                {
+                    return Err(anyhow::anyhow!("{reason}"));
+                }
+            }
+            Err(e)
+        }
+    }
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
