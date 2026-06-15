@@ -92,6 +92,7 @@ Forgejo extensions of the Gitea base.
 - Branch protection rules (`fj protect`)
 - Mirrors (`fj repo mirror`)
 - Topics (`fj repo topics`)
+- Repository collaborators (`fj repo collaborator`)
 - Webhooks (`fj hook`), present in Gitea too, identical surface
 - Actions runs / secrets / variables (`fj run`, `fj secret`,
   `fj variable`)

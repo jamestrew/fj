@@ -3,10 +3,13 @@ use clap::{Args, Subcommand};
 
 use crate::api;
 use crate::cli::context::resolve_repo;
+use crate::cli::repo_collaborator::CollaboratorCmd;
 use crate::cli::repo_deploy_key::DeployKeyCmd;
 use crate::cli::repo_mirror::{MirrorArgs, MirrorSyncArgs};
 use crate::cli::repo_social::{SimpleRepoArgs, StarredArgs};
-use crate::cli::{list as list_output, repo_deploy_key, repo_mirror, repo_social};
+use crate::cli::{
+    list as list_output, repo_collaborator, repo_deploy_key, repo_mirror, repo_social,
+};
 use crate::client::Client;
 use crate::config::hosts::Hosts;
 use crate::git;
@@ -65,6 +68,8 @@ pub enum RepoSub {
     Starred(StarredArgs),
     /// Pin which repo `fj` targets in this directory (like `gh repo set-default`).
     SetDefault(SetDefaultArgs),
+    /// Manage repository collaborators.
+    Collaborator(CollaboratorCmd),
     /// Manage repository deploy keys.
     DeployKey(DeployKeyCmd),
 }
@@ -277,6 +282,7 @@ pub async fn run(cmd: RepoCmd, host: Option<&str>) -> Result<()> {
         RepoSub::Unstar(args) => repo_social::star(args, host, false).await,
         RepoSub::Starred(args) => repo_social::starred(args, host).await,
         RepoSub::SetDefault(args) => set_default(args).await,
+        RepoSub::Collaborator(cmd) => repo_collaborator::collaborator(cmd, host).await,
         RepoSub::DeployKey(cmd) => repo_deploy_key::deploy_key(cmd, host).await,
     }
 }

@@ -1543,6 +1543,102 @@ async fn repo_set_topics_puts_envelope() {
 }
 
 #[tokio::test]
+async fn repo_collaborator_list_decodes_permissions() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/collaborators"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {
+                "id": 1,
+                "login": "alice",
+                "full_name": "Alice Example",
+                "permissions": { "admin": false, "push": true, "pull": true }
+            },
+            {
+                "id": 2,
+                "login": "bob",
+                "permissions": { "admin": true, "push": true, "pull": true }
+            }
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+
+    let collaborators = crate::api::repo::list_collaborators(&c, "o", "r")
+        .await
+        .expect("collaborators");
+
+    assert_eq!(collaborators.len(), 2);
+    assert_eq!(collaborators[0].user.login, "alice");
+    assert_eq!(collaborators[0].permission_level(), "write");
+    assert_eq!(collaborators[1].permission_level(), "admin");
+}
+
+#[tokio::test]
+async fn repo_collaborator_add_puts_permission_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v1/repos/o/r/collaborators/alice"))
+        .and(body_json(json!({ "permission": "admin" })))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+
+    crate::api::repo::add_collaborator(
+        &c,
+        "o",
+        "r",
+        "alice",
+        crate::api::repo::CollaboratorPermission::Admin,
+    )
+    .await
+    .expect("add collaborator");
+}
+
+#[tokio::test]
+async fn repo_collaborator_remove_deletes_encoded_user() {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/repos/o/r/collaborators/alice%2Fbot"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+
+    crate::api::repo::remove_collaborator(&c, "o", "r", "alice/bot")
+        .await
+        .expect("remove collaborator");
+}
+
+#[tokio::test]
+async fn repo_collaborator_remove_not_found_is_clear() {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/repos/o/r/collaborators/alice"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "message": "not found"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+
+    let err = crate::api::repo::remove_collaborator(&c, "o", "r", "alice")
+        .await
+        .expect_err("remove should fail clearly");
+
+    assert!(
+        err.to_string()
+            .contains("'alice' is not a collaborator on o/r"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
 async fn repo_fork_posts_org_and_name() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

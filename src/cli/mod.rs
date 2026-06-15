@@ -34,6 +34,7 @@ mod pr_status;
 pub mod protect;
 pub mod release;
 pub mod repo;
+mod repo_collaborator;
 mod repo_deploy_key;
 mod repo_mirror;
 mod repo_social;
