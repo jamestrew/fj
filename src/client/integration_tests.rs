@@ -2194,6 +2194,230 @@ async fn pull_merge_sets_delete_branch_after_merge_when_requested() {
 }
 
 #[tokio::test]
+async fn pull_merge_surfaces_forgejo_message_on_405() {
+    // Regression for fj#159/#160: a non-mergeable merge must not collapse to a
+    // bare "405 Method Not Allowed"; the Forgejo `message` has to survive.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/pulls/9/merge"))
+        .respond_with(ResponseTemplate::new(405).set_body_json(json!({
+            "message": "The pull request can not be merged"
+        })))
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let err = crate::api::pull::merge(
+        &c,
+        "o",
+        "r",
+        9,
+        crate::api::pull::MergeStyle::Squash,
+        &crate::api::pull::MergeOptions::default(),
+    )
+    .await
+    .expect_err("merge should fail");
+    assert!(err.to_string().contains("can not be merged"), "got: {err}");
+}
+
+// ── pr merge failure diagnosis (cli::pr_merge_check) ──
+
+/// Build a pull JSON with the mergeability knobs the diagnosis reads.
+fn merge_diag_pull_json(
+    number: u64,
+    mergeable: bool,
+    draft: bool,
+    state: &str,
+) -> serde_json::Value {
+    json!({
+        "id": 1, "number": number, "title": "t", "state": state,
+        "user": { "id": 1, "login": "alice" },
+        "html_url": "https://x/o/r/pulls/1",
+        "head": { "ref": "feature", "sha": "abc1234" },
+        "base": { "ref": "main", "sha": "bbb" },
+        "draft": draft, "mergeable": mergeable, "merged": false,
+        "created_at": "2026-05-30T00:00:00Z",
+        "updated_at": "2026-05-30T00:01:00Z"
+    })
+}
+
+async fn run_merge_diagnose(server: &MockServer, number: u64, style: &str) -> Option<String> {
+    let c = client_for(server).await;
+    let pr = crate::api::pull::get(&c, "o", "r", number)
+        .await
+        .expect("get pull");
+    crate::cli::pr_merge_check::diagnose_merge_failure(&c, "o", "r", &pr, style).await
+}
+
+#[tokio::test]
+async fn diagnose_reports_disabled_merge_style() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/pulls/5"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(merge_diag_pull_json(5, true, false, "open")),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 1, "name": "r", "full_name": "o/r",
+            "owner": { "id": 1, "login": "o" },
+            "html_url": "h", "clone_url": "c", "ssh_url": "s",
+            "default_branch": "main",
+            "allow_merge_commits": false, "allow_rebase": false,
+            "allow_rebase_explicit": false, "allow_squash_merge": true,
+            "updated_at": "2026-05-30T00:00:00Z"
+        })))
+        .mount(&server)
+        .await;
+    // No branch protection on main.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/branch_protections/main"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+
+    let msg = run_merge_diagnose(&server, 5, "merge")
+        .await
+        .expect("a reason");
+    assert!(
+        msg.contains("merge style \"merge\" is not enabled"),
+        "got: {msg}"
+    );
+    assert!(msg.contains("allowed: squash"), "got: {msg}");
+}
+
+#[tokio::test]
+async fn diagnose_reports_merge_conflicts() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/pulls/6"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(merge_diag_pull_json(6, false, false, "open")),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 1, "name": "r", "full_name": "o/r",
+            "owner": { "id": 1, "login": "o" },
+            "html_url": "h", "clone_url": "c", "ssh_url": "s",
+            "default_branch": "main",
+            "updated_at": "2026-05-30T00:00:00Z"
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/branch_protections/main"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+
+    let msg = run_merge_diagnose(&server, 6, "squash")
+        .await
+        .expect("a reason");
+    assert!(msg.contains("merge conflicts with main"), "got: {msg}");
+}
+
+#[tokio::test]
+async fn diagnose_reports_failing_required_check() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/pulls/7"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(merge_diag_pull_json(7, true, false, "open")),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 1, "name": "r", "full_name": "o/r",
+            "owner": { "id": 1, "login": "o" },
+            "html_url": "h", "clone_url": "c", "ssh_url": "s",
+            "default_branch": "main",
+            "updated_at": "2026-05-30T00:00:00Z"
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/branch_protections/main"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "branch_name": "main",
+            "enable_status_check": true,
+            "status_check_contexts": ["ci/test"],
+            "required_approvals": 0
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/commits/abc1234/status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "state": "pending", "sha": "abc1234", "total_count": 1,
+            "statuses": [ { "status": "pending", "context": "ci/test" } ]
+        })))
+        .mount(&server)
+        .await;
+
+    let msg = run_merge_diagnose(&server, 7, "squash")
+        .await
+        .expect("a reason");
+    assert!(msg.contains("required check"), "got: {msg}");
+    assert!(msg.contains("ci/test"), "got: {msg}");
+    assert!(msg.contains("pending"), "got: {msg}");
+}
+
+#[tokio::test]
+async fn diagnose_reports_missing_approvals() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/pulls/8"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(merge_diag_pull_json(8, true, false, "open")),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 1, "name": "r", "full_name": "o/r",
+            "owner": { "id": 1, "login": "o" },
+            "html_url": "h", "clone_url": "c", "ssh_url": "s",
+            "default_branch": "main",
+            "updated_at": "2026-05-30T00:00:00Z"
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/branch_protections/main"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "branch_name": "main",
+            "required_approvals": 2,
+            "enable_status_check": false
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/pulls/8/reviews"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "id": 1, "state": "APPROVED", "user": { "id": 2, "login": "bob" },
+              "submitted_at": "2026-05-30T00:00:00Z", "html_url": "h" }
+        ])))
+        .mount(&server)
+        .await;
+
+    let msg = run_merge_diagnose(&server, 8, "squash")
+        .await
+        .expect("a reason");
+    assert!(
+        msg.contains("needs 2 approving review(s) but has 1"),
+        "got: {msg}"
+    );
+}
+
+#[tokio::test]
 async fn pull_files_decodes_changes() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))

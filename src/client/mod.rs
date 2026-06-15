@@ -372,6 +372,30 @@ impl Client {
             .context("decoding JSON response")
     }
 
+    /// Issue a request that returns no body we need to decode (merge, ready,
+    /// update-branch, …), mapping non-2xx to a typed [`ApiError`]. Unlike
+    /// `reqwest::Response::error_for_status`, this surfaces the parsed Forgejo
+    /// `message` (e.g. why a merge is not allowed) instead of a bare status.
+    pub async fn send<B>(
+        &self,
+        method: Method,
+        path: &str,
+        query: &[(String, String)],
+        body: Option<&B>,
+    ) -> Result<Response>
+    where
+        B: Serialize + ?Sized,
+    {
+        let body_value = match body {
+            Some(b) => Some(serde_json::to_value(b).context("serializing request body")?),
+            None => None,
+        };
+        let res = self
+            .request(method, path, query, body_value.as_ref())
+            .await?;
+        ensure_success(res).await
+    }
+
     /// GET that returns a single page along with pagination metadata.
     pub async fn get_page<T: DeserializeOwned>(
         &self,
