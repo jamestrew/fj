@@ -50,6 +50,7 @@ next rebuild. See `troubleshooting.md`.
 - Always pass `--body "..."` or `--body -` so `fj` never opens
   `$EDITOR`.
 - Pipe output through `--json` for parseable results.
+- Pass `--color=never` or set `NO_COLOR=1` when scripts need plain text.
 - Set `FJ_NO_PAGER=1` (or pass `--no-pager`).
 
 ## Can `fj` work without a git remote?
@@ -93,6 +94,12 @@ FJ_DEBUG=1 fj repo list -R foo/bar
 
 Stderr will show `→ GET https://… ?query` and `← 200 url` for every
 request, with a body preview if applicable.
+
+## How do I control color output?
+
+Use `--color=auto|always|never` for a single invocation. `auto` honors
+`NO_COLOR` and `FORCE_COLOR`, then `fj config set no_color true`, then terminal
+detection. The explicit flag wins over env and config.
 
 ## How do I customize the pager?
 
