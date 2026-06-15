@@ -7,8 +7,11 @@ use std::io::IsTerminal;
 use std::sync::OnceLock;
 
 use anyhow::Result;
+use clap::ValueEnum;
 
 static JSON_FIELDS: OnceLock<Vec<String>> = OnceLock::new();
+static COLOR_CHOICE: OnceLock<ColorChoice> = OnceLock::new();
+static CONFIG_NO_COLOR: OnceLock<bool> = OnceLock::new();
 
 /// Set the global `--json-fields` selector. Called once at startup from
 /// `cli::run`. After this, every `print_json` call routes through the filter.
@@ -27,8 +30,20 @@ fn json_fields() -> Option<&'static [String]> {
         .map(|v| v.as_slice())
 }
 use owo_colors::{OwoColorize, Style};
-use tabled::settings::{object::Columns, Alignment, Modify, Padding, Style as TStyle};
-use tabled::{builder::Builder, Table};
+use tabled::settings::{Alignment, Modify, Padding, Style as TStyle, object::Columns};
+use tabled::{Table, builder::Builder};
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
+pub enum ColorChoice {
+    Auto,
+    Always,
+    Never,
+}
+
+pub fn set_color_choice(choice: ColorChoice, config_no_color: bool) {
+    let _ = COLOR_CHOICE.set(choice);
+    let _ = CONFIG_NO_COLOR.set(config_no_color);
+}
 
 #[allow(dead_code)]
 pub fn stdout_is_tty() -> bool {
@@ -36,7 +51,43 @@ pub fn stdout_is_tty() -> bool {
 }
 
 pub fn supports_color() -> bool {
-    supports_color::on(supports_color::Stream::Stdout).is_some()
+    supports_color_with(
+        *COLOR_CHOICE.get().unwrap_or(&ColorChoice::Auto),
+        env_color_override,
+        || *CONFIG_NO_COLOR.get().unwrap_or(&false),
+        || supports_color::on(supports_color::Stream::Stdout).is_some(),
+    )
+}
+
+fn supports_color_with(
+    choice: ColorChoice,
+    env_override: impl FnOnce() -> Option<bool>,
+    config_no_color: impl FnOnce() -> bool,
+    terminal_supports_color: impl FnOnce() -> bool,
+) -> bool {
+    match choice {
+        ColorChoice::Always => true,
+        ColorChoice::Never => false,
+        ColorChoice::Auto => {
+            if let Some(enabled) = env_override() {
+                return enabled;
+            }
+            if config_no_color() {
+                return false;
+            }
+            terminal_supports_color()
+        }
+    }
+}
+
+fn env_color_override() -> Option<bool> {
+    if std::env::var_os("NO_COLOR").is_some() {
+        return Some(false);
+    }
+    match std::env::var("FORCE_COLOR") {
+        Ok(value) if !value.is_empty() && value != "0" => Some(true),
+        _ => None,
+    }
 }
 
 /// Pretty-print a list as a borderless gh-style table. Header row is
@@ -230,6 +281,64 @@ mod tests {
         for word in ["success", "failure", "cancelled", "running"] {
             assert_eq!(plain(&action_status(word)), word);
         }
+    }
+
+    #[test]
+    fn color_choice_overrides_env_config_and_tty() {
+        assert!(supports_color_with(
+            ColorChoice::Always,
+            || Some(false),
+            || true,
+            || false
+        ));
+        assert!(!supports_color_with(
+            ColorChoice::Never,
+            || Some(true),
+            || false,
+            || true
+        ));
+    }
+
+    #[test]
+    fn color_auto_honors_env_before_config() {
+        assert!(!supports_color_with(
+            ColorChoice::Auto,
+            || Some(false),
+            || false,
+            || true
+        ));
+        assert!(supports_color_with(
+            ColorChoice::Auto,
+            || Some(true),
+            || true,
+            || false
+        ));
+    }
+
+    #[test]
+    fn color_auto_honors_no_color_config_before_tty() {
+        assert!(!supports_color_with(
+            ColorChoice::Auto,
+            || None,
+            || true,
+            || true
+        ));
+    }
+
+    #[test]
+    fn color_auto_falls_back_to_terminal_support() {
+        assert!(supports_color_with(
+            ColorChoice::Auto,
+            || None,
+            || false,
+            || true
+        ));
+        assert!(!supports_color_with(
+            ColorChoice::Auto,
+            || None,
+            || false,
+            || false
+        ));
     }
 
     #[test]

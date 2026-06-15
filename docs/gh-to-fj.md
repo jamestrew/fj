@@ -155,5 +155,6 @@ called out.
 | --------------------------------- | --------------------------------- |
 | `gh ... --hostname`               | `fj ... --host` (also `FJ_HOST`)  |
 | (n/a)                             | `fj ... --debug` (or `FJ_DEBUG`)  |
+| `gh ... --color <when>`           | `fj ... --color <auto|always|never>` |
 | (gh uses `less` by default)       | `fj ... --no-pager` / `FJ_NO_PAGER` / `FJ_PAGER` |
 | `gh ... --json field,field`       | `fj ... --json --json-fields field,field` (global flag, gh-style projection) |

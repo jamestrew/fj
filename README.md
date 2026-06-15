@@ -177,7 +177,11 @@ Run `fj --help` for the live list; every group has its own `--help`.
 | Preview         | `work`, `stack`, `agent`                                        |
 
 **Global flags** (work on every command): `--host` / `FJ_HOST`, `--debug`,
-`--no-pager`, and `--json-fields`.
+`--color`, `--no-pager`, and `--json-fields`.
+
+`--color=auto|always|never` controls ANSI color output. Precedence is
+`--color`, then `NO_COLOR` / `FORCE_COLOR`, then `fj config set no_color true`,
+then terminal detection.
 
 `--json` applies to data-returning commands such as `list`, `view`, and other
 commands that document JSON output. `--web` applies to list/view commands that
@@ -189,7 +193,7 @@ can open results in the browser.
 | -------- | ---- |
 | `$XDG_CONFIG_HOME/fj/hosts.toml` (`~/Library/Application Support/fj/hosts.toml` on macOS) | host registry + current default |
 | `$XDG_CONFIG_HOME/fj/aliases.toml` | user-defined command shortcuts |
-| `$XDG_CONFIG_HOME/fj/config.toml` | editor / pager / browser preferences |
+| `$XDG_CONFIG_HOME/fj/config.toml` | editor / pager / browser / color preferences |
 | OS keychain, service `fj`, key = hostname | Preferred persistent API token store |
 | `$XDG_CONFIG_HOME/fj/tokens.toml` | 0600 fallback token store when the OS keychain is unavailable |
 | `FJ_TOKEN` | Process-scoped token override for headless/CI jobs; checked before persistent stores |

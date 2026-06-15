@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
 
@@ -94,6 +94,19 @@ pub fn lookup(key: &str, env_fallback: Option<&str>) -> Option<String> {
     load().ok().and_then(|c| c.values.get(key).cloned())
 }
 
+pub fn no_color_enabled() -> bool {
+    lookup("no_color", None)
+        .map(|value| matches_truthy(&value))
+        .unwrap_or(false)
+}
+
+fn matches_truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 pub async fn run(cmd: ConfigCmd) -> Result<()> {
     match cmd.command {
         ConfigSub::Get(args) => {
@@ -132,6 +145,21 @@ pub async fn run(cmd: ConfigCmd) -> Result<()> {
         ConfigSub::Path => {
             println!("{}", config_path()?.display());
             Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_color_truthy_values_are_recognized() {
+        for value in ["true", "TRUE", "1", "yes", "on", " on "] {
+            assert!(matches_truthy(value), "{value:?} should be truthy");
+        }
+        for value in ["false", "0", "no", "off", ""] {
+            assert!(!matches_truthy(value), "{value:?} should not be truthy");
         }
     }
 }

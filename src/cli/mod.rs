@@ -53,6 +53,8 @@ mod workflow_variable;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+use crate::output::ColorChoice;
+
 /// `fj` — command-line tool for Forgejo.
 #[derive(Debug, Parser)]
 #[command(
@@ -66,7 +68,7 @@ secrets, variables), plus stacked-PR and working-session helpers.\n\
 \n\
 Most subcommands accept -R <owner>/<name> and otherwise infer the repository from the current \
 git remote (preferring `upstream`, then `origin`). Authenticate once with `fj auth login`. Global \
-flags --host, --debug, --no-pager, and --json-fields work on every command.\n\
+flags --host, --debug, --color, --no-pager, and --json-fields work on every command.\n\
 \n\
 Examples:\n\
 \n\
@@ -93,6 +95,10 @@ pub struct Cli {
     /// Log every HTTP request fj makes to stderr.
     #[arg(long, global = true, env = "FJ_DEBUG")]
     pub debug: bool,
+
+    /// When to use ANSI color in output.
+    #[arg(long, global = true, value_enum, default_value = "auto")]
+    pub color: ColorChoice,
 
     /// Skip piping long output through `$FJ_PAGER` / `$PAGER` (default: less).
     #[arg(long, global = true)]
@@ -191,6 +197,7 @@ pub struct CompletionArgs {
 
 pub async fn run(cli: Cli) -> Result<()> {
     crate::client::set_debug(cli.debug);
+    crate::output::set_color_choice(cli.color, config::no_color_enabled());
     crate::output::set_json_fields(cli.json_fields.as_deref());
     // Page commands whose output can run long. Pass `cli.no_pager` through
     // explicitly so we don't have to mutate the process environment to opt
