@@ -22,6 +22,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
 thiserror = "2"
 clap = { version = "4.5", features = ["derive", "env", "wrap_help", "suggestions"] }
 clap_complete = "4.5"

@@ -3632,6 +3632,90 @@ async fn protect_delete_succeeds_on_204() {
         .expect("delete");
 }
 
+// ---- templates ----
+
+fn repo_json() -> serde_json::Value {
+    json!({
+        "id": 42,
+        "name": "r",
+        "full_name": "o/r",
+        "owner": { "id": 1, "login": "o" },
+        "html_url": "https://x/o/r",
+        "clone_url": "https://x/o/r.git",
+        "ssh_url": "git@x:o/r.git",
+        "default_branch": "main",
+        "updated_at": "2026-05-30T00:00:00Z"
+    })
+}
+
+fn content_file(path_value: &str, body: &str) -> serde_json::Value {
+    use base64::Engine;
+    let name = path_value.rsplit('/').next().unwrap_or(path_value);
+    json!({
+        "name": name,
+        "path": path_value,
+        "type": "file",
+        "encoding": "base64",
+        "content": base64::engine::general_purpose::STANDARD.encode(body),
+    })
+}
+
+#[tokio::test]
+async fn template_list_uses_issue_templates_api_when_available() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/issue_templates"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {
+                "name": "Bug report",
+                "file_name": ".forgejo/issue_template/bug.md",
+                "content": "\n## What happened\n"
+            }
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let templates =
+        crate::api::template::list(&c, "o", "r", crate::api::template::TemplateKind::Issue)
+            .await
+            .expect("templates");
+    assert_eq!(templates.len(), 1);
+    assert_eq!(templates[0].name, "Bug report");
+    assert_eq!(templates[0].content, "## What happened");
+}
+
+#[tokio::test]
+async fn template_list_falls_back_to_pr_template_file_on_default_branch() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(repo_json()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/api/v1/repos/o/r/contents/.forgejo/pull_request_template.md",
+        ))
+        .and(query_param("ref", "main"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(content_file(
+            ".forgejo/pull_request_template.md",
+            "## Summary\n",
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let templates =
+        crate::api::template::list(&c, "o", "r", crate::api::template::TemplateKind::Pull)
+            .await
+            .expect("templates");
+    assert_eq!(templates.len(), 1);
+    assert_eq!(templates[0].name, "pull_request_template");
+    assert_eq!(templates[0].content, "## Summary");
+}
+
 // ---- issues ----
 
 fn issue_json(number: u64, title: &str, state: &str) -> serde_json::Value {

@@ -5,7 +5,9 @@ use clap::{ArgAction, Args, Subcommand};
 
 use crate::api;
 use crate::api::pull::{CreatePull, EditPull, ListOptions};
+use crate::api::template::TemplateKind;
 use crate::cli::context::{repo_web_url, resolve_repo, RepoFlag};
+use crate::cli::create_template;
 use crate::cli::pr_args::{MergeStyleArg, ReviewEventArg, StateFilter, UpdateStyle};
 use crate::cli::pr_fill::{self, FillMode};
 use crate::cli::pr_status::StatusArgs;
@@ -152,6 +154,9 @@ pub struct CreateArgs {
     /// Read body from file (use `-` for stdin).
     #[arg(short = 'F', long = "body-file", value_name = "FILE")]
     pub body_file: Option<String>,
+    /// Preload the pull request body from a repository PR template.
+    #[arg(long, value_name = "NAME", num_args = 0..=1)]
+    pub template: Option<Option<String>>,
     /// Fill title and body from the commits in `base..head` (no API call).
     /// Single commit: its subject and message body. Multiple: the first
     /// subject as the title, a bullet list of subjects as the body.
@@ -542,14 +547,24 @@ async fn create(args: CreateArgs, host: Option<&str>) -> Result<()> {
     if title.trim().is_empty() {
         return Err(anyhow!("title is required"));
     }
+    let template_body = create_template::resolve(
+        &ctx.client,
+        &ctx.owner,
+        &ctx.name,
+        TemplateKind::Pull,
+        args.template,
+    )
+    .await?;
     // Body precedence: an explicit --body / --body-file wins; otherwise the
-    // filled body (if any); otherwise open the editor as before.
+    // filled body (if any); otherwise open the editor seeded by --template.
     let body = match &filled {
-        Some(f) if args.body.is_none() && args.body_file.is_none() => f.body.clone(),
+        Some(f) if args.body.is_none() && args.body_file.is_none() && f.body.is_some() => {
+            f.body.clone()
+        }
         _ => editor::resolve_body_input(
             args.body.as_deref(),
             args.body_file.as_deref(),
-            Some(("PR_BODY.md", "")),
+            Some(("PR_BODY.md", template_body.as_deref().unwrap_or(""))),
         )?,
     };
     let label_names = clean_csv_values(args.label);
@@ -1198,6 +1213,28 @@ mod tests {
                 assert_eq!(a.label, vec!["area/api", "needs-review", "wip"]);
                 assert_eq!(a.assignee, vec!["alice", "bob"]);
             }
+            other => panic!("expected pr create, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_parses_template_with_and_without_name() {
+        use crate::cli::{Cli, Command};
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["fj", "pr", "create", "--template", "default"])
+            .expect("should parse");
+        match cli.command {
+            Command::Pr(PrCmd {
+                command: PrSub::Create(a),
+            }) => assert_eq!(a.template, Some(Some("default".into()))),
+            other => panic!("expected pr create, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["fj", "pr", "create", "--template"]).expect("should parse");
+        match cli.command {
+            Command::Pr(PrCmd {
+                command: PrSub::Create(a),
+            }) => assert_eq!(a.template, Some(None)),
             other => panic!("expected pr create, got {other:?}"),
         }
     }

@@ -3,7 +3,9 @@ use clap::{Args, Subcommand, ValueEnum};
 
 use crate::api;
 use crate::api::issue::{CreateIssue, EditIssue, ListOptions, State};
+use crate::api::template::TemplateKind;
 use crate::cli::context::{repo_web_url, resolve_repo, RepoFlag};
+use crate::cli::create_template;
 use crate::cli::issue_comment::{self, CommentArgs, DeleteCommentArgs, EditCommentArgs};
 use crate::cli::list as list_output;
 use crate::client::{ApiError, Page};
@@ -134,6 +136,9 @@ pub struct CreateArgs {
     /// Read body from file (use `-` for stdin).
     #[arg(short = 'F', long = "body-file", value_name = "FILE")]
     pub body_file: Option<String>,
+    /// Preload the issue body from a repository issue template.
+    #[arg(long, value_name = "NAME", num_args = 0..=1)]
+    pub template: Option<Option<String>>,
     /// Label name to add. Repeat or use commas for multiple labels.
     #[arg(
         short = 'l',
@@ -397,10 +402,18 @@ async fn create(args: CreateArgs, host: Option<&str>) -> Result<()> {
     if title.trim().is_empty() {
         return Err(anyhow!("title is required"));
     }
+    let template_body = create_template::resolve(
+        &ctx.client,
+        &ctx.owner,
+        &ctx.name,
+        TemplateKind::Issue,
+        args.template,
+    )
+    .await?;
     let body = editor::resolve_body_input(
         args.body.as_deref(),
         args.body_file.as_deref(),
-        Some(("ISSUE_BODY.md", "")),
+        Some(("ISSUE_BODY.md", template_body.as_deref().unwrap_or(""))),
     )?;
     let label_names = clean_csv_values(args.label);
     let labels = if label_names.is_empty() {
@@ -650,6 +663,29 @@ mod tests {
                 assert_eq!(a.mentioned.as_deref(), Some("alice"));
             }
             other => panic!("expected issue list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_parses_template_with_and_without_name() {
+        use crate::cli::{Cli, Command};
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["fj", "issue", "create", "--template", "bug"])
+            .expect("should parse");
+        match cli.command {
+            Command::Issue(IssueCmd {
+                command: IssueSub::Create(a),
+            }) => assert_eq!(a.template, Some(Some("bug".into()))),
+            other => panic!("expected issue create, got {other:?}"),
+        }
+
+        let cli =
+            Cli::try_parse_from(["fj", "issue", "create", "--template"]).expect("should parse");
+        match cli.command {
+            Command::Issue(IssueCmd {
+                command: IssueSub::Create(a),
+            }) => assert_eq!(a.template, Some(None)),
+            other => panic!("expected issue create, got {other:?}"),
         }
     }
 

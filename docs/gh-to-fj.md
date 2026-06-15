@@ -44,7 +44,7 @@ called out.
 | --------------------------------- | --------------------------------- | ----------------------------------------------- |
 | `gh issue list`                   | `fj issue list`                   | Supports `--milestone` and `--mentioned`.       |
 | `gh issue view N`                 | `fj issue view N`                 |                                                 |
-| `gh issue create`                 | `fj issue create`                 | Omit `--body` to open `$EDITOR`.                |
+| `gh issue create`                 | `fj issue create`                 | Omit `--body` to open `$EDITOR`; `--template [NAME]` seeds repo templates. |
 | `gh issue edit N`                 | `fj issue edit N`                 |                                                 |
 | `gh issue close N`                | `fj issue close N`                |                                                 |
 | `gh issue reopen N`               | `fj issue reopen N`               |                                                 |
@@ -59,7 +59,7 @@ called out.
 | --------------------------------- | --------------------------------- | ----------------------------------------------- |
 | `gh pr list`                      | `fj pr list`                      | Supports `--base`, `--head`, `--draft`, `--no-draft`. |
 | `gh pr view N`                    | `fj pr view N`                    | `--comments` shows reviews + issue comments.    |
-| `gh pr create`                    | `fj pr create`                    | Head defaults to current branch.                |
+| `gh pr create`                    | `fj pr create`                    | Head defaults to current branch; `--template [NAME]` seeds repo templates. |
 | `gh pr create --fill`             | `fj pr create --fill`             | Title and body from the commits in `base..head`; `--fill-first` uses only the first commit. `--title` / `--body` / `-F` override. |
 | `gh pr edit N`                    | `fj pr edit N`                    | `--attach FILE` uploads files and links them in the body. |
 | _(no equivalent)_                 | `fj pr attach N FILE...`          | Uploads attachments and appends links to the description. |
