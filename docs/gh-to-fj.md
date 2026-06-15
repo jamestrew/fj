@@ -32,6 +32,9 @@ called out.
 | `gh repo delete`                  | `fj repo delete`                  | Requires typing the slug to confirm.            |
 | (n/a)                             | `fj repo branches`                |                                                 |
 | (n/a)                             | `fj repo topics --set a,b,c`      |                                                 |
+| `gh repo list-collaborators`      | `fj repo collaborator list`       | Shows permission level.                         |
+| (n/a)                             | `fj repo collaborator add USER --permission write` | Adds or updates access.             |
+| (n/a)                             | `fj repo collaborator remove USER` | Revokes repository access.                     |
 | (n/a)                             | `fj repo mirror <source-url>`     | Forgejo migrate/mirror endpoint.                |
 | `gh repo set-default`             | `fj repo set-default owner/name`  | Pins `fj.resolved` in local git config; `--view`/`--unset`. |
 | `gh repo deploy-key list`         | `fj repo deploy-key list`         |                                                 |

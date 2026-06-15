@@ -11,6 +11,7 @@ mod pull_review;
 mod pull_status;
 pub mod release;
 pub mod repo;
+mod repo_collaborators;
 mod repo_core;
 mod repo_keys;
 mod repo_social;
