@@ -608,7 +608,7 @@ pub(crate) fn check_body_size(res: &Response) -> Result<()> {
     Ok(())
 }
 
-async fn ensure_success(res: Response) -> Result<Response> {
+pub(crate) async fn ensure_success(res: Response) -> Result<Response> {
     let status = res.status();
     check_body_size(&res)?;
     if status.is_success() {

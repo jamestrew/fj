@@ -12,6 +12,7 @@ pub mod branch;
 pub mod browse;
 pub mod config;
 pub mod context;
+mod create_template;
 pub mod editor;
 pub mod extension;
 pub mod hook;

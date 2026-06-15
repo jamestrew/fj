@@ -78,12 +78,15 @@ fj repo view                             # auto-detects the repo from your git r
 fj pr list --state all -L 10             # latest 10 PRs
 fj pr list --base main --no-draft        # branch/draft filters
 fj issue list --milestone v1 --mentioned alice
-fj issue create --title "..." --body "..."
+fj issue create --template bug            # seed body from repo templates
+fj pr create --template                   # choose a PR template interactively
 fj api /version                          # raw API escape hatch
 ```
 
 `-R/--repo` is always optional inside a clone (fj reads `origin` then
-`upstream` to find the slug). Outside a clone, pass it explicitly.
+`upstream` to find the slug). Outside a clone, pass it explicitly. `create
+--template` uses Forgejo's issue-template API when present and falls back to
+reading template files from the repository's default branch.
 
 ## Everyday workflows
 
