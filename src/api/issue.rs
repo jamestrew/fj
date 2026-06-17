@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
 
-use crate::client::{Client, Page};
+use crate::client::{ensure_success, Client, Page};
 
 use super::user::User;
 
@@ -318,7 +318,7 @@ pub async fn delete_comment(
         crate::api::repo_path(owner, name)
     );
     let res = client.request(Method::DELETE, &path, &[], None).await?;
-    res.error_for_status()?;
+    ensure_success(res).await?;
     Ok(())
 }
 

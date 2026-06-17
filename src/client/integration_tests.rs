@@ -4415,6 +4415,24 @@ async fn issue_delete_and_pin_use_right_verbs() {
         .expect("delete");
 }
 
+#[tokio::test]
+async fn issue_delete_comment_missing_is_not_found() {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/repos/o/r/issues/comments/11"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "message": "not found"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let err = crate::api::issue::delete_comment(&c, "o", "r", 11)
+        .await
+        .expect_err("should fail");
+    assert!(err.to_string().to_lowercase().contains("not found"));
+}
+
 // ---- actions: artifacts + workflow files ----
 
 #[tokio::test]
