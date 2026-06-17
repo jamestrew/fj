@@ -463,6 +463,95 @@ pub async fn list_workflows(client: &Client, owner: &str, name: &str) -> Result<
     Ok(out)
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Workflow {
+    #[serde(default)]
+    #[serde(deserialize_with = "crate::api::serde_util::string_or_number")]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default, rename = "html_url")]
+    pub html_url: String,
+    #[serde(default)]
+    pub badge_url: String,
+    #[serde(default, alias = "created")]
+    pub created_at: Option<DateTime<Utc>>,
+    #[serde(default, alias = "updated")]
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+pub async fn get_workflow(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    workflow: &str,
+) -> Result<Workflow> {
+    let path = workflow_path(owner, name, workflow, None);
+    client.json(Method::GET, &path, &[], None::<&()>).await
+}
+
+pub async fn enable_workflow(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    workflow: &str,
+) -> Result<()> {
+    set_workflow_state(client, owner, name, workflow, "enable").await
+}
+
+pub async fn disable_workflow(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    workflow: &str,
+) -> Result<()> {
+    set_workflow_state(client, owner, name, workflow, "disable").await
+}
+
+fn workflow_path(owner: &str, name: &str, workflow: &str, action: Option<&str>) -> String {
+    let base = format!(
+        "{}/actions/workflows/{}",
+        crate::api::repo_path(owner, name),
+        crate::api::path_segment(workflow)
+    );
+    match action {
+        Some(action) => format!("{base}/{action}"),
+        None => base,
+    }
+}
+
+async fn set_workflow_state(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    workflow: &str,
+    action: &str,
+) -> Result<()> {
+    let path = workflow_path(owner, name, workflow, Some(action));
+    let res = client.request(Method::PUT, &path, &[], None).await?;
+    let status = res.status();
+    if !status.is_success() {
+        let body = res.text().await.unwrap_or_default();
+        let detail = body.trim();
+        return Err(anyhow!(
+            "could not {action} `{workflow}` (HTTP {}){}",
+            status.as_u16(),
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {detail}")
+            }
+        ));
+    }
+    Ok(())
+}
+
 // `rerun` and `cancel` have NO `/api/v1` endpoint on any Forgejo (the API only
 // lists/gets runs; see the run-logs section below). They exist only as web
 // actions, and Forgejo answers a PAT-authenticated POST to them with a
@@ -535,4 +624,25 @@ async fn post_run_action(
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workflow_path_without_action_encodes_segments() {
+        assert_eq!(
+            workflow_path("owner name", "repo/name", "ci.yml", None),
+            "/api/v1/repos/owner%20name/repo%2Fname/actions/workflows/ci.yml"
+        );
+    }
+
+    #[test]
+    fn workflow_path_with_action() {
+        assert_eq!(
+            workflow_path("owner", "repo", "sub/ci.yml", Some("enable")),
+            "/api/v1/repos/owner/repo/actions/workflows/sub%2Fci.yml/enable"
+        );
+    }
 }
