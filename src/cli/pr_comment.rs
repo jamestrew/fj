@@ -8,8 +8,6 @@
 //! status-comment pattern needs: a bot posts "build running" once, then edits
 //! that same comment to "build green" without juggling the comment id itself.
 
-use std::io::Read as _;
-
 use anyhow::{anyhow, Result};
 use clap::{Args, Subcommand};
 
@@ -46,6 +44,14 @@ pub struct AddArgs {
     /// Comment body. Use `-` to read from stdin. Omit to open `$EDITOR`.
     #[arg(short = 'b', long)]
     pub body: Option<String>,
+    /// Read body from file (use `-` for stdin).
+    #[arg(
+        short = 'F',
+        long = "body-file",
+        value_name = "FILE",
+        conflicts_with = "body"
+    )]
+    pub body_file: Option<String>,
     /// Edit your most recent comment on the PR instead of posting a new one.
     /// Errors if you have no comment yet (unless --create-if-none).
     #[arg(long)]
@@ -68,6 +74,14 @@ pub struct EditArgs {
     /// New body. Use `-` to read from stdin. Omit to open `$EDITOR`.
     #[arg(short = 'b', long)]
     pub body: Option<String>,
+    /// Read body from file (use `-` for stdin).
+    #[arg(
+        short = 'F',
+        long = "body-file",
+        value_name = "FILE",
+        conflicts_with = "body"
+    )]
+    pub body_file: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -100,16 +114,9 @@ pub fn last_own_comment<'a>(comments: &'a [Comment], login: &str) -> Option<&'a 
         .max_by_key(|c| c.id)
 }
 
-fn read_body(body: Option<&str>) -> Result<String> {
-    let text = match body {
-        Some("-") => {
-            let mut buf = String::new();
-            std::io::stdin().read_to_string(&mut buf)?;
-            buf
-        }
-        Some(s) => s.to_string(),
-        None => editor::edit_text("PR_COMMENT.md", "")?,
-    };
+fn read_body(body: Option<&str>, body_file: Option<&str>) -> Result<String> {
+    let text = editor::resolve_body_input(body, body_file, Some(("PR_COMMENT.md", "")))?
+        .ok_or_else(|| anyhow!("comment body is empty"))?;
     if text.trim().is_empty() {
         return Err(anyhow!("comment body is empty"));
     }
@@ -127,7 +134,7 @@ async fn add(args: AddArgs, host: Option<&str>) -> Result<()> {
         let comments =
             api::issue::list_comments(&ctx.client, &ctx.owner, &ctx.name, args.number).await?;
         if let Some(existing) = last_own_comment(&comments, &me.login) {
-            let body = read_body(args.body.as_deref())?;
+            let body = read_body(args.body.as_deref(), args.body_file.as_deref())?;
             let c =
                 api::issue::edit_comment(&ctx.client, &ctx.owner, &ctx.name, existing.id, &body)
                     .await?;
@@ -147,7 +154,7 @@ async fn add(args: AddArgs, host: Option<&str>) -> Result<()> {
         // No existing comment but creation is allowed: fall through to post.
     }
 
-    let body = read_body(args.body.as_deref())?;
+    let body = read_body(args.body.as_deref(), args.body_file.as_deref())?;
     let c = api::issue::comment(&ctx.client, &ctx.owner, &ctx.name, args.number, &body).await?;
     println!("✓ Commented on #{} ({})", args.number, c.html_url);
     Ok(())
@@ -156,7 +163,7 @@ async fn add(args: AddArgs, host: Option<&str>) -> Result<()> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn edit(args: EditArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
-    let body = read_body(args.body.as_deref())?;
+    let body = read_body(args.body.as_deref(), args.body_file.as_deref())?;
     let c = api::issue::edit_comment(&ctx.client, &ctx.owner, &ctx.name, args.comment_id, &body)
         .await?;
     println!("✓ Updated comment {} ({})", c.id, c.html_url);
@@ -183,7 +190,11 @@ async fn delete(args: DeleteArgs, host: Option<&str>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::pr::{PrCmd, PrSub};
+    use crate::cli::{Cli, Command};
     use chrono::Utc;
+    use clap::Parser;
+    use std::io::Write;
 
     fn comment(id: u64, login: &str) -> Comment {
         Comment {
@@ -218,5 +229,67 @@ mod tests {
     #[test]
     fn last_own_comment_none_on_empty() {
         assert!(last_own_comment(&[], "alice").is_none());
+    }
+
+    #[test]
+    fn add_comment_parses_body_file_and_stdin() {
+        let cli = Cli::try_parse_from([
+            "fj",
+            "pr",
+            "comment",
+            "33",
+            "--body-file",
+            "path/to/body.md",
+        ])
+        .expect("should parse");
+        match cli.command {
+            Command::Pr(PrCmd {
+                command: PrSub::Comment(cmd),
+            }) => match cmd.action {
+                None => {
+                    assert_eq!(cmd.add.body_file.as_deref(), Some("path/to/body.md"));
+                    assert_eq!(cmd.add.body, None);
+                }
+                Some(_) => panic!("expected default add action"),
+            },
+            other => panic!("expected pr comment add, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["fj", "pr", "comment", "33", "--body", "-"])
+            .expect("should parse");
+        match cli.command {
+            Command::Pr(PrCmd {
+                command: PrSub::Comment(cmd),
+            }) => match cmd.action {
+                None => assert_eq!(cmd.add.body.as_deref(), Some("-")),
+                Some(_) => panic!("expected default add action"),
+            },
+            other => panic!("expected pr comment add, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn add_comment_rejects_body_and_body_file_together() {
+        let err = Cli::try_parse_from([
+            "fj",
+            "pr",
+            "comment",
+            "33",
+            "--body",
+            "inline",
+            "--body-file",
+            "path/to/body.md",
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("cannot be used with"));
+    }
+
+    #[test]
+    fn edit_comment_reads_body_file() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"edited comment body\n").unwrap();
+
+        let body = read_body(None, Some(file.path().to_str().unwrap())).unwrap();
+        assert_eq!(body, "edited comment body");
     }
 }
