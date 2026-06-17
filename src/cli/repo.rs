@@ -8,7 +8,7 @@ use crate::cli::repo_deploy_key::DeployKeyCmd;
 use crate::cli::repo_mirror::{MirrorArgs, MirrorSyncArgs};
 use crate::cli::repo_social::{SimpleRepoArgs, StarredArgs};
 use crate::cli::{
-    list as list_output, repo_collaborator, repo_deploy_key, repo_mirror, repo_social,
+    branch, list as list_output, repo_collaborator, repo_deploy_key, repo_mirror, repo_social,
 };
 use crate::client::Client;
 use crate::config::hosts::Hosts;
@@ -48,7 +48,7 @@ pub enum RepoSub {
     Unarchive(ArchiveArgs),
     /// Delete a repository. Destructive.
     Delete(DeleteArgs),
-    /// List branches.
+    /// List, create, or delete branches.
     Branches(BranchesArgs),
     /// Manage repo topics (tags).
     Topics(TopicsArgs),
@@ -236,6 +236,8 @@ pub struct DeleteArgs {
 
 #[derive(Debug, Args)]
 pub struct BranchesArgs {
+    #[command(subcommand)]
+    pub command: Option<RepoBranchesSub>,
     /// Repository as owner/name
     pub repo: Option<String>,
     /// Alias for the positional repo arg
@@ -244,6 +246,14 @@ pub struct BranchesArgs {
     /// Emit JSON instead of a table
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RepoBranchesSub {
+    /// Create a branch.
+    Create(branch::BranchCreateArgs),
+    /// Delete a branch.
+    Delete(branch::BranchDeleteArgs),
 }
 
 #[derive(Debug, Args)]
@@ -581,6 +591,17 @@ async fn delete(args: DeleteArgs, host: Option<&str>) -> Result<()> {
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn branches(args: BranchesArgs, host: Option<&str>) -> Result<()> {
+    if let Some(command) = args.command {
+        match command {
+            RepoBranchesSub::Create(args) => return branch::create(args, host).await,
+            RepoBranchesSub::Delete(args) => return branch::delete(args, host).await,
+        }
+    }
+    list_branches(args, host).await
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn list_branches(args: BranchesArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(pick_repo(args.repo.as_ref(), args.repo_flag.as_ref()), host)?;
     let bs = api::repo::list_branches(&ctx.client, &ctx.owner, &ctx.name).await?;
     if args.json {
@@ -639,6 +660,8 @@ async fn topics(args: TopicsArgs, host: Option<&str>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::{Cli, Command};
+    use clap::Parser;
 
     #[test]
     fn pick_repo_prefers_the_flag_over_positional() {
@@ -656,5 +679,72 @@ mod tests {
     #[test]
     fn pick_repo_none_when_neither() {
         assert_eq!(pick_repo(None, None), None);
+    }
+
+    #[test]
+    fn branches_default_path_lists() {
+        let cli = Cli::try_parse_from(["fj", "repo", "branches", "owner/repo", "--json"])
+            .expect("should parse");
+        match cli.command {
+            Command::Repo(RepoCmd {
+                command:
+                    RepoSub::Branches(BranchesArgs {
+                        command: None,
+                        repo,
+                        repo_flag,
+                        json: true,
+                    }),
+            }) => {
+                assert_eq!(repo, Some("owner/repo".to_string()));
+                assert_eq!(repo_flag, None);
+            }
+            other => panic!("expected repo branches list path, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn branches_create_parses_name_and_ref() {
+        let cli = Cli::try_parse_from([
+            "fj",
+            "repo",
+            "branches",
+            "create",
+            "release/v1",
+            "--from",
+            "main",
+        ])
+        .expect("should parse");
+        match cli.command {
+            Command::Repo(RepoCmd {
+                command:
+                    RepoSub::Branches(BranchesArgs {
+                        command: Some(RepoBranchesSub::Create(args)),
+                        ..
+                    }),
+            }) => {
+                assert_eq!(args.name, "release/v1");
+                assert_eq!(args.from, Some("main".to_string()));
+            }
+            other => panic!("expected repo branches create, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn branches_delete_requires_confirmation_prompt_by_default() {
+        let cli = Cli::try_parse_from(["fj", "repo", "branches", "delete", "release/v1"])
+            .expect("should parse");
+        match cli.command {
+            Command::Repo(RepoCmd {
+                command:
+                    RepoSub::Branches(BranchesArgs {
+                        command: Some(RepoBranchesSub::Delete(args)),
+                        ..
+                    }),
+            }) => {
+                assert!(!args.yes);
+                assert_eq!(args.name, "release/v1");
+            }
+            other => panic!("expected repo branches delete, got {other:?}"),
+        }
     }
 }
