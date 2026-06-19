@@ -701,126 +701,14 @@ async fn ensure_pr(
     ))
 }
 
-/// Markers bracketing the fj-managed navigation block in a PR body. Content
-/// outside them is human-authored and always preserved; content inside is
-/// regenerated on every sync.
-const STACK_BLOCK_START: &str = "<!-- fj-stack:start -->";
-const STACK_BLOCK_END: &str = "<!-- fj-stack:end -->";
-
-/// Schema version of the machine-readable stack payload embedded in PR bodies.
-/// Bump when the shape changes incompatibly; consumers should check it.
-const STACK_PAYLOAD_VERSION: u32 = 1;
-
-/// One entry in the machine-readable stack payload.
-#[derive(Debug, Serialize, PartialEq)]
-struct StackPayloadEntry {
-    /// 1-based position from the stack base upward.
-    position: usize,
-    branch: String,
-    title: String,
-    /// PR number, or null when this entry has no PR yet.
-    pr: Option<u64>,
-}
-
-/// The structured stack data mirrored into each PR body alongside the human
-/// rendering, so consumers (the Fjord mobile/web apps) read data instead of
-/// scraping markdown. Stable and versioned. See `docs/stack-annotation.md`.
-#[derive(Debug, Serialize, PartialEq)]
-struct StackPayload {
-    version: u32,
-    name: String,
-    base: String,
-    /// 1-based position of the PR this payload is embedded in.
-    current: usize,
-    entries: Vec<StackPayloadEntry>,
-}
-
-/// Build the payload for the PR of item `current`.
-fn stack_payload(stack: &Stack, current: usize) -> StackPayload {
-    StackPayload {
-        version: STACK_PAYLOAD_VERSION,
-        name: stack.name.clone(),
-        base: stack.base.clone(),
-        current: current + 1,
-        entries: stack
-            .items
-            .iter()
-            .enumerate()
-            .map(|(i, item)| StackPayloadEntry {
-                position: i + 1,
-                branch: item.branch.clone(),
-                title: item.title.clone(),
-                pr: item.pr.as_ref().map(|p| p.number),
-            })
-            .collect(),
-    }
-}
-
-/// Serialize the payload into a one-line HTML comment. Any `-->` inside string
-/// values (e.g. a title) is escaped to `-->` so it can't terminate the
-/// comment early; a JSON parser decodes that back to `-->`, so the data round
-/// trips losslessly.
-fn payload_comment(stack: &Stack, current: usize) -> String {
-    let json = serde_json::to_string(&stack_payload(stack, current)).unwrap_or_default();
-    let safe = json.replace("-->", "--\\u003e");
-    format!("<!-- fj-stack-data: {safe} -->")
-}
-
-/// Render the navigation block (without the start/end markers) for the PR of
-/// item `current`: a machine-readable payload line, then the human rendering of
-/// the whole stack bottom-up, each line linking the item's PR (or naming its
-/// branch when it has none yet) and marking the current entry.
-fn render_stack_block(stack: &Stack, current: usize) -> String {
-    use std::fmt::Write;
-    let mut s = String::new();
-    let _ = writeln!(s, "{}", payload_comment(stack, current));
-    let _ = writeln!(s, "### Stack: {}", stack.name);
-    let _ = writeln!(s);
-    for (i, item) in stack.items.iter().enumerate() {
-        let label = match &item.pr {
-            Some(pr) => format!("#{}", pr.number),
-            None => format!("`{}`", item.branch),
-        };
-        let here = if i == current { " ← this PR" } else { "" };
-        let _ = writeln!(s, "{}. {} {}{}", i + 1, label, item.title, here);
-    }
-    let _ = writeln!(s);
-    // Plain markdown italics, not `<sub>`: Forgejo's PR-body sanitizer drops the
-    // raw HTML tag, so the caption wouldn't render.
-    let _ = write!(
-        s,
-        "_Maintained by `fj stack sync`; edits inside this block are overwritten._"
-    );
-    s
-}
-
-/// Splice the navigation block into `existing`, replacing a prior fj block when
-/// present and otherwise appending it. Everything outside the markers is kept
-/// verbatim, so a hand-written PR description survives re-syncs.
-fn apply_stack_block(existing: &str, block: &str) -> String {
-    let wrapped = format!("{STACK_BLOCK_START}\n{block}\n{STACK_BLOCK_END}");
-    if let (Some(start), Some(end)) = (
-        existing.find(STACK_BLOCK_START),
-        existing.find(STACK_BLOCK_END),
-    ) {
-        if start < end {
-            let after = &existing[end + STACK_BLOCK_END.len()..];
-            return format!("{}{}{}", &existing[..start], wrapped, after);
-        }
-    }
-    if existing.trim().is_empty() {
-        wrapped
-    } else {
-        format!("{}\n\n{}", existing.trim_end(), wrapped)
-    }
-}
-
 /// Mirror the stack navigation into every item's PR body, preserving any
 /// human-authored content. Lists the PRs once for their current bodies, then
 /// PATCHes only those whose body actually changes. Returns how many were
-/// updated. Items without a PR number are skipped.
+/// updated. Items without a PR number are skipped. The block markup, payload,
+/// and splice rules live in `fjord_core`; fj supplies its caption label.
 async fn annotate_prs(client: &Client, owner: &str, name: &str, stack: &Stack) -> Result<usize> {
     let page = api::pull::list(client, owner, name, api::pull::ListOptions::default()).await?;
+    let core_stack: fjord_core::workflows::stack::Stack = stack.into();
     let mut annotated = 0usize;
     for (i, item) in stack.items.iter().enumerate() {
         let Some(pr) = &item.pr else {
@@ -832,7 +720,12 @@ async fn annotate_prs(client: &Client, owner: &str, name: &str, stack: &Stack) -
             .find(|p| p.number == pr.number)
             .map(|p| p.body.clone())
             .unwrap_or_default();
-        let new_body = apply_stack_block(&existing, &render_stack_block(stack, i));
+        let new_body = fjord_core::workflows::stack::apply_stack_navigation(
+            &existing,
+            &core_stack,
+            i,
+            "`fj stack sync`",
+        );
         if new_body != existing {
             api::pull::edit(
                 client,
@@ -2219,112 +2112,21 @@ mod tests {
         s
     }
 
+    // The block markup, payload, and splice rules now live in `fjord_core`
+    // (covered by its own tests). fj's only contribution is the caption label;
+    // assert that the literal it passes flows into the rendered navigation.
     #[test]
-    fn render_stack_block_lists_entries_and_marks_current() {
+    fn navigation_carries_fj_caption() {
         let stack = stack_with_prs(&["feature/a", "feature/b"], &[7, 8]);
-        let block = render_stack_block(&stack, 1);
-        assert!(block.contains("### Stack: feat"));
-        assert!(block.contains("1. #7 Item 1"));
-        assert!(block.contains("2. #8 Item 2 ← this PR"));
-        // The caption is markdown italics, not raw `<sub>` (Forgejo strips it).
+        let core_stack: fjord_core::workflows::stack::Stack = (&stack).into();
+        let block = fjord_core::workflows::stack::apply_stack_navigation(
+            "",
+            &core_stack,
+            1,
+            "`fj stack sync`",
+        );
         assert!(block
             .contains("_Maintained by `fj stack sync`; edits inside this block are overwritten._"));
-        assert!(!block.contains("<sub>"));
-        // an item without a PR yet falls back to its branch name
-        let mut partial = stack_with_prs(&["feature/a", "feature/b"], &[7]);
-        partial.items[1].pr = None;
-        let block = render_stack_block(&partial, 0);
-        assert!(block.contains("2. `feature/b` Item 2"));
-    }
-
-    /// Pull the JSON out of the `<!-- fj-stack-data: ... -->` comment in a block,
-    /// mirroring what a consumer (mobile/web) does.
-    fn payload_json(block: &str) -> serde_json::Value {
-        let start = block.find("<!-- fj-stack-data: ").unwrap() + "<!-- fj-stack-data: ".len();
-        let rest = &block[start..];
-        let end = rest.find(" -->").unwrap();
-        serde_json::from_str(&rest[..end]).expect("payload is valid JSON")
-    }
-
-    #[test]
-    fn stack_payload_shape_is_stable() {
-        let stack = stack_with_prs(&["feature/a", "feature/b"], &[7, 8]);
-        let p = stack_payload(&stack, 1);
-        let v = serde_json::to_value(&p).unwrap();
-        assert_eq!(v["version"], STACK_PAYLOAD_VERSION);
-        assert_eq!(v["name"], "feat");
-        assert_eq!(v["base"], "main");
-        assert_eq!(v["current"], 2); // 1-based position of "this PR"
-        assert_eq!(v["entries"][0]["position"], 1);
-        assert_eq!(v["entries"][0]["branch"], "feature/a");
-        assert_eq!(v["entries"][0]["pr"], 7);
-        assert_eq!(v["entries"][1]["pr"], 8);
-        // entry without a PR -> null
-        let mut partial = stack_with_prs(&["feature/a", "feature/b"], &[7]);
-        partial.items[1].pr = None;
-        let v = serde_json::to_value(stack_payload(&partial, 0)).unwrap();
-        assert!(v["entries"][1]["pr"].is_null());
-    }
-
-    #[test]
-    fn render_block_embeds_parseable_payload() {
-        let stack = stack_with_prs(&["feature/a", "feature/b"], &[7, 8]);
-        let block = render_stack_block(&stack, 0);
-        let v = payload_json(&block);
-        assert_eq!(v["version"], 1);
-        assert_eq!(v["current"], 1);
-        assert_eq!(v["entries"][1]["branch"], "feature/b");
-    }
-
-    #[test]
-    fn payload_comment_escapes_arrow_in_titles() {
-        // A title containing `-->` must not terminate the HTML comment early,
-        // and must round-trip through a JSON parser.
-        let mut stack = stack_with_prs(&["feature/a"], &[7]);
-        stack.items[0].title = "fix --> bar".to_string();
-        let comment = payload_comment(&stack, 0);
-        // exactly one comment terminator (the real one at the end)
-        assert_eq!(comment.matches("-->").count(), 1);
-        assert!(comment.trim_end().ends_with("-->"));
-        // and the escaped form decodes back to the original title
-        let block = format!("{comment}\n");
-        let v = payload_json(&block);
-        assert_eq!(v["entries"][0]["title"], "fix --> bar");
-    }
-
-    #[test]
-    fn apply_stack_block_appends_when_absent() {
-        let out = apply_stack_block("Human-written description.", "NAV");
-        assert!(out.starts_with("Human-written description.\n\n"));
-        assert!(out.contains(STACK_BLOCK_START));
-        assert!(out.contains("\nNAV\n"));
-        assert!(out.trim_end().ends_with(STACK_BLOCK_END));
-        // empty existing body -> just the wrapped block
-        let only = apply_stack_block("", "NAV");
-        assert_eq!(only, format!("{STACK_BLOCK_START}\nNAV\n{STACK_BLOCK_END}"));
-    }
-
-    #[test]
-    fn apply_stack_block_replaces_in_place_preserving_surroundings() {
-        let existing = format!(
-            "Top prose.\n\n{STACK_BLOCK_START}\nOLD NAV\n{STACK_BLOCK_END}\n\nBottom prose."
-        );
-        let out = apply_stack_block(&existing, "NEW NAV");
-        assert!(out.contains("Top prose."));
-        assert!(out.contains("Bottom prose."));
-        assert!(out.contains("NEW NAV"));
-        assert!(!out.contains("OLD NAV"));
-        // exactly one block remains
-        assert_eq!(out.matches(STACK_BLOCK_START).count(), 1);
-        assert_eq!(out.matches(STACK_BLOCK_END).count(), 1);
-    }
-
-    #[test]
-    fn apply_stack_block_is_idempotent() {
-        let block = "NAV";
-        let once = apply_stack_block("body", block);
-        let twice = apply_stack_block(&once, block);
-        assert_eq!(once, twice);
     }
 
     #[tokio::test]
@@ -2336,7 +2138,12 @@ mod tests {
 
         // PR #7 has no fj block yet -> must be patched. PR #8 already carries the
         // exact block it would get -> must be left alone.
-        let body8 = apply_stack_block("", &render_stack_block(&stack, 1));
+        let body8 = fjord_core::workflows::stack::apply_stack_navigation(
+            "",
+            &(&stack).into(),
+            1,
+            "`fj stack sync`",
+        );
         Mock::given(method("GET"))
             .and(path("/api/v1/repos/o/r/pulls"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
