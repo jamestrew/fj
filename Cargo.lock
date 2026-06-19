@@ -585,9 +585,9 @@ dependencies = [
 
 [[package]]
 name = "fjord-core"
-version = "0.1.0"
+version = "0.1.2"
 source = "sparse+https://rasterhub.com/api/packages/rasterstate/cargo/"
-checksum = "0c3822e1b4b1332182a9a238a9c593c5efae6707f9ddbfc8b7ba9b97dc307e3c"
+checksum = "ded428ebecbb51071fbd43a71d9d48fbb9142ffd1c22f117424db6d17e4bd8f8"
 dependencies = [
  "rusqlite",
  "serde",

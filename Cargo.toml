@@ -25,7 +25,7 @@ anyhow = "1"
 base64 = "0.22"
 # Shared product/domain layer (fjord-architecture ADR 0001). fj is the first
 # consumer and validates each promoted workflow before the GUI surfaces adopt it.
-fjord-core = { version = "0.1.0", registry = "fjord" }
+fjord-core = { version = "0.1.2", registry = "fjord" }
 thiserror = "2"
 clap = { version = "4.5", features = ["derive", "env", "wrap_help", "suggestions"] }
 clap_complete = "4.5"

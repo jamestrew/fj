@@ -586,44 +586,27 @@ fn pr_base(stack_base: &str, items: &[StackItem], i: usize) -> String {
 
 /// Validate the stack is syncable: at least one item, and unique, non-empty
 /// branch names (a malformed/duplicated chain would push/PR incorrectly).
+/// Delegates the rules to `fjord_core`; fj only supplies its command label and
+/// maps the core error back to a bare anyhow message.
 fn validate_items(items: &[StackItem]) -> Result<()> {
-    if items.is_empty() {
-        bail!("stack has no items to sync (author one with `fj stack new`)");
-    }
-    let mut seen = std::collections::BTreeSet::new();
-    for item in items {
-        if item.branch.trim().is_empty() {
-            bail!("stack item '{}' has an empty branch name", item.id);
-        }
-        if !seen.insert(item.branch.as_str()) {
-            bail!("duplicate branch '{}' in the stack", item.branch);
-        }
-    }
-    Ok(())
+    let core_items: Vec<fjord_core::workflows::stack::StackItem> =
+        items.iter().map(Into::into).collect();
+    fjord_core::workflows::stack::validate_items(&core_items, "`fj stack new`").map_err(|e| match e
+    {
+        fjord_core::error::CoreError::Validation { message } => anyhow::anyhow!(message),
+        other => anyhow::anyhow!(other.to_string()),
+    })
 }
 
-/// What a sync intends to do for one item. Serializes for `--json` / dry-run.
-#[derive(Debug, Serialize, PartialEq)]
-struct PlannedOp {
-    branch: String,
-    base: String,
-    title: String,
+use fjord_core::workflows::stack::SyncStep;
+
+/// The bottom-up sync plan, computed by `fjord_core`. `SyncStep` serializes for
+/// `--json` / dry-run.
+fn plan_sync(stack: &Stack) -> Vec<SyncStep> {
+    fjord_core::workflows::stack::plan_sync(&stack.into())
 }
 
-fn plan_sync(stack: &Stack) -> Vec<PlannedOp> {
-    stack
-        .items
-        .iter()
-        .enumerate()
-        .map(|(i, item)| PlannedOp {
-            branch: item.branch.clone(),
-            base: pr_base(&stack.base, &stack.items, i),
-            title: item.title.clone(),
-        })
-        .collect()
-}
-
-fn render_plan(plan: &[PlannedOp]) -> String {
+fn render_plan(plan: &[SyncStep]) -> String {
     use std::fmt::Write;
     let mut s = String::from("Would sync (no pushes or PR writes):\n");
     for op in plan {
@@ -1366,57 +1349,59 @@ async fn absorb(args: AbsorbArgs, _host: Option<&str>) -> Result<()> {
 
 // ── stack ship ─────────────────────────────────────────────────────────────
 
-/// The merge style to use. `--squash`/`--merge` are explicit; the default is
-/// a plain merge commit, the most universally-allowed (safest) style.
-fn merge_style(squash: bool, merge: bool) -> MergeStyle {
-    match (squash, merge) {
-        (true, _) => MergeStyle::Squash,
-        _ => MergeStyle::Merge,
+/// The Forgejo merge styles bridge 1:1 with `fjord_core`'s, so the surfaces
+/// agree on the token sent to the API.
+impl From<fjord_core::workflows::stack::MergeStyle> for MergeStyle {
+    fn from(s: fjord_core::workflows::stack::MergeStyle) -> Self {
+        use fjord_core::workflows::stack::MergeStyle as Core;
+        match s {
+            Core::Merge => MergeStyle::Merge,
+            Core::Rebase => MergeStyle::Rebase,
+            Core::RebaseMerge => MergeStyle::RebaseMerge,
+            Core::Squash => MergeStyle::Squash,
+        }
     }
+}
+
+impl From<MergeStyle> for fjord_core::workflows::stack::MergeStyle {
+    fn from(s: MergeStyle) -> Self {
+        use fjord_core::workflows::stack::MergeStyle as Core;
+        match s {
+            MergeStyle::Merge => Core::Merge,
+            MergeStyle::Rebase => Core::Rebase,
+            MergeStyle::RebaseMerge => Core::RebaseMerge,
+            MergeStyle::Squash => Core::Squash,
+        }
+    }
+}
+
+/// The merge style to use. `--squash`/`--merge` are explicit; the default is
+/// a plain merge commit, the most universally-allowed (safest) style. The
+/// squash-wins resolution lives in `fjord_core`.
+fn merge_style(squash: bool, _merge: bool) -> MergeStyle {
+    fjord_core::workflows::stack::merge_style(squash).into()
 }
 
 /// Whether a PR is shippable: approved and green. "Green" treats no CI
 /// (`none`/absent) as non-blocking; only pending/failure/error block.
 /// Already-merged PRs are shippable (they're skipped). Returns the blocking
-/// reason on failure.
+/// reason on failure. Gating rules live in `fjord_core`.
 fn shippable(review: &str, checks: Option<&str>, state: &str) -> std::result::Result<(), String> {
-    if state == "merged" {
-        return Ok(());
-    }
-    if review != "approved" {
-        return Err(format!("not approved (review: {review})"));
-    }
-    match checks {
-        Some(s) if s != "success" && s != "none" => Err(format!("checks not green (ci: {s})")),
-        _ => Ok(()),
+    match fjord_core::workflows::stack::ship_blocker(review, checks, state) {
+        Some(reason) => Err(reason),
+        None => Ok(()),
     }
 }
 
-/// What `ship` intends to do per item, bottom-up. For `--dry-run` / `--json`.
-#[derive(Debug, Serialize, PartialEq)]
-struct ShipPlan {
-    branch: String,
-    base: String,
-    style: String,
+use fjord_core::workflows::stack::ShipStep;
+
+/// The bottom-up ship plan, computed by `fjord_core`. `ShipStep` serializes for
+/// `--dry-run` / `--json`.
+fn plan_ship(stack: &Stack, style: MergeStyle) -> Vec<ShipStep> {
+    fjord_core::workflows::stack::plan_ship(&stack.into(), style.into())
 }
 
-fn plan_ship(stack: &Stack, style: MergeStyle) -> Vec<ShipPlan> {
-    let bases: Vec<String> = (0..stack.items.len())
-        .map(|i| pr_base(&stack.base, &stack.items, i))
-        .collect();
-    stack
-        .items
-        .iter()
-        .zip(bases)
-        .map(|(item, base)| ShipPlan {
-            branch: item.branch.clone(),
-            base,
-            style: style.as_str().to_string(),
-        })
-        .collect()
-}
-
-fn render_ship_plan(plan: &[ShipPlan]) -> String {
+fn render_ship_plan(plan: &[ShipStep]) -> String {
     use std::fmt::Write;
     let mut s = String::from("Would ship bottom-up (no merges or deletes):\n");
     for p in plan {
@@ -1425,21 +1410,10 @@ fn render_ship_plan(plan: &[ShipPlan]) -> String {
     s
 }
 
-/// Recovery guidance printed when a merge fails partway through.
+/// Recovery guidance printed when a merge fails partway through. Composed by
+/// `fjord_core`; fj only supplies its command label.
 fn recovery_message(failed_branch: &str, merged: &[String]) -> String {
-    use std::fmt::Write;
-    let mut s = String::new();
-    let _ = writeln!(s, "Stopped: merging '{failed_branch}' failed.");
-    if merged.is_empty() {
-        let _ = writeln!(s, "  Nothing was merged.");
-    } else {
-        let _ = writeln!(s, "  Already merged: {}", merged.join(", "));
-    }
-    let _ = writeln!(
-        s,
-        "  Fix the issue, then re-run `fj stack ship` — merged items are skipped."
-    );
-    s
+    fjord_core::workflows::stack::recovery_message(failed_branch, merged, "`fj stack ship`")
 }
 
 #[derive(Debug, Serialize)]

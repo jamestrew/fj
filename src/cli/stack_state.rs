@@ -101,6 +101,72 @@ impl From<fjord_core::workflows::stack::StackItem> for StackItem {
     }
 }
 
+// The forward direction (fj -> core), so the on-disk stack can be handed to the
+// core planning/annotation engine. fj carries PR/issue numbers as u64; core
+// models them as i64 (matching the API DTOs). The widening always succeeds for
+// real, positive values, so `unwrap_or_default` can never lose one.
+impl From<&ItemPr> for fjord_core::workflows::stack::ItemPr {
+    fn from(p: &ItemPr) -> Self {
+        Self {
+            number: i64::try_from(p.number).unwrap_or_default(),
+            url: p.url.clone(),
+            state: p.state.clone(),
+        }
+    }
+}
+
+impl From<&StackItem> for fjord_core::workflows::stack::StackItem {
+    fn from(it: &StackItem) -> Self {
+        Self {
+            id: it.id.clone(),
+            title: it.title.clone(),
+            branch: it.branch.clone(),
+            base: it.base.clone(),
+            pr: it.pr.as_ref().map(Into::into),
+            status: it.status.clone(),
+        }
+    }
+}
+
+impl From<&RepoRef> for fjord_core::workflows::stack::RepoRef {
+    fn from(r: &RepoRef) -> Self {
+        Self {
+            path: r.path.clone(),
+            remote: r.remote.clone(),
+            url: r.url.clone(),
+            host: r.host.clone(),
+        }
+    }
+}
+
+impl From<&IssueRef> for fjord_core::workflows::stack::IssueRef {
+    fn from(i: &IssueRef) -> Self {
+        Self {
+            number: i64::try_from(i.number).unwrap_or_default(),
+            title: i.title.clone(),
+            url: i.url.clone(),
+        }
+    }
+}
+
+impl From<&Stack> for fjord_core::workflows::stack::Stack {
+    fn from(s: &Stack) -> Self {
+        Self {
+            version: s.version,
+            id: s.id.clone(),
+            name: s.name.clone(),
+            slug: s.slug.clone(),
+            repo: (&s.repo).into(),
+            base: s.base.clone(),
+            created_at: s.created_at.clone(),
+            updated_at: s.updated_at.clone(),
+            issue: s.issue.as_ref().map(Into::into),
+            items: s.items.iter().map(Into::into).collect(),
+            shipped_at: s.shipped_at.clone(),
+        }
+    }
+}
+
 /// Path to the stack file under a git directory (`.git/fj/stack.json`).
 pub fn stack_path(git_dir: &Path) -> PathBuf {
     git_dir.join("fj").join("stack.json")
