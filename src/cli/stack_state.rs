@@ -74,6 +74,33 @@ pub struct ItemPr {
     pub state: String,
 }
 
+// fjord-core owns the canonical stack-item shape (ADR 0001). Core models PR
+// numbers as i64 to match the API DTOs; fj has always carried them as u64, so
+// the conversion narrows back (PR numbers are positive, hence `unwrap_or_default`
+// can never lose a real value).
+impl From<fjord_core::workflows::stack::ItemPr> for ItemPr {
+    fn from(p: fjord_core::workflows::stack::ItemPr) -> Self {
+        Self {
+            number: u64::try_from(p.number).unwrap_or_default(),
+            url: p.url,
+            state: p.state,
+        }
+    }
+}
+
+impl From<fjord_core::workflows::stack::StackItem> for StackItem {
+    fn from(it: fjord_core::workflows::stack::StackItem) -> Self {
+        Self {
+            id: it.id,
+            title: it.title,
+            branch: it.branch,
+            base: it.base,
+            pr: it.pr.map(Into::into),
+            status: it.status,
+        }
+    }
+}
+
 /// Path to the stack file under a git directory (`.git/fj/stack.json`).
 pub fn stack_path(git_dir: &Path) -> PathBuf {
     git_dir.join("fj").join("stack.json")

@@ -958,38 +958,25 @@ async fn sync(args: SyncArgs, host: Option<&str>) -> Result<()> {
 // the one below, bottom-up. It only moves local refs (no force-push, no API),
 // so it's offline and reversible: the original commits stay reachable.
 
-/// One commit ahead of the base: its full sha and subject line.
-#[derive(Debug, PartialEq)]
-struct Commit {
-    sha: String,
-    subject: String,
-}
+/// One commit ahead of the base: its full sha and subject line. The canonical
+/// shape lives in fjord-core (ADR 0001); re-exported so call sites and tests
+/// keep the short local name.
+use fjord_core::workflows::stack::Commit;
 
 /// Parse `git log --format=%H\x1f%s` output (oldest first) into commits.
-/// Blank lines and sha-less rows are skipped.
+/// Blank lines and sha-less rows are skipped. Delegates to fjord-core.
 fn parse_commits(raw: &str) -> Vec<Commit> {
-    raw.lines()
-        .filter_map(|line| {
-            let mut parts = line.splitn(2, '\x1f');
-            let sha = parts.next()?.trim();
-            if sha.is_empty() {
-                return None;
-            }
-            Some(Commit {
-                sha: sha.to_string(),
-                subject: parts.next().unwrap_or("").trim().to_string(),
-            })
-        })
-        .collect()
+    fjord_core::workflows::stack::parse_commits(raw)
 }
 
-/// A split needs at least two commits; one (or zero) is a no-op.
+/// A split needs at least two commits; one (or zero) is a no-op. Delegates the
+/// rule to fjord-core, mapping its validation error back to a bare fj message
+/// (core's `Display` prefixes "invalid request:", which we don't want here).
 fn validate_split(commits: &[Commit]) -> Result<()> {
-    match commits.len() {
-        0 => bail!("no commits between the stack base and HEAD to split"),
-        1 => bail!("only one commit ahead of the base; nothing to split"),
-        _ => Ok(()),
-    }
+    fjord_core::workflows::stack::validate_split(commits).map_err(|e| match e {
+        fjord_core::error::CoreError::Validation { message } => anyhow::anyhow!(message),
+        other => anyhow::anyhow!(other.to_string()),
+    })
 }
 
 /// Split only operates on a pristine single-entry stack, checked out on its
@@ -1038,31 +1025,9 @@ fn stack_handle(stack: &Stack) -> String {
 /// on `handle/slug-k`, bases on the one below (the stack base for the first),
 /// and takes its title from the commit subject (falling back to the branch).
 fn plan_split(base: &str, handle: &str, slug: &str, commits: &[Commit]) -> Vec<StackItem> {
-    commits
-        .iter()
-        .enumerate()
-        .map(|(i, c)| {
-            let n = i + 1;
-            let branch = stack_state::item_branch(handle, slug, n);
-            let item_base = if i == 0 {
-                base.to_string()
-            } else {
-                stack_state::item_branch(handle, slug, i)
-            };
-            let title = if c.subject.is_empty() {
-                format!("{slug}-{n}")
-            } else {
-                c.subject.clone()
-            };
-            StackItem {
-                id: format!("{slug}-{n}"),
-                title,
-                branch,
-                base: item_base,
-                pr: None,
-                status: "local".to_string(),
-            }
-        })
+    fjord_core::workflows::stack::plan_split(base, handle, slug, commits)
+        .into_iter()
+        .map(StackItem::from)
         .collect()
 }
 
