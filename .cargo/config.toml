@@ -1,0 +1,6 @@
+# The `fjord` registry is the Forgejo cargo registry on rasterhub.com, where
+# fjord-core publishes. fj consumes the shared product/domain layer from here
+# (see fjord-architecture ADR 0001). Reads are open, so CI resolves it without a
+# token; publishing fjord-core needs a write:package PAT (that repo's concern).
+[registries.fjord]
+index = "sparse+https://rasterhub.com/api/packages/rasterstate/cargo/"

@@ -412,19 +412,14 @@ struct EntryPr {
     requested_reviewers: Vec<String>,
 }
 
-/// Aggregate PR review state. Request-changes dominates an approval; an
-/// approval dominates plain comments; no reviews → "none".
+/// Aggregate PR review state into the ship-gate token. The reduction lives in
+/// fjord-core so fj and the GUI clients share one verdict (ADR 0001); fj maps
+/// its fetched reviews to the per-review states core reduces over.
 fn summarize_reviews(reviews: &[api::pull::Review]) -> String {
-    let has = |s: &str| reviews.iter().any(|r| r.state.eq_ignore_ascii_case(s));
-    if has("REQUEST_CHANGES") {
-        "changes_requested".to_string()
-    } else if has("APPROVED") {
-        "approved".to_string()
-    } else if reviews.is_empty() {
-        "none".to_string()
-    } else {
-        "commented".to_string()
-    }
+    let states: Vec<String> = reviews.iter().map(|r| r.state.clone()).collect();
+    fjord_core::workflows::stack::summarize_reviews(&states)
+        .as_str()
+        .to_string()
 }
 
 /// Assemble the per-PR view from already-fetched pieces. Pure for testing.

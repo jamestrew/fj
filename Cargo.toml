@@ -2,7 +2,7 @@
 name = "fj"
 version = "0.2.0"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.95"
 description = "Command-line tool for Forgejo, in the spirit of gh"
 authors = ["Raster & State <support@rasterstate.com>"]
 license = "MIT"
@@ -23,6 +23,9 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
+# Shared product/domain layer (fjord-architecture ADR 0001). fj is the first
+# consumer and validates each promoted workflow before the GUI surfaces adopt it.
+fjord-core = { version = "0.1.0", registry = "fjord" }
 thiserror = "2"
 clap = { version = "4.5", features = ["derive", "env", "wrap_help", "suggestions"] }
 clap_complete = "4.5"
