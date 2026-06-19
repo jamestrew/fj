@@ -142,46 +142,27 @@ pub fn save_to(path: &Path, stack: &Stack) -> Result<()> {
     std::fs::write(path, json).with_context(|| format!("writing {}", path.display()))
 }
 
+// fjord-core owns the canonical stack naming rules (ADR 0001) so a stack
+// authored on the CLI and one authored on mobile land on byte-identical branch
+// names. These thin wrappers delegate while keeping the in-crate call sites and
+// fj's `usize` index ergonomics. (The unrelated `slugify` in issue.rs is a
+// different transform — "issue" fallback, 40-char cap — and stays local.)
+
 /// Lowercase, hyphen-separated, branch-safe slug derived from a name. Falls
 /// back to `stack` for empty input; capped to keep branch names sane.
 pub fn slugify(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    let mut prev_dash = false;
-    for c in name.chars() {
-        if c.is_ascii_alphanumeric() {
-            out.push(c.to_ascii_lowercase());
-            prev_dash = false;
-        } else if !prev_dash && !out.is_empty() {
-            out.push('-');
-            prev_dash = true;
-        }
-    }
-    while out.ends_with('-') {
-        out.pop();
-    }
-    if out.is_empty() {
-        out.push_str("stack");
-    }
-    out.chars().take(50).collect::<String>()
+    fjord_core::workflows::stack::slugify(name)
 }
 
 /// A branch-safe handle for branch prefixes: prefer the account login, then
 /// the local git user, then `user`. Sanitized like a slug.
 pub fn safe_handle(account: Option<&str>, git_user: Option<&str>) -> String {
-    // slugify only returns its "stack" fallback for empty / symbol-only input,
-    // so that doubles as "no usable handle here" — move to the next candidate.
-    for candidate in [account, git_user].into_iter().flatten() {
-        let s = slugify(candidate);
-        if s != "stack" {
-            return s;
-        }
-    }
-    "user".to_string()
+    fjord_core::workflows::stack::safe_handle(account, git_user)
 }
 
 /// Deterministic branch name for stack item `n` (1-based): `handle/slug-n`.
 pub fn item_branch(handle: &str, slug: &str, n: usize) -> String {
-    format!("{handle}/{slug}-{n}")
+    fjord_core::workflows::stack::item_branch(handle, slug, n as u32)
 }
 
 #[cfg(test)]
