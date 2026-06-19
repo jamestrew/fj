@@ -1138,87 +1138,39 @@ fn supports_update_refs(version: (u32, u32)) -> bool {
     version >= (2, 38)
 }
 
+// fjord-core owns the canonical absorb routing and its data shapes (ADR 0001);
+// re-exported so the render helpers, the `absorb()` driver, and the tests keep
+// the short local names. The shapes are identical (pub fields, same order, same
+// serde layout), so this slice is pure delegation with no conversion.
+use fjord_core::workflows::stack::{AbsorbPlan, FileAttribution};
+
 /// Map every commit sha in the stack to the entry (0-based) it belongs to.
 /// `entries[i]` is the list of shas in item `i`'s range (`prev..branch`).
 /// Later entries win a tie (a sha should only appear once in a linear stack).
+/// Delegates to fjord-core.
 fn index_commits(entries: &[Vec<String>]) -> std::collections::HashMap<String, usize> {
-    let mut map = std::collections::HashMap::new();
-    for (i, shas) in entries.iter().enumerate() {
-        for sha in shas {
-            map.insert(sha.clone(), i);
-        }
-    }
-    map
-}
-
-/// A staged file routed to a stack entry, or left unattributed.
-#[derive(Debug, PartialEq)]
-struct FileAttribution {
-    file: String,
-    /// `Some(entry_index)` when the file's last-touching commit is in the stack.
-    entry: Option<usize>,
+    fjord_core::workflows::stack::index_commits(entries)
 }
 
 /// Attribute each `(file, last_touching_sha)` to a stack entry via the
 /// sha→entry index. A file whose last touch is outside the stack (e.g. from the
-/// base branch, or brand new) is left unattributed.
+/// base branch, or brand new) is left unattributed. Delegates to fjord-core.
 fn attribute_files(
     files: &[(String, Option<String>)],
     sha_to_entry: &std::collections::HashMap<String, usize>,
 ) -> Vec<FileAttribution> {
-    files
-        .iter()
-        .map(|(file, sha)| FileAttribution {
-            file: file.clone(),
-            entry: sha.as_ref().and_then(|s| sha_to_entry.get(s).copied()),
-        })
-        .collect()
-}
-
-/// One entry's absorb group: the target commit to fix up, the entry's branch,
-/// and the files headed for it. Serializes for `--json` / dry-run.
-#[derive(Debug, Serialize, PartialEq)]
-struct AbsorbGroup {
-    branch: String,
-    /// The commit (a stack entry's tip) the fixup targets.
-    target: String,
-    files: Vec<String>,
-}
-
-/// The full absorb plan: per-entry groups plus the files left staged.
-#[derive(Debug, Serialize, PartialEq)]
-struct AbsorbPlan {
-    groups: Vec<AbsorbGroup>,
-    /// Files that couldn't be attributed; they stay staged, untouched.
-    skipped: Vec<String>,
+    fjord_core::workflows::stack::attribute_files(files, sha_to_entry)
 }
 
 /// Build the plan from attributions. `tips[i]` is item `i`'s target commit sha
 /// (its branch tip); `branches[i]` its branch name. Groups preserve entry order
-/// (bottom-up) and are dropped when they have no files.
+/// (bottom-up) and are dropped when they have no files. Delegates to fjord-core.
 fn plan_absorb(
     attributions: &[FileAttribution],
     branches: &[String],
     tips: &[String],
 ) -> AbsorbPlan {
-    let mut groups: Vec<AbsorbGroup> = branches
-        .iter()
-        .zip(tips)
-        .map(|(branch, target)| AbsorbGroup {
-            branch: branch.clone(),
-            target: target.clone(),
-            files: Vec::new(),
-        })
-        .collect();
-    let mut skipped = Vec::new();
-    for a in attributions {
-        match a.entry {
-            Some(i) if i < groups.len() => groups[i].files.push(a.file.clone()),
-            _ => skipped.push(a.file.clone()),
-        }
-    }
-    groups.retain(|g| !g.files.is_empty());
-    AbsorbPlan { groups, skipped }
+    fjord_core::workflows::stack::plan_absorb(attributions, branches, tips)
 }
 
 fn render_absorb_plan(plan: &AbsorbPlan) -> String {
@@ -1644,6 +1596,7 @@ mod tests {
     use super::*;
     use crate::cli::{Cli, Command};
     use clap::{CommandFactory, Parser};
+    use fjord_core::workflows::stack::AbsorbGroup;
 
     #[test]
     fn stack_subtree_is_internally_consistent() {
