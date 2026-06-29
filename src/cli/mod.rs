@@ -441,9 +441,6 @@ mod tests {
             "fj alias list",
             "fj config list",
             "fj extension list",
-            // `fj instances` exposes `--json` on the parent command; the bare
-            // `list` leaf delegates to it rather than redefining the flag.
-            "fj instances list",
         ];
 
         fn accepts_json(cmd: &clap::Command) -> bool {

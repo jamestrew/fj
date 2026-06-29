@@ -6,6 +6,7 @@ use clap::{Args, Subcommand};
 use crate::api;
 use crate::api::milestone::{CreateMilestone, EditMilestone};
 use crate::cli::context::{resolve_repo, RepoFlag};
+use crate::cli::pr_args::StateFilter;
 use crate::output;
 
 use super::editor;
@@ -41,8 +42,8 @@ pub struct ListArgs {
     #[command(flatten)]
     pub r: RepoFlag,
     /// Filter by state
-    #[arg(short = 's', long, default_value = "open")]
-    pub state: String,
+    #[arg(short = 's', long, value_enum, default_value_t = StateFilter::Open)]
+    pub state: StateFilter,
     /// Emit JSON instead of a table
     #[arg(long)]
     pub json: bool,
@@ -136,7 +137,8 @@ pub async fn run(cmd: MilestoneCmd, host: Option<&str>) -> Result<()> {
 
 async fn list(args: ListArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
-    let items = api::milestone::list(&ctx.client, &ctx.owner, &ctx.name, &args.state).await?;
+    let items =
+        api::milestone::list(&ctx.client, &ctx.owner, &ctx.name, args.state.as_str()).await?;
     if args.json {
         return output::print_json(&serde_json::to_value(&items)?);
     }
@@ -290,4 +292,36 @@ async fn assign(args: AssignArgs, host: Option<&str>) -> Result<()> {
         None => println!("✓ Detached #{} from any milestone", args.issue),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn list_state_rejects_unknown_value() {
+        let err = crate::cli::Cli::try_parse_from(["fj", "milestone", "list", "-s", "bogus"])
+            .expect_err("unknown state should be rejected by clap");
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn list_state_parses_open_closed_all() {
+        for (raw, expected) in [
+            ("open", StateFilter::Open),
+            ("closed", StateFilter::Closed),
+            ("all", StateFilter::All),
+        ] {
+            let cli = crate::cli::Cli::try_parse_from(["fj", "milestone", "list", "-s", raw])
+                .expect("state should parse");
+            let crate::cli::Command::Milestone(MilestoneCmd {
+                command: MilestoneSub::List(args),
+            }) = cli.command
+            else {
+                panic!("expected milestone list");
+            };
+            assert_eq!(args.state.as_str(), expected.as_str());
+        }
+    }
 }

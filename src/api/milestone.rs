@@ -32,7 +32,10 @@ pub async fn list(client: &Client, owner: &str, name: &str, state: &str) -> Resu
 
 pub async fn get(client: &Client, owner: &str, name: &str, id: u64) -> Result<Milestone> {
     let path = format!("{}/milestones/{id}", crate::api::repo_path(owner, name));
-    client.json(Method::GET, &path, &[], None::<&()>).await
+    client
+        .json(Method::GET, &path, &[], None::<&()>)
+        .await
+        .map_err(|e| crate::client::with_not_found_context(e, format!("milestone #{id} not found")))
 }
 
 #[derive(Debug, Clone, Serialize)]

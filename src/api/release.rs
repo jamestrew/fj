@@ -78,7 +78,10 @@ pub async fn get_by_tag(client: &Client, owner: &str, name: &str, tag: &str) -> 
         crate::api::repo_path(owner, name),
         crate::api::path_segment(tag)
     );
-    client.json(Method::GET, &path, &[], None::<&()>).await
+    client
+        .json(Method::GET, &path, &[], None::<&()>)
+        .await
+        .map_err(|e| crate::client::with_not_found_context(e, format!("release '{tag}' not found")))
 }
 
 #[derive(Debug, Clone, Serialize)]

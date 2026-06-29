@@ -1271,7 +1271,10 @@ impl From<MergeStyle> for fjord_core::workflows::stack::MergeStyle {
 /// The merge style to use. `--squash`/`--merge` are explicit; the default is
 /// a plain merge commit, the most universally-allowed (safest) style. The
 /// squash-wins resolution lives in `fjord_core`.
-fn merge_style(squash: bool, _merge: bool) -> MergeStyle {
+fn merge_style(squash: bool, merge: bool) -> MergeStyle {
+    if merge {
+        return MergeStyle::Merge;
+    }
     fjord_core::workflows::stack::merge_style(squash).into()
 }
 
@@ -1964,10 +1967,10 @@ mod tests {
     }
 
     #[test]
-    fn merge_style_defaults_to_merge_commit() {
-        assert!(matches!(merge_style(false, false), MergeStyle::Merge));
+    fn merge_style_flags_select_expected_style() {
         assert!(matches!(merge_style(false, true), MergeStyle::Merge));
         assert!(matches!(merge_style(true, false), MergeStyle::Squash));
+        assert!(matches!(merge_style(false, false), MergeStyle::Merge));
     }
 
     #[test]

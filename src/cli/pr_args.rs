@@ -23,6 +23,16 @@ impl From<StateFilter> for State {
     }
 }
 
+impl StateFilter {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            StateFilter::Open => "open",
+            StateFilter::Closed => "closed",
+            StateFilter::All => "all",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum MergeStyleArg {
     Merge,
@@ -83,6 +93,9 @@ mod tests {
         assert!(matches!(State::from(StateFilter::Open), State::Open));
         assert!(matches!(State::from(StateFilter::Closed), State::Closed));
         assert!(matches!(State::from(StateFilter::All), State::All));
+        assert_eq!(StateFilter::Open.as_str(), "open");
+        assert_eq!(StateFilter::Closed.as_str(), "closed");
+        assert_eq!(StateFilter::All.as_str(), "all");
     }
 
     #[test]

@@ -631,6 +631,17 @@ pub(crate) async fn ensure_success(res: Response) -> Result<Response> {
     }
 }
 
+pub(crate) fn with_not_found_context(err: anyhow::Error, context: String) -> anyhow::Error {
+    if err
+        .downcast_ref::<ApiError>()
+        .is_some_and(|e| e.status == StatusCode::NOT_FOUND)
+    {
+        err.context(context)
+    } else {
+        err
+    }
+}
+
 fn friendly_http_error(
     status: StatusCode,
     url: &Url,

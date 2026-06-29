@@ -58,17 +58,25 @@ pub async fn status(args: StatusArgs, host: Option<&str>) -> Result<()> {
         .await?;
 
     if args.json {
-        return output::print_json(&serde_json::json!({
-            "authored": authored,
-            "review_requested": review_requested,
-            "mentioned": mentioned,
-        }));
+        return output::print_json(&status_json_value(&authored, &review_requested, &mentioned));
     }
 
     print_status_section("Created by you", &authored);
     print_status_section("Requesting your review", &review_requested);
     print_status_section("Mentioning you", &mentioned);
     Ok(())
+}
+
+fn status_json_value(
+    authored: &[api::issue::Issue],
+    review_requested: &[api::issue::Issue],
+    mentioned: &[api::issue::Issue],
+) -> serde_json::Value {
+    serde_json::json!({
+        "authored": authored,
+        "review_requested": review_requested,
+        "mentioned": mentioned,
+    })
 }
 
 fn print_status_section(label: &str, items: &[api::issue::Issue]) {
@@ -87,4 +95,16 @@ fn print_status_section(label: &str, items: &[api::issue::Issue]) {
         );
     }
     println!();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_json_fields_can_project_authored() {
+        let value = status_json_value(&[], &[], &[]);
+        let projected = output::json_filter::project(&value, &["authored".into()]);
+        assert_eq!(projected, serde_json::json!({ "authored": [] }));
+    }
 }

@@ -49,7 +49,15 @@ pub async fn get(
         crate::api::repo_path(owner, name),
         crate::api::path_segment(branch)
     );
-    client.json(Method::GET, &path, &[], None::<&()>).await
+    client
+        .json(Method::GET, &path, &[], None::<&()>)
+        .await
+        .map_err(|e| {
+            crate::client::with_not_found_context(
+                e,
+                format!("branch protection for '{branch}' not found"),
+            )
+        })
 }
 
 #[derive(Debug, Clone, Serialize)]

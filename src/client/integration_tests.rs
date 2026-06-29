@@ -2905,6 +2905,25 @@ async fn pull_combined_status_decodes_state_and_statuses() {
     assert_eq!(cs.statuses[1].description, "");
 }
 
+#[tokio::test]
+async fn pull_combined_status_empty_payload_is_no_ci() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/commits/no-ci/status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let cs = crate::api::pull::combined_status(&c, "o", "r", "no-ci")
+        .await
+        .expect("empty combined status should be no-CI, not a decode error");
+    assert_eq!(cs.sha, "no-ci");
+    assert_eq!(cs.state, "");
+    assert_eq!(cs.total_count, 0);
+    assert!(cs.statuses.is_empty());
+}
+
 // A minimal repo object that satisfies the non-defaulted fields of
 // `api::repo::Repo`. Used by the search/star tests below.
 fn minimal_repo_json(name: &str) -> serde_json::Value {
@@ -3042,6 +3061,23 @@ async fn release_list_sends_limit_and_page() {
     .expect("list");
     assert_eq!(rels.items.len(), 1);
     assert_eq!(rels.items[0].tag_name, "v1.0.0");
+}
+
+#[tokio::test]
+async fn release_view_404_names_missing_tag() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/releases/tags/v9.9.9"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({"message": "not found"})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let err = crate::api::release::get_by_tag(&c, "o", "r", "v9.9.9")
+        .await
+        .expect_err("missing release should error");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("release 'v9.9.9' not found"), "got: {msg}");
 }
 
 #[tokio::test]
@@ -3543,6 +3579,23 @@ async fn milestone_list_sends_state_filter() {
 }
 
 #[tokio::test]
+async fn milestone_view_404_names_missing_id() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/milestones/99"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({"message": "not found"})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let err = crate::api::milestone::get(&c, "o", "r", 99)
+        .await
+        .expect_err("missing milestone should error");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("milestone #99 not found"), "got: {msg}");
+}
+
+#[tokio::test]
 async fn milestone_create_skips_none_fields() {
     use crate::api::milestone::CreateMilestone;
     let server = MockServer::start().await;
@@ -3827,6 +3880,26 @@ async fn protect_list_and_get() {
         .await
         .expect("get");
     assert_eq!(rule.required_approvals, 2);
+}
+
+#[tokio::test]
+async fn protect_view_404_names_missing_branch_protection() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/branch_protections/feature%2Fx"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({"message": "not found"})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let err = crate::api::protect::get(&c, "o", "r", "feature/x")
+        .await
+        .expect_err("missing branch protection should error");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("branch protection for 'feature/x' not found"),
+        "got: {msg}"
+    );
 }
 
 #[tokio::test]
@@ -4986,6 +5059,23 @@ async fn variable_list_json_shape_and_projection() {
     assert!(v[0].get("data").is_none());
     let projected = project_fields(&v, "name");
     assert_eq!(projected, json!([{ "name": "REGION" }, { "name": "TIER" }]));
+}
+
+#[tokio::test]
+async fn tag_view_404_names_missing_tag() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/tags/feature%2Fx"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({"message": "not found"})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let err = crate::api::tag::get(&c, "o", "r", "feature/x")
+        .await
+        .expect_err("missing tag should error");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("tag 'feature/x' not found"), "got: {msg}");
 }
 
 #[tokio::test]

@@ -22,16 +22,23 @@ pub struct InstancesCmd {
     pub host: Option<String>,
     /// Emit JSON instead of a table. Only meaningful with `list` (or with
     /// no subcommand, which defaults to list).
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub json: bool,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum InstancesSub {
     /// List the Forgejo instances owned by this Fjord Account.
-    List,
+    List(ListArgs),
     /// Set the default Forgejo instance subsequent commands will route to.
     Use(UseArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ListArgs {
+    /// Emit JSON instead of a table.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -45,7 +52,8 @@ pub async fn run(cmd: InstancesCmd, top_host: Option<&str>) -> Result<()> {
     // `--host` on the subcommand wins over the top-level `--host`.
     let host_flag = cmd.host.as_deref().or(top_host);
     match cmd.command {
-        None | Some(InstancesSub::List) => list(host_flag, cmd.json).await,
+        None => list(host_flag, cmd.json).await,
+        Some(InstancesSub::List(args)) => list(host_flag, cmd.json || args.json).await,
         Some(InstancesSub::Use(args)) => use_instance(host_flag, args).await,
     }
 }
@@ -239,6 +247,22 @@ mod tests {
         assert_eq!(obj["publicUrl"], "https://my-forge.example");
         // createdAt is intentionally not surfaced in the serialized view.
         assert!(obj.get("createdAt").is_none());
+    }
+
+    #[test]
+    fn instances_list_accepts_json_after_subcommand() {
+        use clap::Parser;
+
+        let cli = crate::cli::Cli::try_parse_from(["fj", "instances", "list", "--json"])
+            .expect("instances list should accept --json after the subcommand");
+        let crate::cli::Command::Instances(InstancesCmd {
+            command: Some(InstancesSub::List(args)),
+            ..
+        }) = cli.command
+        else {
+            panic!("expected instances list");
+        };
+        assert!(args.json);
     }
 
     #[test]

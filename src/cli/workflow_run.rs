@@ -45,7 +45,7 @@ pub struct ListArgs {
     /// Fetch every available page
     #[arg(long)]
     pub paginate: bool,
-    /// Filter by run status or conclusion
+    /// Filter by run status
     #[arg(long)]
     pub status: Option<String>,
     /// Filter by source branch
@@ -246,32 +246,27 @@ async fn list(args: ListArgs, host: Option<&str>) -> Result<()> {
         println!("(no workflow runs)");
         return Ok(());
     }
-    let rows: Vec<Vec<String>> = runs
-        .iter()
-        .map(|r| {
-            let conclusion = r.conclusion.clone().unwrap_or_default();
-            vec![
-                r.run_number.to_string(),
-                output::truncate(&r.name, 40),
-                r.status.clone(),
-                conclusion,
-                output::truncate(&r.head_branch, 30),
-                output::dim(
-                    &r.updated_at
-                        .map(output::relative_time)
-                        .unwrap_or_else(|| "-".into()),
-                ),
-            ]
-        })
-        .collect();
-    print!(
-        "{}",
-        output::render_table(
-            &["#", "WORKFLOW", "STATUS", "CONCLUSION", "BRANCH", "UPDATED"],
-            &rows
-        )
-    );
+    let rows: Vec<Vec<String>> = runs.iter().map(run_list_row).collect();
+    print!("{}", output::render_table(run_list_headers(), &rows));
     Ok(())
+}
+
+fn run_list_headers() -> &'static [&'static str] {
+    &["#", "WORKFLOW", "STATUS", "BRANCH", "UPDATED"]
+}
+
+fn run_list_row(r: &api::workflow::WorkflowRun) -> Vec<String> {
+    vec![
+        r.run_number.to_string(),
+        output::truncate(&r.name, 40),
+        r.status.clone(),
+        output::truncate(&r.head_branch, 30),
+        output::dim(
+            &r.updated_at
+                .map(output::relative_time)
+                .unwrap_or_else(|| "-".into()),
+        ),
+    ]
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -1189,6 +1184,39 @@ mod tests {
         for url in ["https://elsewhere.test/x", "http://elsewhere.test/y", ""] {
             assert_eq!(absolutize(&c, url), url);
         }
+    }
+
+    #[test]
+    fn run_list_table_uses_status_without_dead_conclusion_column() {
+        let run = api::workflow::WorkflowRun {
+            run_number: 42,
+            name: "CI".into(),
+            status: "success".into(),
+            conclusion: None,
+            head_branch: "main".into(),
+            ..serde_json::from_value(serde_json::json!({})).unwrap()
+        };
+        assert_eq!(
+            run_list_headers(),
+            &["#", "WORKFLOW", "STATUS", "BRANCH", "UPDATED"]
+        );
+        let row = run_list_row(&run);
+        assert_eq!(row[2], "success");
+        assert_eq!(row.len(), run_list_headers().len());
+    }
+
+    #[test]
+    fn run_list_status_help_names_status_only() {
+        use clap::CommandFactory;
+        let help = crate::cli::Cli::command()
+            .find_subcommand_mut("run")
+            .unwrap()
+            .find_subcommand_mut("list")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("Filter by run status"));
+        assert!(!help.contains("Filter by run status or conclusion"));
     }
 
     #[test]

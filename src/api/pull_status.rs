@@ -11,6 +11,7 @@ use crate::client::Client;
 pub struct CombinedStatus {
     #[serde(default)]
     pub state: String,
+    #[serde(default)]
     pub sha: String,
     #[serde(default)]
     pub statuses: Vec<CommitStatus>,
@@ -43,5 +44,39 @@ pub async fn combined_status(
         crate::api::repo_path(owner, name),
         crate::api::path_segment(sha)
     );
-    client.json(Method::GET, &path, &[], None::<&()>).await
+    let value: serde_json::Value = client.json(Method::GET, &path, &[], None::<&()>).await?;
+    if value.is_null() {
+        return Ok(empty_combined_status(sha));
+    }
+    let mut status: CombinedStatus = serde_json::from_value(value)?;
+    if status.sha.is_empty() {
+        status.sha = sha.to_string();
+    }
+    Ok(status)
+}
+
+fn empty_combined_status(sha: &str) -> CombinedStatus {
+    CombinedStatus {
+        state: String::new(),
+        sha: sha.to_string(),
+        statuses: Vec::new(),
+        total_count: 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn combined_status_decodes_empty_no_ci_payload() {
+        let mut status: CombinedStatus = serde_json::from_value(serde_json::json!({})).unwrap();
+        if status.sha.is_empty() {
+            status.sha = "abc123".to_string();
+        }
+        assert_eq!(status.sha, "abc123");
+        assert_eq!(status.state, "");
+        assert!(status.statuses.is_empty());
+        assert_eq!(status.total_count, 0);
+    }
 }
