@@ -127,7 +127,26 @@ codesign -dvv fj-v0.1.4-darwin-aarch64/fj 2>&1 | grep -E 'Authority|TeamIdentifi
 
 ## Homebrew tap
 
-The release workflow attaches a rendered `fj.rb` as a release asset. The
-homebrew tap repo at `rasterandstate/homebrew-tap` is currently updated by
-hand. (Open issue: automate the bump via a tap-side workflow that polls
-`/releases/latest` and PRs in the new formula.)
+The release workflow attaches a rendered `fj.rb` as a release asset.
+
+The canonical tap is `rasterhub.com/rasterstate/homebrew-tap` (self-hosted);
+`github.com/rasterandstate/homebrew-tap` is a downstream push-mirror, so the
+install command does not depend on GitHub:
+
+```sh
+brew tap rasterandstate/tap https://rasterhub.com/rasterstate/homebrew-tap
+brew install fj
+```
+
+The tap is updated by hand after each release: copy the rendered `fj.rb` asset
+onto the canonical tap and push.
+
+```sh
+git clone https://rasterhub.com/rasterstate/homebrew-tap.git
+curl -fsSL https://rasterhub.com/rasterstate/fj/releases/download/vX.Y.Z/fj.rb \
+  -o homebrew-tap/Formula/fj.rb
+cd homebrew-tap && git commit -am "fj X.Y.Z" && git push   # push-mirror carries it to GitHub
+```
+
+(Open issue: automate the bump via a tap-side Forgejo Action that polls
+`/releases/latest` and commits the new formula.)
