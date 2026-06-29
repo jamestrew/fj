@@ -284,13 +284,24 @@ async fn generate_man_pages(args: ManArgs) -> Result<()> {
     let dir = &args.output_dir;
     std::fs::create_dir_all(dir)?;
     let cmd = Cli::command();
-    write_man_for(&cmd, "fj", dir)?;
-    for sub in cmd.get_subcommands() {
-        let name = format!("fj-{}", sub.get_name());
-        write_man_for(sub, &name, dir)?;
+    for (name, command) in man_pages(&cmd) {
+        write_man_for(command, &name, dir)?;
     }
     println!("✓ Wrote man pages to {}", dir.display());
     Ok(())
+}
+
+fn man_pages(cmd: &clap::Command) -> Vec<(String, &clap::Command)> {
+    fn walk<'a>(cmd: &'a clap::Command, name: String, out: &mut Vec<(String, &'a clap::Command)>) {
+        out.push((name.clone(), cmd));
+        for sub in cmd.get_subcommands() {
+            walk(sub, format!("{name}-{}", sub.get_name()), out);
+        }
+    }
+
+    let mut out = Vec::new();
+    walk(cmd, "fj".to_string(), &mut out);
+    out
 }
 
 fn write_man_for(cmd: &clap::Command, file_name: &str, dir: &std::path::Path) -> Result<()> {
@@ -393,6 +404,16 @@ mod tests {
             }) => assert_eq!(args.body_file.as_deref(), Some("-")),
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn man_pages_include_nested_subcommands() {
+        let cmd = Cli::command();
+        let pages: std::collections::BTreeSet<String> =
+            man_pages(&cmd).into_iter().map(|(name, _)| name).collect();
+        assert!(pages.contains("fj"));
+        assert!(pages.contains("fj-auth-login"));
+        assert!(pages.contains("fj-config-get"));
     }
 
     /// Every subcommand (and nested subcommand) must render its help and

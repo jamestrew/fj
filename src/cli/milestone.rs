@@ -92,7 +92,7 @@ pub struct EditArgs {
     /// Read description from file (use `-` for stdin).
     #[arg(short = 'F', long = "body-file", value_name = "FILE")]
     pub body_file: Option<String>,
-    /// Due date (YYYY-MM-DD)
+    /// Due date in ISO-8601 (e.g. `2026-06-01T00:00:00Z`).
     #[arg(long)]
     pub due_on: Option<String>,
     /// Edit the description in $EDITOR
@@ -298,6 +298,20 @@ async fn assign(args: AssignArgs, host: Option<&str>) -> Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn milestone_edit_due_on_help_matches_create() {
+        use clap::CommandFactory;
+        let help = crate::cli::Cli::command()
+            .find_subcommand_mut("milestone")
+            .unwrap()
+            .find_subcommand_mut("edit")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("ISO-8601"));
+        assert!(help.contains("2026-06-01T00:00:00Z"));
+    }
 
     #[test]
     fn list_state_rejects_unknown_value() {

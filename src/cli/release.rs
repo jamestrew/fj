@@ -62,8 +62,8 @@ pub struct ViewArgs {
     pub r: RepoFlag,
     /// Release tag (defaults to the latest published release)
     pub tag: Option<String>,
-    /// View the latest published release
-    #[arg(long, conflicts_with = "tag")]
+    /// View the latest published release. Redundant when TAG is omitted.
+    #[arg(long)]
     pub latest: bool,
     /// Emit JSON instead of a table
     #[arg(long)]
@@ -155,8 +155,8 @@ pub struct DownloadArgs {
     pub r: RepoFlag,
     /// Release tag (defaults to the latest published release)
     pub tag: Option<String>,
-    /// Download from the latest published release
-    #[arg(long, conflicts_with = "tag")]
+    /// Download from the latest published release. Redundant when TAG is omitted.
+    #[arg(long)]
     pub latest: bool,
     /// Asset name. If omitted, all assets are downloaded.
     #[arg(short = 'n', long)]
@@ -739,6 +739,38 @@ mod tests {
                     assert!(args.json);
                 }
                 other => panic!("expected release view, got {other:?}"),
+            },
+            other => panic!("expected release command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn release_latest_is_allowed_without_tag() {
+        let cli = Cli::try_parse_from(["fj", "release", "view", "--latest", "-R", "o/r"])
+            .expect("--latest without tag should parse");
+        match cli.command {
+            Command::Release(cmd) => match cmd.command {
+                super::ReleaseSub::View(args) => {
+                    assert_eq!(args.tag, None);
+                    assert!(args.latest);
+                }
+                other => panic!("expected release view, got {other:?}"),
+            },
+            other => panic!("expected release command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn release_download_latest_is_allowed_without_tag() {
+        let cli = Cli::try_parse_from(["fj", "release", "download", "--latest", "-R", "o/r"])
+            .expect("download --latest without tag should parse");
+        match cli.command {
+            Command::Release(cmd) => match cmd.command {
+                super::ReleaseSub::Download(args) => {
+                    assert_eq!(args.tag, None);
+                    assert!(args.latest);
+                }
+                other => panic!("expected release download, got {other:?}"),
             },
             other => panic!("expected release command, got {other:?}"),
         }
