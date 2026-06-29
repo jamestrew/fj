@@ -339,7 +339,7 @@ async fn list(args: ListArgs, host: Option<&str>) -> Result<()> {
         api::repo::list_for_user(&client, opts).await?
     };
     if args.json {
-        return list_output::print_json(&page);
+        return output::print_json(&serde_json::to_value(&page.items)?);
     }
     if page.items.is_empty() {
         println!("(no repositories)");

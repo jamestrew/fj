@@ -116,13 +116,16 @@ pub fn render_table(headers: &[&str], rows: &[Vec<String>]) -> String {
 
 /// Print JSON pretty-formatted to stdout. If `--json-fields foo,bar` was
 /// set globally, the value is projected through that filter first.
-pub fn print_json(value: &serde_json::Value) -> Result<()> {
+pub fn json_text(value: &serde_json::Value) -> Result<String> {
     let projected = match json_fields() {
         Some(fs) => json_filter::project(value, fs),
         None => value.clone(),
     };
-    let text = serde_json::to_string_pretty(&projected)?;
-    println!("{text}");
+    Ok(serde_json::to_string_pretty(&projected)?)
+}
+
+pub fn print_json(value: &serde_json::Value) -> Result<()> {
+    println!("{}", json_text(value)?);
     Ok(())
 }
 

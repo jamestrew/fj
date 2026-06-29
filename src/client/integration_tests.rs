@@ -386,12 +386,12 @@ async fn workflow_org_secrets_and_variables_use_org_actions_paths() {
 
     Mock::given(method("GET"))
         .and(path("/api/v1/orgs/team/actions/secrets"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "secrets": [{
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {
                 "name": "REGISTRY_TOKEN",
                 "created_at": "2026-06-01T00:00:00Z"
-            }]
-        })))
+            }
+        ])))
         .expect(1)
         .mount(&server)
         .await;
@@ -410,9 +410,9 @@ async fn workflow_org_secrets_and_variables_use_org_actions_paths() {
         .await;
     Mock::given(method("GET"))
         .and(path("/api/v1/orgs/team/actions/variables"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "variables": [{"name": "IMAGE", "data": "registry.example/app"}]
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {"name": "IMAGE", "created_at": "2026-06-01T00:00:00Z"}
+        ])))
         .expect(1)
         .mount(&server)
         .await;
@@ -445,7 +445,7 @@ async fn workflow_org_secrets_and_variables_use_org_actions_paths() {
     let variables = crate::api::workflow::list_org_variables(&c, "team")
         .await
         .expect("org variables list");
-    assert_eq!(variables[0].data, "registry.example/app");
+    assert_eq!(variables[0].name, "IMAGE");
     crate::api::workflow::set_org_variable(&c, "team", "IMAGE", "registry.example/app")
         .await
         .expect("org variable set");
@@ -1856,7 +1856,7 @@ async fn list_workflows_reads_both_dirs_and_filters_yaml() {
 }
 
 #[tokio::test]
-async fn list_secrets_parses_envelope() {
+async fn list_secrets_parses_live_bare_array() {
     let server = MockServer::start().await;
     let owner = "o";
     let name = "r";
@@ -1865,12 +1865,10 @@ async fn list_secrets_parses_envelope() {
             "/api/v1/repos/{owner}/{name}/actions/secrets"
         )))
         .and(header("authorization", "token test-token"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "secrets": [
-                { "name": "DEPLOY_KEY", "created_at": "2024-01-02T03:04:05Z" },
-                { "name": "TOKEN", "created_at": "2024-02-03T04:05:06Z" }
-            ]
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "name": "DEPLOY_KEY", "created_at": "2024-01-02T03:04:05Z" },
+            { "name": "TOKEN", "created_at": "2024-02-03T04:05:06Z" }
+        ])))
         .mount(&server)
         .await;
     let client = client_for(&server).await;
@@ -1922,7 +1920,7 @@ async fn delete_secret_issues_delete() {
 }
 
 #[tokio::test]
-async fn list_variables_parses_envelope() {
+async fn list_variables_parses_live_bare_array() {
     let server = MockServer::start().await;
     let owner = "o";
     let name = "r";
@@ -1931,12 +1929,10 @@ async fn list_variables_parses_envelope() {
             "/api/v1/repos/{owner}/{name}/actions/variables"
         )))
         .and(header("authorization", "token test-token"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "variables": [
-                { "name": "REGION", "data": "us-east-1" },
-                { "name": "STAGE", "data": "prod" }
-            ]
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "name": "REGION", "created_at": "2026-01-01T00:00:00Z" },
+            { "name": "STAGE", "created_at": "2026-01-02T00:00:00Z" }
+        ])))
         .mount(&server)
         .await;
     let client = client_for(&server).await;
@@ -1945,7 +1941,6 @@ async fn list_variables_parses_envelope() {
         .unwrap();
     assert_eq!(vars.len(), 2);
     assert_eq!(vars[0].name, "REGION");
-    assert_eq!(vars[0].data, "us-east-1");
     assert_eq!(vars[1].name, "STAGE");
 }
 
@@ -4794,6 +4789,62 @@ fn project_fields(value: &serde_json::Value, spec: &str) -> serde_json::Value {
 }
 
 #[tokio::test]
+async fn repo_list_json_shape_is_bare_array_and_projects_fields() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/user/repos"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {
+                "id": 1,
+                "name": "r1",
+                "full_name": "o/r1",
+                "owner": { "id": 1, "login": "o" },
+                "description": "one",
+                "private": false,
+                "html_url": "https://forge.example/o/r1",
+                "clone_url": "https://forge.example/o/r1.git",
+                "ssh_url": "git@forge.example:o/r1.git",
+                "updated_at": "2026-01-01T00:00:00Z"
+            },
+            {
+                "id": 2,
+                "name": "r2",
+                "full_name": "o/r2",
+                "owner": { "id": 1, "login": "o" },
+                "description": "two",
+                "private": true,
+                "html_url": "https://forge.example/o/r2",
+                "clone_url": "https://forge.example/o/r2.git",
+                "ssh_url": "git@forge.example:o/r2.git",
+                "updated_at": "2026-01-02T00:00:00Z"
+            }
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let page = crate::api::repo::list_for_user(
+        &c,
+        crate::api::repo::ListOptions {
+            limit: 30,
+            page: 1,
+            paginate: false,
+            query: None,
+        },
+    )
+    .await
+    .expect("repos");
+
+    let v = serde_json::to_value(&page.items).expect("serialize repo array");
+    assert!(v.is_array(), "repo list --json should emit a bare array");
+    let projected = project_fields(&v, "full_name");
+    assert_eq!(
+        projected,
+        json!([{ "full_name": "o/r1" }, { "full_name": "o/r2" }])
+    );
+}
+
+#[tokio::test]
 async fn pr_checks_json_shape_and_projection() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -4892,12 +4943,10 @@ async fn secret_list_json_shape_and_projection() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/api/v1/repos/o/r/actions/secrets"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "secrets": [
-                { "name": "TOKEN", "created_at": "2024-01-01T00:00:00Z" },
-                { "name": "API_KEY", "created_at": "2024-02-01T00:00:00Z" }
-            ]
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "name": "TOKEN", "created_at": "2024-01-01T00:00:00Z" },
+            { "name": "API_KEY", "created_at": "2024-02-01T00:00:00Z" }
+        ])))
         .expect(1)
         .mount(&server)
         .await;
@@ -4920,12 +4969,10 @@ async fn variable_list_json_shape_and_projection() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/api/v1/repos/o/r/actions/variables"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "variables": [
-                { "name": "REGION", "data": "us-east" },
-                { "name": "TIER", "data": "prod" }
-            ]
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "name": "REGION", "created_at": "2026-01-01T00:00:00Z" },
+            { "name": "TIER", "created_at": "2026-01-02T00:00:00Z" }
+        ])))
         .expect(1)
         .mount(&server)
         .await;
@@ -4935,7 +4982,8 @@ async fn variable_list_json_shape_and_projection() {
         .expect("variables");
     let v = serde_json::to_value(&vars).expect("serialize");
     assert_eq!(v[0]["name"], "REGION");
-    assert_eq!(v[0]["data"], "us-east");
+    assert!(v[0]["created_at"].is_string());
+    assert!(v[0].get("data").is_none());
     let projected = project_fields(&v, "name");
     assert_eq!(projected, json!([{ "name": "REGION" }, { "name": "TIER" }]));
 }

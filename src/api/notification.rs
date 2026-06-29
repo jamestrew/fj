@@ -12,6 +12,7 @@ pub struct Notification {
     pub pinned: bool,
     pub updated_at: DateTime<Utc>,
     pub url: String,
+    #[serde(default)]
     pub html_url: String,
     pub subject: Subject,
     pub repository: Option<NotificationRepo>,
@@ -32,6 +33,7 @@ pub struct Subject {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotificationRepo {
     pub full_name: String,
+    #[serde(default)]
     pub html_url: String,
 }
 
@@ -49,4 +51,32 @@ pub async fn mark_all_read(client: &Client) -> Result<()> {
     let res = client.request(Method::PUT, path, &[], None).await?;
     res.error_for_status()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notification_deserializes_when_html_urls_are_missing() {
+        let n: Notification = serde_json::from_value(serde_json::json!({
+            "id": 1,
+            "unread": true,
+            "pinned": false,
+            "updated_at": "2026-01-01T00:00:00Z",
+            "url": "https://forge.example/api/v1/notifications/1",
+            "subject": {
+                "title": "Build failed",
+                "type": "Issue",
+                "state": "open"
+            },
+            "repository": {
+                "full_name": "o/r"
+            }
+        }))
+        .expect("notification without html_url fields should deserialize");
+
+        assert_eq!(n.html_url, "");
+        assert_eq!(n.repository.unwrap().html_url, "");
+    }
 }

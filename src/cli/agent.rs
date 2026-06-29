@@ -310,6 +310,11 @@ fn fix_input(diff: &str) -> String {
     )
 }
 
+fn fix_input_redacted(diff: &str) -> String {
+    let redacted = redact_diff(diff, &[]);
+    fix_input(&redacted.text)
+}
+
 /// The fix branch for `--pr`: the caller's `--branch`, else `agent-fix`.
 fn fix_branch(provided: Option<&str>) -> String {
     provided
@@ -419,7 +424,7 @@ async fn fix(args: FixArgs, host: Option<&str>) -> Result<()> {
     let provider = agent_provider::resolve(&cfg)?;
     let resp = provider.complete(&AgentRequest {
         task: AgentTask::Fix,
-        input: fix_input(&diff),
+        input: fix_input_redacted(&diff),
         model: cfg.model.clone(),
     })?;
 
@@ -671,6 +676,21 @@ mod tests {
         let s = fix_input("diff --git a/x b/x\n@@ -1 +1 @@");
         assert!(s.contains("ONLY a unified diff"));
         assert!(s.contains("diff --git a/x b/x"));
+    }
+
+    #[test]
+    fn fix_input_redacted_omits_sensitive_files_and_masks_secrets() {
+        let diff = "diff --git a/.env b/.env\n--- a/.env\n+++ b/.env\n@@ -0,0 +1 @@\n+API_TOKEN=super-secret\n\
+diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -0,0 +1 @@\n+let token = \"ghp_abcdefghijklmnopqrstuvwxyz123456\";\n";
+        let prompt = fix_input_redacted(diff);
+
+        assert!(prompt.contains("ONLY a unified diff"));
+        assert!(!prompt.contains("super-secret"));
+        assert!(!prompt.contains("API_TOKEN"));
+        assert!(!prompt.contains("diff --git a/.env b/.env"));
+        assert!(prompt.contains("diff --git a/src/lib.rs b/src/lib.rs"));
+        assert!(prompt.contains("***REDACTED***"));
+        assert!(!prompt.contains("ghp_abcdefghijklmnopqrstuvwxyz123456"));
     }
 
     #[test]

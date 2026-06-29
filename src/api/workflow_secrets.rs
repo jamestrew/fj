@@ -23,13 +23,7 @@ pub async fn list_org_secrets(client: &Client, org: &str) -> Result<Vec<ActionSe
 }
 
 async fn list_secrets_at(client: &Client, path: &str) -> Result<Vec<ActionSecret>> {
-    #[derive(Deserialize)]
-    struct Envelope {
-        #[serde(default)]
-        secrets: Vec<ActionSecret>,
-    }
-    let env: Envelope = client.json(Method::GET, path, &[], None::<&()>).await?;
-    Ok(env.secrets)
+    client.json(Method::GET, path, &[], None::<&()>).await
 }
 
 #[derive(Debug, Serialize)]
@@ -105,7 +99,7 @@ async fn delete_secret_at(client: &Client, path: &str) -> Result<()> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionVariable {
     pub name: String,
-    pub data: String,
+    pub created_at: DateTime<Utc>,
 }
 
 pub async fn list_variables(
@@ -121,13 +115,7 @@ pub async fn list_org_variables(client: &Client, org: &str) -> Result<Vec<Action
 }
 
 async fn list_variables_at(client: &Client, path: &str) -> Result<Vec<ActionVariable>> {
-    #[derive(Deserialize)]
-    struct Envelope {
-        #[serde(default)]
-        variables: Vec<ActionVariable>,
-    }
-    let env: Envelope = client.json(Method::GET, path, &[], None::<&()>).await?;
-    Ok(env.variables)
+    client.json(Method::GET, path, &[], None::<&()>).await
 }
 
 pub async fn set_variable(
@@ -220,4 +208,35 @@ fn org_actions_item_path(org: &str, kind: &str, item: &str) -> String {
         org_actions_path(org, kind),
         crate::api::path_segment(item)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn action_secrets_decode_live_bare_array_without_values() {
+        let secrets: Vec<ActionSecret> = serde_json::from_value(serde_json::json!([
+            { "name": "TOKEN", "created_at": "2026-01-01T00:00:00Z" }
+        ]))
+        .expect("bare secret array");
+
+        assert_eq!(secrets.len(), 1);
+        assert_eq!(secrets[0].name, "TOKEN");
+        let rendered = serde_json::to_string(&secrets).unwrap();
+        assert!(!rendered.contains("secret-value"));
+    }
+
+    #[test]
+    fn action_variables_decode_live_bare_array_without_values() {
+        let vars: Vec<ActionVariable> = serde_json::from_value(serde_json::json!([
+            { "name": "RUST_LOG", "created_at": "2026-01-01T00:00:00Z" }
+        ]))
+        .expect("bare variable array");
+
+        assert_eq!(vars.len(), 1);
+        assert_eq!(vars[0].name, "RUST_LOG");
+        let rendered = serde_json::to_string(&vars).unwrap();
+        assert!(!rendered.contains("variable-value"));
+    }
 }

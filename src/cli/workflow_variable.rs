@@ -53,9 +53,9 @@ async fn var_list(args: SecretListArgs, host: Option<&str>) -> Result<()> {
     }
     let rows: Vec<Vec<String>> = v
         .iter()
-        .map(|x| vec![x.name.clone(), x.data.clone()])
+        .map(|x| vec![x.name.clone(), output::relative_time(x.created_at)])
         .collect();
-    print!("{}", output::render_table(&["NAME", "VALUE"], &rows));
+    print!("{}", output::render_table(&["NAME", "CREATED"], &rows));
     Ok(())
 }
 

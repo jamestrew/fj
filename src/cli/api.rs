@@ -110,7 +110,7 @@ pub async fn run(args: ApiArgs, host: Option<&str>) -> Result<()> {
 
     if !status.is_success() {
         eprintln!("HTTP {status}");
-        output::print_json(&parsed)?;
+        eprintln!("{}", error_body_text(&parsed)?);
         return Err(anyhow!("request failed"));
     }
 
@@ -122,6 +122,10 @@ pub async fn run(args: ApiArgs, host: Option<&str>) -> Result<()> {
         output::print_json(&projected)?;
     }
     Ok(())
+}
+
+fn error_body_text(value: &Value) -> Result<String> {
+    output::json_text(value)
 }
 
 fn pick_method(args: &ApiArgs) -> Result<Method> {
@@ -358,6 +362,13 @@ mod tests {
         let mut a = base_args();
         a.method = Some("patch".into());
         assert_eq!(pick_method(&a).unwrap(), Method::PATCH);
+    }
+
+    #[test]
+    fn error_body_text_formats_json_for_stderr_without_stdout_printing() {
+        let text = error_body_text(&serde_json::json!({ "message": "not found" })).unwrap();
+        assert!(text.contains("not found"));
+        assert!(!text.ends_with("\n"));
     }
 
     #[test]
