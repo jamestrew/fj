@@ -27,7 +27,7 @@ pub enum SearchSub {
 pub struct QueryArgs {
     /// Search query
     pub query: String,
-    /// Maximum number of results to fetch
+    /// Maximum number of results to fetch (max 50)
     #[arg(short = 'L', long, default_value_t = 20)]
     pub limit: u32,
     /// Emit JSON instead of a table
@@ -118,4 +118,21 @@ async fn search_users(client: &Client, args: QueryArgs) -> Result<()> {
         output::render_table(&["LOGIN", "NAME", "EMAIL"], &rows)
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    #[test]
+    fn search_limit_help_documents_cap() {
+        let help = crate::cli::Cli::command()
+            .find_subcommand_mut("search")
+            .unwrap()
+            .find_subcommand_mut("repos")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("max 50"));
+    }
 }

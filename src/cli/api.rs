@@ -95,11 +95,7 @@ pub async fn run(args: ApiArgs, host: Option<&str>) -> Result<()> {
     let text = res.text().await.context("reading response body")?;
 
     if args.include {
-        eprintln!("HTTP {status}");
-        for (k, v) in resp_headers.iter() {
-            eprintln!("{}: {}", k.as_str(), v.to_str().unwrap_or("(binary)"));
-        }
-        eprintln!();
+        print!("{}", included_headers_text(status, &resp_headers));
     }
 
     let parsed: Value = if text.is_empty() {
@@ -122,6 +118,18 @@ pub async fn run(args: ApiArgs, host: Option<&str>) -> Result<()> {
         output::print_json(&projected)?;
     }
     Ok(())
+}
+
+fn included_headers_text(status: reqwest::StatusCode, headers: &HeaderMap) -> String {
+    let mut out = format!("HTTP {status}\n");
+    for (k, v) in headers.iter() {
+        out.push_str(k.as_str());
+        out.push_str(": ");
+        out.push_str(v.to_str().unwrap_or("(binary)"));
+        out.push('\n');
+    }
+    out.push('\n');
+    out
 }
 
 fn error_body_text(value: &Value) -> Result<String> {
@@ -362,6 +370,15 @@ mod tests {
         let mut a = base_args();
         a.method = Some("patch".into());
         assert_eq!(pick_method(&a).unwrap(), Method::PATCH);
+    }
+
+    #[test]
+    fn include_headers_text_formats_for_stdout() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-test", HeaderValue::from_static("ok"));
+        let text = included_headers_text(reqwest::StatusCode::OK, &headers);
+        assert!(text.starts_with("HTTP 200 OK\n"));
+        assert!(text.contains("x-test: ok\n"));
     }
 
     #[test]

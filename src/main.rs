@@ -94,20 +94,24 @@ fn handle_parse_outcome(err: clap::Error) -> ExitCode {
     use clap::error::ErrorKind;
     use std::io::IsTerminal;
 
-    let show_logo = match err.kind() {
-        // The version line, explicit help screen, and bare-`fj` help screen
-        // only get the mark on an interactive stdout, so piped output stays
-        // clean and parseable.
-        ErrorKind::DisplayVersion
-        | ErrorKind::DisplayHelp
-        | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => std::io::stdout().is_terminal(),
-        _ => false,
-    };
+    let show_logo = matches!(
+        err.kind(),
+        ErrorKind::DisplayVersion | ErrorKind::DisplayHelp
+    ) && std::io::stdout().is_terminal();
+    let code = parse_error_exit_code(err.kind());
     if show_logo {
         print!("{}", logo::banner());
     }
     let _ = err.print();
-    ExitCode::from(err.exit_code() as u8)
+    ExitCode::from(code)
+}
+
+fn parse_error_exit_code(kind: clap::error::ErrorKind) -> u8 {
+    use clap::error::ErrorKind;
+    match kind {
+        ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => 0,
+        _ => 2,
+    }
 }
 
 /// Returns `Some(name)` if `argv[1]` is unrecognized by clap AND a `fj-<name>`
@@ -138,7 +142,7 @@ fn detect_plugin(argv: &[String]) -> Option<String> {
 
 /// Keep this list in sync with `cli::Command`. It's an allowlist used to avoid
 /// hijacking real subcommands as plugin candidates.
-const KNOWN_SUBCOMMANDS: &[&str] = &[
+pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
     "auth",
     "instances",
     "repo",
@@ -173,3 +177,21 @@ const KNOWN_SUBCOMMANDS: &[&str] = &[
     "man",
     "help",
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::error::ErrorKind;
+
+    #[test]
+    fn parse_error_exit_codes_match_cli_conventions() {
+        assert_eq!(parse_error_exit_code(ErrorKind::DisplayHelp), 0);
+        assert_eq!(parse_error_exit_code(ErrorKind::DisplayVersion), 0);
+        assert_eq!(parse_error_exit_code(ErrorKind::MissingRequiredArgument), 2);
+        assert_eq!(parse_error_exit_code(ErrorKind::InvalidSubcommand), 2);
+        assert_eq!(
+            parse_error_exit_code(ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand),
+            2
+        );
+    }
+}

@@ -147,9 +147,9 @@ pub struct CreateArgs {
     /// Pull request title
     #[arg(short = 't', long)]
     pub title: Option<String>,
-    /// Base branch the PR targets
-    #[arg(short = 'B', long, default_value = "main")]
-    pub base: String,
+    /// Base branch the PR targets. Defaults to the repository default branch.
+    #[arg(short = 'B', long)]
+    pub base: Option<String>,
     /// Head branch. Either a branch name on the same repo, or `owner:branch`.
     #[arg(short = 'H', long)]
     pub head: Option<String>,
@@ -564,11 +564,12 @@ async fn create(args: CreateArgs, host: Option<&str>) -> Result<()> {
         None => detect_current_branch()
             .ok_or_else(|| anyhow!("could not determine head branch; pass --head"))?,
     };
+    let base = resolve_create_base(&ctx, args.base.as_deref()).await?;
     // Resolve --fill / --fill-first up front so both title and body can draw
     // from the branch's commits. None when neither flag was passed.
     let filled = match fill_mode(args.fill, args.fill_first) {
         Some(mode) => {
-            let commits = git::log_commits(&args.base, &local_head_ref(&head))?;
+            let commits = git::log_commits(&base, &local_head_ref(&head))?;
             Some(pr_fill::fill_from_commits(&commits, mode)?)
         }
         None => None,
@@ -620,7 +621,7 @@ async fn create(args: CreateArgs, host: Option<&str>) -> Result<()> {
         &CreatePull {
             title: &title,
             head: &head,
-            base: &args.base,
+            base: &base,
             body: body.as_deref(),
             draft: args.draft,
         },
@@ -655,6 +656,22 @@ async fn create(args: CreateArgs, host: Option<&str>) -> Result<()> {
         web::open(&pr.html_url)?;
     }
     Ok(())
+}
+
+async fn resolve_create_base(
+    ctx: &crate::cli::context::RepoContext,
+    explicit: Option<&str>,
+) -> Result<String> {
+    match explicit.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(base) => Ok(base.to_string()),
+        None => {
+            let repo = api::repo::get(&ctx.client, &ctx.owner, &ctx.name).await?;
+            if repo.default_branch.trim().is_empty() {
+                return Err(anyhow!("repository default branch is empty; pass --base"));
+            }
+            Ok(repo.default_branch)
+        }
+    }
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -1368,6 +1385,78 @@ mod tests {
             }) => assert_eq!(a.number, 9),
             other => panic!("expected pr unlock, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn create_base_is_optional_at_parse_time() {
+        use crate::cli::{Cli, Command};
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["fj", "pr", "create", "--title", "t"])
+            .expect("base should be optional");
+        match cli.command {
+            Command::Pr(PrCmd {
+                command: PrSub::Create(a),
+            }) => assert!(a.base.is_none()),
+            other => panic!("expected pr create, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_base_defaults_to_repo_default_branch() {
+        use url::Url;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/o/r"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 1,
+                "name": "r",
+                "full_name": "o/r",
+                "owner": { "id": 1, "login": "o" },
+                "html_url": "https://forge.example/o/r",
+                "clone_url": "https://forge.example/o/r.git",
+                "ssh_url": "git@forge.example:o/r.git",
+                "default_branch": "develop",
+                "updated_at": "2026-01-01T00:00:00Z"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = crate::client::Client::for_base_url(
+            Url::parse(&format!("{}/api/v1/", server.uri())).unwrap(),
+            "tok".into(),
+        )
+        .unwrap();
+        let ctx = crate::cli::context::RepoContext {
+            client,
+            host: "forge.example".into(),
+            web_base: None,
+            owner: "o".into(),
+            name: "r".into(),
+        };
+        assert_eq!(resolve_create_base(&ctx, None).await.unwrap(), "develop");
+    }
+
+    #[tokio::test]
+    async fn create_base_uses_explicit_base_without_repo_lookup() {
+        let client = crate::client::Client::for_base_url(
+            "https://forge.example/api/v1/".parse().unwrap(),
+            "tok".into(),
+        )
+        .unwrap();
+        let ctx = crate::cli::context::RepoContext {
+            client,
+            host: "forge.example".into(),
+            web_base: None,
+            owner: "o".into(),
+            name: "r".into(),
+        };
+        assert_eq!(
+            resolve_create_base(&ctx, Some("release")).await.unwrap(),
+            "release"
+        );
     }
 
     #[test]

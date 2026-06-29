@@ -91,7 +91,13 @@ async fn list(args: ListArgs, host: Option<&str>) -> Result<()> {
     }
     let rows: Vec<Vec<String>> = tags
         .iter()
-        .map(|t| vec![t.name.clone(), short_sha(&t.commit.sha), t.message.clone()])
+        .map(|t| {
+            vec![
+                t.name.clone(),
+                short_sha(&t.commit.sha),
+                tag_message_summary(&t.message),
+            ]
+        })
         .collect();
     print!(
         "{}",
@@ -155,10 +161,26 @@ async fn delete(args: DeleteArgs, host: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+fn tag_message_summary(message: &str) -> String {
+    output::truncate(message.lines().next().unwrap_or(""), 60)
+}
+
 fn short_sha(sha: &str) -> String {
     if sha.is_empty() {
         String::new()
     } else {
         output::dim(&sha[..7.min(sha.len())])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tag_message_summary_uses_first_line_and_truncates() {
+        let summary = tag_message_summary(&format!("{}\nsecond line", "x".repeat(80)));
+        assert!(!summary.contains("second line"));
+        assert!(summary.chars().count() <= 60);
     }
 }

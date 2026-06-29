@@ -39,6 +39,10 @@ pub enum ConfigSub {
     Get(GetArgs),
     /// Set a key.
     Set(SetArgs),
+    /// Unset a key.
+    Unset(GetArgs),
+    /// Remove a key.
+    Remove(GetArgs),
     /// Show all configured keys.
     List,
     /// Print the path of the config file.
@@ -107,6 +111,28 @@ fn matches_truthy(value: &str) -> bool {
     )
 }
 
+fn validate_key(key: &str) -> Result<()> {
+    if KNOWN_KEYS.contains(&key) {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "unknown config key '{key}' (known: {})",
+            KNOWN_KEYS.join(", ")
+        ))
+    }
+}
+
+fn set_value(file: &mut ConfigFile, key: &str, value: &str) -> Result<()> {
+    validate_key(key)?;
+    file.values.insert(key.to_string(), value.to_string());
+    Ok(())
+}
+
+fn unset_value(file: &mut ConfigFile, key: &str) -> Result<()> {
+    file.values.remove(key);
+    Ok(())
+}
+
 pub async fn run(cmd: ConfigCmd) -> Result<()> {
     match cmd.command {
         ConfigSub::Get(args) => {
@@ -118,17 +144,19 @@ pub async fn run(cmd: ConfigCmd) -> Result<()> {
             Ok(())
         }
         ConfigSub::Set(args) => {
-            if !KNOWN_KEYS.contains(&args.key.as_str()) {
-                eprintln!(
-                    "note: '{}' is not a well-known key (known: {})",
-                    args.key,
-                    KNOWN_KEYS.join(", ")
-                );
-            }
+            validate_key(&args.key)?;
             let mut file = load()?;
-            file.values.insert(args.key.clone(), args.value.clone());
+            set_value(&mut file, &args.key, &args.value)?;
             save(&file)?;
             println!("✓ {} = {}", args.key, args.value);
+            Ok(())
+        }
+        ConfigSub::Unset(args) | ConfigSub::Remove(args) => {
+            validate_key(&args.key)?;
+            let mut file = load()?;
+            unset_value(&mut file, &args.key)?;
+            save(&file)?;
+            println!("✓ unset {}", args.key);
             Ok(())
         }
         ConfigSub::List => {
@@ -146,5 +174,26 @@ pub async fn run(cmd: ConfigCmd) -> Result<()> {
             println!("{}", config_path()?.display());
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_set_rejects_unknown_keys() {
+        let mut file = ConfigFile::default();
+        let err = set_value(&mut file, "typo_key", "value").expect_err("unknown key rejected");
+        assert!(err.to_string().contains("unknown config key"));
+        assert!(file.values.is_empty());
+    }
+
+    #[test]
+    fn config_unset_removes_key() {
+        let mut file = ConfigFile::default();
+        set_value(&mut file, "editor", "vim").unwrap();
+        unset_value(&mut file, "editor").unwrap();
+        assert!(!file.values.contains_key("editor"));
     }
 }

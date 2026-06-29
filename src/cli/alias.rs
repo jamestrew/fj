@@ -86,6 +86,7 @@ pub async fn run(cmd: AliasCmd) -> Result<()> {
     match cmd.command {
         AliasSub::List => list(&file),
         AliasSub::Set(args) => {
+            validate_alias_name(&args.name)?;
             file.aliases
                 .insert(args.name.clone(), args.expansion.clone());
             save(&file)?;
@@ -101,6 +102,18 @@ pub async fn run(cmd: AliasCmd) -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn validate_alias_name(name: &str) -> Result<()> {
+    if crate::KNOWN_SUBCOMMANDS
+        .iter()
+        .any(|builtin| builtin == &name)
+    {
+        return Err(anyhow::anyhow!(
+            "alias '{name}' would shadow a built-in fj command"
+        ));
+    }
+    Ok(())
 }
 
 fn list(file: &AliasFile) -> Result<()> {
@@ -189,6 +202,17 @@ mod tests {
     #[test]
     fn expand_empty_argv() {
         assert_eq!(expand_argv(vec!["fj".into()]), vec!["fj".to_string()]);
+    }
+
+    #[test]
+    fn alias_set_refuses_to_shadow_builtin_subcommands() {
+        let err = validate_alias_name("pr").expect_err("builtin alias should be rejected");
+        assert!(err.to_string().contains("built-in fj command"));
+    }
+
+    #[test]
+    fn alias_set_accepts_non_builtin_name() {
+        validate_alias_name("co").expect("custom alias should be accepted");
     }
 
     #[test]
