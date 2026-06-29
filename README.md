@@ -51,7 +51,7 @@ commands work on Gitea too. See [docs/compatibility.md](docs/compatibility.md).
 **Homebrew** (macOS and Linux x86_64), signed and notarized:
 
 ```sh
-brew tap rasterandstate/tap
+brew tap rasterandstate/tap https://rasterhub.com/rasterstate/homebrew-tap
 brew install fj
 ```
 
