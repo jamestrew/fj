@@ -4,7 +4,7 @@ All notable changes will be recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] - 2026-06-29
 
 ### Added
 
@@ -56,6 +56,37 @@ All notable changes will be recorded here. The format follows
 - **Man pages on install**: `make install` now generates and installs man pages
   to `$(MANDIR)`, so `man fj` works out of the box. The top-level page gained a
   real description and examples instead of echoing the one-line summary.
+- **`fj workflow enable` / `disable` / `view`**: manage and inspect Actions
+  workflows from the terminal.
+- **`fj branch-create` / `fj branch-delete`**: create and delete branches on the
+  remote without a local clone.
+- **`fj issue lock` / `unlock` and `fj pr lock` / `unlock`**: lock or unlock a
+  conversation, with an optional reason.
+- **`fj repo collaborator`**: list, add, and remove repository collaborators.
+- **`fj tag`** (list/create/delete/view) and branch ref commands for managing
+  git refs directly through the API.
+- **Issue templates**: create issues from a repository's issue templates.
+- **`fj release` gains `--pattern`, `--clobber`, and implicit-latest**: glob
+  asset selection, overwrite existing assets, and omit the tag to act on the
+  latest release for download/upload/view.
+- **`fj workflow run` returns a run handle**: `--json`, `--watch`, and
+  `--exit-status` let scripts trigger a workflow and follow it to completion.
+- **`fj run` exit status and `run list` filters**: gate scripts on a run's
+  outcome and filter the run list.
+- **`fj secret` / `fj variable --org`**: read and write org-scoped CI
+  credentials shared across repos. Values are never printed.
+- **`fj pr comment` edit/delete and idempotent upsert**, plus `-F` /
+  `--body-file` body input across `issue`, `pr`, `release`, `milestone`, and the
+  comment verbs.
+- **`fj api` reads the request body from stdin or a file** for scripted writes.
+- **List filters, pagination, and counts**: `issue list` / `pr list` gain state,
+  `--label`, and `--author` filters; list commands gain `--paginate` and total
+  counts.
+- **`--json` on read-only `pr` / `secret` / `variable` commands** for scripting.
+- **Label and assignee support**: set labels and assignees on `pr`, and add or
+  remove them additively on `issue` create and edit.
+- **File-backed token store fallback**: `fj auth` falls back to a file token
+  store when the OS keychain or Secret Service is unavailable.
 
 ### Changed
 
@@ -66,6 +97,16 @@ All notable changes will be recorded here. The format follows
   straight to Fjord, and any PAT input (`--host`, `--token`, `--with-token`,
   or `FJ_TOKEN`) goes straight to the token flow, so scripts and the
   non-interactive paths behave exactly as before.
+- **Global `--color` flag** and the `no_color` config / `NO_COLOR` env are now
+  honored across colored output.
+- **Reworked API error UX and exit codes**: friendly, actionable messages now
+  also cover 409 conflict and 422 validation responses, with consistent
+  non-zero exit codes.
+- **Unavailable keychains are treated as a missing token** (prompting a clean
+  re-auth) rather than surfacing a hard error.
+- **The `fj stack` engine now consumes the shared `fjord-core` library** for
+  naming, plan and ship gating, split/absorb routing, review summarization, and
+  PR-body annotation, keeping the CLI and the Fjord apps in sync.
 
 ### Fixed
 
@@ -89,6 +130,38 @@ All notable changes will be recorded here. The format follows
   out-of-date branch, or an already-merged/closed PR. When nothing specific is
   found it falls back to the raw Forgejo message, which is now surfaced instead
   of swallowed. `fj pr view` and `fj pr checks` gained a `Mergeable:` line.
+- Piped `fj --version` output is no longer truncated.
+- Quoted arguments are parsed correctly in alias expansions.
+- scp-form remote URLs with a stray colon in the path are rejected, and
+  malformed hostnames are rejected before they reach the git credential helper.
+- Digit-only object keys resolve correctly in the JSON path engine.
+- No longer panics slicing a multibyte debug body preview.
+- Corrected Forgejo host URL handling.
+
+#### Audit pass (commands, correctness, and UX)
+
+A sweep of every subcommand and flag fixed the following:
+
+- Crashes in `fj status`, `fj secret list`, and `fj variable list` from live
+  payloads returned as bare arrays or with omitted fields.
+- `fj agent fix` now redacts secrets and drops sensitive files before sending
+  the diff to the provider, matching `fj agent review`.
+- Error bodies print to stderr (stdout stays clean on failure); `fj api -i`
+  writes headers to stdout.
+- `fj milestone list -s` validates the state filter (open/closed/all) instead of
+  silently returning everything.
+- `fj pr status --json-fields` projects correctly, and `fj pr checks` reports
+  "no checks" on a no-CI PR instead of a decode error.
+- `fj run list` shows a real conclusion, `fj instances list --json` works, and
+  `fj stack ship --merge` selects a merge-commit style.
+- Not-found errors name the missing sub-resource (branch protection, release,
+  milestone, tag) rather than the repo.
+- Usage errors exit non-zero; `fj alias set` refuses to shadow built-in
+  subcommands; `fj man` recurses into nested subcommands; `fj config` gains
+  `unset` and rejects unknown keys.
+- `fj browse` gains `--print-url` / `--no-browser`; `fj pr create --base`
+  defaults to the repo's default branch; `fj search -L` documents its cap; and
+  `fj tag list` truncates long annotated-tag messages.
 
 ## [0.2.0] - 2026-06-02
 
