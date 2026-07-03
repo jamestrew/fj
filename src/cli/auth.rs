@@ -180,7 +180,10 @@ fn session(args: SessionArgs) -> Result<()> {
 
     let storage = token_store::store_session_cookie(&host, &cookie)?;
     if let token_store::TokenStoreLocation::File(path) = storage {
-        println!("! Keychain unavailable; stored session in {}", path.display());
+        println!(
+            "! Keychain unavailable; stored session in {}",
+            path.display()
+        );
     }
     println!(
         "✓ Imported web session for {host}. Cookie-gated Actions log and rerun routes will use it."
