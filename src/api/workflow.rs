@@ -5,6 +5,7 @@
 //! focused; the glob re-exports below preserve every `api::workflow::*` path
 //! so call sites need no changes.
 
+pub use crate::api::workflow_logs::*;
 pub use crate::api::workflow_run::*;
 pub use crate::api::workflow_secrets::*;
 pub use crate::api::workflow_view::*;

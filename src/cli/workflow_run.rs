@@ -25,6 +25,8 @@ pub enum RunSub {
     List(ListArgs),
     /// View a workflow run, or its logs with `--log` / `--log-failed`.
     View(ViewArgs),
+    /// Print a workflow run's logs.
+    Log(LogArgs),
     /// Stream a run's logs live until the job finishes.
     Watch(WatchArgs),
     /// List or download a run's artifacts.
@@ -87,6 +89,26 @@ pub struct ViewArgs {
     /// Exit with status 1 unless the run conclusion is success or skipped.
     #[arg(long)]
     pub exit_status: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct LogArgs {
+    #[command(flatten)]
+    pub r: RepoFlag,
+    /// Run number, as shown in the `#` column of `fj run list`.
+    pub run_id: u64,
+    /// Job index within the run (0-based). Omit to log every job.
+    #[arg(short = 'j', long)]
+    pub job: Option<usize>,
+    /// Attempt number. Defaults to the latest attempt exposed by the task log source.
+    #[arg(long)]
+    pub attempt: Option<u32>,
+    /// Print only jobs that did not succeed.
+    #[arg(long)]
+    pub failed: bool,
+    /// Emit JSON instead of text.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -165,6 +187,7 @@ pub async fn run(cmd: RunCmd, host: Option<&str>) -> Result<()> {
     match cmd.command {
         RunSub::List(args) => list(args, host).await,
         RunSub::View(args) => view(args, host).await,
+        RunSub::Log(args) => log(args, host).await,
         RunSub::Watch(args) => watch(args, host).await,
         RunSub::Download(args) => workflow_artifact::download(args, host).await,
         RunSub::Rerun(args) => rerun(args, host).await,
@@ -273,81 +296,28 @@ fn run_list_row(r: &api::workflow::WorkflowRun) -> Vec<String> {
 async fn view(args: ViewArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
 
-    // Everything `view` shows comes from the Forgejo web routes, not the API:
-    // `/api/v1` has no single-run or log endpoint on current Forgejo (see
-    // api::workflow's run-logs section).
-    guard_web_routes(&ctx.client)?;
-
     if args.log || args.log_failed {
-        // An explicit `--job N` logs just that job. Otherwise span the whole
-        // run: every job for `--log`, only the non-green ones for
-        // `--log-failed` (so a failure in job 1 isn't hidden behind a green
-        // job 0, which is the default-to-job-0 trap this avoids).
-        let targets = match args.job {
-            Some(j) => vec![j],
-            None => {
-                let summary = api::workflow::fetch_run_summary(
-                    &ctx.client,
-                    &ctx.owner,
-                    &ctx.name,
-                    args.run_id,
-                )
-                .await?;
-                let statuses: Vec<String> = summary
-                    .state
-                    .run
-                    .jobs
-                    .iter()
-                    .map(|j| j.status.clone())
-                    .collect();
-                let sel = jobs_to_log(&statuses, args.log_failed);
-                if sel.is_empty() {
-                    let note = if statuses.is_empty() {
-                        "This run has no jobs."
-                    } else {
-                        "No failed jobs in this run."
-                    };
-                    println!("{}", output::dim(note));
-                    return ensure_exit_status(&summary.state.run.status, args.exit_status);
-                }
-                sel
-            }
-        };
-
-        let mut run_status = None;
-        let multi = targets.len() > 1;
-        for (i, &job) in targets.iter().enumerate() {
-            let attempt = match args.attempt {
-                Some(a) => a,
-                None => {
-                    api::workflow::latest_attempt(
-                        &ctx.client,
-                        &ctx.owner,
-                        &ctx.name,
-                        args.run_id,
-                        job,
-                    )
-                    .await?
-                }
-            };
-            let view = api::workflow::fetch_job_logs(
-                &ctx.client,
-                &ctx.owner,
-                &ctx.name,
-                args.run_id,
-                job,
-                attempt,
-            )
-            .await?;
-            validate_job(&view, job)?;
-            if multi && i > 0 {
-                println!();
-            }
-            print_logs(&view, args.log_failed);
-            run_status = Some(view.state.run.status.clone());
+        let logs = api::workflow::fetch_run_logs(
+            &ctx.client,
+            &ctx.owner,
+            &ctx.name,
+            args.run_id,
+            args.job,
+            args.attempt,
+            args.log_failed,
+        )
+        .await?;
+        if args.json {
+            output::print_json(&serde_json::to_value(&logs)?)?;
+        } else {
+            print_run_logs(&logs);
         }
-        return ensure_exit_status(run_status.as_deref().unwrap_or(""), args.exit_status);
+        return ensure_exit_status(logs.status().unwrap_or(""), args.exit_status);
     }
+
+    // Non-log `view` still reads Forgejo web routes. The API/Loki log path
+    // above intentionally stays available for Fjord Account gateway hosts.
+    guard_web_routes(&ctx.client)?;
 
     let view =
         api::workflow::fetch_run_summary(&ctx.client, &ctx.owner, &ctx.name, args.run_id).await?;
@@ -404,49 +374,49 @@ async fn view(args: ViewArgs, host: Option<&str>) -> Result<()> {
     ensure_exit_status(&run.status, args.exit_status)
 }
 
-/// Render a fully-fetched job view. With `failed_only`, skip steps that
-/// succeeded or were skipped.
-fn print_logs(view: &api::workflow::RunView, failed_only: bool) {
-    let job = &view.state.current_job;
-    let title = if job.title.is_empty() {
-        "job"
-    } else {
-        &job.title
-    };
-    println!(
-        "{} {}",
-        output::bold(title),
-        output::action_status(&view.state.run.status),
-    );
-    if view.state.run.jobs.len() > 1 {
-        let others: Vec<String> = view
-            .state
-            .run
-            .jobs
-            .iter()
-            .map(|j| format!("{} ({})", j.name, j.duration))
-            .collect();
-        println!(
-            "{}",
-            output::dim(&format!("jobs in run: {}", others.join(", ")))
-        );
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn log(args: LogArgs, host: Option<&str>) -> Result<()> {
+    let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
+    let logs = api::workflow::fetch_run_logs(
+        &ctx.client,
+        &ctx.owner,
+        &ctx.name,
+        args.run_id,
+        args.job,
+        args.attempt,
+        args.failed,
+    )
+    .await?;
+    if args.json {
+        return output::print_json(&serde_json::to_value(&logs)?);
     }
-    let steps = &job.steps;
-    for sl in &view.logs.steps_log {
-        let meta = steps.get(sl.step);
-        let status = meta.map(|s| s.status.as_str()).unwrap_or("");
-        if failed_only && matches!(status, "success" | "skipped" | "") {
-            continue;
+    print_run_logs(&logs);
+    Ok(())
+}
+
+fn print_run_logs(logs: &api::workflow::RunLogs) {
+    if logs.jobs.is_empty() {
+        println!("{}", output::dim("No matching jobs in this run."));
+        return;
+    }
+    let multi = logs.jobs.len() > 1;
+    for (i, job) in logs.jobs.iter().enumerate() {
+        if multi {
+            if i > 0 {
+                println!();
+            }
+            let task = job
+                .task_id
+                .map(|id| format!("task {id}"))
+                .unwrap_or_else(|| "task unknown".into());
+            println!(
+                "{} {} {}",
+                output::bold(&format!("==> {}", job.name)),
+                output::action_status(&job.status),
+                output::dim(&format!("{} - {task}", logs.source))
+            );
         }
-        let summary = meta.map(|s| s.summary.as_str()).unwrap_or("step");
-        let duration = meta.map(|s| s.duration.as_str()).unwrap_or("");
-        println!(
-            "{} {} {}",
-            output::bold(&format!("==> {summary}")),
-            output::action_status(status),
-            output::dim(duration),
-        );
-        for line in &sl.lines {
+        for line in &job.lines {
             println!("{}", line.message);
         }
     }
@@ -714,6 +684,7 @@ fn run_status_succeeded(status: &str) -> bool {
 /// `--log` spans every job; `--log-failed` keeps only the jobs that did not
 /// finish green (anything but `success` / `skipped`), so a failure isn't
 /// hidden behind an earlier passing job.
+#[cfg(test)]
 fn jobs_to_log(statuses: &[String], failed_only: bool) -> Vec<usize> {
     if !failed_only {
         return (0..statuses.len()).collect();

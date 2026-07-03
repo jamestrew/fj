@@ -1041,6 +1041,153 @@ async fn run_list_unknown_filter_value_errors_after_unfiltered_check() {
 // list yields step metadata, and a populated list yields lines.
 
 #[tokio::test]
+async fn run_logs_falls_back_to_loki_task_container_logs() {
+    let server = MockServer::start().await;
+    let loki = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/tasks"))
+        .and(query_param("run", "56"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"tasks": [
+            {
+                "id": 123,
+                "name": "build",
+                "status": "failure",
+                "started_at": "2026-07-03T00:00:00Z",
+                "stopped_at": "2026-07-03T00:05:00Z"
+            }
+        ]})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/runs/56/jobs/0/logs"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/loki/api/v1/query_range"))
+        .and(query_param(
+            "query",
+            r#"{job="docker", container=~"/FORGEJO-ACTIONS-TASK-123-.*"}"#,
+        ))
+        .and(query_param("direction", "forward"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "status": "success",
+            "data": {
+                "resultType": "streams",
+                "result": [{
+                    "stream": {
+                        "repo": "o/r",
+                        "run_id": "56",
+                        "container": "/FORGEJO-ACTIONS-TASK-123-WORKFLOW-abcd",
+                        "stream": "stdout"
+                    },
+                    "values": [
+                        ["1793577000000000000", r#"{"log":"first line\n"}"#],
+                        ["1793577001000000000", "second line\n"]
+                    ]
+                }]
+            }
+        })))
+        .expect(1)
+        .mount(&loki)
+        .await;
+
+    let c = client_for(&server).await;
+    let logs = crate::api::workflow::fetch_run_logs_with_loki_base(
+        &c,
+        "o",
+        "r",
+        56,
+        None,
+        None,
+        false,
+        &loki.uri(),
+    )
+    .await
+    .expect("logs");
+
+    assert_eq!(logs.source, "loki");
+    assert_eq!(logs.jobs.len(), 1);
+    assert_eq!(logs.jobs[0].task_id, Some(123));
+    assert_eq!(logs.jobs[0].name, "build");
+    assert_eq!(logs.jobs[0].lines[0].message, "first line");
+    assert_eq!(logs.jobs[0].lines[1].message, "second line");
+}
+
+#[tokio::test]
+async fn run_logs_uses_selected_task_id_for_loki_query() {
+    let server = MockServer::start().await;
+    let loki = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/tasks"))
+        .and(query_param("run", "57"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"tasks": [
+            {
+                "id": 111,
+                "name": "lint",
+                "status": "success",
+                "started_at": "2026-07-03T00:00:00Z",
+                "stopped_at": "2026-07-03T00:02:00Z"
+            },
+            {
+                "id": 456,
+                "name": "test",
+                "status": "failure",
+                "started_at": "2026-07-03T00:03:00Z",
+                "stopped_at": "2026-07-03T00:06:00Z"
+            }
+        ]})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/runs/57/jobs/1/logs"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/loki/api/v1/query_range"))
+        .and(query_param(
+            "query",
+            r#"{job="docker", container=~"/FORGEJO-ACTIONS-TASK-456-.*"}"#,
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "status": "success",
+            "data": { "resultType": "streams", "result": [{
+                "stream": {"stream": "stderr"},
+                "values": [["1793577100000000000", "selected job"]]
+            }]}
+        })))
+        .expect(1)
+        .mount(&loki)
+        .await;
+
+    let c = client_for(&server).await;
+    let logs = crate::api::workflow::fetch_run_logs_with_loki_base(
+        &c,
+        "o",
+        "r",
+        57,
+        Some(1),
+        None,
+        false,
+        &loki.uri(),
+    )
+    .await
+    .expect("logs");
+
+    assert_eq!(logs.jobs.len(), 1);
+    assert_eq!(logs.jobs[0].job, 1);
+    assert_eq!(logs.jobs[0].task_id, Some(456));
+    assert_eq!(logs.jobs[0].lines[0].stream.as_deref(), Some("stderr"));
+}
+
+#[tokio::test]
 async fn run_logs_fetch_job_logs_two_phase() {
     let server = MockServer::start().await;
     // Phase 1: empty `logCursors` → state only, two steps, no lines.

@@ -175,6 +175,7 @@ pub struct JobBrief {
 #[derive(Debug, Deserialize)]
 pub struct CurrentJob {
     #[serde(default)]
+    #[allow(dead_code)]
     pub title: String,
     #[serde(
         default,
@@ -194,8 +195,10 @@ pub struct StepBrief {
     #[serde(default)]
     pub summary: String,
     #[serde(default)]
+    #[allow(dead_code)]
     pub status: String,
     #[serde(default)]
+    #[allow(dead_code)]
     pub duration: String,
 }
 
@@ -347,6 +350,7 @@ pub async fn latest_attempt(
 /// Fetch every step's log lines for a run+job+attempt in one shot. Does a
 /// cheap empty-body call first to learn the step count, then requests cursors
 /// 0..n. The returned `RunView` carries both the lines and the step metadata.
+#[allow(dead_code)]
 pub async fn fetch_job_logs(
     client: &Client,
     owner: &str,
