@@ -25,6 +25,13 @@ const SERVICE: &str = "fj";
 /// pre-existing PAT for that host, or vice versa.
 const FJORD_PREFIX: &str = "fjord-account:";
 
+/// Prefix on the keychain key that flags a stored Forgejo **web session
+/// cookie** (the `i_like_gitea` value) rather than a PAT. The web frontend
+/// log/rerun routes authenticate by session cookie only and reject a PAT
+/// (fj#103); a session imported with `fj auth session` is stored under this
+/// disjoint key so it can never clobber, or be clobbered by, the host's PAT.
+const SESSION_PREFIX: &str = "session:";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TokenStoreLocation {
     Keychain,
@@ -269,6 +276,43 @@ pub fn delete_fjord_bearer(platform_url: &str) -> Result<()> {
     delete_token(&fjord_keychain_key(platform_url))
 }
 
+/// Compose the keychain key for a host's Forgejo web session cookie. Disjoint
+/// from the bare-host PAT key and the Fjord bearer key by construction.
+pub fn session_keychain_key(host: &str) -> String {
+    format!("{SESSION_PREFIX}{host}")
+}
+
+/// Return an ephemeral session cookie from `FJ_SESSION` when set to a non-empty
+/// value. Process-scoped, for scripted/CI use, mirroring [`env_token`]; avoids
+/// touching keychain services in headless containers.
+pub fn env_session() -> Option<String> {
+    std::env::var("FJ_SESSION")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Store the Forgejo web session cookie (`i_like_gitea` value) for `host`.
+/// Replaces any existing entry. The value is a raw cookie, never a PAT.
+pub fn store_session_cookie(host: &str, cookie: &str) -> Result<TokenStoreLocation> {
+    store_token(&session_keychain_key(host), cookie)
+}
+
+/// Load the web session cookie for `host`: first `FJ_SESSION`, then keychain,
+/// then file. `Ok(None)` when absent so callers can point the user at
+/// `fj auth session`.
+pub fn load_session_cookie(host: &str) -> Result<Option<String>> {
+    if let Some(cookie) = env_session() {
+        return Ok(Some(cookie));
+    }
+    load_persisted_token(&session_keychain_key(host))
+}
+
+/// Delete the stored web session cookie for `host`.
+pub fn delete_session_cookie(host: &str) -> Result<()> {
+    delete_token(&session_keychain_key(host))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,6 +340,28 @@ mod tests {
         assert!(k.contains("forgejo-site.pages.dev"));
         // Bare hostname keys and fjord keys can't collide.
         assert_ne!(k, "forgejo-site.pages.dev");
+    }
+
+    #[test]
+    fn session_key_is_namespaced_and_disjoint() {
+        let host = "rasterhub.com";
+        let s = session_keychain_key(host);
+        assert!(s.starts_with(SESSION_PREFIX));
+        assert!(s.contains(host));
+        // A session key can collide with neither the bare-host PAT key nor the
+        // Fjord bearer key for the same string.
+        assert_ne!(s, host);
+        assert_ne!(s, fjord_keychain_key(host));
+    }
+
+    #[test]
+    fn env_session_trims_and_rejects_empty() {
+        std::env::set_var("FJ_SESSION", "  cookieval  ");
+        assert_eq!(env_session().as_deref(), Some("cookieval"));
+        std::env::set_var("FJ_SESSION", "   ");
+        assert_eq!(env_session(), None);
+        std::env::remove_var("FJ_SESSION");
+        assert_eq!(env_session(), None);
     }
 
     #[test]

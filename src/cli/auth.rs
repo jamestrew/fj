@@ -30,8 +30,28 @@ pub enum AuthSub {
     Token(TokenArgs),
     /// Re-verify the stored token. Replaces it if a new one is given.
     Refresh(RefreshArgs),
+    /// Import a Forgejo web session cookie for the cookie-gated Actions log
+    /// and rerun routes (a PAT is rejected there; see fj#103).
+    Session(SessionArgs),
     /// Install a git credential helper that uses fj's stored token.
     SetupGit(SetupGitArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct SessionArgs {
+    /// Forgejo host the session belongs to (defaults to the current host).
+    #[arg(long)]
+    pub host: Option<String>,
+    /// The `i_like_gitea` session cookie value, copied from a signed-in
+    /// browser. Prefer `--with-cookie` (stdin) to keep it out of shell history.
+    #[arg(long, env = "FJ_SESSION", hide_env_values = true)]
+    pub cookie: Option<String>,
+    /// Read the cookie value from stdin.
+    #[arg(long, conflicts_with = "cookie")]
+    pub with_cookie: bool,
+    /// Forget the stored session for the host instead of importing one.
+    #[arg(long, conflicts_with_all = ["cookie", "with_cookie"])]
+    pub clear: bool,
 }
 
 #[derive(Debug, Args)]
@@ -126,8 +146,46 @@ pub async fn run(cmd: AuthCmd) -> Result<()> {
         AuthSub::Switch(args) => switch(args),
         AuthSub::Token(args) => token(args),
         AuthSub::Refresh(args) => refresh(args).await,
+        AuthSub::Session(args) => session(args),
         AuthSub::SetupGit(args) => auth_setup_git::setup_git(args),
     }
+}
+
+fn session(args: SessionArgs) -> Result<()> {
+    let hosts = Hosts::load()?;
+    let host = hosts.resolve_host(args.host.as_deref())?.to_string();
+
+    if args.clear {
+        token_store::delete_session_cookie(&host)?;
+        println!("✓ Cleared the stored web session for {host}");
+        return Ok(());
+    }
+
+    let cookie = if let Some(c) = args.cookie {
+        c
+    } else if args.with_cookie {
+        use std::io::Read;
+        let mut buf = String::new();
+        std::io::stdin().read_to_string(&mut buf)?;
+        buf.trim().to_string()
+    } else {
+        return Err(anyhow!(
+            "pass the session cookie via --cookie, or --with-cookie to read it from stdin. \
+             Copy the `i_like_gitea` cookie value from a signed-in browser."
+        ));
+    };
+    if cookie.is_empty() {
+        return Err(anyhow!("empty cookie value; nothing stored"));
+    }
+
+    let storage = token_store::store_session_cookie(&host, &cookie)?;
+    if let token_store::TokenStoreLocation::File(path) = storage {
+        println!("! Keychain unavailable; stored session in {}", path.display());
+    }
+    println!(
+        "✓ Imported web session for {host}. Cookie-gated Actions log and rerun routes will use it."
+    );
+    Ok(())
 }
 
 fn token(args: TokenArgs) -> Result<()> {
@@ -283,6 +341,15 @@ async fn status(args: StatusArgs) -> Result<()> {
                 "missing"
             }
         );
+        // Web session (cookie) for the log/rerun routes is separate from the
+        // API token: a host can have a valid PAT and still lack a session.
+        let session_present = token_store::load_session_cookie(name)?.is_some();
+        let session_label = if session_present {
+            "present (Actions log + rerun routes)".to_string()
+        } else {
+            output::dim("none (run `fj auth session` to enable Actions logs on private repos)")
+        };
+        println!("  Web session: {session_label}");
         if args.show_token {
             use std::io::IsTerminal;
             if std::io::stdout().is_terminal() {
