@@ -246,7 +246,13 @@ async fn refresh(args: RefreshArgs) -> Result<()> {
         let fa = cfg.fjord_account.as_ref().ok_or_else(|| {
             anyhow!("host '{host}' is fjord_account but missing fjord_account config")
         })?;
-        if crate::auth::load_fjord_refresh(&fa.platform_url)?.is_none() {
+        let has_refresh = token_store::load_fjord_bearer(&fa.platform_url)?
+            .as_deref()
+            .map(|b| crate::fjord::oidc::valid_refresh_token(&fa.platform_url, b))
+            .transpose()?
+            .flatten()
+            .is_some();
+        if !has_refresh {
             return Err(anyhow!(
                 "this Fjord Account session has no refresh token (it predates SSO refresh, or \
                  was created by the email/password flow). Re-run `fj auth login --fjord`."
@@ -335,7 +341,12 @@ async fn status(args: StatusArgs) -> Result<()> {
                 Some("oidc") => "SSO / OIDC",
                 _ => "email + password",
             };
-            let refresh_present = token_store::load_fjord_refresh(&fa.platform_url)?.is_some();
+            let refresh_present = token_store::load_fjord_bearer(&fa.platform_url)?
+                .as_deref()
+                .map(|b| crate::fjord::oidc::valid_refresh_token(&fa.platform_url, b))
+                .transpose()?
+                .flatten()
+                .is_some();
             println!(
                 "  Sign-in: {sign_in}{}",
                 if refresh_present {

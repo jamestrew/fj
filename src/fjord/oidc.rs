@@ -25,7 +25,7 @@
 use anyhow::{anyhow, Context, Result};
 use base64::Engine as _;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, USER_AGENT};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::time::{Duration, Instant};
@@ -426,30 +426,95 @@ async fn post_token(platform_url: &str, form: &[(&str, &str)]) -> Result<TokenRe
         .with_context(|| format!("decoding token response: {}", super::preview(&text)))
 }
 
+/// A refresh token persisted together with the identity of the account that
+/// obtained it. Binding the identity is what keeps a refresh usable only for
+/// that account: without it, a refresh token left behind by a previously
+/// signed-in account on the same platform URL could be replayed on a 401 to
+/// silently restore that account (fj#219).
+#[derive(Debug, Serialize, Deserialize)]
+struct StoredRefresh {
+    identity: String,
+    refresh_token: String,
+}
+
+/// Parse the identity-bound refresh record stored for `platform_url`. A missing
+/// or unparseable value (including a bare legacy token) reads as `None`.
+fn stored_refresh(platform_url: &str) -> Result<Option<StoredRefresh>> {
+    Ok(token_store::load_fjord_refresh(platform_url)?
+        .and_then(|raw| serde_json::from_str::<StoredRefresh>(&raw).ok()))
+}
+
+/// Pure identity check: yield the stored refresh token only when it was issued
+/// to the same account the `current_bearer` identifies.
+fn select_valid_refresh(stored: Option<StoredRefresh>, current_bearer: &str) -> Option<String> {
+    let record = stored?;
+    match bearer_identity(current_bearer) {
+        Some(id) if id == record.identity => Some(record.refresh_token),
+        _ => None,
+    }
+}
+
+/// Load the stored refresh token for `platform_url`, but only if it belongs to
+/// the account identified by `current_bearer`. A token issued to a different
+/// account reads as `None` so callers fall back to interactive sign-in rather
+/// than resurrecting a stale session (fj#219).
+pub fn valid_refresh_token(platform_url: &str, current_bearer: &str) -> Result<Option<String>> {
+    Ok(select_valid_refresh(
+        stored_refresh(platform_url)?,
+        current_bearer,
+    ))
+}
+
 /// Persist the tokens from a sign-in / refresh: the access token in the Fjord
-/// bearer slot (what every downstream call reads) and the refresh token in its
-/// own slot. Returns where the access token landed so the caller can warn on a
-/// file-store fallback.
+/// bearer slot (what every downstream call reads) and, when present, the
+/// refresh token bound to the signing-in account's identity. Returns where the
+/// access token landed so the caller can warn on a file-store fallback.
 pub fn store_tokens(
     platform_url: &str,
     tokens: &TokenResponse,
 ) -> Result<token_store::TokenStoreLocation> {
     let location = token_store::store_fjord_bearer(platform_url, &tokens.access_token)?;
-    // A response that omits a refresh token (a refresh-less issuance, or a
-    // rotation that didn't return a new one) keeps whatever is already stored
-    // rather than stranding the session; only a present token is persisted.
-    if let Some(rt) = &tokens.refresh_token {
-        token_store::store_fjord_refresh(platform_url, rt)?;
+    let identity = bearer_identity(&tokens.access_token);
+    match (tokens.refresh_token.as_deref(), identity.as_deref()) {
+        // Persist the new refresh token bound to the account that just proved
+        // it, overwriting any token held for this platform URL.
+        (Some(rt), Some(id)) => {
+            let record = serde_json::to_string(&StoredRefresh {
+                identity: id.to_string(),
+                refresh_token: rt.to_string(),
+            })
+            .context("encoding the refresh token record")?;
+            token_store::store_fjord_refresh(platform_url, &record)?;
+        }
+        // Refresh-less issuance (or an access token we can't attribute to an
+        // identity): keep an already-stored token only if it belongs to THIS
+        // account, so a rotation that returns no new token doesn't strand the
+        // session; drop one issued to a different account so a later 401 can't
+        // silently restore it (fj#219).
+        _ => {
+            let keep = matches!(
+                (stored_refresh(platform_url)?, identity.as_deref()),
+                (Some(record), Some(id)) if record.identity == id
+            );
+            if !keep {
+                token_store::delete_fjord_refresh(platform_url)?;
+            }
+        }
     }
     Ok(location)
 }
 
-/// Silent refresh: load the stored refresh token, exchange it, persist the new
-/// tokens, and return the fresh access token. Errors clearly when no refresh
-/// token is stored (a credentials-flow or PAT host, or an OIDC host signed in
-/// before refresh support) so the caller can tell the user to sign in again.
+/// Silent refresh: load the stored refresh token for the currently signed-in
+/// account, exchange it, persist the new tokens, and return the fresh access
+/// token. Errors clearly when no usable refresh token is stored (a
+/// credentials-flow or PAT host, an OIDC host signed in before refresh support,
+/// or a token that belongs to a different account) so the caller can tell the
+/// user to sign in again.
 pub async fn refresh_session(platform_url: &str) -> Result<String> {
-    let refresh_token = token_store::load_fjord_refresh(platform_url)?.ok_or_else(|| {
+    let bearer = token_store::load_fjord_bearer(platform_url)?.ok_or_else(|| {
+        anyhow!("no Fjord Account session stored for {platform_url}; run `fj auth login --fjord` to sign in again")
+    })?;
+    let refresh_token = valid_refresh_token(platform_url, &bearer)?.ok_or_else(|| {
         anyhow!(
             "no refresh token stored for {platform_url}; run `fj auth login --fjord` to sign in again"
         )
@@ -461,19 +526,37 @@ pub async fn refresh_session(platform_url: &str) -> Result<String> {
     Ok(tokens.access_token)
 }
 
-/// Best-effort email extraction from a stored bearer for the sign-in success
-/// line. The access token is `base64(STANDARD, {kid, payload:{email,…}, …})`;
-/// decode it non-cryptographically (Paragon re-verifies on every call, so this
-/// is display-only) and read `payload.email`. Returns `None` on any mismatch.
-pub fn bearer_email(access_token: &str) -> Option<String> {
+/// Decode the non-cryptographic `payload` object from a stored bearer. The
+/// access token is `base64(STANDARD, {kid, payload:{…}, signature})`; Paragon
+/// re-verifies the signature on every call, so decoding it here is display- and
+/// identity-only, never a trust decision. Returns `None` on any mismatch.
+fn bearer_payload(access_token: &str) -> Option<serde_json::Value> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(access_token.trim())
         .ok()?;
     let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    value
-        .get("payload")
-        .and_then(|p| p.get("email"))
+    value.get("payload").cloned()
+}
+
+/// Best-effort email extraction from a stored bearer for the sign-in success
+/// line: reads `payload.email`.
+pub fn bearer_email(access_token: &str) -> Option<String> {
+    bearer_payload(access_token)?
+        .get("email")
         .and_then(|e| e.as_str())
+        .map(str::to_string)
+}
+
+/// Stable account identity carried in a Fjord access token: the immutable
+/// `user_id` when present, else the `email`. A stored refresh token is bound to
+/// this identity so a token left behind by a previously signed-in account on
+/// the same platform URL can never be replayed for a different one (fj#219).
+pub fn bearer_identity(access_token: &str) -> Option<String> {
+    let payload = bearer_payload(access_token)?;
+    payload
+        .get("user_id")
+        .and_then(|v| v.as_str())
+        .or_else(|| payload.get("email").and_then(|v| v.as_str()))
         .map(str::to_string)
 }
 
@@ -591,6 +674,62 @@ mod tests {
         );
         assert_eq!(bearer_email(&token).as_deref(), Some("dev@example.com"));
         assert_eq!(bearer_email("not-base64!!!"), None);
+    }
+
+    /// Mint a bearer in the same envelope Paragon issues:
+    /// `base64(STANDARD, {kid, payload, signature})`.
+    fn fake_bearer(user_id: Option<&str>, email: Option<&str>) -> String {
+        let mut payload = serde_json::Map::new();
+        if let Some(u) = user_id {
+            payload.insert("user_id".into(), u.into());
+        }
+        if let Some(e) = email {
+            payload.insert("email".into(), e.into());
+        }
+        base64::engine::general_purpose::STANDARD.encode(
+            serde_json::json!({ "kid": "k1", "payload": payload, "signature": "AAA=" }).to_string(),
+        )
+    }
+
+    #[test]
+    fn bearer_identity_prefers_user_id_then_email() {
+        let both = fake_bearer(Some("u-123"), Some("a@example.com"));
+        assert_eq!(bearer_identity(&both).as_deref(), Some("u-123"));
+        let email_only = fake_bearer(None, Some("a@example.com"));
+        assert_eq!(
+            bearer_identity(&email_only).as_deref(),
+            Some("a@example.com")
+        );
+        // No attributable field, or an undecodable token, has no identity.
+        assert_eq!(bearer_identity(&fake_bearer(None, None)), None);
+        assert_eq!(bearer_identity("not-base64!!!"), None);
+    }
+
+    #[test]
+    fn refresh_token_is_bound_to_the_account_that_obtained_it() {
+        let account_a = fake_bearer(Some("u-A"), Some("a@example.com"));
+        let account_b = fake_bearer(Some("u-B"), Some("b@example.com"));
+        let record = serde_json::to_string(&StoredRefresh {
+            identity: bearer_identity(&account_a).unwrap(),
+            refresh_token: "refresh-A".into(),
+        })
+        .unwrap();
+        let parsed = || serde_json::from_str::<StoredRefresh>(&record).ok();
+
+        // The account that obtained it can use it...
+        assert_eq!(
+            select_valid_refresh(parsed(), &account_a).as_deref(),
+            Some("refresh-A")
+        );
+        // ...but a different account on the same platform URL cannot: this is
+        // the fj#219 replay the identity binding closes.
+        assert_eq!(select_valid_refresh(parsed(), &account_b), None);
+        // Nothing stored, or a bearer we can't attribute, yields nothing.
+        assert_eq!(select_valid_refresh(None, &account_a), None);
+        assert_eq!(select_valid_refresh(parsed(), "garbage-bearer"), None);
+        // A bare legacy token (no envelope) is not a valid record, so it reads
+        // as absent rather than being used.
+        assert!(serde_json::from_str::<StoredRefresh>("bare-legacy-token").is_err());
     }
 
     #[test]

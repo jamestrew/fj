@@ -69,7 +69,7 @@ async fn fetch_instances(platform_url: &str, bearer: &str) -> Result<Vec<ForgeIn
         Ok(instances) => Ok(instances),
         Err(e) => {
             let expired = e.downcast_ref::<fjord::SessionExpired>().is_some();
-            if expired && token_store::load_fjord_refresh(platform_url)?.is_some() {
+            if expired && fjord::oidc::valid_refresh_token(platform_url, bearer)?.is_some() {
                 let fresh = fjord::oidc::refresh_session(platform_url)
                     .await
                     .with_context(|| format!("{e}; automatic session refresh failed"))?;
