@@ -70,6 +70,13 @@ pub struct FjordAccount {
     /// that need the actual Forgejo origin rather than the Fjord platform URL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_instance_public_url: Option<String>,
+    /// Which sign-in flow minted this session: `"oidc"` (SSO, refresh-token in
+    /// the keychain) or `"credentials"` (email + password). Absent on entries
+    /// written before the field existed; treated as `"credentials"` for
+    /// display. Purely informational: refresh keys off the presence of a stored
+    /// refresh token, not this marker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_flow: Option<String>,
 }
 
 fn default_git_protocol() -> String {

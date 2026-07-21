@@ -233,13 +233,32 @@ async fn refresh(args: RefreshArgs) -> Result<()> {
         .cloned()
         .ok_or_else(|| anyhow!("host '{host}' not configured"))?;
 
-    // `fj auth refresh` is a PAT-mode workflow ("paste me a fresh PAT").
-    // Fjord-Account sessions are refreshed by re-running `fj auth login --fjord`.
+    // A Fjord Account session refreshes via its OIDC refresh token (silent, no
+    // browser) when one is stored. A credentials-flow session has no refresh
+    // token, so it still points the user back at `fj auth login --fjord`.
     if matches!(cfg.auth_kind, crate::config::hosts::AuthKind::FjordAccount) {
-        return Err(anyhow!(
-            "`fj auth refresh` is for Forgejo PAT hosts. For a Fjord Account session, \
-             re-run `fj auth login --fjord` instead."
-        ));
+        if args.token.is_some() || args.with_token {
+            return Err(anyhow!(
+                "a Fjord Account session can't be refreshed with a pasted token; \
+                 `fj auth refresh` renews it silently from the stored session."
+            ));
+        }
+        let fa = cfg.fjord_account.as_ref().ok_or_else(|| {
+            anyhow!("host '{host}' is fjord_account but missing fjord_account config")
+        })?;
+        if crate::auth::load_fjord_refresh(&fa.platform_url)?.is_none() {
+            return Err(anyhow!(
+                "this Fjord Account session has no refresh token (it predates SSO refresh, or \
+                 was created by the email/password flow). Re-run `fj auth login --fjord`."
+            ));
+        }
+        crate::fjord::oidc::refresh_session(&fa.platform_url).await?;
+        println!(
+            "{} Refreshed the Fjord Account session for {}",
+            output::bold("✓"),
+            output::bold(&fa.platform_url)
+        );
+        return Ok(());
     }
 
     let new_token = if let Some(t) = args.token {
@@ -312,6 +331,19 @@ async fn status(args: StatusArgs) -> Result<()> {
         }
         if let Some(fa) = host.fjord_account.as_ref() {
             println!("  Platform URL: {}", fa.platform_url);
+            let sign_in = match fa.auth_flow.as_deref() {
+                Some("oidc") => "SSO / OIDC",
+                _ => "email + password",
+            };
+            let refresh_present = token_store::load_fjord_refresh(&fa.platform_url)?.is_some();
+            println!(
+                "  Sign-in: {sign_in}{}",
+                if refresh_present {
+                    " (silent refresh available)"
+                } else {
+                    ""
+                }
+            );
             match fa.default_instance_id.as_deref() {
                 Some(id) => {
                     let display = fa.default_instance_display_name.as_deref().unwrap_or("");
@@ -407,6 +439,7 @@ fn logout(args: LogoutArgs) -> Result<()> {
         crate::config::hosts::AuthKind::FjordAccount => {
             if let Some(fa) = removed.fjord_account.as_ref() {
                 token_store::delete_fjord_bearer(&fa.platform_url)?;
+                token_store::delete_fjord_refresh(&fa.platform_url)?;
             }
         }
     }

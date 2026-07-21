@@ -25,6 +25,12 @@ const SERVICE: &str = "fj";
 /// pre-existing PAT for that host, or vice versa.
 const FJORD_PREFIX: &str = "fjord-account:";
 
+/// Prefix on the keychain key that flags a Fjord Account **refresh** token
+/// (from the OIDC sign-in flow) rather than the short-lived access bearer.
+/// Disjoint from every other prefix so the two Fjord tokens for one platform
+/// URL coexist without collision.
+const FJORD_REFRESH_PREFIX: &str = "fjord-refresh:";
+
 /// Prefix on the keychain key that flags a stored Forgejo **web session
 /// cookie** (the `i_like_gitea` value) rather than a PAT. The web frontend
 /// log/rerun routes authenticate by session cookie only and reject a PAT
@@ -274,6 +280,30 @@ pub fn load_fjord_bearer(platform_url: &str) -> Result<Option<String>> {
 /// Convenience: delete the Fjord Account bearer for `platform_url`.
 pub fn delete_fjord_bearer(platform_url: &str) -> Result<()> {
     delete_token(&fjord_keychain_key(platform_url))
+}
+
+/// Compose the keychain key for a Fjord Account **refresh** token. Disjoint
+/// from the access-bearer key so the short-lived access token and the
+/// long-lived refresh token never clobber one another. Only the OIDC sign-in
+/// flow stores one; credentials/PAT hosts have no entry here.
+pub fn fjord_refresh_keychain_key(platform_url: &str) -> String {
+    format!("{FJORD_REFRESH_PREFIX}{platform_url}")
+}
+
+/// Store the Fjord Account OIDC refresh token for `platform_url`.
+pub fn store_fjord_refresh(platform_url: &str, token: &str) -> Result<TokenStoreLocation> {
+    store_token(&fjord_refresh_keychain_key(platform_url), token)
+}
+
+/// Load the Fjord Account OIDC refresh token for `platform_url`. `Ok(None)`
+/// when absent (a credentials/PAT host, or an OIDC host that never got one).
+pub fn load_fjord_refresh(platform_url: &str) -> Result<Option<String>> {
+    load_persisted_token(&fjord_refresh_keychain_key(platform_url))
+}
+
+/// Delete the Fjord Account OIDC refresh token for `platform_url`.
+pub fn delete_fjord_refresh(platform_url: &str) -> Result<()> {
+    delete_token(&fjord_refresh_keychain_key(platform_url))
 }
 
 /// Compose the keychain key for a host's Forgejo web session cookie. Disjoint

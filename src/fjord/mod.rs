@@ -18,8 +18,18 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use url::Url;
 
+pub mod oidc;
+
 /// Default fjord-platform deployment users sign in against.
 pub const DEFAULT_PLATFORM_URL: &str = "https://forgejo-site.pages.dev";
+
+/// Marker error: a Fjord-Account call got HTTP 401. Returned bare (never
+/// wrapped with `.context()`) so callers can `downcast_ref` it and decide
+/// whether to attempt a silent OIDC refresh before giving up. Its `Display`
+/// is the user-facing message for the terminal case.
+#[derive(Debug, thiserror::Error)]
+#[error("Fjord Account session expired or revoked (HTTP 401). Re-run `fj auth login --fjord`.")]
+pub struct SessionExpired;
 
 fn user_agent() -> &'static str {
     concat!("fj/", env!("CARGO_PKG_VERSION"))
@@ -216,9 +226,9 @@ pub async fn list_instances(platform_url: &str, bearer: &str) -> Result<Vec<Forg
         return Ok(Vec::new());
     }
     if status == StatusCode::UNAUTHORIZED {
-        return Err(anyhow!(
-            "Fjord Account session expired or revoked (HTTP 401). Re-run `fj auth login --fjord`."
-        ));
+        // Bare marker (no `.context()`) so a caller with a stored refresh token
+        // can downcast it, silently refresh, and retry before surfacing this.
+        return Err(SessionExpired.into());
     }
     let text = res
         .text()

@@ -150,20 +150,139 @@ async fn login_pat(args: LoginArgs) -> Result<()> {
     Ok(())
 }
 
-/// Fjord Account sign-in: email + password (+ TOTP if Paragon asks). The
-/// resulting bearer is stored under the platform URL's keychain slot so it
-/// doesn't collide with any PAT for the same DNS host (which can't happen
-/// in practice, but the keychain key is namespaced anyway).
+/// Fjord Account sign-in. The deployment's `GET /api/auth/status` decides the
+/// shape: an `oidc` deployment (production) runs the browser-based
+/// Authorization Code + PKCE loopback flow; a `credentials` deployment runs the
+/// email + password flow. Either way the resulting bearer is stored under the
+/// platform URL's keychain slot.
 async fn login_fjord(args: LoginArgs) -> Result<()> {
-    use crate::config::hosts::{AuthKind, FjordAccount};
-    use crate::fjord::{
-        normalize_platform_url, sign_in, SignInRequest, SignInResponse, DEFAULT_PLATFORM_URL,
-    };
+    use crate::fjord::oidc::{self, AuthStrategy};
+    use crate::fjord::{normalize_platform_url, DEFAULT_PLATFORM_URL};
 
     let platform_url = match args.platform_url.as_deref() {
         Some(p) => normalize_platform_url(p)?,
         None => DEFAULT_PLATFORM_URL.to_string(),
     };
+
+    // Pick the sign-in shape from the deployment. A probe failure is
+    // non-fatal: fall back to the credentials flow, which still surfaces a
+    // clear `StrategyMismatch` error if the deployment is actually OIDC.
+    match oidc::probe_strategy(&platform_url).await {
+        Ok(AuthStrategy::Oidc) => return login_fjord_oidc(args, platform_url).await,
+        Ok(AuthStrategy::Mock) => {
+            eprintln!(
+                "note: this deployment reports no live Fjord Account sign-in (dev/pending mode); \
+                 attempting credentials sign-in."
+            );
+        }
+        Ok(AuthStrategy::Unknown(_)) => {
+            eprintln!(
+                "note: this deployment reports an unrecognized sign-in strategy; \
+                 attempting credentials sign-in."
+            );
+        }
+        Ok(AuthStrategy::Credentials) => {}
+        Err(e) => {
+            eprintln!("note: could not probe {platform_url} sign-in strategy ({e}); attempting credentials sign-in.");
+        }
+    }
+    login_fjord_credentials(args, platform_url).await
+}
+
+/// Fjord Account sign-in via SSO/OIDC: OAuth 2.0 Authorization Code + PKCE over
+/// a loopback redirect. Opens the user's browser to the platform's hosted login
+/// page; on success captures the code on `127.0.0.1`, exchanges it for tokens,
+/// and stores the access + refresh tokens in the keychain.
+async fn login_fjord_oidc(args: LoginArgs, platform_url: String) -> Result<()> {
+    use crate::cli::web;
+    use crate::config::hosts::{AuthKind, FjordAccount, Host};
+    use crate::fjord::oidc;
+
+    let client = oidc::client_id();
+    let pkce = oidc::Pkce::generate()?;
+    let server = oidc::LoopbackServer::bind()?;
+    let redirect_uri = server.redirect_uri.clone();
+    let authorize_url = oidc::build_authorize_url(&platform_url, &client, &redirect_uri, &pkce);
+
+    println!(
+        "{} Opening your browser to sign in to {}",
+        output::bold("→"),
+        output::bold(&platform_url)
+    );
+    println!(
+        "  {}",
+        output::dim("If it doesn't open, copy this URL into your browser:")
+    );
+    println!("  {authorize_url}");
+    // A failed opener (headless box, no `open`/`xdg-open`) isn't fatal: the URL
+    // is printed above, so the user can paste it and the loopback still catches
+    // the redirect.
+    if let Err(e) = web::open(&authorize_url) {
+        eprintln!(
+            "  {}",
+            output::dim(&format!("(couldn't launch a browser automatically: {e})"))
+        );
+    }
+    println!("  {}", output::dim("Waiting for the sign-in to complete…"));
+
+    let code = server.wait_for_code(pkce.state.clone()).await?;
+    let tokens =
+        oidc::exchange_code(&platform_url, &client, &code, &redirect_uri, &pkce.verifier).await?;
+
+    if tokens.refresh_token.is_none() {
+        eprintln!(
+            "{}",
+            output::dim(
+                "note: the provider returned no refresh token; you'll re-run `fj auth login --fjord` when the session expires."
+            )
+        );
+    }
+    let user_email = oidc::bearer_email(&tokens.access_token);
+
+    let mut hosts = Hosts::load()?;
+    let host_entry = Host {
+        user: user_email.clone(),
+        git_protocol: args.git_protocol.clone(),
+        web_url: None,
+        api_base_path: None,
+        auth_kind: AuthKind::FjordAccount,
+        fjord_account: Some(FjordAccount {
+            platform_url: platform_url.clone(),
+            default_instance_id: None,
+            default_instance_display_name: None,
+            default_instance_slug: None,
+            default_instance_public_url: None,
+            auth_flow: Some("oidc".to_string()),
+        }),
+    };
+    hosts.upsert(&platform_url, host_entry);
+    hosts.save()?;
+    let storage = oidc::store_tokens(&platform_url, &tokens)?;
+    print_file_store_notice(&storage);
+
+    println!(
+        "{} Signed in to {}{}",
+        output::bold("✓"),
+        output::bold(&platform_url),
+        match user_email.as_deref() {
+            Some(e) => format!(" as {}", output::bold(e)),
+            None => String::new(),
+        }
+    );
+    println!(
+        "  {}",
+        output::dim("Next: `fj instances list` to see your Forgejo instances, then `fj instances use <id>`.")
+    );
+    Ok(())
+}
+
+/// Fjord Account sign-in: email + password (+ TOTP if Paragon asks). The
+/// resulting bearer is stored under the platform URL's keychain slot so it
+/// doesn't collide with any PAT for the same DNS host (which can't happen
+/// in practice, but the keychain key is namespaced anyway).
+async fn login_fjord_credentials(args: LoginArgs, platform_url: String) -> Result<()> {
+    use crate::config::hosts::{AuthKind, FjordAccount};
+    use crate::fjord::{sign_in, SignInRequest, SignInResponse};
 
     let email = prompt_email()?;
     let password = Password::new()
@@ -234,6 +353,7 @@ async fn login_fjord(args: LoginArgs) -> Result<()> {
             default_instance_display_name: None,
             default_instance_slug: None,
             default_instance_public_url: None,
+            auth_flow: Some("credentials".to_string()),
         }),
     };
     hosts.upsert(&platform_url, host_entry);

@@ -58,6 +58,29 @@ pub async fn run(cmd: InstancesCmd, top_host: Option<&str>) -> Result<()> {
     }
 }
 
+/// List the account's forge instances, transparently refreshing the session
+/// once if the bearer has expired. On an OIDC (SSO) host a stored refresh token
+/// renews the access token silently and the call is retried; without one, the
+/// original 401 (`SessionExpired`) surfaces so the user re-runs
+/// `fj auth login --fjord`.
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn fetch_instances(platform_url: &str, bearer: &str) -> Result<Vec<ForgeInstance>> {
+    match fjord::list_instances(platform_url, bearer).await {
+        Ok(instances) => Ok(instances),
+        Err(e) => {
+            let expired = e.downcast_ref::<fjord::SessionExpired>().is_some();
+            if expired && token_store::load_fjord_refresh(platform_url)?.is_some() {
+                let fresh = fjord::oidc::refresh_session(platform_url)
+                    .await
+                    .with_context(|| format!("{e}; automatic session refresh failed"))?;
+                fjord::list_instances(platform_url, &fresh).await
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
 /// Look up the active Fjord-Account host config + bearer. Errors clearly
 /// when the user is signed in only via PAT.
 fn resolve_fjord(host_flag: Option<&str>) -> Result<(String, crate::config::hosts::Host, String)> {
@@ -93,7 +116,7 @@ async fn list(host_flag: Option<&str>, json: bool) -> Result<()> {
         .fjord_account
         .as_ref()
         .expect("resolve_fjord guarantees fjord_account is Some");
-    let instances = fjord::list_instances(&fa.platform_url, &bearer)
+    let instances = fetch_instances(&fa.platform_url, &bearer)
         .await
         .with_context(|| format!("listing forge instances at {}", fa.platform_url))?;
 
@@ -174,7 +197,7 @@ async fn use_instance(host_flag: Option<&str>, args: UseArgs) -> Result<()> {
     // Refresh the list and look up by id or slug. We do this fetch every
     // time rather than letting the user pick something stale; instance ids
     // are stable but plans / states aren't.
-    let instances = fjord::list_instances(&fa.platform_url, &bearer)
+    let instances = fetch_instances(&fa.platform_url, &bearer)
         .await
         .with_context(|| format!("listing forge instances at {}", fa.platform_url))?;
     let target = instances
