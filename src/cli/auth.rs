@@ -119,6 +119,16 @@ pub struct LoginArgs {
     /// Fjord mode only.
     #[arg(long, visible_alias = "no-browser", requires = "fjord")]
     pub manual: bool,
+    /// Durable cross-device sign-in for a Fjord Account on an SSO/OIDC
+    /// deployment via the OAuth 2.0 Device Authorization Grant (RFC 8628).
+    /// `fj` shows a short code and a link (plus a scannable QR code); you open
+    /// it on ANY device (phone, iPad, another laptop), approve, and `fj` picks
+    /// up the session automatically (no loopback, no copy-paste). This is the
+    /// durable replacement for `--manual` when your browser is on a different
+    /// device than `fj`, and it's auto-selected on a headless / SSH session.
+    /// Fjord mode only.
+    #[arg(long, requires = "fjord", conflicts_with = "manual")]
+    pub device: bool,
     /// fjord-platform deployment URL to sign in against. Defaults to the
     /// production deployment. Use this for local dev (`http://localhost:5180`)
     /// or to point at a staging environment.

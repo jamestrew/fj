@@ -52,6 +52,11 @@ shlex = "1.3"
 # verifier / state / nonce, `ring` computes the S256 code challenge.
 getrandom = "0.2"
 ring = "0.17"
+# Terminal QR code for the OAuth device-flow sign-in (`--device`): renders the
+# verification URL as scannable Unicode blocks so a phone/iPad can jump straight
+# to the approval page. `default-features = false` drops the image/svg encoders
+# we don't use, leaving just the pure-Rust string renderer.
+qrcode = { version = "0.14", default-features = false }
 
 [dev-dependencies]
 wiremock = "0.6"

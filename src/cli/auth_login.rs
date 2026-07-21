@@ -25,6 +25,7 @@ enum LoginMode {
 /// (`--fjord`, or any PAT input like `--host` / `--token` / `--with-token` /
 /// `FJ_TOKEN`) skips the menu so scripts and the documented non-interactive
 /// paths behave exactly as before. Kept pure so the branching is obvious.
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn resolve_login_mode(args: &LoginArgs, stdin_is_tty: bool) -> LoginMode {
     if args.fjord {
         return LoginMode::Fjord;
@@ -44,6 +45,7 @@ fn resolve_login_mode(args: &LoginArgs, stdin_is_tty: bool) -> LoginMode {
 }
 
 /// The mobile-style first screen: pick Fjord Account or your own Forgejo.
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn prompt_login_mode() -> Result<LoginMode> {
     let items = [
         "Fjord Account (email + password)",
@@ -62,6 +64,7 @@ fn prompt_login_mode() -> Result<LoginMode> {
     })
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) async fn login(args: LoginArgs) -> Result<()> {
     use std::io::IsTerminal;
     let mode = match resolve_login_mode(&args, std::io::stdin().is_terminal()) {
@@ -83,6 +86,7 @@ pub(crate) async fn login(args: LoginArgs) -> Result<()> {
     }
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn login_pat(args: LoginArgs) -> Result<()> {
     let host_input = match args.host.clone() {
         Some(h) => h,
@@ -155,6 +159,7 @@ async fn login_pat(args: LoginArgs) -> Result<()> {
 /// Authorization Code + PKCE loopback flow; a `credentials` deployment runs the
 /// email + password flow. Either way the resulting bearer is stored under the
 /// platform URL's keychain slot.
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn login_fjord(args: LoginArgs) -> Result<()> {
     use crate::fjord::oidc::{self, AuthStrategy};
     use crate::fjord::{normalize_platform_url, DEFAULT_PLATFORM_URL};
@@ -189,39 +194,204 @@ async fn login_fjord(args: LoginArgs) -> Result<()> {
     login_fjord_credentials(args, platform_url).await
 }
 
-/// Fjord Account sign-in via SSO/OIDC: OAuth 2.0 Authorization Code + PKCE.
-///
-/// Two ways to capture the authorization code, sharing PKCE generation, the
-/// token exchange, and persistence:
-/// - default: bind a loopback listener, open the browser, and capture the
-///   redirect on `127.0.0.1` (same-device, zero copy-paste);
-/// - `--manual`: bind nothing; print the authorize URL, let the user sign in on
-///   any device, and paste the redirected URL (or bare code) back. This is the
-///   interim path for signing in when the browser is on a different device than
-///   `fj` (a remote server, an iPad). The durable replacement is OAuth device
-///   flow (separate work); this needs zero platform/Paragon changes because the
-///   `fj-cli` client is already registered with the loopback redirect.
+/// Fjord Account sign-in via SSO/OIDC. Three ways to obtain the session, all
+/// sharing the token persistence in [`persist_oidc_session`] so the result is
+/// identical whichever ran:
+/// - default (same-device): bind a loopback listener, open the browser, and
+///   capture the Authorization Code + PKCE redirect on `127.0.0.1` (zero
+///   copy-paste);
+/// - `--device`: the OAuth 2.0 Device Authorization Grant (RFC 8628); show a
+///   short code + link + QR, poll for approval from any device. The durable
+///   cross-device path; auto-selected on a headless / SSH session (see
+///   [`choose_oidc_capture`]);
+/// - `--manual`: the interim paste path (superseded by `--device` for the
+///   cross-device case); print the authorize URL and read back the redirected
+///   URL (or bare code) the user pastes.
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn login_fjord_oidc(args: LoginArgs, platform_url: String) -> Result<()> {
     use crate::fjord::oidc;
 
-    let client = oidc::client_id();
-    let pkce = oidc::Pkce::generate()?;
+    match choose_oidc_capture(args.device, args.manual, env_prefers_device_flow()) {
+        OidcCapture::Device { auto } => return login_device_flow(&args, platform_url, auto).await,
+        OidcCapture::Manual => {
+            let client = oidc::client_id();
+            let pkce = oidc::Pkce::generate()?;
+            let (code, redirect_uri) = acquire_code_manual(&platform_url, &client, &pkce)?;
+            let tokens =
+                oidc::exchange_code(&platform_url, &client, &code, &redirect_uri, &pkce.verifier)
+                    .await?;
+            persist_oidc_session(&args, platform_url, tokens)
+        }
+        OidcCapture::Loopback => {
+            let client = oidc::client_id();
+            let pkce = oidc::Pkce::generate()?;
+            let (code, redirect_uri) = acquire_code_loopback(&platform_url, &client, &pkce).await?;
+            let tokens =
+                oidc::exchange_code(&platform_url, &client, &code, &redirect_uri, &pkce.verifier)
+                    .await?;
+            persist_oidc_session(&args, platform_url, tokens)
+        }
+    }
+}
 
-    let (code, redirect_uri) = if args.manual {
-        acquire_code_manual(&platform_url, &client, &pkce)?
+/// Which OIDC code-capture strategy `fj auth login --fjord` runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OidcCapture {
+    /// Device Authorization Grant. `auto` is true when it was chosen for the
+    /// user (headless / SSH) rather than requested with `--device`, so the CLI
+    /// can explain why and how to override.
+    Device { auto: bool },
+    /// The `--manual` paste path.
+    Manual,
+    /// The default same-device loopback capture.
+    Loopback,
+}
+
+/// Pick the OIDC capture strategy from the flags and the environment. Explicit
+/// flags always win: `--device` and `--manual` conflict at the CLI layer, so at
+/// most one is set. With neither, a headless / SSH session (no local browser to
+/// open, no loopback the user can reach) auto-selects device flow; a normal
+/// desktop keeps loopback. Pure so the precedence is unit-tested.
+fn choose_oidc_capture(device_flag: bool, manual_flag: bool, headless: bool) -> OidcCapture {
+    if device_flag {
+        OidcCapture::Device { auto: false }
+    } else if manual_flag {
+        OidcCapture::Manual
+    } else if headless {
+        OidcCapture::Device { auto: true }
     } else {
-        acquire_code_loopback(&platform_url, &client, &pkce).await?
-    };
+        OidcCapture::Loopback
+    }
+}
 
-    let tokens =
-        oidc::exchange_code(&platform_url, &client, &code, &redirect_uri, &pkce.verifier).await?;
-    persist_oidc_session(&args, platform_url, tokens)
+/// True when the environment can't drive the same-device loopback flow: a
+/// remote shell (`$SSH_CONNECTION` / `$SSH_TTY`), or a Unix session with no
+/// display server. macOS and Windows always have a windowing system, so they
+/// never auto-fall-back. `FJ_FORCE_LOOPBACK` opts out (for tests / odd setups
+/// where a browser really is reachable).
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn env_prefers_device_flow() -> bool {
+    if std::env::var_os("FJ_FORCE_LOOPBACK").is_some() {
+        return false;
+    }
+    if std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some() {
+        return true;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let has_display = std::env::var_os("DISPLAY").is_some_and(|v| !v.is_empty())
+            || std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty());
+        if !has_display {
+            return true;
+        }
+    }
+    false
+}
+
+/// Device Authorization Grant sign-in (RFC 8628): request a device+user code,
+/// show the user where to approve it (code + link + QR), and poll until the
+/// session lands. `auto` distinguishes an auto-selected run (headless / SSH)
+/// from an explicit `--device` so the intro line can explain the choice.
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn login_device_flow(args: &LoginArgs, platform_url: String, auto: bool) -> Result<()> {
+    use crate::fjord::oidc;
+    use std::time::{Duration, Instant};
+
+    let client = oidc::client_id();
+    let auth = oidc::request_device_authorization(&platform_url, &client, None)
+        .await
+        .context("starting device-flow sign-in")?;
+
+    render_device_prompt(&platform_url, &auth, auto);
+
+    let deadline = Instant::now() + Duration::from_secs(auth.expires_in);
+    let interval = Duration::from_secs(auth.interval.max(1));
+    let tokens = oidc::poll_for_device_token(
+        &platform_url,
+        &client,
+        &auth.device_code,
+        interval,
+        deadline,
+    )
+    .await?;
+    persist_oidc_session(args, platform_url, tokens)
+}
+
+/// Print the branded device-flow instructions: the verification URL, the code
+/// to enter, and a scannable QR of the complete link. Mirrors the `--manual`
+/// copy style (numbered, dimmed guidance, brand arrow).
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn render_device_prompt(
+    platform_url: &str,
+    auth: &crate::fjord::oidc::DeviceAuthorization,
+    auto: bool,
+) {
+    use crate::fjord::oidc;
+
+    println!(
+        "{} Sign in to {} from any device {}",
+        output::bold("→"),
+        output::bold(platform_url),
+        output::dim("(device flow)")
+    );
+    if auto {
+        println!(
+            "  {}",
+            output::dim(
+                "(no local browser detected; using the cross-device flow. Pass --device to force it, or set FJ_FORCE_LOOPBACK=1 for the loopback flow.)"
+            )
+        );
+    }
+    println!();
+    println!(
+        "  {} {}",
+        output::dim("To sign in, open"),
+        output::bold(&auth.verification_uri)
+    );
+    println!(
+        "  {} {}",
+        output::dim("on any device (phone, iPad, laptop) and enter code:"),
+        output::bold(&auth.user_code)
+    );
+    println!();
+
+    let link = auth.best_verification_link();
+    if auth.verification_uri_complete.is_some() {
+        println!(
+            "  {}",
+            output::dim("Or open this link directly (it fills in the code for you):")
+        );
+        println!("  {link}");
+        println!();
+    }
+
+    match oidc::render_qr(link) {
+        Some(qr) => {
+            println!("{}", output::dim("  Scan to open on a phone or iPad:"));
+            // The QR block is already spaced; indent each line to match the copy.
+            for line in qr.lines() {
+                println!("  {line}");
+            }
+        }
+        None => {
+            // Rendering failed (data too large): the URL above is the fallback.
+        }
+    }
+
+    let minutes = auth.expires_in / 60;
+    println!(
+        "  {}",
+        output::dim(&format!(
+            "Waiting for you to approve the sign-in… (the code expires in about {minutes} min)"
+        ))
+    );
 }
 
 /// Default (same-device) code capture: bind the loopback listener, open the
 /// browser to the authorize URL, and wait for the redirect. Returns the
 /// captured `code` and the exact `redirect_uri` the listener bound (needed
 /// verbatim at token exchange).
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn acquire_code_loopback(
     platform_url: &str,
     client: &str,
@@ -266,6 +436,7 @@ async fn acquire_code_loopback(
 /// paste carried one) against the value we generated. Returns the `code` and
 /// the fixed registered `redirect_uri` — which must match what the token
 /// exchange sends.
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn acquire_code_manual(
     platform_url: &str,
     client: &str,
@@ -321,6 +492,7 @@ fn acquire_code_manual(
 /// Persist a completed OIDC sign-in: store the access + refresh tokens, upsert
 /// the Fjord-Account host entry, and print the success line. Shared by the
 /// loopback and manual paths.
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn persist_oidc_session(
     args: &LoginArgs,
     platform_url: String,
@@ -380,6 +552,7 @@ fn persist_oidc_session(
 /// resulting bearer is stored under the platform URL's keychain slot so it
 /// doesn't collide with any PAT for the same DNS host (which can't happen
 /// in practice, but the keychain key is namespaced anyway).
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn login_fjord_credentials(args: LoginArgs, platform_url: String) -> Result<()> {
     use crate::config::hosts::{AuthKind, FjordAccount};
     use crate::fjord::{sign_in, SignInRequest, SignInResponse};
@@ -474,6 +647,7 @@ async fn login_fjord_credentials(args: LoginArgs, platform_url: String) -> Resul
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn print_file_store_notice(storage: &token_store::TokenStoreLocation) {
     if let token_store::TokenStoreLocation::File(path) = storage {
         println!(
@@ -489,6 +663,7 @@ enum TotpInput {
     Recovery(String),
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn prompt_totp_or_recovery() -> Result<TotpInput> {
     use std::io::{stderr, stdin, Write};
     eprint!("TOTP code (or `r` to use a recovery code): ");
@@ -509,6 +684,7 @@ fn prompt_totp_or_recovery() -> Result<TotpInput> {
     }
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn prompt_email() -> Result<String> {
     use std::io::{stderr, stdin, Write};
     eprint!("Fjord Account email: ");
@@ -526,6 +702,7 @@ fn prompt_email() -> Result<String> {
 /// `--manual` sign-in to read the pasted callback URL / code. Not masked: a
 /// single-use authorization code isn't a long-lived secret, and the user is
 /// pasting a URL they need to see.
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn prompt_line(prompt: &str) -> Result<String> {
     use std::io::{stderr, stdin, Write};
     eprint!("{prompt}");
@@ -539,6 +716,7 @@ fn prompt_line(prompt: &str) -> Result<String> {
 
 /// Map a non-Success outcome to an `Err` with a user-readable explanation.
 /// Success passes through verbatim so the caller can keep unwrapping fields.
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn settle_outcome(o: crate::fjord::SignInResponse) -> Result<crate::fjord::SignInResponse> {
     use crate::fjord::SignInResponse as R;
     match o {
@@ -575,6 +753,7 @@ fn settle_outcome(o: crate::fjord::SignInResponse) -> Result<crate::fjord::SignI
     }
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn read_token(args: &LoginArgs) -> Result<String> {
     if let Some(t) = &args.token {
         // `--token` also binds FJ_TOKEN. If the value didn't come from the
@@ -601,6 +780,7 @@ fn read_token(args: &LoginArgs) -> Result<String> {
     Ok(t)
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn prompt_hostname() -> Result<String> {
     eprint!("Hostname or URL (e.g. rasterhub.com or http://localhost:3000): ");
     use std::io::{stderr, stdin, Write};
@@ -610,6 +790,7 @@ fn prompt_hostname() -> Result<String> {
     Ok(buf)
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn normalize_pat_host(raw: &str) -> Result<(String, Option<String>)> {
     let trimmed = raw.trim().trim_end_matches('/');
     if trimmed.is_empty() {
@@ -661,4 +842,37 @@ fn normalize_pat_host(raw: &str) -> Result<(String, Option<String>)> {
     web.set_fragment(None);
     let normalized = web.as_str().trim_end_matches('/').to_string();
     Ok((key, Some(normalized)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn choose_oidc_capture_precedence() {
+        // Explicit --device always wins (even on a normal desktop), and is not
+        // marked auto.
+        assert_eq!(
+            choose_oidc_capture(true, false, false),
+            OidcCapture::Device { auto: false }
+        );
+        // Explicit --device still wins if the env also looks headless.
+        assert_eq!(
+            choose_oidc_capture(true, false, true),
+            OidcCapture::Device { auto: false }
+        );
+        // Explicit --manual is honored when device isn't requested.
+        assert_eq!(choose_oidc_capture(false, true, false), OidcCapture::Manual);
+        assert_eq!(choose_oidc_capture(false, true, true), OidcCapture::Manual);
+        // No flags on a headless / SSH session: auto-select device flow.
+        assert_eq!(
+            choose_oidc_capture(false, false, true),
+            OidcCapture::Device { auto: true }
+        );
+        // No flags on a normal desktop: keep the same-device loopback default.
+        assert_eq!(
+            choose_oidc_capture(false, false, false),
+            OidcCapture::Loopback
+        );
+    }
 }

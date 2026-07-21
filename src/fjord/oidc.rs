@@ -628,6 +628,234 @@ async fn post_token(platform_url: &str, form: &[(&str, &str)]) -> Result<TokenRe
         .with_context(|| format!("decoding token response: {}", super::preview(&text)))
 }
 
+// ---- OAuth 2.0 Device Authorization Grant (RFC 8628) ----
+//
+// The durable cross-device sign-in: when the browser is on a DIFFERENT device
+// than `fj` (an iPad while `fj` runs on a Mac/server, or fully headless), the
+// user approves on that other device and `fj` polls for the result. Supersedes
+// the `--manual` paste interim. The Paragon OP side is merged (paragon #863) and
+// re-exposed by fjord-platform at `{platform}/oauth/device_authorization` and
+// `{platform}/oauth/token`. `fj` is the same `fj-cli` public client (no secret;
+// device flow needs no PKCE; the device code itself binds the exchange).
+
+/// The `grant_type` a device-code token poll sends (RFC 8628 §3.4).
+pub const DEVICE_CODE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
+
+/// A successful `POST {platform}/oauth/device_authorization` response
+/// (RFC 8628 §3.2). `verification_uri_complete` embeds the `user_code` so a
+/// scanned QR / tapped link needs no manual code entry; it is RECOMMENDED, not
+/// required, so it's optional here and the CLI falls back to `verification_uri`
+/// + the code shown separately.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeviceAuthorization {
+    pub device_code: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    #[serde(default)]
+    pub verification_uri_complete: Option<String>,
+    pub expires_in: u64,
+    /// Minimum seconds between polls. Absent means the RFC 8628 default of 5.
+    #[serde(default = "default_device_interval")]
+    pub interval: u64,
+}
+
+fn default_device_interval() -> u64 {
+    5
+}
+
+impl DeviceAuthorization {
+    /// The URL to render as a QR / tappable link: the complete URI (with the
+    /// code baked in) when the OP provided one, else the bare verification URI.
+    pub fn best_verification_link(&self) -> &str {
+        self.verification_uri_complete
+            .as_deref()
+            .unwrap_or(&self.verification_uri)
+    }
+}
+
+/// `POST {platform}/oauth/device_authorization` (form: `client_id`, optional
+/// `scope`). Starts a device-flow sign-in and returns the codes to display.
+pub async fn request_device_authorization(
+    platform_url: &str,
+    client_id: &str,
+    scope: Option<&str>,
+) -> Result<DeviceAuthorization> {
+    let url = format!("{platform_url}/oauth/device_authorization");
+    let mut form = vec![("client_id", client_id)];
+    if let Some(scope) = scope {
+        form.push(("scope", scope));
+    }
+    let http = super::http_client()?;
+    let res = http
+        .post(&url)
+        .header(USER_AGENT, super::user_agent())
+        .header(ACCEPT, "application/json")
+        .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .form(&form)
+        .send()
+        .await
+        .with_context(|| format!("POST {url}"))?;
+    let status = res.status();
+    let text = res
+        .text()
+        .await
+        .with_context(|| format!("reading device-authorization response (HTTP {status})"))?;
+    if !status.is_success() {
+        return Err(anyhow!(
+            "device-authorization endpoint returned HTTP {status}: {}",
+            super::preview(&text)
+        ));
+    }
+    serde_json::from_str::<DeviceAuthorization>(&text).with_context(|| {
+        format!(
+            "decoding device-authorization response: {}",
+            super::preview(&text)
+        )
+    })
+}
+
+/// The outcome of one device-token poll. The pending / slow-down / terminal
+/// states map to RFC 8628 §3.5 `error` codes; `Approved` carries the tokens.
+#[derive(Debug)]
+pub enum DevicePoll {
+    /// The user approved: sign-in is complete.
+    Approved(Box<TokenResponse>),
+    /// `authorization_pending`: keep polling at the current interval.
+    Pending,
+    /// `slow_down`: the OP wants a longer interval (RFC 8628 §3.5: +5s).
+    SlowDown,
+    /// `access_denied`: the user declined on the other device.
+    Denied,
+    /// `expired_token`: the device code aged out before approval.
+    Expired,
+    /// Any other terminal `error` (e.g. `invalid_grant`: consumed / unknown
+    /// code / wrong client). Carries the code verbatim for the message.
+    Failed(String),
+}
+
+/// The `{error, error_description}` body a device-token poll returns on a 400
+/// (RFC 8628 §3.5 / RFC 6749 §5.2).
+#[derive(Debug, Deserialize)]
+struct OAuthErrorBody {
+    #[serde(default)]
+    error: Option<String>,
+}
+
+/// One `POST {platform}/oauth/token` device-code poll. A 200 yields
+/// [`DevicePoll::Approved`]; a 4xx carrying a recognized OAuth `error` maps to
+/// the matching state. A non-OAuth failure (a proxy 502, an HTML error page)
+/// is a hard `Err` so the caller stops rather than hot-looping.
+pub async fn poll_device_token(
+    platform_url: &str,
+    client_id: &str,
+    device_code: &str,
+) -> Result<DevicePoll> {
+    let url = format!("{platform_url}/oauth/token");
+    let http = super::http_client()?;
+    let res = http
+        .post(&url)
+        .header(USER_AGENT, super::user_agent())
+        .header(ACCEPT, "application/json")
+        .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .form(&[
+            ("grant_type", DEVICE_CODE_GRANT),
+            ("client_id", client_id),
+            ("device_code", device_code),
+        ])
+        .send()
+        .await
+        .with_context(|| format!("POST {url}"))?;
+    let status = res.status();
+    let text = res
+        .text()
+        .await
+        .with_context(|| format!("reading device-token response (HTTP {status})"))?;
+    if status.is_success() {
+        let tokens = serde_json::from_str::<TokenResponse>(&text).with_context(|| {
+            format!("decoding device-token response: {}", super::preview(&text))
+        })?;
+        return Ok(DevicePoll::Approved(Box::new(tokens)));
+    }
+    match parse_device_error(&text).as_deref() {
+        Some("authorization_pending") => Ok(DevicePoll::Pending),
+        Some("slow_down") => Ok(DevicePoll::SlowDown),
+        Some("access_denied") => Ok(DevicePoll::Denied),
+        Some("expired_token") => Ok(DevicePoll::Expired),
+        Some(other) => Ok(DevicePoll::Failed(other.to_string())),
+        // No recognizable OAuth error in the body: a transport/proxy failure,
+        // not a poll state. Surface it so the loop aborts.
+        None => Err(anyhow!(
+            "device-token endpoint returned HTTP {status}: {}",
+            super::preview(&text)
+        )),
+    }
+}
+
+/// Pure extraction of the OAuth `error` code from a token-poll body.
+fn parse_device_error(body: &str) -> Option<String> {
+    serde_json::from_str::<OAuthErrorBody>(body)
+        .ok()
+        .and_then(|b| b.error)
+}
+
+/// Drive the device-token poll loop until the user approves, denies, or the
+/// code expires. Waits `interval` between polls (RFC 8628 §3.5), grows it by 5s
+/// on each `slow_down`, and gives up at `deadline`. Kept parameterized over
+/// `interval`/`deadline` (rather than reading them off the authorization here)
+/// so tests can drive it fast.
+pub async fn poll_for_device_token(
+    platform_url: &str,
+    client_id: &str,
+    device_code: &str,
+    interval: Duration,
+    deadline: Instant,
+) -> Result<TokenResponse> {
+    let mut interval = interval;
+    loop {
+        if Instant::now() >= deadline {
+            return Err(anyhow!(
+                "the sign-in code expired before it was approved; run `fj auth login --fjord --device` again"
+            ));
+        }
+        tokio::time::sleep(interval).await;
+        match poll_device_token(platform_url, client_id, device_code).await? {
+            DevicePoll::Approved(tokens) => return Ok(*tokens),
+            DevicePoll::Pending => {}
+            DevicePoll::SlowDown => interval += Duration::from_secs(5),
+            DevicePoll::Denied => {
+                return Err(anyhow!(
+                    "the sign-in was denied on the other device; run `fj auth login --fjord --device` to try again"
+                ))
+            }
+            DevicePoll::Expired => {
+                return Err(anyhow!(
+                    "the sign-in code expired before it was approved; run `fj auth login --fjord --device` again"
+                ))
+            }
+            DevicePoll::Failed(err) => {
+                return Err(anyhow!("the sign-in could not be completed ({err}); run `fj auth login --fjord --device` again"))
+            }
+        }
+    }
+}
+
+/// Render `data` as a QR code of Unicode half-blocks for the terminal, so a
+/// phone/iPad camera can jump straight to the verification link. Returns `None`
+/// when the data won't fit in a QR symbol (the caller then shows just the URL),
+/// so QR rendering is never load-bearing. Colors follow the `qrcode` crate's
+/// documented terminal recipe (dark modules drawn light, light modules dark).
+pub fn render_qr(data: &str) -> Option<String> {
+    use qrcode::render::unicode;
+    let code = qrcode::QrCode::new(data.as_bytes()).ok()?;
+    Some(
+        code.render::<unicode::Dense1x2>()
+            .dark_color(unicode::Dense1x2::Light)
+            .light_color(unicode::Dense1x2::Dark)
+            .quiet_zone(true)
+            .build(),
+    )
+}
+
 /// A refresh token persisted together with the identity of the account that
 /// obtained it. Binding the identity is what keeps a refresh usable only for
 /// that account: without it, a refresh token left behind by a previously
@@ -1069,6 +1297,57 @@ mod tests {
     }
 
     #[test]
+    fn device_authorization_defaults_interval_and_picks_best_link() {
+        // Full body: complete link is preferred, interval honored.
+        let full: DeviceAuthorization = serde_json::from_str(
+            r#"{"device_code":"dc","user_code":"WXYZ-ABCD",
+                "verification_uri":"https://fjord.sh/device",
+                "verification_uri_complete":"https://fjord.sh/device?user_code=WXYZ-ABCD",
+                "expires_in":600,"interval":5}"#,
+        )
+        .unwrap();
+        assert_eq!(full.user_code, "WXYZ-ABCD");
+        assert_eq!(full.interval, 5);
+        assert_eq!(
+            full.best_verification_link(),
+            "https://fjord.sh/device?user_code=WXYZ-ABCD"
+        );
+
+        // No `interval` → RFC 8628 default of 5; no complete link → bare URI.
+        let minimal: DeviceAuthorization = serde_json::from_str(
+            r#"{"device_code":"dc","user_code":"AAAA-BBBB",
+                "verification_uri":"https://fjord.sh/device","expires_in":600}"#,
+        )
+        .unwrap();
+        assert_eq!(minimal.interval, 5);
+        assert_eq!(minimal.best_verification_link(), "https://fjord.sh/device");
+    }
+
+    #[test]
+    fn parse_device_error_extracts_code() {
+        assert_eq!(
+            parse_device_error(r#"{"error":"authorization_pending"}"#).as_deref(),
+            Some("authorization_pending")
+        );
+        assert_eq!(parse_device_error("not json").as_deref(), None);
+        assert_eq!(parse_device_error("{}").as_deref(), None);
+    }
+
+    #[test]
+    fn render_qr_produces_a_block_grid_and_tolerates_huge_input() {
+        let qr = render_qr("https://fjord.sh/device?user_code=WXYZ-ABCD")
+            .expect("a short URL fits in a QR symbol");
+        // Multi-line grid of Unicode half-blocks (the Dense1x2 renderer).
+        assert!(qr.lines().count() > 5, "QR should be a multi-row grid");
+        assert!(
+            qr.contains('█') || qr.contains('▀') || qr.contains('▄') || qr.contains(' '),
+            "QR uses half-block glyphs"
+        );
+        // Oversized data can't be encoded: render_qr degrades to None, never panics.
+        assert!(render_qr(&"x".repeat(10_000)).is_none());
+    }
+
+    #[test]
     fn auth_status_body_parses_strategy() {
         let b: AuthStatusBody =
             serde_json::from_str(r#"{"mode":"live","strategy":"oidc"}"#).unwrap();
@@ -1248,6 +1527,280 @@ mod tests {
                 .to_string();
             assert!(err.contains("400"), "want status in error: {err}");
             assert!(err.contains("invalid_grant"), "want body in error: {err}");
+        }
+
+        // ---- Device Authorization Grant (RFC 8628) ----
+
+        #[tokio::test]
+        async fn device_authorization_posts_client_and_scope_and_parses() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/oauth/device_authorization"))
+                .and(header("content-type", "application/x-www-form-urlencoded"))
+                .and(body_string_contains("client_id=fj-cli"))
+                .and(body_string_contains("scope=openid"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "device_code": "the-device-code",
+                    "user_code": "WXYZ-ABCD",
+                    "verification_uri": "https://fjord.sh/device",
+                    "verification_uri_complete": "https://fjord.sh/device?user_code=WXYZ-ABCD",
+                    "expires_in": 600,
+                    "interval": 5,
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let auth = request_device_authorization(&server.uri(), "fj-cli", Some("openid email"))
+                .await
+                .unwrap();
+            assert_eq!(auth.device_code, "the-device-code");
+            assert_eq!(auth.user_code, "WXYZ-ABCD");
+            assert_eq!(auth.expires_in, 600);
+            assert_eq!(auth.interval, 5);
+        }
+
+        /// One poll maps each RFC 8628 §3.5 outcome. A public client sends the
+        /// device-code grant, the client id, and the device code; no secret.
+        #[tokio::test]
+        async fn device_token_poll_maps_each_outcome() {
+            // 400 error bodies → the matching non-terminal / terminal states.
+            for (err, want) in [
+                ("authorization_pending", "Pending"),
+                ("slow_down", "SlowDown"),
+                ("access_denied", "Denied"),
+                ("expired_token", "Expired"),
+                ("invalid_grant", "Failed"),
+            ] {
+                let server = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .and(path("/oauth/token"))
+                    .and(body_string_contains(
+                        "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code",
+                    ))
+                    .and(body_string_contains("client_id=fj-cli"))
+                    .and(body_string_contains("device_code=dc"))
+                    .respond_with(
+                        ResponseTemplate::new(400)
+                            .set_body_json(serde_json::json!({ "error": err })),
+                    )
+                    .mount(&server)
+                    .await;
+                let poll = poll_device_token(&server.uri(), "fj-cli", "dc")
+                    .await
+                    .unwrap();
+                let got = match poll {
+                    DevicePoll::Pending => "Pending",
+                    DevicePoll::SlowDown => "SlowDown",
+                    DevicePoll::Denied => "Denied",
+                    DevicePoll::Expired => "Expired",
+                    DevicePoll::Failed(_) => "Failed",
+                    DevicePoll::Approved(_) => "Approved",
+                };
+                assert_eq!(got, want, "error {err} should map to {want}");
+
+                // No client_secret ever leaves a public client.
+                let reqs = server.received_requests().await.unwrap();
+                let body = String::from_utf8(reqs[0].body.clone()).unwrap();
+                assert!(!body.contains("client_secret"), "no secret: {body}");
+            }
+
+            // 200 → Approved with the parsed tokens.
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/oauth/token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "acc",
+                    "id_token": "idt",
+                    "token_type": "Bearer",
+                    "expires_in": 3600,
+                    "refresh_token": "ref",
+                })))
+                .mount(&server)
+                .await;
+            match poll_device_token(&server.uri(), "fj-cli", "dc")
+                .await
+                .unwrap()
+            {
+                DevicePoll::Approved(t) => {
+                    assert_eq!(t.access_token, "acc");
+                    assert_eq!(t.refresh_token.as_deref(), Some("ref"));
+                }
+                other => panic!("want Approved, got {other:?}"),
+            }
+        }
+
+        /// A non-OAuth failure (a proxy 502 with an HTML body, no `error`) is a
+        /// hard error so the poll loop aborts instead of hot-looping.
+        #[tokio::test]
+        async fn device_token_poll_surfaces_non_oauth_failure() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/oauth/token"))
+                .respond_with(
+                    ResponseTemplate::new(502).set_body_string("<html>bad gateway</html>"),
+                )
+                .mount(&server)
+                .await;
+            let err = poll_device_token(&server.uri(), "fj-cli", "dc")
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("502"), "want status in error: {err}");
+        }
+
+        /// Happy path through the loop: `authorization_pending` then `200`.
+        #[tokio::test]
+        async fn device_poll_loop_pending_then_approved() {
+            use std::time::{Duration, Instant};
+            let server = MockServer::start().await;
+            // First poll: pending.
+            Mock::given(method("POST"))
+                .and(path("/oauth/token"))
+                .and(body_string_contains("grant_type=urn%3Aietf"))
+                .respond_with(
+                    ResponseTemplate::new(400)
+                        .set_body_json(serde_json::json!({ "error": "authorization_pending" })),
+                )
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+            // Then: approved.
+            Mock::given(method("POST"))
+                .and(path("/oauth/token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "acc",
+                    "refresh_token": "ref",
+                    "token_type": "Bearer",
+                    "expires_in": 3600,
+                })))
+                .mount(&server)
+                .await;
+            let tokens = poll_for_device_token(
+                &server.uri(),
+                "fj-cli",
+                "dc",
+                Duration::from_millis(10),
+                Instant::now() + Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+            assert_eq!(tokens.access_token, "acc");
+            assert_eq!(tokens.refresh_token.as_deref(), Some("ref"));
+        }
+
+        /// `slow_down` is honored (loop keeps going after a back-off) and then
+        /// approves; the loop doesn't treat it as terminal.
+        #[tokio::test]
+        async fn device_poll_loop_honors_slow_down_then_approves() {
+            use std::time::{Duration, Instant};
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/oauth/token"))
+                .respond_with(
+                    ResponseTemplate::new(400)
+                        .set_body_json(serde_json::json!({ "error": "slow_down" })),
+                )
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/oauth/token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "acc2",
+                    "token_type": "Bearer",
+                    "expires_in": 3600,
+                })))
+                .mount(&server)
+                .await;
+            let tokens = poll_for_device_token(
+                &server.uri(),
+                "fj-cli",
+                "dc",
+                Duration::from_millis(5),
+                Instant::now() + Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+            assert_eq!(tokens.access_token, "acc2");
+        }
+
+        /// `access_denied` aborts the loop with a clear message.
+        #[tokio::test]
+        async fn device_poll_loop_aborts_on_denied() {
+            use std::time::{Duration, Instant};
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/oauth/token"))
+                .respond_with(
+                    ResponseTemplate::new(400)
+                        .set_body_json(serde_json::json!({ "error": "access_denied" })),
+                )
+                .mount(&server)
+                .await;
+            let err = poll_for_device_token(
+                &server.uri(),
+                "fj-cli",
+                "dc",
+                Duration::from_millis(5),
+                Instant::now() + Duration::from_secs(30),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("denied"), "want denial message: {err}");
+        }
+
+        /// `expired_token` from the server aborts with the run-again message.
+        #[tokio::test]
+        async fn device_poll_loop_aborts_on_expired() {
+            use std::time::{Duration, Instant};
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/oauth/token"))
+                .respond_with(
+                    ResponseTemplate::new(400)
+                        .set_body_json(serde_json::json!({ "error": "expired_token" })),
+                )
+                .mount(&server)
+                .await;
+            let err = poll_for_device_token(
+                &server.uri(),
+                "fj-cli",
+                "dc",
+                Duration::from_millis(5),
+                Instant::now() + Duration::from_secs(30),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("expired"), "want expiry message: {err}");
+        }
+
+        /// The client-side deadline stops a loop the server never resolves,
+        /// even while it keeps returning `authorization_pending`.
+        #[tokio::test]
+        async fn device_poll_loop_stops_at_deadline() {
+            use std::time::{Duration, Instant};
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/oauth/token"))
+                .respond_with(
+                    ResponseTemplate::new(400)
+                        .set_body_json(serde_json::json!({ "error": "authorization_pending" })),
+                )
+                .mount(&server)
+                .await;
+            let err = poll_for_device_token(
+                &server.uri(),
+                "fj-cli",
+                "dc",
+                Duration::from_millis(10),
+                Instant::now() + Duration::from_millis(60),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("expired"), "want deadline message: {err}");
         }
     }
 }

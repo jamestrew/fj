@@ -17,6 +17,18 @@ All notable changes will be recorded here. The format follows
   token is stored in the OS keychain alongside the access token, so an expired
   session renews itself silently (also on demand via `fj auth refresh`), and
   `fj instances` refreshes and retries once on a 401.
+- **`fj auth login --fjord --device`**: durable cross-device sign-in for
+  SSO/OIDC Fjord Accounts via the OAuth 2.0 Device Authorization Grant
+  (RFC 8628). `fj` shows a short user code, the verification link, and a
+  scannable terminal QR code; you approve on any device (phone, iPad, another
+  laptop) and `fj` polls until the session lands, honoring the server's poll
+  `interval`, `slow_down` back-off, and the code's expiry. No loopback and no
+  copy-paste, so it works when `fj` runs on a remote server or headless box. It
+  is auto-selected when no local browser is reachable (a `$SSH_CONNECTION`
+  session, or a Unix session with no display server); `FJ_FORCE_LOOPBACK=1`
+  opts back out. The resulting session is identical to the loopback flow (same
+  keychain slots, silent refresh, `fj auth status` shows the Fjord Account).
+  This supersedes `--manual` for the cross-device case.
 - **`fj auth login --fjord --manual`** (alias `--no-browser`): manual,
   cross-device sign-in for SSO/OIDC Fjord Accounts. The default loopback capture
   only works when your browser is on the same machine as `fj`; `--manual` prints
@@ -24,7 +36,7 @@ All notable changes will be recorded here. The format follows
   laptop), and reads back the redirected `127.0.0.1` URL (or the bare code) you
   paste, even though that page fails to load on the other device. It keeps the
   same Authorization Code + PKCE exchange, validates the returned `state`, and
-  needs no platform changes. Interim until OAuth device flow lands.
+  needs no platform changes. Superseded by `--device` for the cross-device case.
 - The browser page shown after a loopback sign-in is now a branded, self-contained
   Fjord page (inline styles, embedded mark, light/dark aware) for the success,
   failure, and state-mismatch outcomes.
