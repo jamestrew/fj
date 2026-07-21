@@ -17,7 +17,9 @@ on:
 permissions:
   contents: read
   issues: write
-  pull-requests: read
+  # write (was read) so Forseti can submit a formal pull review
+  # (REQUEST_CHANGES / APPROVE), not just an issue comment.
+  pull-requests: write
 
 concurrency:
   group: forseti-review-${{ github.event.pull_request.number }}
@@ -61,4 +63,10 @@ jobs:
           # the pricey Opus the stable image defaults to. Overrides the image
           # default via forseti's FORSETI_ANTHROPIC_MODEL knob (provider.rs).
           FORSETI_ANTHROPIC_MODEL: claude-haiku-4-5-20251001
+          # Phase 1 (visibility): submit a formal Forgejo review so a blocking
+          # P0/P1 shows as a red "changes requested" state in the PR list and
+          # clears to APPROVE on a clean re-review, instead of reviews: NONE.
+          # fj main does NOT block on rejected reviews, so this stays purely
+          # visible-non-blocking until FORSETI_GATE is turned on (Phase 2).
+          FORSETI_FORMAL_REVIEW: "1"
         run: forseti-review
