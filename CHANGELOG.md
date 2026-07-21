@@ -17,6 +17,17 @@ All notable changes will be recorded here. The format follows
   token is stored in the OS keychain alongside the access token, so an expired
   session renews itself silently (also on demand via `fj auth refresh`), and
   `fj instances` refreshes and retries once on a 401.
+- **`fj auth login --fjord --manual`** (alias `--no-browser`): manual,
+  cross-device sign-in for SSO/OIDC Fjord Accounts. The default loopback capture
+  only works when your browser is on the same machine as `fj`; `--manual` prints
+  the sign-in URL, lets you complete it on any device (phone, iPad, another
+  laptop), and reads back the redirected `127.0.0.1` URL (or the bare code) you
+  paste, even though that page fails to load on the other device. It keeps the
+  same Authorization Code + PKCE exchange, validates the returned `state`, and
+  needs no platform changes. Interim until OAuth device flow lands.
+- The browser page shown after a loopback sign-in is now a branded, self-contained
+  Fjord page (inline styles, embedded mark, light/dark aware) for the success,
+  failure, and state-mismatch outcomes.
 
 ## [0.3.0] - 2026-06-29
 

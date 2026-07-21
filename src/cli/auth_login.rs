@@ -189,25 +189,55 @@ async fn login_fjord(args: LoginArgs) -> Result<()> {
     login_fjord_credentials(args, platform_url).await
 }
 
-/// Fjord Account sign-in via SSO/OIDC: OAuth 2.0 Authorization Code + PKCE over
-/// a loopback redirect. Opens the user's browser to the platform's hosted login
-/// page; on success captures the code on `127.0.0.1`, exchanges it for tokens,
-/// and stores the access + refresh tokens in the keychain.
+/// Fjord Account sign-in via SSO/OIDC: OAuth 2.0 Authorization Code + PKCE.
+///
+/// Two ways to capture the authorization code, sharing PKCE generation, the
+/// token exchange, and persistence:
+/// - default: bind a loopback listener, open the browser, and capture the
+///   redirect on `127.0.0.1` (same-device, zero copy-paste);
+/// - `--manual`: bind nothing; print the authorize URL, let the user sign in on
+///   any device, and paste the redirected URL (or bare code) back. This is the
+///   interim path for signing in when the browser is on a different device than
+///   `fj` (a remote server, an iPad). The durable replacement is OAuth device
+///   flow (separate work); this needs zero platform/Paragon changes because the
+///   `fj-cli` client is already registered with the loopback redirect.
 async fn login_fjord_oidc(args: LoginArgs, platform_url: String) -> Result<()> {
-    use crate::cli::web;
-    use crate::config::hosts::{AuthKind, FjordAccount, Host};
     use crate::fjord::oidc;
 
     let client = oidc::client_id();
     let pkce = oidc::Pkce::generate()?;
+
+    let (code, redirect_uri) = if args.manual {
+        acquire_code_manual(&platform_url, &client, &pkce)?
+    } else {
+        acquire_code_loopback(&platform_url, &client, &pkce).await?
+    };
+
+    let tokens =
+        oidc::exchange_code(&platform_url, &client, &code, &redirect_uri, &pkce.verifier).await?;
+    persist_oidc_session(&args, platform_url, tokens)
+}
+
+/// Default (same-device) code capture: bind the loopback listener, open the
+/// browser to the authorize URL, and wait for the redirect. Returns the
+/// captured `code` and the exact `redirect_uri` the listener bound (needed
+/// verbatim at token exchange).
+async fn acquire_code_loopback(
+    platform_url: &str,
+    client: &str,
+    pkce: &crate::fjord::oidc::Pkce,
+) -> Result<(String, String)> {
+    use crate::cli::web;
+    use crate::fjord::oidc;
+
     let server = oidc::LoopbackServer::bind()?;
     let redirect_uri = server.redirect_uri.clone();
-    let authorize_url = oidc::build_authorize_url(&platform_url, &client, &redirect_uri, &pkce);
+    let authorize_url = oidc::build_authorize_url(platform_url, client, &redirect_uri, pkce);
 
     println!(
         "{} Opening your browser to sign in to {}",
         output::bold("→"),
-        output::bold(&platform_url)
+        output::bold(platform_url)
     );
     println!(
         "  {}",
@@ -216,7 +246,8 @@ async fn login_fjord_oidc(args: LoginArgs, platform_url: String) -> Result<()> {
     println!("  {authorize_url}");
     // A failed opener (headless box, no `open`/`xdg-open`) isn't fatal: the URL
     // is printed above, so the user can paste it and the loopback still catches
-    // the redirect.
+    // the redirect. (If the browser is on another device entirely, use
+    // `--manual`.)
     if let Err(e) = web::open(&authorize_url) {
         eprintln!(
             "  {}",
@@ -226,8 +257,77 @@ async fn login_fjord_oidc(args: LoginArgs, platform_url: String) -> Result<()> {
     println!("  {}", output::dim("Waiting for the sign-in to complete…"));
 
     let code = server.wait_for_code(pkce.state.clone()).await?;
-    let tokens =
-        oidc::exchange_code(&platform_url, &client, &code, &redirect_uri, &pkce.verifier).await?;
+    Ok((code, redirect_uri))
+}
+
+/// Manual (`--manual`) code capture for a browser on a different device. Binds
+/// no listener: prints the authorize URL, then reads the redirected URL (or
+/// bare code) the user pastes back and validates the returned `state` (when the
+/// paste carried one) against the value we generated. Returns the `code` and
+/// the fixed registered `redirect_uri` — which must match what the token
+/// exchange sends.
+fn acquire_code_manual(
+    platform_url: &str,
+    client: &str,
+    pkce: &crate::fjord::oidc::Pkce,
+) -> Result<(String, String)> {
+    use crate::fjord::oidc;
+
+    let redirect_uri = oidc::default_redirect_uri();
+    let authorize_url = oidc::build_authorize_url(platform_url, client, &redirect_uri, pkce);
+
+    println!(
+        "{} Sign in to {} from any device {}",
+        output::bold("→"),
+        output::bold(platform_url),
+        output::dim("(manual mode)")
+    );
+    println!();
+    println!(
+        "  {} {}",
+        output::bold("1."),
+        output::dim("Open this URL in a browser on any device (phone, iPad, laptop):")
+    );
+    println!("     {authorize_url}");
+    println!();
+    println!(
+        "  {} {}",
+        output::bold("2."),
+        output::dim("Sign in. Your browser will try to reach a 127.0.0.1 address and show")
+    );
+    println!(
+        "     {}",
+        output::dim("a \"can't connect\" / \"page not found\" error — that is expected.")
+    );
+    println!();
+    println!(
+        "  {} {}",
+        output::bold("3."),
+        output::dim("Copy the full address from the browser's address bar — it looks like")
+    );
+    println!(
+        "     {}",
+        output::dim("http://127.0.0.1:47017/callback?code=…&state=… — and paste it below.")
+    );
+    println!();
+
+    let pasted = prompt_line("Paste the redirected URL (or just the code): ")?;
+    let parsed = oidc::parse_pasted_callback(&pasted)?;
+    parsed.check_state(&pkce.state)?;
+
+    Ok((parsed.code, redirect_uri))
+}
+
+/// Persist a completed OIDC sign-in: store the access + refresh tokens, upsert
+/// the Fjord-Account host entry, and print the success line. Shared by the
+/// loopback and manual paths.
+fn persist_oidc_session(
+    args: &LoginArgs,
+    platform_url: String,
+    tokens: crate::fjord::oidc::TokenResponse,
+) -> Result<()> {
+    use crate::config::hosts::{AuthKind, FjordAccount, Host};
+    use crate::fjord::oidc;
 
     if tokens.refresh_token.is_none() {
         eprintln!(
@@ -420,6 +520,21 @@ fn prompt_email() -> Result<String> {
         return Err(anyhow!("email is required"));
     }
     Ok(trimmed.to_string())
+}
+
+/// Read one line from stdin after printing `prompt` to stderr. Used by
+/// `--manual` sign-in to read the pasted callback URL / code. Not masked: a
+/// single-use authorization code isn't a long-lived secret, and the user is
+/// pasting a URL they need to see.
+fn prompt_line(prompt: &str) -> Result<String> {
+    use std::io::{stderr, stdin, Write};
+    eprint!("{prompt}");
+    stderr().flush().ok();
+    let mut buf = String::new();
+    stdin()
+        .read_line(&mut buf)
+        .context("reading the pasted sign-in callback")?;
+    Ok(buf)
 }
 
 /// Map a non-Success outcome to an `Err` with a user-readable explanation.

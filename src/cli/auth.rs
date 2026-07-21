@@ -110,6 +110,15 @@ pub struct LoginArgs {
     /// after signing in to list and pick an instance.
     #[arg(long, conflicts_with_all = ["token", "with_token"])]
     pub fjord: bool,
+    /// Manual / no-browser sign-in for a Fjord Account on an SSO/OIDC
+    /// deployment: instead of capturing the redirect on a local loopback
+    /// listener (which only works when your browser is on the SAME machine as
+    /// `fj`), print the sign-in URL, let you sign in on ANY device, and paste
+    /// the redirected URL (or the bare code) back. Use this when `fj` runs on a
+    /// remote server or your browser is on a separate device (e.g. an iPad).
+    /// Fjord mode only.
+    #[arg(long, visible_alias = "no-browser", requires = "fjord")]
+    pub manual: bool,
     /// fjord-platform deployment URL to sign in against. Defaults to the
     /// production deployment. Use this for local dev (`http://localhost:5180`)
     /// or to point at a staging environment.

@@ -66,6 +66,16 @@ pub fn client_id() -> String {
         .unwrap_or_else(|| DEFAULT_CLIENT_ID.to_string())
 }
 
+/// The redirect URI `--manual` sign-in uses. Manual mode binds no loopback
+/// listener, so it can't discover a free port the way [`LoopbackServer::bind`]
+/// does; it pins the first (canonical) registered callback instead. This must
+/// stay a redirect URI registered on the `fj-cli` client because Paragon
+/// validates by exact match, and it must be the exact string sent in both the
+/// authorize request and the token exchange.
+pub fn default_redirect_uri() -> String {
+    format!("http://127.0.0.1:{}/callback", CALLBACK_PORTS[0])
+}
+
 /// Sign-in shape a deployment offers, from `GET /api/auth/status`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthStrategy {
@@ -268,33 +278,21 @@ fn handle_connection(stream: std::net::TcpStream, expected_state: &str) -> Resul
     let target = request_line.split_whitespace().nth(1).unwrap_or("");
     match parse_callback(target) {
         CallbackOutcome::Ignore => {
-            write_response(stream, "404 Not Found", "Not found.");
+            write_page(stream, CallbackPage::NotFound);
             Ok(None)
         }
         CallbackOutcome::Error(msg) => {
-            write_response(
-                stream,
-                "400 Bad Request",
-                "Sign-in failed. You can close this window and return to your terminal.",
-            );
+            write_page(stream, CallbackPage::Failed);
             Err(anyhow!("sign-in was denied by the provider: {msg}"))
         }
         CallbackOutcome::Code { code, state } => {
             if state != expected_state {
-                write_response(
-                    stream,
-                    "400 Bad Request",
-                    "Sign-in state mismatch. Close this window and try again.",
-                );
+                write_page(stream, CallbackPage::StateMismatch);
                 return Err(anyhow!(
                     "OAuth state mismatch on the callback; aborting to avoid a possible CSRF"
                 ));
             }
-            write_response(
-                stream,
-                "200 OK",
-                "Signed in to fj. You can close this window and return to your terminal.",
-            );
+            write_page(stream, CallbackPage::Success);
             Ok(Some(code))
         }
     }
@@ -336,14 +334,218 @@ fn parse_callback(target: &str) -> CallbackOutcome {
     }
 }
 
-fn write_response(mut stream: std::net::TcpStream, status: &str, message: &str) {
-    let body = format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>fj</title></head>\
-         <body style=\"font-family:system-ui,sans-serif;max-width:32rem;margin:4rem auto;text-align:center\">\
-         <h1>fj</h1><p>{message}</p></body></html>"
-    );
+/// A `code` (and optional CSRF `state`) parsed from a `--manual` paste.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PastedCode {
+    pub code: String,
+    /// The `state` when the paste carried one (a full URL or query). `None` for
+    /// a bare code, which the caller then cannot CSRF-check.
+    pub state: Option<String>,
+}
+
+impl PastedCode {
+    /// CSRF guard for the manual flow: when the paste carried a `state`, require
+    /// it to equal the value this sign-in attempt generated. A bare code (no
+    /// state) passes — it can't be checked here, but the PKCE verifier held only
+    /// by this process still binds the exchange, and the code is single-use and
+    /// short-lived.
+    pub fn check_state(&self, expected: &str) -> Result<()> {
+        match self.state.as_deref() {
+            Some(state) if state != expected => Err(anyhow!(
+                "the pasted sign-in `state` doesn't match this attempt; start over with \
+                 `fj auth login --fjord --manual` (a stale paste, or a possible CSRF)"
+            )),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Parse what the user pastes back in `--manual` sign-in. Accepts three shapes:
+/// the whole redirected callback URL
+/// (`http://127.0.0.1:47017/callback?code=…&state=…`, even though that page
+/// failed to load on the other device), just its query string
+/// (`code=…&state=…`), or a bare `code`. Returns the `code` plus any `state`
+/// for the caller to compare against the value it generated. A provider
+/// `error=…`, an empty paste, or a query with no `code` is an error.
+///
+/// Pure (no I/O) so the URL-or-bare-code parsing is unit-tested directly.
+pub fn parse_pasted_callback(input: &str) -> Result<PastedCode> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!(
+            "nothing pasted; copy the redirected URL (or the code value) and press Enter"
+        ));
+    }
+
+    // A query is present if there's a `?`, or a bare `k=v` pair we recognize.
+    // A value with none of those is treated as a bare code.
+    let query_start = trimmed.find('?');
+    let looks_like_query = query_start.is_some()
+        || trimmed.contains("code=")
+        || trimmed.contains("error=")
+        || trimmed.contains("state=");
+    if !looks_like_query {
+        if trimmed.contains("://") {
+            return Err(anyhow!(
+                "that URL has no `?code=…` in it; copy the FULL redirected address, or just the code value"
+            ));
+        }
+        // Bare code: nothing to CSRF-check against.
+        return Ok(PastedCode {
+            code: trimmed.to_string(),
+            state: None,
+        });
+    }
+
+    // Take everything after the first `?` (a full URL / path), or the whole
+    // string when it's a bare `code=…&state=…` query. Drop any `#fragment`.
+    let query = match query_start {
+        Some(i) => &trimmed[i + 1..],
+        None => trimmed,
+    };
+    let query = query.split('#').next().unwrap_or(query);
+
+    let mut code = None;
+    let mut state = None;
+    let mut error = None;
+    for (k, v) in url::form_urlencoded::parse(query.as_bytes()) {
+        match k.as_ref() {
+            "code" => code = Some(v.into_owned()),
+            "state" => state = Some(v.into_owned()),
+            "error" => error = Some(v.into_owned()),
+            _ => {}
+        }
+    }
+    if let Some(err) = error {
+        return Err(anyhow!(
+            "the provider returned an error instead of a code: {err}"
+        ));
+    }
+    match code {
+        Some(code) if !code.is_empty() => Ok(PastedCode { code, state }),
+        _ => Err(anyhow!(
+            "couldn't find a `code` in what you pasted; copy the whole redirected URL \
+             (…/callback?code=…&state=…) or just the code value"
+        )),
+    }
+}
+
+/// The branded page the loopback listener serves back to the browser after the
+/// redirect. Manual (`--manual`) sign-in never reaches here: it binds no
+/// listener, so the browser (on another device) sees its own can't-connect page
+/// and the user pastes the code instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallbackPage {
+    /// Code captured and state verified: sign-in is done.
+    Success,
+    /// The provider returned `error=…` (e.g. the user denied access).
+    Failed,
+    /// The callback's `state` didn't match: aborted as a possible CSRF.
+    StateMismatch,
+    /// A stray request (favicon, `/`) that isn't the sign-in redirect.
+    NotFound,
+}
+
+impl CallbackPage {
+    /// The HTTP status line to serve the page under.
+    fn http_status(self) -> &'static str {
+        match self {
+            CallbackPage::Success => "200 OK",
+            CallbackPage::Failed | CallbackPage::StateMismatch => "400 Bad Request",
+            CallbackPage::NotFound => "404 Not Found",
+        }
+    }
+}
+
+/// The Fjord brand mark (`fjord-brand/assets/fjord-mark.svg`), inlined so the
+/// loopback page is fully self-contained: it is served with no network, so no
+/// external asset URL would load. `class`/`viewBox` let CSS size it; the fixed
+/// fills are the brand's own colors and read on both light and dark surfaces.
+const FJORD_MARK_SVG: &str = r##"<svg class="mark" viewBox="0 0 1802 1788" fill="none" role="img" aria-label="Fjord" aria-hidden="true"><rect x="217" y="1075" width="1091" height="713" fill="#83C9D1"/><path d="M1198.08 311.303L957.528 1150.87L1221.66 1226.34L1499.95 679.202L1688.61 245.267C1738.93 229.546 1810.25 70.7518 1787.39 33.0183C1764.52 -4.71514 1712.01 -1.57069 1688.61 4.71822C1586.42 58.174 1365.05 173.576 1297.13 207.536C1229.21 241.496 1202.8 290.864 1198.08 311.303Z" fill="#4A7F91"/><path d="M1150.64 1570.66C1046.87 1664.99 1018.8 1731.4 990.5 1788C1150.87 1788 1509.19 1787.66 1622.5 1788C1698.25 1788.23 1801.54 1703.44 1801.54 1609.11V179.234C1801.54 136.784 1805.98 51.8838 1787.39 51.8838C1768.8 51.8838 1553.37 285 1532.69 316.018C1510.03 350 1452.78 589.586 1419.77 716.936C1386.75 844.287 1235.82 1113.14 1212.23 1179.17C1200.7 1211.46 982.946 1157.2 958.482 1151.11L957.529 1150.87C956.292 1152.19 1086.87 1199.27 1127.27 1216.9C1167.66 1234.54 1287.42 1273.51 1287.42 1372.56C1287.42 1471.61 1212.78 1514.17 1150.64 1570.66Z" fill="#205066"/><path d="M80.225 0C38.7182 0 18.9081 34.589 14.1914 51.8835L561.327 1165.02C561.327 1165.02 696.283 1098.58 842.5 1075C785.9 886.333 613.21 314.465 580.194 268.851C569.393 253.93 570.76 249.984 551.893 231.118C533.027 212.251 121.732 0 80.225 0Z" fill="#4A7F91"/><path d="M0.0446917 122.634C0.0446917 81.1272 9.47806 58.1727 14.1947 51.8838C14.1947 51.8838 263.088 293.77 287.759 334.885C312.43 376 532.083 1125.4 566.044 1174.45C608.494 1235.77 876.755 1264.07 872.628 1330.11C868.501 1396.14 629.659 1437.8 471.71 1504.62C349.082 1556.51 250.026 1702.72 217.009 1787.62C37.7591 1787.62 -1.52754 1641.41 0.0446917 1565.94V122.634Z" fill="#205066"/></svg>"##;
+
+/// The page shell: one self-contained document with inline CSS (no external
+/// fonts/styles/scripts, so nothing hits the network) and light/dark support via
+/// `prefers-color-scheme`. Palette mirrors the fjord-platform design tokens
+/// (`src/app.css`: warm accent, teal, ink/cream surfaces) so the page reads as
+/// the same product as fjord.sh. Placeholders are filled by [`render_callback_page`].
+const CALLBACK_PAGE_SHELL: &str = r##"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fjord · fj sign-in</title>
+<style>
+*{box-sizing:border-box}
+:root{--bg:#0d0d10;--card:#16161b;--line:#26262e;--fg:#ededf2;--haze:#9a9aa6;--ok:#79c2cf;--bad:#f87171;--warn:#f2a166}
+@media (prefers-color-scheme:light){:root{--bg:#f4f1ea;--card:#ffffff;--line:#e4ded1;--fg:#1d2a31;--haze:#5d6b73;--ok:#2c6d7c;--bad:#b4453b;--warn:#b85c1e}}
+html,body{margin:0;height:100%}
+body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,system-ui,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:24px;-webkit-font-smoothing:antialiased}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;max-width:26rem;width:100%;padding:40px 32px;text-align:center;box-shadow:0 1px 2px rgba(0,0,0,.18),0 14px 40px -16px rgba(0,0,0,.5)}
+.mark{width:44px;height:44px;margin:0 auto 22px;display:block}
+.icon{width:56px;height:56px;border-radius:50%;display:flex;align-items:center;justify-content:center;margin:0 auto 20px;font-size:27px;font-weight:700;line-height:1;border:2px solid currentColor}
+.icon.ok{color:var(--ok)}.icon.bad{color:var(--bad)}.icon.warn{color:var(--warn)}
+h1{font-size:1.35rem;margin:0 0 10px;letter-spacing:-.01em}
+p{margin:0 auto;max-width:22rem;color:var(--haze);font-size:.98rem;line-height:1.55}
+.foot{margin-top:28px;padding-top:18px;border-top:1px solid var(--line);color:var(--haze);font-size:.8rem;letter-spacing:.02em}
+.foot b{color:var(--fg);font-weight:600}
+</style>
+</head>
+<body>
+<main class="card">
+__MARK__
+<div class="icon __ACCENT__" aria-hidden="true">__GLYPH__</div>
+<h1>__TITLE__</h1>
+<p>__MESSAGE__</p>
+<div class="foot"><b>Fjord</b> CLI · a Raster &amp; State project</div>
+</main>
+</body>
+</html>"##;
+
+/// Render the branded HTML for one [`CallbackPage`]. Pure (string in, string
+/// out) so it is unit-testable without a socket.
+fn render_callback_page(page: CallbackPage) -> String {
+    let (accent, glyph, title, message) = match page {
+        CallbackPage::Success => (
+            "ok",
+            "&check;",
+            "Signed in to Fjord",
+            "You can close this window and return to your terminal.",
+        ),
+        CallbackPage::Failed => (
+            "bad",
+            "&times;",
+            "Sign-in failed",
+            "Something went wrong completing sign-in. Return to your terminal and try again.",
+        ),
+        CallbackPage::StateMismatch => (
+            "warn",
+            "!",
+            "Couldn&rsquo;t verify sign-in",
+            "This sign-in couldn&rsquo;t be verified (state mismatch), so it was stopped. Return to your terminal and start over.",
+        ),
+        CallbackPage::NotFound => (
+            "warn",
+            "?",
+            "Nothing to see here",
+            "This is the fj sign-in callback. You can close this window.",
+        ),
+    };
+    CALLBACK_PAGE_SHELL
+        .replace("__MARK__", FJORD_MARK_SVG)
+        .replace("__ACCENT__", accent)
+        .replace("__GLYPH__", glyph)
+        .replace("__TITLE__", title)
+        .replace("__MESSAGE__", message)
+}
+
+/// Write a branded [`CallbackPage`] back to the browser over the loopback
+/// socket. Best-effort: a write failure never aborts sign-in (the code is
+/// already captured), it just means the browser tab shows its own error.
+fn write_page(mut stream: std::net::TcpStream, page: CallbackPage) {
+    let body = render_callback_page(page);
     let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        page.http_status(),
         body.len()
     );
     let _ = stream.write_all(response.as_bytes());
@@ -650,6 +852,140 @@ mod tests {
     }
 
     #[test]
+    fn default_redirect_uri_is_the_first_registered_callback() {
+        assert_eq!(default_redirect_uri(), "http://127.0.0.1:47017/callback");
+    }
+
+    #[test]
+    fn parse_pasted_full_url_extracts_code_and_state() {
+        let got =
+            parse_pasted_callback("http://127.0.0.1:47017/callback?code=abc123&state=xyz").unwrap();
+        assert_eq!(
+            got,
+            PastedCode {
+                code: "abc123".into(),
+                state: Some("xyz".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_pasted_tolerates_whitespace_query_only_and_fragment() {
+        // Leading/trailing whitespace (a sloppy paste).
+        assert_eq!(
+            parse_pasted_callback("  http://127.0.0.1:47017/callback?code=a&state=b  ")
+                .unwrap()
+                .code,
+            "a"
+        );
+        // Just the query, no scheme/host.
+        assert_eq!(
+            parse_pasted_callback("code=a&state=b").unwrap(),
+            PastedCode {
+                code: "a".into(),
+                state: Some("b".into())
+            }
+        );
+        // A `/callback?…` path, plus a trailing fragment to drop.
+        assert_eq!(
+            parse_pasted_callback("/callback?code=a&state=b#_=_")
+                .unwrap()
+                .state,
+            Some("b".into())
+        );
+        // Order-independent extraction.
+        assert_eq!(
+            parse_pasted_callback("http://127.0.0.1:47017/callback?state=b&code=a")
+                .unwrap()
+                .code,
+            "a"
+        );
+    }
+
+    #[test]
+    fn parse_pasted_bare_code_has_no_state() {
+        let got = parse_pasted_callback("just-the-code-value").unwrap();
+        assert_eq!(
+            got,
+            PastedCode {
+                code: "just-the-code-value".into(),
+                state: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_pasted_rejects_empty_error_and_codeless() {
+        // Empty / whitespace-only paste.
+        assert!(parse_pasted_callback("   ").is_err());
+        // A provider error instead of a code.
+        let err = parse_pasted_callback(
+            "http://127.0.0.1:47017/callback?error=access_denied&error_description=no",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("access_denied"), "want provider error: {err}");
+        // A query that carries a state but no code.
+        assert!(parse_pasted_callback("http://127.0.0.1:47017/callback?state=b").is_err());
+        // A URL-looking value with no query at all is a truncated paste, not a
+        // bare code.
+        assert!(parse_pasted_callback("https://forgejo-site.pages.dev/oauth/authorize").is_err());
+    }
+
+    #[test]
+    fn pasted_state_is_csrf_checked_but_bare_code_passes() {
+        // Matching state passes.
+        let with_state = PastedCode {
+            code: "c".into(),
+            state: Some("s".into()),
+        };
+        assert!(with_state.check_state("s").is_ok());
+        // Mismatched state is rejected (the CSRF guard).
+        assert!(with_state.check_state("different").is_err());
+        // A bare code (no state) passes: nothing to compare, verifier still binds.
+        let bare = PastedCode {
+            code: "c".into(),
+            state: None,
+        };
+        assert!(bare.check_state("s").is_ok());
+    }
+
+    #[test]
+    fn callback_page_is_branded_self_contained_and_theme_aware() {
+        for page in [
+            CallbackPage::Success,
+            CallbackPage::Failed,
+            CallbackPage::StateMismatch,
+            CallbackPage::NotFound,
+        ] {
+            let html = render_callback_page(page);
+            // Self-contained: no external asset the loopback page couldn't load.
+            assert!(
+                !html.contains("http://"),
+                "no external http asset: {page:?}"
+            );
+            assert!(
+                !html.contains("https://"),
+                "no external https asset: {page:?}"
+            );
+            assert!(!html.contains("<script"), "no scripts: {page:?}");
+            // Branded + theme-aware.
+            assert!(html.contains("Fjord"), "wordmark present: {page:?}");
+            assert!(html.contains("<svg"), "inlined mark present: {page:?}");
+            assert!(
+                html.contains("prefers-color-scheme"),
+                "light/dark aware: {page:?}"
+            );
+            // No leftover template placeholders.
+            assert!(!html.contains("__"), "all placeholders filled: {page:?}");
+        }
+        assert!(render_callback_page(CallbackPage::Success).contains("Signed in to Fjord"));
+        assert_eq!(CallbackPage::Success.http_status(), "200 OK");
+        assert_eq!(CallbackPage::NotFound.http_status(), "404 Not Found");
+        assert_eq!(CallbackPage::StateMismatch.http_status(), "400 Bad Request");
+    }
+
+    #[test]
     fn client_id_prefers_env_override() {
         // Default when unset.
         std::env::remove_var("FJ_OIDC_CLIENT_ID");
@@ -823,6 +1159,53 @@ mod tests {
                 !body.contains("client_secret"),
                 "public client must not send a client_secret; body was: {body}"
             );
+        }
+
+        #[tokio::test]
+        async fn manual_flow_parses_paste_checks_state_and_exchanges() {
+            // End-to-end at the module level (no stdin/socket): the exact steps
+            // `--manual` runs after the user pastes the redirected URL — parse,
+            // CSRF-check the state, then exchange the code with the fixed
+            // registered redirect URI.
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/oauth/token"))
+                .and(body_string_contains("grant_type=authorization_code"))
+                .and(body_string_contains("code=pasted-code"))
+                .and(body_string_contains("code_verifier=the-verifier"))
+                // The redirect URI in the exchange must be the fixed registered
+                // callback (percent-encoded in the form body).
+                .and(body_string_contains(
+                    "redirect_uri=http%3A%2F%2F127.0.0.1%3A47017%2Fcallback",
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "acc",
+                    "refresh_token": "ref",
+                    "token_type": "Bearer",
+                    "expires_in": 3600,
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            // The user pastes the full redirected URL from another device.
+            let redirect_uri = default_redirect_uri();
+            let pasted = format!("{redirect_uri}?code=pasted-code&state=the-state");
+            let parsed = parse_pasted_callback(&pasted).unwrap();
+            assert_eq!(parsed.code, "pasted-code");
+            parsed.check_state("the-state").expect("state matches");
+
+            let tokens = exchange_code(
+                &server.uri(),
+                "fj-cli",
+                &parsed.code,
+                &redirect_uri,
+                "the-verifier",
+            )
+            .await
+            .unwrap();
+            assert_eq!(tokens.access_token, "acc");
+            assert_eq!(tokens.refresh_token.as_deref(), Some("ref"));
         }
 
         #[tokio::test]
