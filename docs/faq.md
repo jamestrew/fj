@@ -26,6 +26,31 @@ fj auth switch other.example.com   # make it the default
 fj --host other.example.com repo list
 ```
 
+## How do I sign in to a Fjord Account?
+
+```sh
+fj auth login --fjord
+```
+
+`fj` reads the deployment's sign-in shape from `GET /api/auth/status` and
+picks the flow automatically:
+
+- **SSO / OIDC** (the production shape): `fj` opens your browser to the
+  hosted sign-in page and runs an OAuth 2.0 Authorization Code + PKCE flow
+  over a loopback redirect on `127.0.0.1`. Finish signing in in the browser
+  and `fj` captures the result, no copy-paste. The session (and a refresh
+  token for silent renewal) is stored in your OS keychain like any other
+  credential.
+- **Email + password**: `fj` prompts for your credentials (and a TOTP or
+  recovery code if your account requires one).
+
+After signing in, `fj instances list` shows the Forgejo instances on your
+account and `fj instances use <id>` picks the default one. An expired
+session renews itself silently when a refresh token is present; you can also
+run `fj auth refresh` to renew it on demand. If a deployment exposes no
+CLI-drivable sign-in, sign in to your Forgejo directly with a token instead:
+`fj auth login --host <your-forgejo-host> --token <token>`.
+
 ## What's the difference between `fj api --jq` and `fj --json-fields`?
 
 - `fj api --jq` projects a single JSON document with dotted paths,

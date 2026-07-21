@@ -46,6 +46,12 @@ dialoguer = { version = "0.11", default-features = false, features = ["password"
 libc = "0.2"
 tempfile = "3"
 shlex = "1.3"
+# PKCE for the Fjord Account OIDC sign-in (loopback + authorization code).
+# Both are already in the tree via reqwest's rustls-tls stack, so declaring
+# them direct adds no new compiled crates: `getrandom` mints the code
+# verifier / state / nonce, `ring` computes the S256 code challenge.
+getrandom = "0.2"
+ring = "0.17"
 
 [dev-dependencies]
 wiremock = "0.6"
