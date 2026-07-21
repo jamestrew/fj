@@ -4,6 +4,20 @@ All notable changes will be recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Fjord Account sign-in under SSO/OIDC**: `fj auth login --fjord` now reads
+  the deployment's sign-in shape from `GET /api/auth/status` and, on an `oidc`
+  deployment, runs an OAuth 2.0 Authorization Code + PKCE flow over a loopback
+  redirect. `fj` opens your browser to the hosted sign-in page and captures the
+  result on `127.0.0.1`, no copy-paste. The email + password flow still runs on
+  `credentials` deployments and remains the fallback. The session's refresh
+  token is stored in the OS keychain alongside the access token, so an expired
+  session renews itself silently (also on demand via `fj auth refresh`), and
+  `fj instances` refreshes and retries once on a 401.
+
 ## [0.3.0] - 2026-06-29
 
 ### Added
