@@ -6,6 +6,20 @@ All notable changes will be recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-07-22
+
+### Fixed
+
+- **Silent Fjord Account session refresh across every command.** An expired
+  Fjord access token is now renewed transparently at the shared HTTP client: on
+  a 401 from a host signed with a Fjord bearer, fj refreshes via the stored
+  refresh token and retries the request once, so `fj api`, `fj pr`, `fj issue`,
+  `fj repo`, and the Actions log routes no longer fail with "sign in again" once
+  the short-lived token lapses. Previously only `fj instances` and `fj auth`
+  refreshed. PAT hosts (whose tokens are not refreshable) and the case with no
+  usable refresh token surface the original 401 unchanged, and the refresh is
+  bounded to one attempt per request so a persistently-401 endpoint cannot loop.
+
 ## [0.4.0] - 2026-07-22
 
 ### Added
