@@ -6,6 +6,8 @@ All notable changes will be recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-22
+
 ### Added
 
 - **Fjord Account sign-in under SSO/OIDC**: `fj auth login --fjord` now reads
@@ -40,6 +42,19 @@ All notable changes will be recorded here. The format follows
 - The browser page shown after a loopback sign-in is now a branded, self-contained
   Fjord page (inline styles, embedded mark, light/dark aware) for the success,
   failure, and state-mismatch outcomes.
+- **`fj auth session`**: import a Forgejo web session cookie for the cookie-gated
+  Actions log and rerun routes, which reject a PAT and authenticate by browser
+  session only (fj#103). Pass the `i_like_gitea` cookie via `--cookie` or
+  `--with-cookie` (read from stdin, kept out of shell history), or `--clear` to
+  forget it. The value is never echoed and is stored under a keychain slot
+  disjoint from the API token (with the same `FJ_SESSION` env override and 0600
+  file fallback). `fj auth status` now shows a per-host "Web session" line so you
+  can see whether the log and rerun routes are enabled.
+- **`fj run log`**: a dedicated subcommand to print a run's logs, alongside the
+  existing `fj run view --log`. Takes `--job/-j` to scope to one job, `--attempt`
+  to pick an attempt, `--failed` to keep only jobs that did not succeed, and
+  `--json`. It reads from the API/task-log path with a Loki fallback, so logs
+  remain reachable on deployments where the Forgejo web log route is unavailable.
 
 ## [0.3.0] - 2026-06-29
 

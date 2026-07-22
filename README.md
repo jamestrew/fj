@@ -12,7 +12,7 @@
 
 <p align="center">
   <a href="https://rasterhub.com/rasterstate/fj/actions"><img src="https://rasterhub.com/rasterstate/fj/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
-  <a href="https://rasterhub.com/rasterstate/fj/releases/latest"><img src="https://img.shields.io/badge/release-v0.3.0-blue" alt="version"></a>
+  <a href="https://rasterhub.com/rasterstate/fj/releases/latest"><img src="https://img.shields.io/badge/release-v0.4.0-blue" alt="version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="license"></a>
   <a href="https://rasterhub.com/rasterstate/fj/src/branch/main/CHANGELOG.md"><img src="https://img.shields.io/badge/changelog-keep--a--changelog-orange" alt="changelog"></a>
 </p>
@@ -58,14 +58,14 @@ brew install fj
 **Linux tarball:**
 
 ```sh
-curl -fsSL https://rasterhub.com/rasterstate/fj/releases/download/v0.3.0/fj-v0.3.0-linux-x86_64.tar.gz | tar -xz
-sudo mv fj-v0.3.0-linux-x86_64/fj /usr/local/bin/fj
+curl -fsSL https://rasterhub.com/rasterstate/fj/releases/download/v0.4.0/fj-v0.4.0-linux-x86_64.tar.gz | tar -xz
+sudo mv fj-v0.4.0-linux-x86_64/fj /usr/local/bin/fj
 ```
 
 **From source** (any platform with a current Rust toolchain):
 
 ```sh
-cargo install --git https://rasterhub.com/rasterstate/fj --tag v0.3.0
+cargo install --git https://rasterhub.com/rasterstate/fj --tag v0.4.0
 ```
 
 Windows compiles but is untested. [File an issue](https://rasterhub.com/rasterstate/fj/issues/new) if you try it.
@@ -87,6 +87,67 @@ fj api /version                          # raw API escape hatch
 `upstream` to find the slug). Outside a clone, pass it explicitly. `create
 --template` uses Forgejo's issue-template API when present and falls back to
 reading template files from the repository's default branch.
+
+## Authentication
+
+`fj` signs in two ways, both stored in your OS keychain (0600 file fallback on
+headless hosts):
+
+- **Forgejo personal access token** (the default). `fj auth login --host
+  rasterhub.com` prompts for a token, or pass it non-interactively with
+  `--token` / `--with-token` (stdin).
+- **Fjord Account** (`--fjord`). One sign-in that talks to every Forgejo
+  instance your account owns, through the fjord-platform gateway. After signing
+  in, use `fj instances` to list and pick an instance.
+
+```sh
+fj auth login --host rasterhub.com          # Forgejo PAT
+fj auth login --fjord                        # Fjord Account (opens your browser)
+fj instances                                 # list/pick an instance after --fjord
+fj auth status                               # per-host scheme, sign-in, and session
+```
+
+### Signing in to a Fjord Account across devices
+
+On an SSO/OIDC deployment, plain `--fjord` captures the sign-in on a local
+loopback listener, which only works when your browser is on the **same machine**
+as `fj`. When it isn't (a remote server, an SSH session, or you want to approve
+on your phone or iPad), use one of:
+
+- **`--device`** (recommended): durable cross-device sign-in via the OAuth 2.0
+  Device Authorization Grant (RFC 8628). `fj` prints a short user code, a
+  verification link, and a scannable QR code; approve on any device and `fj`
+  picks up the session automatically. No loopback and no copy-paste. It is
+  auto-selected on a headless / SSH session (opt back out with
+  `FJ_FORCE_LOOPBACK=1`).
+- **`--manual`** (alias `--no-browser`): print the sign-in URL, complete it on
+  any device, and paste the redirected `127.0.0.1` URL (or the bare code) back.
+  Superseded by `--device` for the cross-device case.
+
+```sh
+fj auth login --fjord --device               # show a code + QR; approve anywhere
+fj auth login --fjord --manual               # print URL, paste the result back
+fj auth login --fjord --platform-url http://localhost:5180   # staging / local dev
+```
+
+A Fjord Account session under OIDC keeps a refresh token, so it renews silently
+(and on demand via `fj auth refresh`).
+
+### Web session for Actions logs and reruns
+
+The Forgejo Actions **log** and **rerun** web routes reject a PAT and
+authenticate by browser session cookie only (fj#103). To use `fj run log` /
+`fj run view --log` / `fj run rerun` on a private repo, import the
+`i_like_gitea` cookie from a signed-in browser:
+
+```sh
+fj auth session --with-cookie                # paste the cookie on stdin (kept out of history)
+fj auth session --clear                      # forget the stored web session
+```
+
+The cookie is stored under a keychain slot separate from your API token, is
+never echoed, and honours the `FJ_SESSION` env override. `fj auth status` shows
+a "Web session" line per host so you can see whether these routes are enabled.
 
 ## Everyday workflows
 
