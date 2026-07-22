@@ -8,6 +8,7 @@ use resolve::build_base_url;
 pub use resolve::{resolve, web_base_url, ResolvedHost};
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 static DEBUG: AtomicBool = AtomicBool::new(false);
@@ -44,6 +45,33 @@ pub enum AuthScheme {
     FjordBearer,
 }
 
+/// A test seam for the silent-refresh path: a closure that stands in for the
+/// real `fjord::oidc` refresh so `Client`'s 401-refresh-retry wiring can be
+/// exercised against a mock server without touching the keychain-backed token
+/// store. Returns `Ok(Some(fresh_bearer))` to simulate a successful refresh,
+/// `Ok(None)` for "no usable refresh token" (surface the 401).
+#[cfg(test)]
+type RefreshHook = Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<String>>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Wrap a synchronous closure as a [`RefreshHook`] for tests, so a test can
+/// describe the refresh outcome (`Ok(Some(fresh))` / `Ok(None)`) and count
+/// invocations without writing the boxed-future boilerplate by hand.
+#[cfg(test)]
+pub(crate) fn sync_refresh_hook<F>(f: F) -> RefreshHook
+where
+    F: Fn() -> Result<Option<String>> + Send + Sync + 'static,
+{
+    let f = Arc::new(f);
+    Arc::new(move || {
+        let f = Arc::clone(&f);
+        Box::pin(async move { f() })
+    })
+}
+
 /// Convenience handle for talking to a single Forgejo host (or, in
 /// Fjord-Account mode, to a per-instance gateway endpoint that fronts one).
 #[derive(Clone)]
@@ -52,16 +80,26 @@ pub struct Client {
     #[allow(dead_code)]
     host: String,
     base: Url,
-    token: String,
+    /// The outgoing bearer/PAT. Behind a lock (shared across clones) so the
+    /// silent-refresh path can swap in a freshly minted Fjord access token on a
+    /// 401 and have every later request, and every clone, pick it up.
+    token: Arc<RwLock<String>>,
     auth_scheme: AuthScheme,
+    /// The fjord-platform origin for a Fjord-Account host, used to drive the
+    /// silent OIDC refresh on a 401. `None` for PAT hosts (their tokens are not
+    /// refreshable) and for Fjord hosts we lack platform config for.
+    platform_url: Option<String>,
+    #[cfg(test)]
+    refresh_hook: Option<RefreshHook>,
 }
 
 impl Client {
     pub fn new(resolved: ResolvedHost) -> Result<Self> {
-        let (base, auth_scheme) = match resolved.host.auth_kind {
+        let (base, auth_scheme, platform_url) = match resolved.host.auth_kind {
             AuthKind::Pat => (
                 build_base_url(&resolved.name, &resolved.host)?,
                 AuthScheme::Pat,
+                None,
             ),
             AuthKind::FjordAccount => {
                 let fa = resolved.host.fjord_account.as_ref().ok_or_else(|| {
@@ -79,6 +117,9 @@ impl Client {
                 (
                     fjord::gateway_base_url(&fa.platform_url, instance_id)?,
                     AuthScheme::FjordBearer,
+                    // Remember where to refresh: the platform origin owns the
+                    // OIDC token endpoint and the stored refresh token.
+                    Some(fa.platform_url.clone()),
                 )
             }
         };
@@ -92,8 +133,11 @@ impl Client {
             http,
             host: resolved.name,
             base,
-            token: resolved.token,
+            token: Arc::new(RwLock::new(resolved.token)),
             auth_scheme,
+            platform_url,
+            #[cfg(test)]
+            refresh_hook: None,
         })
     }
 
@@ -128,9 +172,25 @@ impl Client {
             http,
             host,
             base: base_url,
-            token,
+            token: Arc::new(RwLock::new(token)),
             auth_scheme,
+            platform_url: None,
+            refresh_hook: None,
         })
+    }
+
+    /// A `FjordBearer` client whose silent-refresh path is driven by a supplied
+    /// `refresh_hook` instead of the real keychain-backed `fjord::oidc` flow, so
+    /// the 401-refresh-retry wiring is testable against a mock server.
+    #[cfg(test)]
+    pub fn for_base_url_fjord_refresh(
+        base_url: Url,
+        token: String,
+        refresh_hook: RefreshHook,
+    ) -> Result<Self> {
+        let mut client = Self::for_base_url_with_scheme(base_url, token, AuthScheme::FjordBearer)?;
+        client.refresh_hook = Some(refresh_hook);
+        Ok(client)
     }
 
     #[allow(dead_code)]
@@ -149,10 +209,22 @@ impl Client {
         &self.http
     }
 
-    /// Raw token. Use only when constructing custom request headers.
-    #[allow(dead_code)]
-    pub fn token(&self) -> &str {
-        &self.token
+    /// A snapshot of the current bearer/PAT. Cloned out from behind the lock so
+    /// callers never hold the guard across an await.
+    fn current_token(&self) -> String {
+        self.token
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Swap in a freshly minted bearer after a silent refresh. Visible to every
+    /// later request on this client and all its clones (shared `Arc`).
+    fn set_token(&self, token: String) {
+        *self
+            .token
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = token;
     }
 
     /// Which `Authorization` shape this client emits. Used by call sites
@@ -168,9 +240,10 @@ impl Client {
     /// Fjord-Account-mode hosts. Returns an `HeaderValue` so the caller
     /// can plug it into any `HeaderMap` directly.
     pub fn auth_header_value(&self) -> Result<HeaderValue> {
+        let token = self.current_token();
         let raw = match self.auth_scheme {
-            AuthScheme::Pat => format!("token {}", self.token),
-            AuthScheme::FjordBearer => format!("Bearer {}", self.token),
+            AuthScheme::Pat => format!("token {token}"),
+            AuthScheme::FjordBearer => format!("Bearer {token}"),
         };
         HeaderValue::from_str(&raw).map_err(|_| {
             anyhow!(
@@ -248,26 +321,72 @@ impl Client {
         extra: &HeaderMap,
     ) -> Result<Response> {
         let url = self.url(path)?;
-        let mut headers = self.auth_headers()?;
-        if !self.is_trusted_url(&url) {
+        let trusted = self.is_trusted_url(&url);
+        if !trusted {
             // Absolute URL pointing off-host or not over TLS (only reachable
             // via `fj api <url>`): never leak the token there.
-            headers.remove(AUTHORIZATION);
             eprintln!(
                 "warning: not sending your {} token to {} (only same-host HTTPS requests are authenticated)",
                 self.host,
                 url.host_str().unwrap_or("?")
             );
         }
-        for (k, v) in extra.iter() {
-            headers.insert(k.clone(), v.clone());
-        }
 
         if debug_enabled() {
             log_request(&method, &url, query, body);
         }
 
-        let retries = if is_idempotent(&method) { 3 } else { 1 };
+        let res = self
+            .send_once(&method, &url, query, body, extra, trusted)
+            .await?;
+
+        // Transparent Fjord-Account session refresh. On a 401 for a host we
+        // signed the request to with a Fjord bearer, silently renew the access
+        // token via the stored refresh token and retry the request exactly
+        // ONCE. PAT hosts, off-host requests, and the no-refresh-token case fall
+        // through with the original 401 (the user re-runs `fj auth login`).
+        // Bounded to a single refresh+retry, so a persistently-401ing endpoint
+        // can never loop.
+        if trusted
+            && self.auth_scheme == AuthScheme::FjordBearer
+            && res.status() == StatusCode::UNAUTHORIZED
+        {
+            if let Some(fresh) = self.refresh_bearer().await? {
+                self.set_token(fresh);
+                if debug_enabled() {
+                    eprintln!("← 401 {url}: refreshed Fjord session, retrying once");
+                }
+                return self
+                    .send_once(&method, &url, query, body, extra, trusted)
+                    .await;
+            }
+        }
+        Ok(res)
+    }
+
+    /// Send one request with the current bearer, applying the transient-failure
+    /// retry policy (5xx / 429 / transport). Does NOT handle 401 refresh: that
+    /// lives one level up in [`request_with_headers`] so it happens at most once
+    /// per logical request. The `Authorization` header is (re)built from the
+    /// current token on every call, so a post-refresh retry uses the new token.
+    async fn send_once(
+        &self,
+        method: &Method,
+        url: &Url,
+        query: &[(String, String)],
+        body: Option<&serde_json::Value>,
+        extra: &HeaderMap,
+        trusted: bool,
+    ) -> Result<Response> {
+        let mut headers = self.auth_headers()?;
+        if !trusted {
+            headers.remove(AUTHORIZATION);
+        }
+        for (k, v) in extra.iter() {
+            headers.insert(k.clone(), v.clone());
+        }
+
+        let retries = if is_idempotent(method) { 3 } else { 1 };
 
         // Build the request once. `Request::try_clone` (used per retry below)
         // succeeds for any request whose body is `None`, `Bytes`, or `Text`.
@@ -343,6 +462,32 @@ impl Client {
             }
         }
         Err(last_err.unwrap_or_else(|| anyhow!("retries exhausted")))
+    }
+
+    /// Attempt a silent session refresh for a Fjord-Account host. Returns
+    /// `Ok(Some(fresh_bearer))` when a stored refresh token belonging to the
+    /// current account is exchanged for a new access token, and `Ok(None)` when
+    /// there is no usable refresh token (a PAT host, no stored token, or one
+    /// bound to a different account) so the caller surfaces the original 401.
+    /// Reuses [`fjord::oidc::valid_refresh_token`] for the identity-bound gate
+    /// and [`fjord::oidc::refresh_session`] for the exchange-and-persist.
+    async fn refresh_bearer(&self) -> Result<Option<String>> {
+        // Test seam: drive the wiring from a mock instead of the keychain.
+        #[cfg(test)]
+        if let Some(hook) = &self.refresh_hook {
+            return hook().await;
+        }
+        let Some(platform_url) = self.platform_url.as_deref() else {
+            return Ok(None);
+        };
+        let current = self.current_token();
+        if fjord::oidc::valid_refresh_token(platform_url, &current)?.is_none() {
+            return Ok(None);
+        }
+        let fresh = fjord::oidc::refresh_session(platform_url)
+            .await
+            .context("refreshing the expired Fjord Account session")?;
+        Ok(Some(fresh))
     }
 
     /// Issue a request and decode a JSON body, mapping non-2xx to a typed

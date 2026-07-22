@@ -63,6 +63,12 @@ pub async fn run(cmd: InstancesCmd, top_host: Option<&str>) -> Result<()> {
 /// renews the access token silently and the call is retried; without one, the
 /// original 401 (`SessionExpired`) surfaces so the user re-runs
 /// `fj auth login --fjord`.
+///
+/// This refresh stays here (rather than folding into the shared `Client`'s new
+/// central refresh) because `fj instances` talks to the platform's
+/// `/api/v1/me/forge-instances` endpoint via [`fjord::list_instances`], NOT
+/// through `Client` (which is scoped to a single forge gateway). The two paths
+/// are independent; the `Client` refresh covers `fj api`/`pr`/`issue`/etc.
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn fetch_instances(platform_url: &str, bearer: &str) -> Result<Vec<ForgeInstance>> {
     match fjord::list_instances(platform_url, bearer).await {

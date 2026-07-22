@@ -5404,3 +5404,156 @@ async fn ref_mutation_errors_are_clear() {
     assert!(text.contains("409 Conflict"), "{text}");
     assert!(text.contains("tag already exists"), "{text}");
 }
+
+// ---- Silent Fjord-Account session refresh on 401 (fix/client-silent-refresh) ----
+//
+// The shared `Client` now transparently refreshes an expired Fjord bearer on a
+// 401 and retries once. These drive that wiring through a mock token flow (the
+// `refresh_hook` seam stands in for the keychain-backed `fjord::oidc` refresh)
+// so every `Client`-backed command (`fj api`/`pr`/`issue`/…) benefits.
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+#[tokio::test]
+async fn fjord_bearer_refreshes_once_and_retries_with_rotated_token() {
+    let server = MockServer::start().await;
+    // The stale bearer is rejected...
+    Mock::given(method("GET"))
+        .and(path("/api/v1/user"))
+        .and(header("authorization", "Bearer stale-token"))
+        .respond_with(
+            ResponseTemplate::new(401)
+                .set_body_json(json!({"message": "Token expired; sign in again"})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    // ...and the rotated bearer from the refresh is accepted.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/user"))
+        .and(header("authorization", "Bearer fresh-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": 1, "login": "alice"})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let hook = {
+        let calls = Arc::clone(&calls);
+        super::sync_refresh_hook(move || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Some("fresh-token".to_string()))
+        })
+    };
+    let base = Url::parse(&format!("{}/api/v1/", server.uri())).unwrap();
+    let c = Client::for_base_url_fjord_refresh(base, "stale-token".into(), hook).unwrap();
+
+    let res: serde_json::Value = c
+        .json(Method::GET, "/api/v1/user", &[], None::<&()>)
+        .await
+        .expect("request succeeds on the post-refresh retry");
+    assert_eq!(res["login"], "alice");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the session is refreshed exactly once"
+    );
+}
+
+#[tokio::test]
+async fn fjord_bearer_without_refresh_token_surfaces_401() {
+    let server = MockServer::start().await;
+    // Only one request is expected: with no usable refresh token there is no
+    // retry, so the original 401 surfaces unchanged.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/user"))
+        .respond_with(
+            ResponseTemplate::new(401)
+                .set_body_json(json!({"message": "Token expired; sign in again"})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let hook = {
+        let calls = Arc::clone(&calls);
+        super::sync_refresh_hook(move || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(None)
+        })
+    };
+    let base = Url::parse(&format!("{}/api/v1/", server.uri())).unwrap();
+    let c = Client::for_base_url_fjord_refresh(base, "stale-token".into(), hook).unwrap();
+
+    let err = c
+        .json::<serde_json::Value, _>(Method::GET, "/api/v1/user", &[], None::<&()>)
+        .await
+        .expect_err("the 401 surfaces when there is no refresh token");
+    assert!(format!("{err:#}").contains("401"), "{err:#}");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "refresh is checked once and, finding nothing, does not retry"
+    );
+}
+
+#[tokio::test]
+async fn pat_host_401_is_never_refreshed() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/user"))
+        .and(header("authorization", "token pat-token"))
+        .respond_with(ResponseTemplate::new(401))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let base = Url::parse(&format!("{}/api/v1/", server.uri())).unwrap();
+    let c =
+        Client::for_base_url_with_scheme(base, "pat-token".into(), super::AuthScheme::Pat).unwrap();
+
+    let err = c
+        .json::<serde_json::Value, _>(Method::GET, "/api/v1/user", &[], None::<&()>)
+        .await
+        .expect_err("PAT host 401 surfaces unchanged");
+    assert!(format!("{err:#}").contains("401"), "{err:#}");
+    // The mock's `.expect(1)` (verified on server drop) proves there was no
+    // second, post-refresh request for a PAT host.
+}
+
+#[tokio::test]
+async fn persistently_401_refreshes_at_most_once() {
+    let server = MockServer::start().await;
+    // The endpoint stays 401 even with the rotated token: initial request plus
+    // exactly one post-refresh retry, then it gives up (no infinite loop).
+    Mock::given(method("GET"))
+        .and(path("/api/v1/loop"))
+        .respond_with(ResponseTemplate::new(401))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let hook = {
+        let calls = Arc::clone(&calls);
+        super::sync_refresh_hook(move || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Some("fresh-token".to_string()))
+        })
+    };
+    let base = Url::parse(&format!("{}/api/v1/", server.uri())).unwrap();
+    let c = Client::for_base_url_fjord_refresh(base, "stale-token".into(), hook).unwrap();
+
+    let err = c
+        .json::<serde_json::Value, _>(Method::GET, "/api/v1/loop", &[], None::<&()>)
+        .await
+        .expect_err("a persistently-401 endpoint still errors after one refresh");
+    assert!(format!("{err:#}").contains("401"), "{err:#}");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "refresh is attempted at most once, never in a loop"
+    );
+}
