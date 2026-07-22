@@ -12,7 +12,7 @@
 
 <p align="center">
   <a href="https://rasterhub.com/rasterstate/fj/actions"><img src="https://rasterhub.com/rasterstate/fj/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
-  <a href="https://rasterhub.com/rasterstate/fj/releases/latest"><img src="https://img.shields.io/badge/release-v0.4.0-blue" alt="version"></a>
+  <a href="https://rasterhub.com/rasterstate/fj/releases/latest"><img src="https://img.shields.io/badge/release-v0.4.1-blue" alt="version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="license"></a>
   <a href="https://rasterhub.com/rasterstate/fj/src/branch/main/CHANGELOG.md"><img src="https://img.shields.io/badge/changelog-keep--a--changelog-orange" alt="changelog"></a>
 </p>
@@ -58,14 +58,14 @@ brew install fj
 **Linux tarball:**
 
 ```sh
-curl -fsSL https://rasterhub.com/rasterstate/fj/releases/download/v0.4.0/fj-v0.4.0-linux-x86_64.tar.gz | tar -xz
-sudo mv fj-v0.4.0-linux-x86_64/fj /usr/local/bin/fj
+curl -fsSL https://rasterhub.com/rasterstate/fj/releases/download/v0.4.1/fj-v0.4.1-linux-x86_64.tar.gz | tar -xz
+sudo mv fj-v0.4.1-linux-x86_64/fj /usr/local/bin/fj
 ```
 
 **From source** (any platform with a current Rust toolchain):
 
 ```sh
-cargo install --git https://rasterhub.com/rasterstate/fj --tag v0.4.0
+cargo install --git https://rasterhub.com/rasterstate/fj --tag v0.4.1
 ```
 
 Windows compiles but is untested. [File an issue](https://rasterhub.com/rasterstate/fj/issues/new) if you try it.
