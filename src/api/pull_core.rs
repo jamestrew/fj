@@ -461,6 +461,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pull_list_decodes_reviewer_with_negative_system_user_id() {
+        // Regression: `fj pr list --state all` failed with "decoding JSON list
+        // response" because a PR listed the `forgejo-actions` bot as a requested
+        // reviewer, and Forgejo gives that system actor the negative id -2 (the
+        // Ghost placeholder is -1). `User.id` was `u64`, so the whole list decode
+        // aborted. This is a trimmed capture of the offending shape from a real
+        // rasterstate/fj response; it must now decode.
+        let json = r#"[{
+            "id": 100,
+            "number": 42,
+            "title": "example",
+            "state": "open",
+            "user": {"id": 3, "login": "stephen"},
+            "html_url": "https://rasterhub.com/rasterstate/fj/pulls/42",
+            "head": {"label": "topic", "ref": "topic", "sha": "aaa"},
+            "base": {"label": "main", "ref": "main", "sha": "bbb"},
+            "created_at": "2026-07-11T02:10:45Z",
+            "updated_at": "2026-07-11T02:10:45Z",
+            "requested_reviewers": [
+                {"id": -2, "login": "forgejo-actions"}
+            ]
+        }]"#;
+        let pulls: Vec<Pull> =
+            serde_json::from_str(json).expect("list with a bot reviewer decodes");
+        assert_eq!(pulls.len(), 1);
+        assert_eq!(pulls[0].requested_reviewers[0].id, -2);
+        assert_eq!(pulls[0].requested_reviewers[0].login, "forgejo-actions");
+    }
+
+    #[test]
     fn merge_style_as_str_maps_each_variant() {
         assert_eq!(MergeStyle::Merge.as_str(), "merge");
         assert_eq!(MergeStyle::Rebase.as_str(), "rebase");

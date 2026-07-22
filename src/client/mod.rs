@@ -664,7 +664,13 @@ fn decode_list<T: DeserializeOwned>(text: &str) -> Result<Vec<T>> {
     if t.is_empty() || t == "null" {
         Ok(Vec::new())
     } else {
-        serde_json::from_str(t).context("decoding JSON list response")
+        // Fold serde's detail into the headline. The CLI prints only the
+        // top-level error (`{err}`, not `{err:#}`), so a bare
+        // "decoding JSON list response" would otherwise hide the actual cause,
+        // e.g. "invalid value: integer `-2`, expected u64" (a field-type
+        // mismatch) or "invalid type: map, expected a sequence" (the server
+        // answered 200 with an object, not a list).
+        serde_json::from_str(t).map_err(|e| anyhow!("decoding JSON list response: {e}"))
     }
 }
 
@@ -877,6 +883,18 @@ mod trust_tests {
 
     fn client(base: &str) -> Client {
         Client::for_base_url(Url::parse(base).unwrap(), "tok".into()).unwrap()
+    }
+
+    #[test]
+    fn decode_list_error_surfaces_the_serde_cause() {
+        // The CLI prints only the top-level error (`{err}`), so the list-decode
+        // failure must carry the serde detail in its own message rather than a
+        // bare "decoding JSON list response". Here the body is an object, not a
+        // list (what a stray 200 error payload looks like).
+        let err = decode_list::<u64>(r#"{"message":"forbidden"}"#).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("decoding JSON list response"), "{msg}");
+        assert!(msg.contains("expected a sequence"), "{msg}");
     }
 
     #[test]
