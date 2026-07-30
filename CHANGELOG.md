@@ -6,6 +6,42 @@ All notable changes will be recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`fj stack ship` restacks the rest of the stack after a squash land.** A
+  squash merge replaces the item's commits, so every branch above it was left
+  parented on history the trunk no longer had: the PRs above showed the landed
+  diff a second time and the stack had to be repaired by hand. Ship now replays
+  the remainder onto the new trunk tip with a single
+  `git rebase --onto <new trunk> <landed tip> <top branch> --update-refs` (the
+  plumbing `stack absorb` already used), force-pushes each branch with an
+  explicit `--force-with-lease`, and re-syncs the PR bases. A conflicting
+  replay rolls the rebase back and force-pushes nothing, then ship stops with
+  the commands to finish by hand. The PR directly above the landed item is
+  still re-pointed at the trunk, because the base branch it was targeting has
+  merged away and leaving it aimed at a deleted branch would be worse than the
+  no-restack end state. Merge-commit lands are unaffected, since the original
+  commits stay reachable. `--no-restack` opts out. The replay needs git 2.38 or
+  newer.
+- **`fj stack ship` pre-flights the stack's shape in git.** Before merging
+  anything it verifies that each unmerged branch descends from the one below
+  it, that the lowest one contains the trunk's *fetched* tip, and that each
+  local branch tip matches the head of the PR that would merge. A stale or
+  non-linear stack is refused up front with a "restack, then `fj stack sync`"
+  message rather than failing mid-merge with the bottom already landed.
+- **`fj stack ship` re-validates between merges.** After an item lands, the
+  next one is re-checked (still open, still mergeable, still approved, still at
+  the head fj most recently put there) before it is merged. If the ground
+  shifted, ship stops cleanly, reports what already landed, and leaves the rest
+  for a re-run. Checks that ship itself re-armed by force-pushing a restacked
+  branch are not re-gated. A forge still serving the pre-restack head is a
+  lagging read rather than a shift, so ship re-reads a few times; if it never
+  catches up, that is a stop in its own right, since every field on that
+  snapshot describes a shape the restack has already replaced.
+- `stack ship --json` now reports the branches restacked after each item
+  (`restacked`), and `stack review --json` carries each PR's head sha
+  (`head_sha`). Both fields are additive.
+
 ### Fixed
 
 - **The pager no longer swallows short, write, and machine output.** The

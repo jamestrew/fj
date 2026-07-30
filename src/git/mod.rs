@@ -376,6 +376,243 @@ pub fn rebase_abort() {
     let _ = Command::new("git").args(["rebase", "--abort"]).status();
 }
 
+/// A git repository addressed by path rather than by the process's current
+/// directory. `stack ship`'s restack rebases and force-pushes several
+/// branches, which must happen at the repo root (and, in tests, against a
+/// throwaway repo), so those calls go through here instead of the free
+/// functions above.
+#[derive(Debug, Clone)]
+pub struct Repo {
+    dir: PathBuf,
+}
+
+impl Repo {
+    /// Address the repository rooted at `dir`.
+    pub fn at(dir: impl Into<PathBuf>) -> Self {
+        Repo { dir: dir.into() }
+    }
+
+    /// The repository containing the process's current directory, resolved to
+    /// its top level. Falls back to the current directory when `rev-parse`
+    /// can't answer (the caller has already established it is in a repo).
+    pub fn discover() -> Self {
+        let dir = output(&["rev-parse", "--show-toplevel"])
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| ".".to_string());
+        Repo::at(dir)
+    }
+
+    fn command(&self, args: &[&str]) -> Command {
+        let mut c = Command::new("git");
+        c.arg("-C").arg(&self.dir).args(args);
+        c
+    }
+
+    /// Run git in this repo, surfacing stderr on a non-zero exit.
+    fn run(&self, args: &[&str]) -> Result<()> {
+        let out = self
+            .command(args)
+            .output()
+            .with_context(|| "spawning git (is it installed and on PATH?)")?;
+        if !out.status.success() {
+            bail!(
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+
+    /// Run git in this repo and capture stdout.
+    fn output(&self, args: &[&str]) -> Result<String> {
+        let out = self
+            .command(args)
+            .output()
+            .with_context(|| "spawning git (is it installed and on PATH?)")?;
+        if !out.status.success() {
+            bail!(
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    }
+
+    /// Resolve a revision to its full sha.
+    pub fn rev_parse(&self, rev: &str) -> Result<String> {
+        reject_dash_lead("rev", rev)?;
+        Ok(self.output(&["rev-parse", rev])?.trim().to_string())
+    }
+
+    /// True if `rev` resolves in this repo.
+    pub fn rev_exists(&self, rev: &str) -> bool {
+        if reject_dash_lead("rev", rev).is_err() {
+            return false;
+        }
+        self.command(&["rev-parse", "--verify", "--quiet", rev])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// True if `ancestor` is an ancestor of `descendant` (or they're equal).
+    pub fn is_ancestor(&self, ancestor: &str, descendant: &str) -> bool {
+        if reject_dash_lead("ancestor", ancestor).is_err()
+            || reject_dash_lead("descendant", descendant).is_err()
+        {
+            return false;
+        }
+        self.command(&["merge-base", "--is-ancestor", ancestor, descendant])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// Current branch name, or None when HEAD is detached.
+    pub fn current_branch(&self) -> Option<String> {
+        let out = self
+            .command(&["rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let b = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if b.is_empty() || b == "HEAD" {
+            None
+        } else {
+            Some(b)
+        }
+    }
+
+    /// Check out `branch` in this repo.
+    pub fn checkout(&self, branch: &str) -> Result<()> {
+        reject_dash_lead("branch name", branch)?;
+        self.run(&["checkout", branch])
+    }
+
+    /// Fetch one branch from `remote` and return the sha it fetched, without
+    /// touching any local branch. Used to learn the trunk's tip after a PR
+    /// merges server-side.
+    pub fn fetch_branch(&self, remote: &str, branch: &str) -> Result<String> {
+        reject_dash_lead("remote", remote)?;
+        reject_dash_lead("branch name", branch)?;
+        self.run(&["fetch", "--quiet", "--", remote, branch])?;
+        self.rev_parse("FETCH_HEAD")
+    }
+
+    /// Replay `<upstream>..<branch>` onto `newbase`, moving every stacked
+    /// branch ref that points inside the rewritten range (`--update-refs`, git
+    /// 2.38+, the same plumbing `stack absorb` uses). `--autostash` sets aside
+    /// and restores any uncommitted work. Leaves `branch` checked out.
+    pub fn rebase_onto_update_refs(
+        &self,
+        newbase: &str,
+        upstream: &str,
+        branch: &str,
+    ) -> Result<()> {
+        reject_dash_lead("new base", newbase)?;
+        reject_dash_lead("upstream", upstream)?;
+        reject_dash_lead("branch name", branch)?;
+        let out = self
+            .command(&[
+                "rebase",
+                "--update-refs",
+                "--autostash",
+                "--onto",
+                newbase,
+                upstream,
+                branch,
+            ])
+            .env("GIT_SEQUENCE_EDITOR", ":")
+            .env("GIT_EDITOR", "true")
+            .output()
+            .with_context(|| "spawning git rebase")?;
+        if !out.status.success() {
+            bail!(
+                "git rebase --onto {newbase} {upstream} {branch} failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+
+    /// Abort an in-progress rebase in this repo, best effort.
+    pub fn rebase_abort(&self) {
+        let _ = self.command(&["rebase", "--abort"]).output();
+    }
+
+    /// Force-push `branch` to `remote`, but only if the remote ref is still at
+    /// `expect`. The lease is stated explicitly rather than left to the
+    /// remote-tracking ref, so a branch that was never fetched can't be
+    /// clobbered by a stale local view.
+    pub fn push_force_with_lease(&self, remote: &str, branch: &str, expect: &str) -> Result<()> {
+        reject_dash_lead("remote", remote)?;
+        reject_dash_lead("branch name", branch)?;
+        reject_dash_lead("lease", expect)?;
+        let lease = force_with_lease_arg(branch, expect);
+        let out = self
+            .command(&["push", &lease, "--", remote, branch])
+            .output()
+            .with_context(|| "spawning git push")?;
+        if out.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if is_stale_lease(&stderr) {
+            return Err(anyhow::Error::new(StaleLease {
+                branch: branch.to_string(),
+                expected: expect.to_string(),
+            }));
+        }
+        bail!("git push {remote} {branch} failed: {}", stderr.trim());
+    }
+}
+
+/// A force-push git rejected because the remote ref no longer matches the
+/// stated lease: something was pushed to the branch after fj last read it.
+///
+/// Typed rather than folded into a plain error string because the recovery is
+/// the *opposite* of a transport failure's. A push that never reached the
+/// server leaves the local refs authoritative and safe to re-push; a rejected
+/// lease means the local refs are missing whatever landed on the remote, and
+/// pushing harder there destroys it. Callers `downcast_ref` to tell the two
+/// apart before offering advice.
+#[derive(Debug)]
+pub struct StaleLease {
+    pub branch: String,
+    pub expected: String,
+}
+
+impl std::fmt::Display for StaleLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "refusing to force-push '{}': the remote branch moved since fj last \
+             saw it (expected {}). Fetch and re-check the branch, then re-run.",
+            self.branch, self.expected
+        )
+    }
+}
+
+impl std::error::Error for StaleLease {}
+
+/// `--force-with-lease=<ref>:<expected sha>`: push only if the remote ref is
+/// still exactly where we think it is.
+fn force_with_lease_arg(branch: &str, expect: &str) -> String {
+    format!("--force-with-lease={branch}:{expect}")
+}
+
+/// Recognize git's rejection of a force-push whose lease no longer holds.
+fn is_stale_lease(stderr: &str) -> bool {
+    let s = stderr.to_lowercase();
+    s.contains("stale info") || (s.contains("[rejected]") && s.contains("force-with-lease"))
+}
+
 /// Soft-reset HEAD to `rev`, keeping the index and worktree (`git reset
 /// --soft`). Used by `stack absorb` to undo fixup commits while re-staging
 /// their contents after a failed rebase.
@@ -531,5 +768,152 @@ mod tests {
     fn log_records_empty_when_no_commits() {
         assert!(parse_log_records("").is_empty());
         assert!(parse_log_records("\n").is_empty());
+    }
+
+    #[test]
+    fn lease_arg_names_the_ref_and_the_expected_sha() {
+        use super::force_with_lease_arg;
+        assert_eq!(
+            force_with_lease_arg("u/feat-2", "abc123"),
+            "--force-with-lease=u/feat-2:abc123"
+        );
+    }
+
+    #[test]
+    fn detects_a_stale_force_with_lease() {
+        use super::is_stale_lease;
+        assert!(is_stale_lease(
+            " ! [rejected]  u/feat-2 -> u/feat-2 (stale info)"
+        ));
+        assert!(is_stale_lease(
+            " ! [rejected] u/f -> u/f (force-with-lease rejected)"
+        ));
+        assert!(!is_stale_lease("Everything up-to-date"));
+        assert!(!is_stale_lease("Permission denied (publickey)"));
+    }
+}
+
+/// Real-git tests for the restack plumbing `stack ship` uses after a squash
+/// land. They build a throwaway repository (and a bare "remote") in a temp
+/// dir, so they exercise the actual rebase/force-push semantics rather than
+/// just the argv. Skipped when git is missing or older than 2.38.
+#[cfg(test)]
+mod repo_tests {
+    use super::Repo;
+    use crate::gitfixture::{
+        commit_file, count, git, git_supports_update_refs, published_stack, stacked_repo,
+    };
+
+    #[test]
+    fn restack_reparents_every_branch_above_a_squash_land() {
+        if !git_supports_update_refs() {
+            eprintln!("skipping: needs git >= 2.38");
+            return;
+        }
+        let (_tmp, work, tip1) = stacked_repo();
+
+        // Squash-land u/s-1: the trunk gains a *new* commit carrying the same
+        // tree, exactly what a squash merge produces server-side.
+        git(&work, &["checkout", "--quiet", "main"]);
+        let trunk_tip = commit_file(&work, "a.txt", "a", "item 1 (#1)");
+        assert_ne!(trunk_tip, tip1);
+
+        let repo = Repo::at(&work);
+        repo.rebase_onto_update_refs(&trunk_tip, &tip1, "u/s-3")
+            .expect("restack should replay cleanly");
+
+        // The landed branch is left alone; both branches above it now descend
+        // from the new trunk tip, chained, one commit each.
+        assert_eq!(repo.rev_parse("u/s-1").expect("u/s-1"), tip1);
+        assert!(repo.is_ancestor(&trunk_tip, "u/s-2"));
+        assert!(repo.is_ancestor("u/s-2", "u/s-3"));
+        assert_eq!(count(&work, &format!("{trunk_tip}..u/s-2")), 1);
+        assert_eq!(count(&work, "u/s-2..u/s-3"), 1);
+        // The pre-squash commit is gone from the stack above the trunk: this is
+        // the footgun (remaining branches still based on the squashed commit).
+        assert!(!repo.is_ancestor(&tip1, "u/s-3"));
+    }
+
+    #[test]
+    fn restack_aborts_and_leaves_the_branches_alone_on_conflict() {
+        if !git_supports_update_refs() {
+            eprintln!("skipping: needs git >= 2.38");
+            return;
+        }
+        let (_tmp, work, tip1) = stacked_repo();
+        let before_2 = git(&work, &["rev-parse", "u/s-2"]);
+        let before_3 = git(&work, &["rev-parse", "u/s-3"]);
+
+        // Land something on the trunk that collides with u/s-2's commit.
+        git(&work, &["checkout", "--quiet", "main"]);
+        commit_file(&work, "a.txt", "a", "item 1 (#1)");
+        let trunk_tip = commit_file(&work, "b.txt", "conflicting", "someone else");
+
+        let repo = Repo::at(&work);
+        let err = repo
+            .rebase_onto_update_refs(&trunk_tip, &tip1, "u/s-3")
+            .expect_err("conflicting replay should fail");
+        assert!(err.to_string().contains("git rebase --onto"));
+        repo.rebase_abort();
+
+        assert_eq!(git(&work, &["rev-parse", "u/s-2"]), before_2);
+        assert_eq!(git(&work, &["rev-parse", "u/s-3"]), before_3);
+    }
+
+    #[test]
+    fn fetch_branch_reads_the_remote_tip_without_moving_local_refs() {
+        if !git_supports_update_refs() {
+            eprintln!("skipping: needs git >= 2.38");
+            return;
+        }
+        let (tmp, work, bare, _tip1) = published_stack();
+        let local_main = git(&work, &["rev-parse", "main"]);
+
+        // Advance the remote's main behind our back, the way a merge does.
+        let landed = crate::gitfixture::squash_land_on_remote(tmp.path(), &bare);
+
+        let repo = Repo::at(&work);
+        assert_eq!(repo.fetch_branch("origin", "main").expect("fetch"), landed);
+        // The local branch is untouched: fetch_branch only reports the tip.
+        assert_eq!(git(&work, &["rev-parse", "main"]), local_main);
+    }
+
+    #[test]
+    fn force_with_lease_push_honors_the_stated_lease() {
+        if !git_supports_update_refs() {
+            eprintln!("skipping: needs git >= 2.38");
+            return;
+        }
+        let (_tmp, work, bare, _tip1) = published_stack();
+        let published = git(&work, &["rev-parse", "u/s-2"]);
+
+        // Rewrite u/s-2 locally, as a restack does.
+        git(&work, &["checkout", "--quiet", "u/s-2"]);
+        git(
+            &work,
+            &[
+                "commit",
+                "--amend",
+                "--no-verify",
+                "-m",
+                "item 2, restacked",
+            ],
+        );
+        let rewritten = git(&work, &["rev-parse", "u/s-2"]);
+        assert_ne!(rewritten, published);
+
+        let repo = Repo::at(&work);
+        // A lease naming the wrong sha is refused, and the remote is untouched.
+        let wrong = git(&work, &["rev-parse", "main"]);
+        let err = repo
+            .push_force_with_lease("origin", "u/s-2", &wrong)
+            .expect_err("a wrong lease must be refused");
+        assert!(err.to_string().contains("moved since"));
+        assert_eq!(git(&bare, &["rev-parse", "u/s-2"]), published);
+
+        // The true lease goes through.
+        repo.push_force_with_lease("origin", "u/s-2", &published)
+            .expect("push with the right lease");
+        assert_eq!(git(&bare, &["rev-parse", "u/s-2"]), rewritten);
     }
 }

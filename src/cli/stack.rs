@@ -6,16 +6,24 @@
 //! (show the stack + each branch's PR state), `stack sync` (push each branch
 //! and create/update its Forgejo PR, chaining bases so each PR targets the
 //! previous branch, and mirroring a navigation block into each PR body unless
-//! `--no-annotate`), and `stack ship` (merge bottom-up, re-pointing each next
-//! PR onto the trunk as the one below it merges) are implemented, as is
+//! `--no-annotate`), and `stack ship` (merge bottom-up behind a pre-flight
+//! over both the stack's git shape and its review state, replaying the
+//! branches above each squash-landed item onto the new trunk tip and
+//! re-syncing their PR bases) are implemented, as is
 //! `stack split` (turn a single branch's commits into one stacked entry each,
 //! moving only local refs) and `stack absorb` (fold staged changes into the
 //! entries that introduced them, via `fixup!` commits + an autosquash
 //! `--update-refs` rebase). All five are implemented.
+//!
+//! `ship` is a client-orchestrated sequence, not an atomic land: it makes one
+//! merge call per item, and a failure part-way leaves the items below it
+//! merged. What it guarantees is that it refuses up front when the stack can't
+//! land as planned, stops cleanly when the ground shifts under it, and never
+//! leaves a squash-landed stack for the user to repair by hand.
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use clap::{Args, Subcommand};
 use serde::Serialize;
@@ -46,6 +54,25 @@ pub enum StackSub {
     /// Absorb staged changes into the appropriate stack entries.
     Absorb(AbsorbArgs),
     /// Ship (merge) the ready entries of the stack.
+    ///
+    /// Merges bottom-up, one PR at a time. This is a sequence, not an atomic
+    /// land: a failure part-way leaves the items below it merged. What ship
+    /// guarantees is that it refuses before merging anything when the stack
+    /// can't land as planned, and stops cleanly when it can't continue.
+    ///
+    /// Before the first merge it checks that each unmerged branch descends
+    /// from the one below it, that the lowest one contains the trunk's current
+    /// tip, that each branch matches its PR's head, and (unless --force) that
+    /// every PR is approved and green.
+    ///
+    /// After a squash land it replays the branches above onto the new trunk
+    /// tip (one rebase --update-refs, git 2.38+), force-pushes them with a
+    /// lease, and re-points their PRs, so a squash-landed stack is never left
+    /// for you to repair by hand. --no-restack opts out of that and of the
+    /// local checks it depends on.
+    ///
+    /// Between merges it re-checks the next item and stops if the ground
+    /// shifted. Re-running is safe: merged items are skipped.
     Ship(ShipArgs),
 }
 
@@ -146,6 +173,11 @@ pub struct ShipArgs {
     /// Ship even if a PR isn't green/approved.
     #[arg(long)]
     pub force: bool,
+    /// Don't restack after a squash land: skip the local pre-flight, and leave
+    /// the branches above each landed item based on the pre-squash commits
+    /// (you then have to rebase and force-push them yourself).
+    #[arg(long)]
+    pub no_restack: bool,
     /// Emit machine-readable operations/results as JSON.
     #[arg(long)]
     pub json: bool,
@@ -402,6 +434,10 @@ struct EntryPr {
     state: String,
     draft: bool,
     url: String,
+    /// The PR head's commit sha. `stack ship` compares it against the sha it
+    /// validated (and the sha it force-pushed while restacking) to tell an
+    /// independent push apart from its own work.
+    head_sha: String,
     /// "approved" | "changes_requested" | "commented" | "none".
     review: String,
     /// Combined CI state, or null when unavailable.
@@ -430,6 +466,7 @@ fn build_entry_pr(full: &api::pull::Pull, review: String, checks: Option<String>
         state: full.state.clone(),
         draft: full.draft,
         url: full.html_url.clone(),
+        head_sha: full.head.sha.clone(),
         review,
         checks,
         // Mergeability is only meaningful while the PR is open.
@@ -1297,11 +1334,18 @@ fn plan_ship(stack: &Stack, style: MergeStyle) -> Vec<ShipStep> {
     fjord_core::workflows::stack::plan_ship(&stack.into(), style.into())
 }
 
-fn render_ship_plan(plan: &[ShipStep]) -> String {
+fn render_ship_plan(plan: &[ShipStep], restack: bool) -> String {
     use std::fmt::Write;
     let mut s = String::from("Would ship bottom-up (no merges or deletes):\n");
     for p in plan {
         let _ = writeln!(s, "  merge {} → {} ({})", p.branch, p.base, p.style);
+    }
+    if restack && plan.len() > 1 {
+        let _ = writeln!(
+            s,
+            "  after each merge: rebase the branches above onto the new trunk tip, \
+             force-push them (--force-with-lease), and re-point their PRs"
+        );
     }
     s
 }
@@ -1312,12 +1356,492 @@ fn recovery_message(failed_branch: &str, merged: &[String]) -> String {
     fjord_core::workflows::stack::recovery_message(failed_branch, merged, "`fj stack ship`")
 }
 
+/// Recovery guidance when ship stops *before* merging an item, because the
+/// ground shifted under the plan or the stack couldn't be restacked. Mirrors
+/// [`recovery_message`]'s shape (what stopped, what already landed, how to
+/// resume) without claiming a merge was attempted.
+fn stopped_message(branch: &str, reason: &str, merged: &[String]) -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    let _ = writeln!(s, "Stopped before merging '{branch}': {reason}.");
+    if merged.is_empty() {
+        let _ = writeln!(s, "  Nothing was merged.");
+    } else {
+        let _ = writeln!(s, "  Already merged: {}", merged.join(", "));
+    }
+    let _ = writeln!(
+        s,
+        "  Fix the issue, then re-run `fj stack ship`; merged items are skipped."
+    );
+    s
+}
+
+/// Whether a merge style rewrites the commits it lands. A squash (or rebase)
+/// land replaces the item's commits with new ones, so every branch above it is
+/// still parented on history that no longer exists on the trunk and has to be
+/// replayed. A merge commit keeps the original commits reachable, so the
+/// branches above stay valid and only their PR bases move.
+fn rewrites_history(style: MergeStyle) -> bool {
+    match style {
+        MergeStyle::Merge => false,
+        MergeStyle::Squash | MergeStyle::Rebase | MergeStyle::RebaseMerge => true,
+    }
+}
+
+/// What the item's PR head says about the branch that would actually merge.
+#[derive(Debug, Clone, PartialEq)]
+enum HeadCheck {
+    /// The local tip and the PR head are the same commit.
+    Agrees,
+    /// `(local tip, PR head)`: the branch and its PR disagree about what would
+    /// merge.
+    Disagrees(String, String),
+    /// fj could not establish the PR's head, so it cannot say which sha would
+    /// merge or which sha it would lease a force-push against.
+    ///
+    /// This refuses rather than passes, and that direction is the whole fix:
+    /// an unknown head used to fall through a catch-all arm as "nothing to
+    /// report", which silently disabled the check for any stack whose PRs sat
+    /// outside the single unpaginated page ship starts from.
+    Unknown,
+}
+
+/// What git says about one pending stack item, gathered before any merge.
+#[derive(Debug, Clone)]
+struct BranchAncestry {
+    branch: String,
+    /// The item's PR number, for the message when its head can't be read.
+    number: u64,
+    /// The ref this item should sit on: the branch below it, or the trunk for
+    /// the lowest unmerged item. Used for the message, not the test.
+    below: String,
+    /// The branch resolves in this clone.
+    exists: bool,
+    /// `below` is an ancestor of `branch` (tested against the trunk's *fetched*
+    /// tip for the lowest item, so a stale local trunk can't pass).
+    descends: bool,
+    /// How the local tip compares to the PR head.
+    head: HeadCheck,
+}
+
+/// Pre-flight the stack's shape against git and refuse before merging anything
+/// if it can't land as planned: a missing branch, a chain that isn't linear
+/// (item _i_ must descend from item _i-1_, and the lowest unmerged item from
+/// the trunk's current tip), or a branch whose local tip disagrees with the PR
+/// that would be merged. `observed` is bottom-up over the *unmerged* items.
+///
+/// Failing here is the whole point: the alternative is discovering it after
+/// the bottom item has already landed.
+fn linear_history_blocker(observed: &[BranchAncestry]) -> Option<String> {
+    for (i, o) in observed.iter().enumerate() {
+        if !o.exists {
+            return Some(format!(
+                "branch '{}' is not in this clone, so ship can't verify the stack's \
+                 history before merging. Fetch it, or pass --no-restack to ship \
+                 without the local checks.",
+                o.branch
+            ));
+        }
+        if !o.descends {
+            return Some(if i == 0 {
+                format!(
+                    "'{}' is not up to date with '{}': the stack's lowest unmerged \
+                     branch doesn't contain the trunk's current tip. Restack it onto \
+                     '{}', run `fj stack sync`, then re-run `fj stack ship` (or pass \
+                     --no-restack to ship the stack as it is).",
+                    o.branch, o.below, o.below
+                )
+            } else {
+                format!(
+                    "stack is not linear: '{}' is not an ancestor of '{}'. Restack the \
+                     stack, run `fj stack sync`, then re-run `fj stack ship`.",
+                    o.below, o.branch
+                )
+            });
+        }
+        match &o.head {
+            HeadCheck::Agrees => {}
+            HeadCheck::Disagrees(local, head) => {
+                return Some(format!(
+                    "'{}' is at {} locally but its PR head is {}: the branch and the pull \
+                     request disagree about what would merge. Run `fj stack sync` to push \
+                     it (or fetch, if the PR is ahead), then re-run `fj stack ship`.",
+                    o.branch,
+                    short_sha(local),
+                    short_sha(head)
+                ));
+            }
+            HeadCheck::Unknown => {
+                return Some(format!(
+                    "could not read PR #{}'s head, so ship can't confirm that '{}' is what \
+                     would merge. Re-run when the forge is reachable, or pass --no-restack \
+                     to ship without the local checks.",
+                    o.number, o.branch
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// Gather what git says about every pending item, bottom-up, for the
+/// pre-flight.
+///
+/// Split out of `ship` so the refusal it feeds can be exercised directly: this
+/// is the seam where a PR head fj had not read used to be dropped on the floor
+/// instead of stopping the run.
+fn observe_stack(
+    repo: &git::Repo,
+    items: &[StackItem],
+    pending: &[usize],
+    numbers: &[u64],
+    trunk: &str,
+    trunk_tip: &str,
+    heads: &std::collections::HashMap<u64, String>,
+) -> Result<Vec<BranchAncestry>> {
+    let mut observed = Vec::with_capacity(pending.len());
+    for (k, &i) in pending.iter().enumerate() {
+        let branch = items[i].branch.clone();
+        let number = numbers[i];
+        let exists = repo.rev_exists(&format!("refs/heads/{branch}"));
+        let (below, below_rev) = if k == 0 {
+            (trunk.to_string(), trunk_tip.to_string())
+        } else {
+            let b = items[pending[k - 1]].branch.clone();
+            (b.clone(), b)
+        };
+        let descends = exists && repo.is_ancestor(&below_rev, &branch);
+        let head = match heads.get(&number) {
+            Some(head) if exists && !head.is_empty() => {
+                let local = repo.rev_parse(&branch)?;
+                if local == *head {
+                    HeadCheck::Agrees
+                } else {
+                    HeadCheck::Disagrees(local, head.clone())
+                }
+            }
+            // Either the branch isn't in this clone (which `exists` refuses
+            // first, with a better message) or fj never read the PR's head.
+            // Neither is "fine": the fallback has to be the refusing variant.
+            _ => HeadCheck::Unknown,
+        };
+        observed.push(BranchAncestry {
+            branch,
+            number,
+            below,
+            exists,
+            descends,
+            head,
+        });
+    }
+    Ok(observed)
+}
+
+/// The heads `--force` re-validates each item against before merging it.
+///
+/// The gated path re-reads every PR with `enrich_pr` and takes the head from
+/// there; `--force` skips that pass entirely, so this list is the only thing
+/// standing between a shifted head and a merge. A head fj could not read is
+/// therefore a refusal, not an empty expectation: an empty one makes
+/// `revalidate`'s head-moved guard vacuous, which is exactly how the bottom
+/// item could land before a stale lease was ever rejected.
+fn forced_expected_heads(
+    pending: &[usize],
+    numbers: &[u64],
+    heads: &std::collections::HashMap<u64, String>,
+) -> Result<std::collections::HashMap<usize, ExpectedHead>> {
+    let mut expected = std::collections::HashMap::new();
+    for &i in pending {
+        let number = numbers[i];
+        let sha = heads
+            .get(&number)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "could not read PR #{number}'s head, so --force has nothing to check \
+                     it against before merging. Re-run when the forge is reachable."
+                )
+            })?;
+        expected.insert(i, ExpectedHead::validated(sha));
+    }
+    Ok(expected)
+}
+
+fn short_sha(sha: &str) -> String {
+    sha.chars().take(8).collect()
+}
+
+/// How the branches above a landed item get replayed and re-pointed.
+#[derive(Debug, PartialEq)]
+struct RestackPlan {
+    /// The rebase `<upstream>`: the branch whose commits just landed. Commits
+    /// after it are the ones to replay.
+    upstream: String,
+    /// The rebase target. Rewriting the top branch with `--update-refs` moves
+    /// every intermediate stack ref in a single pass, the same plumbing
+    /// `stack absorb` uses.
+    top: String,
+    /// Every branch above the landed item, bottom-up. Parallel to `bases`.
+    branches: Vec<String>,
+    /// The base each of those items' PRs should target once the replay lands:
+    /// the item directly above the landed one moves to the trunk, the rest keep
+    /// targeting the branch below them.
+    bases: Vec<String>,
+}
+
+/// Build the restack for item `merged`, or `None` when it was the top item and
+/// nothing is left above it.
+///
+/// Also `None` when something above it has *already* merged: the chain then has
+/// a hole in it, ship can't have put it there (it merges strictly bottom-up),
+/// and replaying a branch whose PR already landed would be wrong. Ship falls
+/// back to re-pointing the next PR and leaves the repair to the user.
+fn plan_restack(items: &[StackItem], merged: usize, trunk: &str) -> Option<RestackPlan> {
+    let above = items.get(merged + 1..)?;
+    if above.is_empty() || above.iter().any(item_is_merged) {
+        return None;
+    }
+    let branches: Vec<String> = above.iter().map(|i| i.branch.clone()).collect();
+    let mut bases = Vec::with_capacity(branches.len());
+    bases.push(trunk.to_string());
+    for b in branches.iter().take(branches.len() - 1) {
+        bases.push(b.clone());
+    }
+    Some(RestackPlan {
+        upstream: items[merged].branch.clone(),
+        top: branches.last().cloned().expect("non-empty"),
+        branches,
+        bases,
+    })
+}
+
+/// The head fj expects an item's PR to be at when it comes up for merge.
+#[derive(Debug, Clone, Default)]
+struct ExpectedHead {
+    /// Shas fj is itself responsible for: the one it validated in the
+    /// pre-flight, plus any it force-pushed while restacking.
+    shas: Vec<String>,
+    /// fj has force-pushed this branch during this run, so a pending CI state
+    /// is fj re-arming the checks rather than the ground shifting.
+    restacked: bool,
+}
+
+impl ExpectedHead {
+    fn validated(sha: &str) -> Self {
+        ExpectedHead {
+            shas: if sha.is_empty() {
+                Vec::new()
+            } else {
+                vec![sha.to_string()]
+            },
+            restacked: false,
+        }
+    }
+
+    fn pushed(&mut self, sha: &str) {
+        if !sha.is_empty() {
+            self.shas.push(sha.to_string());
+        }
+        self.restacked = true;
+    }
+
+    /// The head fj most recently put on the branch, and the only one the forge
+    /// should be reporting once it has caught up.
+    fn current(&self) -> Option<&str> {
+        self.shas.last().map(String::as_str)
+    }
+
+    /// A sha fj put there but has since replaced. Distinct from a sha fj never
+    /// pushed: this one means the forge has not observed the force-push yet,
+    /// not that the ground shifted.
+    fn superseded(&self, sha: &str) -> bool {
+        self.shas.iter().any(|s| s == sha) && self.current() != Some(sha)
+    }
+}
+
+/// The verdict on an item re-checked just before its merge.
+///
+/// The two failure modes are deliberately separate: one is worth re-reading,
+/// the other never is.
+#[derive(Debug, PartialEq)]
+enum Revalidation {
+    /// Go ahead and merge.
+    Ready,
+    /// The forge is still serving a snapshot from before fj's force-push.
+    /// Nothing in that snapshot can be trusted, so re-read rather than judge
+    /// on it. Terminal if the forge never catches up.
+    Stale(String),
+    /// A hard stop. Re-reading will not change it.
+    Blocked(String),
+}
+
+impl Revalidation {
+    /// The reason to stop, if this verdict is terminal. A `Stale` verdict is
+    /// only terminal once the retry budget is spent, which is the caller's
+    /// business; by then "the forge never caught up" is itself a blocker.
+    fn blocker(self) -> Option<String> {
+        match self {
+            Revalidation::Ready => None,
+            Revalidation::Stale(r) | Revalidation::Blocked(r) => Some(r),
+        }
+    }
+}
+
+/// Re-validate an item just before merging it, once something below it has
+/// landed.
+///
+/// `gated` is false under `--force`, which drops the review/checks gate but
+/// never the structural checks: a PR that closed, stopped merging cleanly, or
+/// moved to a head fj didn't put there still stops the run.
+///
+/// When fj has restacked the branch it force-pushed a new head, which re-arms
+/// CI; that pending state is fj's own doing, and the tree was already approved
+/// and green before the replay, so the checks gate is not re-applied to it.
+/// (`--auto`, the planned follow-up, is what will let a stack wait for the
+/// re-armed checks instead.)
+///
+/// A head fj superseded with its own force-push is `Stale`, not `Ready`: every
+/// other field on that PR record was computed for the pre-restack head against
+/// the pre-retarget base, so judging `state`, `mergeable` or the checks off it
+/// would be reading a snapshot of a shape that no longer exists.
+fn revalidate(pr: &EntryPr, expected: &ExpectedHead, gated: bool) -> Revalidation {
+    if let Some(current) = expected.current() {
+        if pr.head_sha != current {
+            if expected.restacked && expected.superseded(&pr.head_sha) {
+                return Revalidation::Stale(format!(
+                    "the forge still reports its pre-restack head {}, not the {} fj \
+                     force-pushed onto the new trunk tip",
+                    short_sha(&pr.head_sha),
+                    short_sha(current)
+                ));
+            }
+            return Revalidation::Blocked(format!(
+                "its head moved to {} after the ship plan was made (expected {})",
+                short_sha(&pr.head_sha),
+                short_sha(current)
+            ));
+        }
+    }
+    if pr.state != "open" {
+        return Revalidation::Blocked(format!("its pull request is no longer open ({})", pr.state));
+    }
+    if pr.mergeable == Some(false) {
+        return Revalidation::Blocked("it no longer merges cleanly into its base".to_string());
+    }
+    if !gated {
+        return Revalidation::Ready;
+    }
+    let checks = if expected.restacked {
+        None
+    } else {
+        pr.checks.as_deref()
+    };
+    match shippable(&pr.review, checks, &pr.state).err() {
+        Some(reason) => Revalidation::Blocked(reason),
+        None => Revalidation::Ready,
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct ShipOp {
     branch: String,
     number: u64,
     /// "merged" | "skipped"
     action: String,
+    /// Branches replayed onto the new trunk tip and force-pushed after this
+    /// item landed. Empty unless the merge style rewrites history.
+    restacked: Vec<String>,
+}
+
+/// Forgejo updates a PR's head and re-computes its mergeability asynchronously
+/// after a push, so a branch fj has just force-pushed can briefly still report
+/// the pre-push head. Re-read a few times before calling that a shift.
+const REVALIDATE_ATTEMPTS: usize = 3;
+const REVALIDATE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Replay every branch above the item that just landed onto the new trunk tip,
+/// force-push them, and re-point their PRs. One `rebase --onto … --update-refs`
+/// moves the whole remainder, so either all the refs move or the rebase aborts
+/// and none do. Returns the branches it rewrote, with their new tips.
+async fn restack_onto_trunk(
+    repo: &git::Repo,
+    ctx: &crate::cli::context::RepoContext,
+    remote: &str,
+    trunk: &str,
+    plan: &RestackPlan,
+    numbers: &[u64],
+) -> Result<Vec<(String, String)>> {
+    // The trunk moved when the PR merged; read where it landed.
+    let trunk_tip = repo
+        .fetch_branch(remote, trunk)
+        .with_context(|| format!("fetching '{remote}/{trunk}' after the merge"))?;
+    let upstream = repo.rev_parse(&plan.upstream)?;
+    // Lease each force-push against the tip the branch had before the replay.
+    let mut leases = Vec::with_capacity(plan.branches.len());
+    for branch in &plan.branches {
+        leases.push(repo.rev_parse(branch)?);
+    }
+
+    if let Err(e) = repo.rebase_onto_update_refs(&trunk_tip, &upstream, &plan.top) {
+        repo.rebase_abort();
+        return Err(e.context(format!(
+            "replaying the stack above '{}' onto {}. The rebase was rolled back; \
+             resolve the conflict by hand (git rebase --onto {} {} {} --update-refs), \
+             push with --force-with-lease, then re-run `fj stack ship`",
+            plan.upstream,
+            short_sha(&trunk_tip),
+            short_sha(&trunk_tip),
+            short_sha(&upstream),
+            plan.top
+        )));
+    }
+
+    let mut rewritten = Vec::with_capacity(plan.branches.len());
+    for (branch, lease) in plan.branches.iter().zip(&leases) {
+        if let Err(e) = repo.push_force_with_lease(remote, branch, lease) {
+            // A rejected lease and a failed transport need opposite advice. If
+            // the push never landed, the local refs are the replayed truth and
+            // re-pushing them is right. If the *lease* was rejected, someone
+            // pushed to the branch after fj read it, the local refs no longer
+            // contain their commit, and "push it again" is how that commit
+            // gets destroyed.
+            let context = if e.downcast_ref::<git::StaleLease>().is_some() {
+                format!(
+                    "publishing the replayed '{branch}'. Its remote tip moved after fj \
+                     read it, so the local refs are NOT authoritative here: they don't \
+                     contain whatever was pushed. Fetch '{remote}/{branch}' and reconcile \
+                     the two before pushing anything; do not re-run with --force"
+                )
+            } else {
+                format!(
+                    "publishing the replayed '{branch}'. The local refs are already \
+                     correct; push the remaining branches with --force-with-lease, \
+                     then re-run `fj stack ship`"
+                )
+            };
+            return Err(e.context(context));
+        }
+        rewritten.push((branch.clone(), repo.rev_parse(branch)?));
+    }
+
+    // Re-sync the PR bases to match the new shape: the item directly above the
+    // landed one now targets the trunk, the rest keep targeting the branch
+    // below them. Idempotent, so re-pointing to an unchanged base is a no-op.
+    for ((branch, base), &number) in plan.branches.iter().zip(&plan.bases).zip(numbers) {
+        api::pull::edit(
+            &ctx.client,
+            &ctx.owner,
+            &ctx.name,
+            number,
+            &EditPull {
+                base: Some(base),
+                ..Default::default()
+            },
+        )
+        .await
+        .with_context(|| format!("re-pointing PR #{number} ({branch}) at '{base}'"))?;
+    }
+    Ok(rewritten)
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -1327,13 +1851,17 @@ async fn ship(args: ShipArgs, host: Option<&str>) -> Result<()> {
     };
     validate_items(&stack.items)?;
     let style = merge_style(args.squash, args.merge);
+    // A squash (or rebase) land rewrites the commits it lands, so the branches
+    // above it must be replayed onto the new trunk tip or they keep carrying
+    // the pre-squash history. A merge commit leaves them valid as they are.
+    let restack = rewrites_history(style) && !args.no_restack;
 
     if args.dry_run {
         let plan = plan_ship(&stack, style);
         if args.json {
             return output::print_json(&serde_json::to_value(&plan)?);
         }
-        print!("{}", render_ship_plan(&plan));
+        print!("{}", render_ship_plan(&plan, restack));
         return Ok(());
     }
 
@@ -1345,9 +1873,8 @@ async fn ship(args: ShipArgs, host: Option<&str>) -> Result<()> {
         api::pull::ListOptions::default(),
     )
     .await?;
-    // Once an item merges, everything above it should target the trunk (its
-    // own base branch has merged away), so re-point the next PR onto `trunk`.
     let trunk = stack.base.clone();
+    let remote = stack.repo.remote.clone();
 
     // Resolve each item's PR number; every item must have one to ship.
     let mut numbers = Vec::with_capacity(stack.items.len());
@@ -1360,93 +1887,246 @@ async fn ship(args: ShipArgs, host: Option<&str>) -> Result<()> {
             ),
         }
     }
+    // Items that still need merging; the ones below them already landed and
+    // are part of the trunk, so they take no part in the pre-flight.
+    let pending: Vec<usize> = (0..stack.items.len())
+        .filter(|&i| !item_is_merged(&stack.items[i]))
+        .collect();
 
-    // Pre-flight: validate ALL PRs before merging any (unless --force), so we
-    // never merge the bottom and then stop.
-    if !args.force {
-        for (item, &number) in stack.items.iter().zip(&numbers) {
-            let pr = enrich_pr(&ctx.client, &ctx.owner, &ctx.name, number)
-                .await
-                .ok_or_else(|| {
-                    anyhow::anyhow!("could not fetch PR #{number} for '{}'", item.branch)
-                })?;
-            if let Err(reason) = shippable(&pr.review, pr.checks.as_deref(), &pr.state) {
-                bail!(
-                    "'{}' (PR #{number}) is not ready: {reason}. Pass --force to ship anyway.",
-                    item.branch
-                );
-            }
+    // PR head shas, from the list we already have. `page` is a single
+    // unpaginated page of open PRs, so a stack whose PRs fall outside it would
+    // leave the head checks with nothing to compare against; read those
+    // directly. Costs nothing on a repo whose open PRs fit in one page.
+    let mut heads: std::collections::HashMap<u64, String> = page
+        .items
+        .iter()
+        .map(|p| (p.number, p.head.sha.clone()))
+        .collect();
+    for &i in &pending {
+        let number = numbers[i];
+        if heads.contains_key(&number) {
+            continue;
+        }
+        // Best-effort: a head that still can't be read leaves the item's
+        // `HeadCheck::Unknown` (or `forced_expected_heads`) to refuse the run
+        // up front, which is where the operator wants to hear about it.
+        if let Ok(pr) = api::pull::get(&ctx.client, &ctx.owner, &ctx.name, number).await {
+            heads.insert(number, pr.head.sha.clone());
         }
     }
 
-    // Merge bottom-up; stop immediately on failure with recovery guidance.
+    let repo = git::Repo::discover();
+    let started_on = repo.current_branch();
+
+    // Pre-flight 1: the stack's shape in git. Skipped by --no-restack, which
+    // opts out of the local checks along with the replay.
+    if !args.no_restack && !pending.is_empty() {
+        if restack {
+            let version = parse_git_version(&git::version_string()?)
+                .ok_or_else(|| anyhow::anyhow!("could not determine the git version"))?;
+            if !supports_update_refs(version) {
+                bail!(
+                    "restacking after a {} land needs git >= 2.38 (for rebase \
+                     --update-refs); found {}.{}. Pass --no-restack to ship without it.",
+                    style.as_str(),
+                    version.0,
+                    version.1
+                );
+            }
+        }
+        let trunk_tip = repo.fetch_branch(&remote, &trunk).with_context(|| {
+            format!("fetching '{remote}/{trunk}' to check the stack is current")
+        })?;
+        let observed = observe_stack(
+            &repo,
+            &stack.items,
+            &pending,
+            &numbers,
+            &trunk,
+            &trunk_tip,
+            &heads,
+        )?;
+        if let Some(reason) = linear_history_blocker(&observed) {
+            bail!("{reason}");
+        }
+    }
+
+    // Pre-flight 2: validate ALL PRs before merging any (unless --force), so we
+    // never merge the bottom and then stop.
+    let mut expected: std::collections::HashMap<usize, ExpectedHead> =
+        std::collections::HashMap::new();
+    if !args.force {
+        for &i in &pending {
+            let number = numbers[i];
+            let branch = &stack.items[i].branch;
+            let pr = enrich_pr(&ctx.client, &ctx.owner, &ctx.name, number)
+                .await
+                .ok_or_else(|| anyhow::anyhow!("could not fetch PR #{number} for '{branch}'"))?;
+            if let Err(reason) = shippable(&pr.review, pr.checks.as_deref(), &pr.state) {
+                bail!("'{branch}' (PR #{number}) is not ready: {reason}. Pass --force to ship anyway.");
+            }
+            expected.insert(i, ExpectedHead::validated(&pr.head_sha));
+        }
+    } else {
+        expected = forced_expected_heads(&pending, &numbers, &heads)?;
+    }
+
+    // Merge bottom-up; stop cleanly the moment anything stops matching the plan.
     let mut ops = Vec::with_capacity(stack.items.len());
     let mut merged: Vec<String> = Vec::new();
+    let mut landed_this_run = false;
     for i in 0..stack.items.len() {
         let branch = stack.items[i].branch.clone();
         let number = numbers[i];
-        let already_merged = stack.items[i]
-            .pr
-            .as_ref()
-            .map(|p| p.state == "merged")
-            .unwrap_or(false);
+        let mut restacked: Vec<String> = Vec::new();
 
-        if !already_merged {
-            if let Err(e) = api::pull::merge(
-                &ctx.client,
-                &ctx.owner,
-                &ctx.name,
-                number,
-                style,
-                &api::pull::MergeOptions::default(),
-            )
-            .await
-            {
-                eprint!("{}", recovery_message(&branch, &merged));
-                return Err(e.context(format!("merging PR #{number} ({branch})")));
-            }
-            // Re-point the next PR onto the trunk this one merged into.
-            if let Some(next) = numbers.get(i + 1) {
-                let _ = api::pull::edit(
-                    &ctx.client,
-                    &ctx.owner,
-                    &ctx.name,
-                    *next,
-                    &EditPull {
-                        base: Some(&trunk),
-                        ..Default::default()
-                    },
-                )
-                .await;
-            }
-            if args.delete_branches {
-                let _ = git::delete_remote_branch(&stack.repo.remote, &branch);
-                let _ = git::delete_local_branch(&branch);
-            }
-            ops.push(ShipOp {
-                branch: branch.clone(),
-                number,
-                action: "merged".to_string(),
-            });
-        } else {
+        if item_is_merged(&stack.items[i]) {
             ops.push(ShipOp {
                 branch: branch.clone(),
                 number,
                 action: "skipped".to_string(),
+                restacked,
             });
+            record_merged(&mut stack, i, &mut merged, branch);
+            stack_state::save(&stack)?;
+            continue;
         }
 
-        if let Some(pr) = stack.items[i].pr.as_mut() {
-            pr.state = "merged".to_string();
+        // Re-validate before merging: the pre-flight verdict was taken before
+        // anything landed, and a merge can change what sits above it.
+        if landed_this_run {
+            let entry = expected.entry(i).or_default();
+            let mut verdict = Revalidation::Ready;
+            for attempt in 0..REVALIDATE_ATTEMPTS {
+                let pr = enrich_pr(&ctx.client, &ctx.owner, &ctx.name, number)
+                    .await
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("could not re-fetch PR #{number} for '{branch}'")
+                    })?;
+                verdict = revalidate(&pr, entry, !args.force);
+                // Only a stale read is worth re-reading. `Ready` merges, and a
+                // `Blocked` verdict is a real shift that waiting cannot undo.
+                if !matches!(verdict, Revalidation::Stale(_)) || attempt + 1 == REVALIDATE_ATTEMPTS
+                {
+                    break;
+                }
+                tokio::time::sleep(REVALIDATE_BACKOFF).await;
+            }
+            // A forge that never caught up is a blocker in its own right: fj
+            // would otherwise merge on a snapshot it knows is out of date.
+            if let Some(reason) = verdict.blocker() {
+                eprint!("{}", stopped_message(&branch, &reason, &merged));
+                bail!("'{branch}' (PR #{number}) is no longer ready to merge: {reason}");
+            }
         }
-        stack.items[i].status = "merged".to_string();
-        merged.push(branch);
-        stack.updated_at = Utc::now().to_rfc3339();
+
+        if let Err(e) = api::pull::merge(
+            &ctx.client,
+            &ctx.owner,
+            &ctx.name,
+            number,
+            style,
+            &api::pull::MergeOptions::default(),
+        )
+        .await
+        {
+            eprint!("{}", recovery_message(&branch, &merged));
+            return Err(e.context(format!("merging PR #{number} ({branch})")));
+        }
+        landed_this_run = true;
+
+        // The item landed. Bring the rest of the stack onto the new trunk.
+        match (restack, plan_restack(&stack.items, i, &trunk)) {
+            (true, Some(plan)) => {
+                let above: Vec<u64> = numbers[i + 1..].to_vec();
+                match restack_onto_trunk(&repo, &ctx, &remote, &trunk, &plan, &above).await {
+                    Ok(rewritten) => {
+                        for (offset, (b, sha)) in rewritten.iter().enumerate() {
+                            expected.entry(i + 1 + offset).or_default().pushed(sha);
+                            restacked.push(b.clone());
+                        }
+                        for (offset, base) in plan.bases.iter().enumerate() {
+                            stack.items[i + 1 + offset].base = base.clone();
+                        }
+                    }
+                    Err(e) => {
+                        // The item landed and its branch is merging away, so
+                        // the PR above it can't keep targeting it whatever
+                        // happened to the replay. Leave the forge in the state
+                        // ship would have produced without a restack, and let
+                        // the user repair git.
+                        let _ = api::pull::edit(
+                            &ctx.client,
+                            &ctx.owner,
+                            &ctx.name,
+                            numbers[i + 1],
+                            &EditPull {
+                                base: Some(&trunk),
+                                ..Default::default()
+                            },
+                        )
+                        .await;
+                        stack.items[i + 1].base = trunk.clone();
+                        record_merged(&mut stack, i, &mut merged, branch.clone());
+                        stack_state::save(&stack)?;
+                        eprint!(
+                            "{}",
+                            stopped_message(
+                                &plan.top,
+                                "the branches above the item that just landed could not be \
+                                 replayed onto the new trunk tip",
+                                &merged
+                            )
+                        );
+                        return Err(e);
+                    }
+                }
+            }
+            // No replay needed (merge commit, or --no-restack): the next PR
+            // still has to leave the base branch that just merged away.
+            _ => {
+                if let Some(next) = numbers.get(i + 1) {
+                    let _ = api::pull::edit(
+                        &ctx.client,
+                        &ctx.owner,
+                        &ctx.name,
+                        *next,
+                        &EditPull {
+                            base: Some(&trunk),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                    stack.items[i + 1].base = trunk.clone();
+                }
+            }
+        }
+
+        if args.delete_branches {
+            let _ = git::delete_remote_branch(&remote, &branch);
+            let _ = git::delete_local_branch(&branch);
+        }
+        ops.push(ShipOp {
+            branch: branch.clone(),
+            number,
+            action: "merged".to_string(),
+            restacked,
+        });
+        record_merged(&mut stack, i, &mut merged, branch);
         stack_state::save(&stack)?;
     }
 
     stack.shipped_at = Some(Utc::now().to_rfc3339());
     stack_state::save(&stack)?;
+
+    // A restack leaves the top branch checked out; put the user back.
+    if let Some(b) = started_on {
+        if repo.current_branch().as_deref() != Some(b.as_str())
+            && repo.rev_exists(&format!("refs/heads/{b}"))
+        {
+            let _ = repo.checkout(&b);
+        }
+    }
 
     if args.json {
         return output::print_json(&serde_json::to_value(&ops)?);
@@ -1455,10 +2135,38 @@ async fn ship(args: ShipArgs, host: Option<&str>) -> Result<()> {
     let mut out = String::new();
     for op in &ops {
         let _ = writeln!(out, "✓ {} {} (#{})", op.action, op.branch, op.number);
+        if !op.restacked.is_empty() {
+            let _ = writeln!(
+                out,
+                "  restacked onto {}: {}",
+                trunk,
+                op.restacked.join(", ")
+            );
+        }
     }
     let _ = writeln!(out, "Shipped {} item(s).", ops.len());
     print!("{out}");
     Ok(())
+}
+
+/// An item whose PR is already merged: ship skips it (and a re-run resumes
+/// from the first that isn't).
+fn item_is_merged(item: &StackItem) -> bool {
+    item.pr
+        .as_ref()
+        .map(|p| p.state == "merged")
+        .unwrap_or(false)
+}
+
+/// Mark item `i` merged in the stack file and remember it for the recovery
+/// text. The caller saves, so progress survives a mid-run stop.
+fn record_merged(stack: &mut Stack, i: usize, merged: &mut Vec<String>, branch: String) {
+    if let Some(pr) = stack.items[i].pr.as_mut() {
+        pr.state = "merged".to_string();
+    }
+    stack.items[i].status = "merged".to_string();
+    merged.push(branch);
+    stack.updated_at = Utc::now().to_rfc3339();
 }
 
 #[cfg(test)]
@@ -1857,6 +2565,7 @@ mod tests {
                         state: "open".into(),
                         draft: false,
                         url: "https://x/pulls/7".into(),
+                        head_sha: "aaa".into(),
                         review: "approved".into(),
                         checks: Some("success".into()),
                         mergeable: Some(true),
@@ -2003,16 +2712,675 @@ mod tests {
         assert_eq!(plan[2].base, "feature/b");
         assert!(plan.iter().all(|p| p.style == "squash"));
 
-        let out = render_ship_plan(&plan);
+        let out = render_ship_plan(&plan, false);
         assert!(out.contains("Would ship bottom-up"));
         assert!(out.contains("merge feature/a → main (squash)"));
         assert!(out.contains("merge feature/b → feature/a (squash)"));
+        assert!(!out.contains("force-push"));
+
+        // With a history-rewriting style the plan says the stack gets replayed.
+        let out = render_ship_plan(&plan, true);
+        assert!(out.contains("rebase the branches above onto the new trunk tip"));
+        assert!(out.contains("--force-with-lease"));
 
         // JSON shape is stable.
         let v = serde_json::to_value(&plan).unwrap();
         assert_eq!(v[0]["branch"], "feature/a");
         assert_eq!(v[0]["base"], "main");
         assert_eq!(v[2]["style"], "squash");
+    }
+
+    // ---- ship: restack after a squash land ----
+
+    #[test]
+    fn ship_parses_no_restack() {
+        let cli = Cli::try_parse_from(["fj", "stack", "ship", "--squash", "--no-restack"])
+            .expect("parses");
+        match cli.command {
+            Command::Stack(StackCmd {
+                command: StackSub::Ship(a),
+            }) => assert!(a.squash && a.no_restack),
+            other => panic!("expected stack ship, got {other:?}"),
+        }
+        // Off by default: a squash land restacks the remainder.
+        let cli = Cli::try_parse_from(["fj", "stack", "ship"]).expect("parses");
+        match cli.command {
+            Command::Stack(StackCmd {
+                command: StackSub::Ship(a),
+            }) => assert!(!a.no_restack),
+            other => panic!("expected stack ship, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn only_history_rewriting_styles_need_a_restack() {
+        // A squash replaces the item's commits, so everything above it is
+        // parented on history the trunk no longer has.
+        assert!(rewrites_history(MergeStyle::Squash));
+        assert!(rewrites_history(MergeStyle::Rebase));
+        assert!(rewrites_history(MergeStyle::RebaseMerge));
+        // A merge commit keeps the original commits reachable.
+        assert!(!rewrites_history(MergeStyle::Merge));
+    }
+
+    fn ancestry(branch: &str, below: &str) -> BranchAncestry {
+        BranchAncestry {
+            branch: branch.into(),
+            number: 1,
+            below: below.into(),
+            exists: true,
+            descends: true,
+            head: HeadCheck::Agrees,
+        }
+    }
+
+    #[test]
+    fn linear_history_blocker_passes_a_linear_current_stack() {
+        let observed = vec![
+            ancestry("u/f-1", "main"),
+            ancestry("u/f-2", "u/f-1"),
+            ancestry("u/f-3", "u/f-2"),
+        ];
+        assert_eq!(linear_history_blocker(&observed), None);
+        // Nothing pending (everything already merged) has nothing to check.
+        assert_eq!(linear_history_blocker(&[]), None);
+    }
+
+    #[test]
+    fn linear_history_blocker_refuses_a_stack_behind_the_trunk() {
+        let mut observed = vec![ancestry("u/f-1", "main"), ancestry("u/f-2", "u/f-1")];
+        observed[0].descends = false;
+        let reason = linear_history_blocker(&observed).expect("should refuse");
+        assert!(reason.contains("'u/f-1' is not up to date with 'main'"));
+        assert!(reason.contains("trunk's current tip"));
+        assert!(reason.contains("fj stack sync"));
+    }
+
+    #[test]
+    fn linear_history_blocker_refuses_a_broken_link() {
+        let mut observed = vec![
+            ancestry("u/f-1", "main"),
+            ancestry("u/f-2", "u/f-1"),
+            ancestry("u/f-3", "u/f-2"),
+        ];
+        observed[2].descends = false;
+        let reason = linear_history_blocker(&observed).expect("should refuse");
+        assert!(reason.contains("stack is not linear"));
+        assert!(reason.contains("'u/f-2' is not an ancestor of 'u/f-3'"));
+        assert!(reason.contains("fj stack sync"));
+    }
+
+    #[test]
+    fn linear_history_blocker_refuses_a_branch_that_is_not_here() {
+        let mut observed = vec![ancestry("u/f-1", "main"), ancestry("u/f-2", "u/f-1")];
+        observed[1].exists = false;
+        let reason = linear_history_blocker(&observed).expect("should refuse");
+        assert!(reason.contains("'u/f-2' is not in this clone"));
+        assert!(reason.contains("--no-restack"));
+    }
+
+    #[test]
+    fn linear_history_blocker_refuses_when_the_branch_and_its_pr_disagree() {
+        let mut observed = vec![ancestry("u/f-1", "main")];
+        observed[0].head = HeadCheck::Disagrees("abcdef1234".into(), "9876543210".into());
+        let reason = linear_history_blocker(&observed).expect("should refuse");
+        assert!(reason.contains("'u/f-1' is at abcdef12 locally but its PR head is 98765432"));
+        assert!(reason.contains("fj stack sync"));
+    }
+
+    /// An unreadable PR head refuses instead of passing. It used to fall
+    /// through a catch-all and leave the check with nothing to report.
+    #[test]
+    fn linear_history_blocker_refuses_a_head_it_could_not_read() {
+        let mut observed = vec![ancestry("u/f-1", "main"), ancestry("u/f-2", "u/f-1")];
+        observed[0].number = 412;
+        observed[0].head = HeadCheck::Unknown;
+        let reason = linear_history_blocker(&observed).expect("should refuse");
+        assert!(reason.contains("could not read PR #412's head"));
+        assert!(reason.contains("'u/f-1'"));
+    }
+
+    #[test]
+    fn linear_history_blocker_reports_the_lowest_break_first() {
+        // Two breaks: the message names the one nearest the trunk, because
+        // that is the one the user has to repair first.
+        let mut observed = vec![
+            ancestry("u/f-1", "main"),
+            ancestry("u/f-2", "u/f-1"),
+            ancestry("u/f-3", "u/f-2"),
+        ];
+        observed[1].descends = false;
+        observed[2].descends = false;
+        let reason = linear_history_blocker(&observed).expect("should refuse");
+        assert!(reason.contains("'u/f-1' is not an ancestor of 'u/f-2'"));
+    }
+
+    /// The pre-flight hole, closed.
+    ///
+    /// `ship` reads PR heads from one unpaginated page of open PRs. A stack
+    /// whose PRs sit outside that page left *both* head guards with nothing to
+    /// check: the pre-flight's comparison fell through a catch-all, and
+    /// `--force` handed `revalidate` an empty expectation. A stale
+    /// bottom item therefore passed the pre-flight, squash-landed, and only
+    /// then failed mid-restack on a rejected lease, with the bottom already
+    /// merged and the stack half-repaired. Both guards now refuse first.
+    ///
+    /// Driven against a real repo so the git shape is genuinely linear and
+    /// current: nothing but the head check can account for the refusal.
+    #[test]
+    fn a_stale_bottom_is_refused_up_front_when_its_pr_is_off_the_list_page() {
+        use crate::gitfixture::{git, git_supports_update_refs, published_stack};
+        use std::collections::HashMap;
+        if !git_supports_update_refs() {
+            eprintln!("skipping: needs git >= 2.38");
+            return;
+        }
+        let (_tmp, work, _bare, _tip1) = published_stack();
+        let repo = git::Repo::at(&work);
+        let items = stack_with_branches(&["u/s-1", "u/s-2", "u/s-3"]).items;
+        let pending = vec![0usize, 1, 2];
+        // PR numbers well past the first page of open PRs.
+        let numbers = vec![41u64, 42, 43];
+        let trunk_tip = git(&work, &["rev-parse", "main"]);
+
+        // Baseline: with every head read and matching, the stack passes. This
+        // is what keeps the refusals below meaningful.
+        let agreeing: HashMap<u64, String> = numbers
+            .iter()
+            .zip(["u/s-1", "u/s-2", "u/s-3"])
+            .map(|(&n, b)| (n, git(&work, &["rev-parse", b])))
+            .collect();
+        let observed = observe_stack(
+            &repo, &items, &pending, &numbers, "main", &trunk_tip, &agreeing,
+        )
+        .expect("observing a healthy stack");
+        assert!(observed.iter().all(|o| o.exists && o.descends));
+        assert_eq!(linear_history_blocker(&observed), None);
+
+        // The hole: the stack's PRs are off the page, so no head was read.
+        let unread: HashMap<u64, String> = HashMap::new();
+        let observed = observe_stack(
+            &repo, &items, &pending, &numbers, "main", &trunk_tip, &unread,
+        )
+        .expect("observing still works without heads");
+        // The git shape is fine; this is purely the head check talking.
+        assert!(observed.iter().all(|o| o.exists && o.descends));
+        assert_eq!(observed[0].head, HeadCheck::Unknown);
+        let reason = linear_history_blocker(&observed)
+            .expect("an unread head must refuse before anything merges");
+        assert!(reason.contains("could not read PR #41's head"));
+        assert!(reason.contains("'u/s-1'"));
+
+        // …and the same input under --force, which skips the per-PR gate and
+        // so has only this list to lean on. It used to yield an empty
+        // expectation and merge; now it refuses.
+        let err = forced_expected_heads(&pending, &numbers, &unread)
+            .expect_err("--force must not merge an item whose head it never read");
+        let chain = format!("{err:#}");
+        assert!(chain.contains("could not read PR #41's head"));
+        assert!(chain.contains("--force has nothing to check it against"));
+
+        // A head that *was* read but disagrees is refused with both shas, the
+        // case the pre-flight was written for.
+        let mut stale = agreeing.clone();
+        let pr_head = git(&work, &["rev-parse", "u/s-2"]);
+        stale.insert(41, pr_head.clone()); // someone pushed; the local tip is behind
+        let observed = observe_stack(
+            &repo, &items, &pending, &numbers, "main", &trunk_tip, &stale,
+        )
+        .expect("observing a stale bottom");
+        let local = git(&work, &["rev-parse", "u/s-1"]);
+        assert_eq!(
+            observed[0].head,
+            HeadCheck::Disagrees(local.clone(), pr_head.clone())
+        );
+        let reason = linear_history_blocker(&observed).expect("a stale bottom must refuse");
+        assert!(reason.contains(&format!("'u/s-1' is at {}", short_sha(&local))));
+        assert!(reason.contains("disagree about what would merge"));
+
+        // Finally, under --force the re-validation now carries a real sha, so
+        // a head that moves after the plan still stops the run rather than
+        // being waved through by an empty expectation.
+        let expected = forced_expected_heads(&pending, &numbers, &agreeing)
+            .expect("every head was read this time");
+        let entry = expected.get(&0).expect("bottom item");
+        assert_eq!(entry.shas, vec![git(&work, &["rev-parse", "u/s-1"])]);
+        let moved = entry_pr("open", "approved", Some("success"), Some(true));
+        // `entry_pr`'s head is a sha fj never validated or pushed, so this is
+        // Blocked rather than Stale: there was no force-push to lag behind.
+        let verdict = revalidate(&moved, entry, false);
+        assert!(matches!(verdict, Revalidation::Blocked(_)));
+        assert!(verdict
+            .blocker()
+            .expect("a moved head must stop --force")
+            .contains("its head moved to"));
+    }
+
+    #[test]
+    fn plan_restack_reparents_the_remainder_and_resyncs_bases() {
+        let items = stack_with_branches(&["u/f-1", "u/f-2", "u/f-3"]).items;
+        let plan = plan_restack(&items, 0, "main").expect("two items are left above");
+        // The commits to replay are the ones after the branch that just landed.
+        assert_eq!(plan.upstream, "u/f-1");
+        // One rebase of the top branch moves every ref in between.
+        assert_eq!(plan.top, "u/f-3");
+        assert_eq!(plan.branches, vec!["u/f-2", "u/f-3"]);
+        // The item directly above the landed one now targets the trunk; the
+        // rest keep targeting the branch below them.
+        assert_eq!(plan.bases, vec!["main", "u/f-2"]);
+
+        // Landing the middle item next leaves only the top.
+        let plan = plan_restack(&items, 1, "main").expect("one item is left above");
+        assert_eq!(plan.upstream, "u/f-2");
+        assert_eq!(plan.top, "u/f-3");
+        assert_eq!(plan.branches, vec!["u/f-3"]);
+        assert_eq!(plan.bases, vec!["main"]);
+    }
+
+    #[test]
+    fn plan_restack_is_none_at_the_top_of_the_stack() {
+        let items = stack_with_branches(&["u/f-1", "u/f-2"]).items;
+        assert_eq!(plan_restack(&items, 1, "main"), None);
+        assert_eq!(plan_restack(&items, 9, "main"), None);
+    }
+
+    #[test]
+    fn plan_restack_is_none_when_the_chain_above_has_a_hole() {
+        // Someone merged the top item out of order. Replaying a branch whose PR
+        // already landed would be wrong, so ship doesn't try.
+        let mut items = stack_with_branches(&["u/f-1", "u/f-2", "u/f-3"]).items;
+        items[2].pr = Some(ItemPr {
+            number: 9,
+            url: "u".into(),
+            state: "merged".into(),
+        });
+        assert_eq!(plan_restack(&items, 0, "main"), None);
+    }
+
+    // ---- ship: re-validation between merges ----
+
+    fn entry_pr(
+        state: &str,
+        review: &str,
+        checks: Option<&str>,
+        mergeable: Option<bool>,
+    ) -> EntryPr {
+        EntryPr {
+            number: 7,
+            title: "t".into(),
+            state: state.into(),
+            draft: false,
+            url: "https://x/pulls/7".into(),
+            head_sha: "sha-validated".into(),
+            review: review.into(),
+            checks: checks.map(str::to_string),
+            mergeable,
+            requested_reviewers: vec![],
+        }
+    }
+
+    #[test]
+    fn revalidate_lets_an_unchanged_ready_item_through() {
+        let pr = entry_pr("open", "approved", Some("success"), Some(true));
+        let expected = ExpectedHead::validated("sha-validated");
+        assert_eq!(revalidate(&pr, &expected, true), Revalidation::Ready);
+    }
+
+    #[test]
+    fn revalidate_stops_when_the_item_stops_being_mergeable() {
+        // The item below landed and this one now conflicts with the trunk.
+        let pr = entry_pr("open", "approved", Some("success"), Some(false));
+        let expected = ExpectedHead::validated("sha-validated");
+        let reason = revalidate(&pr, &expected, true)
+            .blocker()
+            .expect("should stop");
+        assert!(reason.contains("no longer merges cleanly"));
+        // Still enforced under --force: the merge would fail anyway.
+        assert!(revalidate(&pr, &expected, false).blocker().is_some());
+    }
+
+    #[test]
+    fn revalidate_stops_when_someone_else_pushed() {
+        let mut pr = entry_pr("open", "approved", Some("success"), Some(true));
+        pr.head_sha = "sha-theirs".into();
+        let expected = ExpectedHead::validated("sha-validated");
+        let reason = revalidate(&pr, &expected, true)
+            .blocker()
+            .expect("should stop");
+        assert!(reason.contains("its head moved to sha-thei"));
+    }
+
+    #[test]
+    fn revalidate_stops_when_the_pr_is_no_longer_open() {
+        let pr = entry_pr("closed", "approved", Some("success"), None);
+        let expected = ExpectedHead::validated("sha-validated");
+        let reason = revalidate(&pr, &expected, true)
+            .blocker()
+            .expect("should stop");
+        assert!(reason.contains("no longer open (closed)"));
+    }
+
+    #[test]
+    fn revalidate_stops_when_the_review_or_checks_regressed() {
+        let expected = ExpectedHead::validated("sha-validated");
+        let pr = entry_pr("open", "changes_requested", Some("success"), Some(true));
+        assert!(revalidate(&pr, &expected, true)
+            .blocker()
+            .expect("should stop")
+            .contains("changes_requested"));
+        let pr = entry_pr("open", "approved", Some("failure"), Some(true));
+        assert!(revalidate(&pr, &expected, true)
+            .blocker()
+            .expect("should stop")
+            .contains("checks not green"));
+        // --force drops the review/checks gate but keeps the rest.
+        assert_eq!(revalidate(&pr, &expected, false), Revalidation::Ready);
+    }
+
+    #[test]
+    fn revalidate_accepts_the_head_fj_force_pushed_and_its_re_armed_checks() {
+        let mut expected = ExpectedHead::validated("sha-validated");
+        expected.pushed("sha-restacked");
+        // fj rewrote the branch onto the new trunk tip, so CI is running again
+        // on a tree that was already approved and green. Pending is fj's own
+        // doing, not the ground shifting.
+        let mut pr = entry_pr("open", "approved", Some("pending"), Some(true));
+        pr.head_sha = "sha-restacked".into();
+        assert_eq!(revalidate(&pr, &expected, true), Revalidation::Ready);
+        // The review gate still applies to the restacked head.
+        pr.review = "changes_requested".into();
+        assert!(revalidate(&pr, &expected, true).blocker().is_some());
+        // A head fj did not push is still a shift, restack or no restack.
+        let mut theirs = entry_pr("open", "approved", Some("pending"), Some(true));
+        theirs.head_sha = "sha-theirs".into();
+        assert!(revalidate(&theirs, &expected, true).blocker().is_some());
+    }
+
+    #[test]
+    fn revalidate_treats_a_superseded_head_as_a_lagging_forge_not_a_pass() {
+        // The regression this guards: the pre-restack sha stays in the
+        // acceptance set, so `contains` used to return Ready and the retry
+        // loop broke on the first read. A stale read must be Stale, which is
+        // what makes the caller re-read instead of merging.
+        let mut expected = ExpectedHead::validated("sha-validated");
+        expected.pushed("sha-restacked");
+        let mut lagging = entry_pr("open", "approved", Some("success"), Some(true));
+        lagging.head_sha = "sha-validated".into();
+        let verdict = revalidate(&lagging, &expected, true);
+        assert!(
+            matches!(verdict, Revalidation::Stale(_)),
+            "a superseded head is the forge lagging, not a ready item: {verdict:?}"
+        );
+        // Nothing on that snapshot is judged: the item is not merged, and the
+        // reason names both shas so the terminal message is actionable.
+        let reason = verdict
+            .blocker()
+            .expect("stale is terminal once retries run out");
+        assert!(reason.contains("pre-restack head sha-vali"));
+        assert!(reason.contains("sha-rest"));
+    }
+
+    #[test]
+    fn revalidate_does_not_treat_a_stale_read_as_stale_without_a_restack() {
+        // No force-push happened, so there is exactly one expected sha and a
+        // mismatch can only be somebody else. This is what keeps the common
+        // path free of the retry latency.
+        let expected = ExpectedHead::validated("sha-validated");
+        let mut pr = entry_pr("open", "approved", Some("success"), Some(true));
+        pr.head_sha = "sha-theirs".into();
+        assert!(matches!(
+            revalidate(&pr, &expected, true),
+            Revalidation::Blocked(_)
+        ));
+        // And the matching head is Ready with no retry.
+        let ready = entry_pr("open", "approved", Some("success"), Some(true));
+        assert_eq!(revalidate(&ready, &expected, true), Revalidation::Ready);
+    }
+
+    #[test]
+    fn revalidate_judges_nothing_off_a_stale_snapshot() {
+        // Every other field on a pre-restack record was computed for the old
+        // head against the base that has since merged away. A stale
+        // `mergeable: true` must not be read as "still merges cleanly".
+        let mut expected = ExpectedHead::validated("sha-validated");
+        expected.pushed("sha-restacked");
+        let mut lagging = entry_pr("open", "approved", Some("success"), Some(true));
+        lagging.head_sha = "sha-validated".into();
+        assert!(matches!(
+            revalidate(&lagging, &expected, true),
+            Revalidation::Stale(_)
+        ));
+        // Same verdict under --force: this is a structural check, not a gate.
+        assert!(matches!(
+            revalidate(&lagging, &expected, false),
+            Revalidation::Stale(_)
+        ));
+    }
+
+    #[test]
+    fn revalidate_stale_resolves_to_ready_once_the_forge_catches_up() {
+        // The retry budget exists for exactly this: the same PR, read again.
+        let mut expected = ExpectedHead::validated("sha-validated");
+        expected.pushed("sha-restacked");
+        let mut pr = entry_pr("open", "approved", Some("pending"), Some(true));
+        pr.head_sha = "sha-validated".into();
+        assert!(matches!(
+            revalidate(&pr, &expected, true),
+            Revalidation::Stale(_)
+        ));
+        pr.head_sha = "sha-restacked".into();
+        assert_eq!(revalidate(&pr, &expected, true), Revalidation::Ready);
+    }
+
+    #[test]
+    fn revalidate_lag_tolerance_does_not_compound_down_the_stack() {
+        // Each land restacks again, so an entry deep in the stack accumulates
+        // several shas fj pushed. Only the newest may pass; every earlier one
+        // is the forge lagging, however many rounds ago fj pushed it.
+        let mut expected = ExpectedHead::validated("sha-validated");
+        expected.pushed("sha-restack-1");
+        expected.pushed("sha-restack-2");
+        for stale in ["sha-validated", "sha-restack-1"] {
+            let mut pr = entry_pr("open", "approved", Some("success"), Some(true));
+            pr.head_sha = stale.into();
+            assert!(
+                matches!(revalidate(&pr, &expected, true), Revalidation::Stale(_)),
+                "{stale} is superseded and must not pass"
+            );
+        }
+        let mut current = entry_pr("open", "approved", Some("success"), Some(true));
+        current.head_sha = "sha-restack-2".into();
+        assert_eq!(revalidate(&current, &expected, true), Revalidation::Ready);
+    }
+
+    #[test]
+    fn revalidate_without_a_known_head_falls_back_to_the_gate() {
+        // Nothing to compare against, so the sha check is skipped and the
+        // ordinary gate decides. `ship` no longer reaches this state (it
+        // refuses up front rather than merging on an unread head, see
+        // `forced_expected_heads`), but the fallback is kept honest here so
+        // the gate stays the floor if anything else ever constructs one.
+        let expected = ExpectedHead::validated("");
+        let pr = entry_pr("open", "approved", Some("success"), Some(true));
+        assert_eq!(revalidate(&pr, &expected, true), Revalidation::Ready);
+        let pr = entry_pr("open", "none", Some("success"), Some(true));
+        assert!(revalidate(&pr, &expected, true).blocker().is_some());
+    }
+
+    #[test]
+    fn stopped_message_names_the_reason_and_what_already_landed() {
+        let m = stopped_message("u/f-2", "it no longer merges cleanly", &[]);
+        assert!(m.contains("Stopped before merging 'u/f-2': it no longer merges cleanly."));
+        assert!(m.contains("Nothing was merged"));
+        assert!(m.contains("re-run `fj stack ship`; merged items are skipped"));
+
+        let m = stopped_message("u/f-3", "its head moved", &["u/f-1".into(), "u/f-2".into()]);
+        assert!(m.contains("Already merged: u/f-1, u/f-2"));
+    }
+
+    #[test]
+    fn item_is_merged_reads_the_recorded_pr_state() {
+        let mut items = stack_with_branches(&["u/f-1", "u/f-2"]).items;
+        assert!(!item_is_merged(&items[0])); // no PR recorded yet
+        items[0].pr = Some(ItemPr {
+            number: 7,
+            url: "u".into(),
+            state: "merged".into(),
+        });
+        items[1].pr = Some(ItemPr {
+            number: 8,
+            url: "u".into(),
+            state: "open".into(),
+        });
+        assert!(item_is_merged(&items[0]));
+        assert!(!item_is_merged(&items[1]));
+    }
+
+    // ---- ship: the restack, end to end against real git ----
+
+    fn repo_context(server: &wiremock::MockServer) -> crate::cli::context::RepoContext {
+        crate::cli::context::RepoContext {
+            client: client_for(server),
+            host: "x".into(),
+            web_base: None,
+            owner: "o".into(),
+            name: "r".into(),
+        }
+    }
+
+    /// The footgun, closed: a squash land leaves the branches above it based on
+    /// the pre-squash commit until something replays them. This drives the real
+    /// rebase, the real force-push (to a bare "origin"), and the PR retarget.
+    #[tokio::test]
+    async fn restack_onto_trunk_replays_pushes_and_repoints_every_remaining_pr() {
+        use crate::gitfixture::{
+            count, git, git_supports_update_refs, published_stack, squash_land_on_remote,
+        };
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        if !git_supports_update_refs() {
+            eprintln!("skipping: needs git >= 2.38");
+            return;
+        }
+        let (tmp, work, bare, tip1) = published_stack();
+        // PR #7 (u/s-1) squash-merges: the trunk gains one new commit.
+        let landed = squash_land_on_remote(tmp.path(), &bare);
+
+        let items = stack_with_branches(&["u/s-1", "u/s-2", "u/s-3"]).items;
+        let plan = plan_restack(&items, 0, "main").expect("two items above");
+
+        let server = MockServer::start().await;
+        // u/s-2 moves onto the trunk; u/s-3 keeps targeting u/s-2.
+        Mock::given(method("PATCH"))
+            .and(path("/api/v1/repos/o/r/pulls/8"))
+            .and(body_json(serde_json::json!({ "base": "main" })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(pull_value(8, "u/s-2", "open", false)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/v1/repos/o/r/pulls/9"))
+            .and(body_json(serde_json::json!({ "base": "u/s-2" })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(pull_value(9, "u/s-3", "open", false)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let ctx = repo_context(&server);
+        let repo = git::Repo::at(&work);
+        let rewritten = restack_onto_trunk(&repo, &ctx, "origin", "main", &plan, &[8, 9])
+            .await
+            .expect("the stack should replay onto the landed trunk");
+
+        let branches: Vec<String> = rewritten.iter().map(|(b, _)| b.clone()).collect();
+        assert_eq!(branches, vec!["u/s-2", "u/s-3"]);
+
+        // Locally: both branches now descend from the squashed trunk tip, one
+        // commit each, and no longer carry the pre-squash commit.
+        assert!(repo.is_ancestor(&landed, "u/s-2"));
+        assert!(repo.is_ancestor("u/s-2", "u/s-3"));
+        assert_eq!(count(&work, &format!("{landed}..u/s-2")), 1);
+        assert_eq!(count(&work, "u/s-2..u/s-3"), 1);
+        assert!(!repo.is_ancestor(&tip1, "u/s-3"));
+
+        // And on the remote, so each PR shows only its own diff.
+        assert_eq!(git(&bare, &["rev-parse", "u/s-2"]), rewritten[0].1);
+        assert_eq!(git(&bare, &["rev-parse", "u/s-3"]), rewritten[1].1);
+    }
+
+    /// A replay that can't be applied rolls back and touches nothing: no moved
+    /// refs, no force-push, no retargeted PRs.
+    ///
+    /// Scoped to `restack_onto_trunk` itself. Ship's caller still re-points the
+    /// PR directly above the landed item at the trunk afterwards, because that
+    /// item's base branch has merged away regardless of the replay; see the
+    /// `Err` arm in `ship`.
+    #[tokio::test]
+    async fn restack_onto_trunk_rolls_back_and_retargets_nothing_on_conflict() {
+        use crate::gitfixture::{
+            clone_repo, commit_file, git, git_supports_update_refs, published_stack,
+        };
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        if !git_supports_update_refs() {
+            eprintln!("skipping: needs git >= 2.38");
+            return;
+        }
+        let (tmp, work, bare, _tip1) = published_stack();
+
+        // The trunk lands u/s-1 *and* an edit that collides with u/s-2.
+        let forge = tmp.path().join("forge");
+        clone_repo(&bare, &forge);
+        commit_file(&forge, "a.txt", "a", "item 1 (#1)");
+        commit_file(&forge, "b.txt", "conflicting", "someone else");
+        git(&forge, &["push", "--quiet", "origin", "main"]);
+
+        let before_2 = git(&work, &["rev-parse", "u/s-2"]);
+        let before_3 = git(&work, &["rev-parse", "u/s-3"]);
+        let published_2 = git(&bare, &["rev-parse", "u/s-2"]);
+
+        let items = stack_with_branches(&["u/s-1", "u/s-2", "u/s-3"]).items;
+        let plan = plan_restack(&items, 0, "main").expect("two items above");
+
+        let server = MockServer::start().await;
+        // Any PR write at all would be a bug: nothing was replayed.
+        Mock::given(method("PATCH"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let ctx = repo_context(&server);
+        let repo = git::Repo::at(&work);
+        let err = restack_onto_trunk(&repo, &ctx, "origin", "main", &plan, &[8, 9])
+            .await
+            .expect_err("a conflicting replay must fail");
+        let chain = format!("{err:#}");
+        assert!(chain.contains("The rebase was rolled back"));
+        assert!(chain.contains("--force-with-lease"));
+
+        assert_eq!(git(&work, &["rev-parse", "u/s-2"]), before_2);
+        assert_eq!(git(&work, &["rev-parse", "u/s-3"]), before_3);
+        assert_eq!(git(&bare, &["rev-parse", "u/s-2"]), published_2);
+    }
+
+    #[test]
+    fn ship_op_json_reports_the_branches_it_restacked() {
+        let ops = vec![ShipOp {
+            branch: "u/f-1".into(),
+            number: 7,
+            action: "merged".into(),
+            restacked: vec!["u/f-2".into(), "u/f-3".into()],
+        }];
+        let v = serde_json::to_value(&ops).unwrap();
+        assert_eq!(v[0]["branch"], "u/f-1");
+        assert_eq!(v[0]["action"], "merged");
+        assert_eq!(v[0]["restacked"][0], "u/f-2");
+        assert_eq!(v[0]["restacked"][1], "u/f-3");
     }
 
     #[test]

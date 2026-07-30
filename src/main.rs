@@ -12,6 +12,10 @@ mod client;
 mod config;
 mod fjord;
 mod git;
+/// Throwaway git repositories, shared by the tests that exercise real git
+/// plumbing (`stack ship`'s restack).
+#[cfg(test)]
+mod gitfixture;
 mod output;
 
 use std::process::{Command, ExitCode};
