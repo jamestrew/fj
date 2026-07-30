@@ -222,6 +222,7 @@ fj stack new "Login Flow"     # author a stack and its first branch
 fj stack review               # PR number, review, CI, and mergeability per item
 fj stack sync                 # push branches and create/update the PRs
 fj stack ship                 # merge bottom-up behind a green-and-approved gate
+fj stack ship --squash        # ... and replay the rest of the stack onto the new trunk tip
 ```
 
 <p align="center">

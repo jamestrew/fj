@@ -6,6 +6,36 @@ All notable changes will be recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`fj stack ship` restacks the rest of the stack after a squash land.** A
+  squash merge replaces the item's commits, so every branch above it was left
+  parented on history the trunk no longer had: the PRs above showed the landed
+  diff a second time and the stack had to be repaired by hand. Ship now replays
+  the remainder onto the new trunk tip with a single
+  `git rebase --onto <new trunk> <landed tip> <top branch> --update-refs` (the
+  plumbing `stack absorb` already used), force-pushes each branch with an
+  explicit `--force-with-lease`, and re-syncs the PR bases. A conflicting
+  replay is rolled back: nothing is pushed, no PR is retargeted, and ship stops
+  with the commands to finish by hand. Merge-commit lands are unaffected, since
+  the original commits stay reachable. `--no-restack` opts out. The replay
+  needs git 2.38 or newer.
+- **`fj stack ship` pre-flights the stack's shape in git.** Before merging
+  anything it verifies that each unmerged branch descends from the one below
+  it, that the lowest one contains the trunk's *fetched* tip, and that each
+  local branch tip matches the head of the PR that would merge. A stale or
+  non-linear stack is refused up front with a "restack, then `fj stack sync`"
+  message rather than failing mid-merge with the bottom already landed.
+- **`fj stack ship` re-validates between merges.** After an item lands, the
+  next one is re-checked (still open, still mergeable, still approved, still at
+  a head fj put there) before it is merged. If the ground shifted, ship stops
+  cleanly, reports what already landed, and leaves the rest for a re-run.
+  Checks that ship itself re-armed by force-pushing a restacked branch are not
+  re-gated.
+- `stack ship --json` now reports the branches restacked after each item
+  (`restacked`), and `stack review --json` carries each PR's head sha
+  (`head_sha`). Both fields are additive.
+
 ### Fixed
 
 - **The pager no longer swallows short, write, and machine output.** The
