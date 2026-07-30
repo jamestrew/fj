@@ -564,15 +564,42 @@ impl Repo {
         }
         let stderr = String::from_utf8_lossy(&out.stderr);
         if is_stale_lease(&stderr) {
-            bail!(
-                "refusing to force-push '{branch}': the remote branch moved since \
-                 fj last saw it (expected {expect}). Fetch and re-check the branch, \
-                 then re-run."
-            );
+            return Err(anyhow::Error::new(StaleLease {
+                branch: branch.to_string(),
+                expected: expect.to_string(),
+            }));
         }
         bail!("git push {remote} {branch} failed: {}", stderr.trim());
     }
 }
+
+/// A force-push git rejected because the remote ref no longer matches the
+/// stated lease: something was pushed to the branch after fj last read it.
+///
+/// Typed rather than folded into a plain error string because the recovery is
+/// the *opposite* of a transport failure's. A push that never reached the
+/// server leaves the local refs authoritative and safe to re-push; a rejected
+/// lease means the local refs are missing whatever landed on the remote, and
+/// pushing harder there destroys it. Callers `downcast_ref` to tell the two
+/// apart before offering advice.
+#[derive(Debug)]
+pub struct StaleLease {
+    pub branch: String,
+    pub expected: String,
+}
+
+impl std::fmt::Display for StaleLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "refusing to force-push '{}': the remote branch moved since fj last \
+             saw it (expected {}). Fetch and re-check the branch, then re-run.",
+            self.branch, self.expected
+        )
+    }
+}
+
+impl std::error::Error for StaleLease {}
 
 /// `--force-with-lease=<ref>:<expected sha>`: push only if the remote ref is
 /// still exactly where we think it is.

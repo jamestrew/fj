@@ -1388,10 +1388,30 @@ fn rewrites_history(style: MergeStyle) -> bool {
     }
 }
 
+/// What the item's PR head says about the branch that would actually merge.
+#[derive(Debug, Clone, PartialEq)]
+enum HeadCheck {
+    /// The local tip and the PR head are the same commit.
+    Agrees,
+    /// `(local tip, PR head)`: the branch and its PR disagree about what would
+    /// merge.
+    Disagrees(String, String),
+    /// fj could not establish the PR's head, so it cannot say which sha would
+    /// merge or which sha it would lease a force-push against.
+    ///
+    /// This refuses rather than passes, and that direction is the whole fix:
+    /// an unknown head used to fall through a catch-all arm as "nothing to
+    /// report", which silently disabled the check for any stack whose PRs sat
+    /// outside the single unpaginated page ship starts from.
+    Unknown,
+}
+
 /// What git says about one pending stack item, gathered before any merge.
 #[derive(Debug, Clone)]
 struct BranchAncestry {
     branch: String,
+    /// The item's PR number, for the message when its head can't be read.
+    number: u64,
     /// The ref this item should sit on: the branch below it, or the trunk for
     /// the lowest unmerged item. Used for the message, not the test.
     below: String,
@@ -1400,8 +1420,8 @@ struct BranchAncestry {
     /// `below` is an ancestor of `branch` (tested against the trunk's *fetched*
     /// tip for the lowest item, so a stale local trunk can't pass).
     descends: bool,
-    /// `(local tip, PR head)` when the local branch and its PR disagree.
-    head_mismatch: Option<(String, String)>,
+    /// How the local tip compares to the PR head.
+    head: HeadCheck,
 }
 
 /// Pre-flight the stack's shape against git and refuse before merging anything
@@ -1439,18 +1459,112 @@ fn linear_history_blocker(observed: &[BranchAncestry]) -> Option<String> {
                 )
             });
         }
-        if let Some((local, head)) = &o.head_mismatch {
-            return Some(format!(
-                "'{}' is at {} locally but its PR head is {}: the branch and the pull \
-                 request disagree about what would merge. Run `fj stack sync` to push \
-                 it (or fetch, if the PR is ahead), then re-run `fj stack ship`.",
-                o.branch,
-                short_sha(local),
-                short_sha(head)
-            ));
+        match &o.head {
+            HeadCheck::Agrees => {}
+            HeadCheck::Disagrees(local, head) => {
+                return Some(format!(
+                    "'{}' is at {} locally but its PR head is {}: the branch and the pull \
+                     request disagree about what would merge. Run `fj stack sync` to push \
+                     it (or fetch, if the PR is ahead), then re-run `fj stack ship`.",
+                    o.branch,
+                    short_sha(local),
+                    short_sha(head)
+                ));
+            }
+            HeadCheck::Unknown => {
+                return Some(format!(
+                    "could not read PR #{}'s head, so ship can't confirm that '{}' is what \
+                     would merge. Re-run when the forge is reachable, or pass --no-restack \
+                     to ship without the local checks.",
+                    o.number, o.branch
+                ));
+            }
         }
     }
     None
+}
+
+/// Gather what git says about every pending item, bottom-up, for the
+/// pre-flight.
+///
+/// Split out of `ship` so the refusal it feeds can be exercised directly: this
+/// is the seam where a PR head fj had not read used to be dropped on the floor
+/// instead of stopping the run.
+fn observe_stack(
+    repo: &git::Repo,
+    items: &[StackItem],
+    pending: &[usize],
+    numbers: &[u64],
+    trunk: &str,
+    trunk_tip: &str,
+    heads: &std::collections::HashMap<u64, String>,
+) -> Result<Vec<BranchAncestry>> {
+    let mut observed = Vec::with_capacity(pending.len());
+    for (k, &i) in pending.iter().enumerate() {
+        let branch = items[i].branch.clone();
+        let number = numbers[i];
+        let exists = repo.rev_exists(&format!("refs/heads/{branch}"));
+        let (below, below_rev) = if k == 0 {
+            (trunk.to_string(), trunk_tip.to_string())
+        } else {
+            let b = items[pending[k - 1]].branch.clone();
+            (b.clone(), b)
+        };
+        let descends = exists && repo.is_ancestor(&below_rev, &branch);
+        let head = match heads.get(&number) {
+            Some(head) if exists && !head.is_empty() => {
+                let local = repo.rev_parse(&branch)?;
+                if local == *head {
+                    HeadCheck::Agrees
+                } else {
+                    HeadCheck::Disagrees(local, head.clone())
+                }
+            }
+            // Either the branch isn't in this clone (which `exists` refuses
+            // first, with a better message) or fj never read the PR's head.
+            // Neither is "fine": the fallback has to be the refusing variant.
+            _ => HeadCheck::Unknown,
+        };
+        observed.push(BranchAncestry {
+            branch,
+            number,
+            below,
+            exists,
+            descends,
+            head,
+        });
+    }
+    Ok(observed)
+}
+
+/// The heads `--force` re-validates each item against before merging it.
+///
+/// The gated path re-reads every PR with `enrich_pr` and takes the head from
+/// there; `--force` skips that pass entirely, so this list is the only thing
+/// standing between a shifted head and a merge. A head fj could not read is
+/// therefore a refusal, not an empty expectation: an empty one makes
+/// `revalidate_blocker`'s head-moved guard vacuous, which is exactly how the
+/// bottom item could land before a stale lease was ever rejected.
+fn forced_expected_heads(
+    pending: &[usize],
+    numbers: &[u64],
+    heads: &std::collections::HashMap<u64, String>,
+) -> Result<std::collections::HashMap<usize, ExpectedHead>> {
+    let mut expected = std::collections::HashMap::new();
+    for &i in pending {
+        let number = numbers[i];
+        let sha = heads
+            .get(&number)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "could not read PR #{number}'s head, so --force has nothing to check \
+                     it against before merging. Re-run when the forge is reachable."
+                )
+            })?;
+        expected.insert(i, ExpectedHead::validated(sha));
+    }
+    Ok(expected)
 }
 
 fn short_sha(sha: &str) -> String {
@@ -1625,14 +1739,29 @@ async fn restack_onto_trunk(
 
     let mut rewritten = Vec::with_capacity(plan.branches.len());
     for (branch, lease) in plan.branches.iter().zip(&leases) {
-        repo.push_force_with_lease(remote, branch, lease)
-            .with_context(|| {
+        if let Err(e) = repo.push_force_with_lease(remote, branch, lease) {
+            // A rejected lease and a failed transport need opposite advice. If
+            // the push never landed, the local refs are the replayed truth and
+            // re-pushing them is right. If the *lease* was rejected, someone
+            // pushed to the branch after fj read it, the local refs no longer
+            // contain their commit, and "push it again" is how that commit
+            // gets destroyed.
+            let context = if e.downcast_ref::<git::StaleLease>().is_some() {
+                format!(
+                    "publishing the replayed '{branch}'. Its remote tip moved after fj \
+                     read it, so the local refs are NOT authoritative here: they don't \
+                     contain whatever was pushed. Fetch '{remote}/{branch}' and reconcile \
+                     the two before pushing anything; do not re-run with --force"
+                )
+            } else {
                 format!(
                     "publishing the replayed '{branch}'. The local refs are already \
                      correct; push the remaining branches with --force-with-lease, \
                      then re-run `fj stack ship`"
                 )
-            })?;
+            };
+            return Err(e.context(context));
+        }
         rewritten.push((branch.clone(), repo.rev_parse(branch)?));
     }
 
@@ -1699,18 +1828,33 @@ async fn ship(args: ShipArgs, host: Option<&str>) -> Result<()> {
             ),
         }
     }
-    // PR head shas, from the list we already have.
-    let heads: std::collections::HashMap<u64, String> = page
-        .items
-        .iter()
-        .map(|p| (p.number, p.head.sha.clone()))
-        .collect();
-
     // Items that still need merging; the ones below them already landed and
     // are part of the trunk, so they take no part in the pre-flight.
     let pending: Vec<usize> = (0..stack.items.len())
         .filter(|&i| !item_is_merged(&stack.items[i]))
         .collect();
+
+    // PR head shas, from the list we already have. `page` is a single
+    // unpaginated page of open PRs, so a stack whose PRs fall outside it would
+    // leave the head checks with nothing to compare against; read those
+    // directly. Costs nothing on a repo whose open PRs fit in one page.
+    let mut heads: std::collections::HashMap<u64, String> = page
+        .items
+        .iter()
+        .map(|p| (p.number, p.head.sha.clone()))
+        .collect();
+    for &i in &pending {
+        let number = numbers[i];
+        if heads.contains_key(&number) {
+            continue;
+        }
+        // Best-effort: a head that still can't be read leaves the item's
+        // `HeadCheck::Unknown` (or `forced_expected_heads`) to refuse the run
+        // up front, which is where the operator wants to hear about it.
+        if let Ok(pr) = api::pull::get(&ctx.client, &ctx.owner, &ctx.name, number).await {
+            heads.insert(number, pr.head.sha.clone());
+        }
+    }
 
     let repo = git::Repo::discover();
     let started_on = repo.current_branch();
@@ -1734,32 +1878,15 @@ async fn ship(args: ShipArgs, host: Option<&str>) -> Result<()> {
         let trunk_tip = repo.fetch_branch(&remote, &trunk).with_context(|| {
             format!("fetching '{remote}/{trunk}' to check the stack is current")
         })?;
-        let mut observed = Vec::with_capacity(pending.len());
-        for (k, &i) in pending.iter().enumerate() {
-            let branch = stack.items[i].branch.clone();
-            let exists = repo.rev_exists(&format!("refs/heads/{branch}"));
-            let (below, below_rev) = if k == 0 {
-                (trunk.clone(), trunk_tip.clone())
-            } else {
-                let b = stack.items[pending[k - 1]].branch.clone();
-                (b.clone(), b)
-            };
-            let descends = exists && repo.is_ancestor(&below_rev, &branch);
-            let head_mismatch = match (exists, heads.get(&numbers[i])) {
-                (true, Some(head)) => {
-                    let local = repo.rev_parse(&branch)?;
-                    (local != *head).then_some((local, head.clone()))
-                }
-                _ => None,
-            };
-            observed.push(BranchAncestry {
-                branch,
-                below,
-                exists,
-                descends,
-                head_mismatch,
-            });
-        }
+        let observed = observe_stack(
+            &repo,
+            &stack.items,
+            &pending,
+            &numbers,
+            &trunk,
+            &trunk_tip,
+            &heads,
+        )?;
         if let Some(reason) = linear_history_blocker(&observed) {
             bail!("{reason}");
         }
@@ -1782,10 +1909,7 @@ async fn ship(args: ShipArgs, host: Option<&str>) -> Result<()> {
             expected.insert(i, ExpectedHead::validated(&pr.head_sha));
         }
     } else {
-        for &i in &pending {
-            let sha = heads.get(&numbers[i]).cloned().unwrap_or_default();
-            expected.insert(i, ExpectedHead::validated(&sha));
-        }
+        expected = forced_expected_heads(&pending, &numbers, &heads)?;
     }
 
     // Merge bottom-up; stop cleanly the moment anything stops matching the plan.
@@ -2578,10 +2702,11 @@ mod tests {
     fn ancestry(branch: &str, below: &str) -> BranchAncestry {
         BranchAncestry {
             branch: branch.into(),
+            number: 1,
             below: below.into(),
             exists: true,
             descends: true,
-            head_mismatch: None,
+            head: HeadCheck::Agrees,
         }
     }
 
@@ -2633,10 +2758,22 @@ mod tests {
     #[test]
     fn linear_history_blocker_refuses_when_the_branch_and_its_pr_disagree() {
         let mut observed = vec![ancestry("u/f-1", "main")];
-        observed[0].head_mismatch = Some(("abcdef1234".into(), "9876543210".into()));
+        observed[0].head = HeadCheck::Disagrees("abcdef1234".into(), "9876543210".into());
         let reason = linear_history_blocker(&observed).expect("should refuse");
         assert!(reason.contains("'u/f-1' is at abcdef12 locally but its PR head is 98765432"));
         assert!(reason.contains("fj stack sync"));
+    }
+
+    /// An unreadable PR head refuses instead of passing. It used to fall
+    /// through a catch-all and leave the check with nothing to report.
+    #[test]
+    fn linear_history_blocker_refuses_a_head_it_could_not_read() {
+        let mut observed = vec![ancestry("u/f-1", "main"), ancestry("u/f-2", "u/f-1")];
+        observed[0].number = 412;
+        observed[0].head = HeadCheck::Unknown;
+        let reason = linear_history_blocker(&observed).expect("should refuse");
+        assert!(reason.contains("could not read PR #412's head"));
+        assert!(reason.contains("'u/f-1'"));
     }
 
     #[test]
@@ -2652,6 +2789,103 @@ mod tests {
         observed[2].descends = false;
         let reason = linear_history_blocker(&observed).expect("should refuse");
         assert!(reason.contains("'u/f-1' is not an ancestor of 'u/f-2'"));
+    }
+
+    /// The pre-flight hole, closed.
+    ///
+    /// `ship` reads PR heads from one unpaginated page of open PRs. A stack
+    /// whose PRs sit outside that page left *both* head guards with nothing to
+    /// check: the pre-flight's comparison fell through a catch-all, and
+    /// `--force` handed `revalidate_blocker` an empty expectation. A stale
+    /// bottom item therefore passed the pre-flight, squash-landed, and only
+    /// then failed mid-restack on a rejected lease, with the bottom already
+    /// merged and the stack half-repaired. Both guards now refuse first.
+    ///
+    /// Driven against a real repo so the git shape is genuinely linear and
+    /// current: nothing but the head check can account for the refusal.
+    #[test]
+    fn a_stale_bottom_is_refused_up_front_when_its_pr_is_off_the_list_page() {
+        use crate::gitfixture::{git, git_supports_update_refs, published_stack};
+        use std::collections::HashMap;
+        if !git_supports_update_refs() {
+            eprintln!("skipping: needs git >= 2.38");
+            return;
+        }
+        let (_tmp, work, _bare, _tip1) = published_stack();
+        let repo = git::Repo::at(&work);
+        let items = stack_with_branches(&["u/s-1", "u/s-2", "u/s-3"]).items;
+        let pending = vec![0usize, 1, 2];
+        // PR numbers well past the first page of open PRs.
+        let numbers = vec![41u64, 42, 43];
+        let trunk_tip = git(&work, &["rev-parse", "main"]);
+
+        // Baseline: with every head read and matching, the stack passes. This
+        // is what keeps the refusals below meaningful.
+        let agreeing: HashMap<u64, String> = numbers
+            .iter()
+            .zip(["u/s-1", "u/s-2", "u/s-3"])
+            .map(|(&n, b)| (n, git(&work, &["rev-parse", b])))
+            .collect();
+        let observed = observe_stack(
+            &repo, &items, &pending, &numbers, "main", &trunk_tip, &agreeing,
+        )
+        .expect("observing a healthy stack");
+        assert!(observed.iter().all(|o| o.exists && o.descends));
+        assert_eq!(linear_history_blocker(&observed), None);
+
+        // The hole: the stack's PRs are off the page, so no head was read.
+        let unread: HashMap<u64, String> = HashMap::new();
+        let observed = observe_stack(
+            &repo, &items, &pending, &numbers, "main", &trunk_tip, &unread,
+        )
+        .expect("observing still works without heads");
+        // The git shape is fine; this is purely the head check talking.
+        assert!(observed.iter().all(|o| o.exists && o.descends));
+        assert_eq!(observed[0].head, HeadCheck::Unknown);
+        let reason = linear_history_blocker(&observed)
+            .expect("an unread head must refuse before anything merges");
+        assert!(reason.contains("could not read PR #41's head"));
+        assert!(reason.contains("'u/s-1'"));
+
+        // …and the same input under --force, which skips the per-PR gate and
+        // so has only this list to lean on. It used to yield an empty
+        // expectation and merge; now it refuses.
+        let err = forced_expected_heads(&pending, &numbers, &unread)
+            .expect_err("--force must not merge an item whose head it never read");
+        let chain = format!("{err:#}");
+        assert!(chain.contains("could not read PR #41's head"));
+        assert!(chain.contains("--force has nothing to check it against"));
+
+        // A head that *was* read but disagrees is refused with both shas, the
+        // case the pre-flight was written for.
+        let mut stale = agreeing.clone();
+        let pr_head = git(&work, &["rev-parse", "u/s-2"]);
+        stale.insert(41, pr_head.clone()); // someone pushed; the local tip is behind
+        let observed = observe_stack(
+            &repo, &items, &pending, &numbers, "main", &trunk_tip, &stale,
+        )
+        .expect("observing a stale bottom");
+        let local = git(&work, &["rev-parse", "u/s-1"]);
+        assert_eq!(
+            observed[0].head,
+            HeadCheck::Disagrees(local.clone(), pr_head.clone())
+        );
+        let reason = linear_history_blocker(&observed).expect("a stale bottom must refuse");
+        assert!(reason.contains(&format!("'u/s-1' is at {}", short_sha(&local))));
+        assert!(reason.contains("disagree about what would merge"));
+
+        // Finally, under --force the re-validation now carries a real sha, so
+        // a head that moves after the plan still stops the run rather than
+        // being waved through by an empty expectation.
+        let expected = forced_expected_heads(&pending, &numbers, &agreeing)
+            .expect("every head was read this time");
+        let entry = expected.get(&0).expect("bottom item");
+        assert_eq!(entry.shas, vec![git(&work, &["rev-parse", "u/s-1"])]);
+        let moved = entry_pr("open", "approved", Some("success"), Some(true));
+        // `entry_pr`'s head is a sha fj never validated or pushed.
+        assert!(revalidate_blocker(&moved, entry, false)
+            .expect("a moved head must stop --force")
+            .contains("its head moved to"));
     }
 
     #[test]
@@ -2793,8 +3027,11 @@ mod tests {
 
     #[test]
     fn revalidate_without_a_known_head_falls_back_to_the_gate() {
-        // Nothing to compare against (the PR wasn't in the open list), so the
-        // sha check is skipped and the ordinary gate decides.
+        // Nothing to compare against, so the sha check is skipped and the
+        // ordinary gate decides. `ship` no longer reaches this state (it
+        // refuses up front rather than merging on an unread head, see
+        // `forced_expected_heads`), but the fallback is kept honest here so
+        // the gate stays the floor if anything else ever constructs one.
         let expected = ExpectedHead::validated("");
         let pr = entry_pr("open", "approved", Some("success"), Some(true));
         assert_eq!(revalidate_blocker(&pr, &expected, true), None);
