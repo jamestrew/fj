@@ -4,12 +4,49 @@ on:
   push:
     tags:
       - 'v*'
+  # A tag push reads this file from the tag, so a bug fixed after the tag was
+  # cut can never be applied by re-running that tag's run. Dispatch from a
+  # branch that has the fix and pass the tag instead: every job below builds
+  # and publishes `tag`, not the dispatching ref.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build and publish (e.g. v0.4.1).'
+        required: true
 
 permissions:
   contents: write
+  issues: write
 
 jobs:
+  # Single source of truth for which tag this run is about, and a guard against
+  # dispatching with a branch name by mistake.
+  prepare:
+    runs-on: docker
+    container: alpine:3.20
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - name: resolve tag
+        id: resolve
+        run: |
+          set -eu
+          TAG="${{ inputs.tag || github.ref_name }}"
+          case "$TAG" in
+            v[0-9]*) ;;
+            *)
+              echo "::error::expected a v-prefixed tag, got '$TAG'."
+              echo "::error::On workflow_dispatch, pass the tag in the 'tag' input."
+              exit 1
+              ;;
+          esac
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "releasing $TAG"
+
   build:
+    needs: prepare
     strategy:
       fail-fast: false
       matrix:
@@ -45,6 +82,8 @@ jobs:
     steps:
       - name: checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
 
       # Installs rustup from rustup.rs when absent (the linux container has
       # none; macOS runners already have it) and adds the cross-compile target.
@@ -108,7 +147,7 @@ jobs:
           mkdir -p dist
           BIN=target/${{ matrix.target }}/release/fj
           test -x "$BIN" || (echo "binary missing"; exit 1)
-          STAGE=fj-${{ github.ref_name }}-${{ matrix.name }}
+          STAGE=fj-${{ needs.prepare.outputs.tag }}-${{ matrix.name }}
           mkdir -p "$STAGE"
           cp "$BIN" "$STAGE/"
           cp README.md LICENSE CHANGELOG.md "$STAGE/"
@@ -176,7 +215,7 @@ jobs:
           overwrite: true
 
   publish:
-    needs: build
+    needs: [prepare, build]
     runs-on: docker
     container: alpine:3.20
     # Release artifacts live on our own S3 (hel1). download-artifact-action
@@ -192,8 +231,14 @@ jobs:
     steps:
       - name: install tools
         # nodejs is required by the JS actions in this job (download-artifact,
-        # forgejo-release); the bare alpine image doesn't ship it.
-        run: apk add --no-cache coreutils bash tar zstd gzip nodejs
+        # forgejo-release); the bare alpine image doesn't ship it. git + the
+        # release-notes step need the repo, so checkout needs git too.
+        run: apk add --no-cache coreutils bash tar zstd gzip nodejs git
+
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
 
       - name: fetch artifacts
         uses: https://rasterhub.com/rasterstate/download-artifact-action@v1
@@ -203,23 +248,52 @@ jobs:
 
       - name: combined SHA256SUMS
         run: |
+          set -euo pipefail
           cd dist
           ls -la
           # Concatenate per-artifact sha256 files into a single SHA256SUMS.
           cat *.sha256 | sort > SHA256SUMS
           cat SHA256SUMS
 
+      # The release body was empty on every release before this step existed.
+      # Pull the tag's own CHANGELOG section so the release page says what
+      # changed without a human pasting it.
+      - name: release notes from CHANGELOG
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          awk -v v="## [$VERSION]" '
+            index($0, v) == 1 { inside = 1; next }
+            inside && /^## \[/ { exit }
+            inside { print }
+          ' CHANGELOG.md | sed -e '/./,$!d' > dist/RELEASE_NOTES.md
+          if [ ! -s dist/RELEASE_NOTES.md ]; then
+            echo "::error::CHANGELOG.md has no '## [$VERSION]' section."
+            echo "::error::Add the section to the tagged commit and re-dispatch."
+            exit 1
+          fi
+          cat dist/RELEASE_NOTES.md
+
       - name: render homebrew formula
         env:
           REPO: ${{ github.repository }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
           HOST: ${{ github.server_url }}
         run: |
           set -euo pipefail
-          VERSION=${TAG#v}
           ARM_SHA=$(awk '/darwin-aarch64\.tar\.gz$/{print $1}' dist/SHA256SUMS)
           X64_SHA=$(awk '/darwin-x86_64\.tar\.gz$/{print $1}' dist/SHA256SUMS)
           LIN_SHA=$(awk '/linux-x86_64\.tar\.gz$/{print $1}' dist/SHA256SUMS)
+          # A missing matrix leg used to render `sha256 ""` and publish a
+          # formula that could never install. Refuse instead.
+          for pair in "darwin-aarch64:$ARM_SHA" "darwin-x86_64:$X64_SHA" "linux-x86_64:$LIN_SHA"; do
+            if [ -z "${pair#*:}" ]; then
+              echo "::error::no sha256 for ${pair%%:*} in dist/SHA256SUMS; refusing to render a formula with a hole in it."
+              exit 1
+            fi
+          done
           BASE="$HOST/$REPO/releases/download/$TAG"
           mkdir -p homebrew-out
           cat > homebrew-out/fj.rb <<RUBY
@@ -248,12 +322,11 @@ jobs:
             end
 
             def install
-              target = if OS.mac?
-                Hardware::CPU.arm? ? "darwin-aarch64" : "darwin-x86_64"
-              else
-                "linux-x86_64"
-              end
-              cd "fj-#{version}-#{target}"
+              # The tarball has a single top-level dir (fj-v<version>-<target>/)
+              # and Homebrew auto-cds into it before running install, so install
+              # directly. An explicit cd here fails twice over: the directory is
+              # already the working directory, and its name carries the tag's "v"
+              # that #{version} does not.
               bin.install "fj"
               pkgshare.install "README.md", "LICENSE", "CHANGELOG.md"
             end
@@ -273,9 +346,77 @@ jobs:
       - name: publish release
         uses: https://rasterhub.com/rasterstate/forgejo-release-action@v1
         with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          body_path: dist/RELEASE_NOTES.md
+          # A pattern that matches nothing used to pass quietly, which is how a
+          # release ships with fewer assets than it should.
+          fail_on_unmatched_files: true
           files: |
             dist/fj-*.tar.gz
             dist/SHA256SUMS
             homebrew-out/fj.rb
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Forgejo surfaces a pushed tag as a published release immediately, so a build
+  # that fails leaves a real-looking release with zero assets and nothing says
+  # so. v0.4.1 sat like that from 2026-07-22 until fj#232 noticed. Demote it and
+  # file an issue instead of failing silently.
+  guard:
+    needs: [prepare, build, publish]
+    if: always() && needs.prepare.result == 'success' && (needs.build.result != 'success' || needs.publish.result != 'success')
+    runs-on: docker
+    container: alpine:3.20
+    steps:
+      - name: install tools
+        run: apk add --no-cache curl jq
+
+      - name: demote the release and open an issue
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          REPO: ${{ github.repository }}
+          API: ${{ github.server_url }}/api/v1
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_number }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          auth="Authorization: token $TOKEN"
+
+          rel=$(curl -sf -H "$auth" "$API/repos/$REPO/releases/tags/$TAG" || echo '{}')
+          rel_id=$(echo "$rel" | jq -r '.id // empty')
+          assets=$(echo "$rel" | jq -r '(.assets // []) | length')
+
+          if [ -n "$rel_id" ] && [ "$assets" = "0" ]; then
+            echo "Release $TAG has no assets; marking it draft so it stops advertising itself."
+            body="The release job for \`$TAG\` failed and no artifacts were published. Do not install this version. See $RUN_URL."
+            curl -sf -X PATCH -H "$auth" -H 'Content-Type: application/json' \
+              -d "$(jq -n --arg b "$body" '{draft: true, prerelease: true, body: $b}')" \
+              "$API/repos/$REPO/releases/$rel_id" > /dev/null
+          else
+            echo "Release $TAG has $assets asset(s); leaving its state alone."
+          fi
+
+          title="release $TAG failed: no installable artifacts"
+          existing=$(curl -sf -H "$auth" "$API/repos/$REPO/issues?state=open&type=issues&limit=50" \
+            | jq -r --arg t "$title" '[.[] | select(.title == $t)] | length')
+          if [ "$existing" != "0" ]; then
+            echo "Issue already open for $TAG; not filing a duplicate."
+            exit 0
+          fi
+
+          read -r -d '' issue <<EOF || true
+          The release workflow for \`$TAG\` did not publish artifacts.
+
+          - build: ${{ needs.build.result }}
+          - publish: ${{ needs.publish.result }}
+          - run: $RUN_URL
+
+          Until this is resolved, \`brew install fj\` serves whatever the tap
+          last pinned, which is the previous release. After fixing the cause,
+          re-release without moving the tag: dispatch the release workflow from
+          the default branch with \`tag: $TAG\`.
+          EOF
+          curl -sf -X POST -H "$auth" -H 'Content-Type: application/json' \
+            -d "$(jq -n --arg t "$title" --arg b "$issue" '{title: $t, body: $b}')" \
+            "$API/repos/$REPO/issues" > /dev/null
+          echo "::error::release $TAG published no artifacts; filed an issue."
