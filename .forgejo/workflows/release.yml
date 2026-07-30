@@ -4,12 +4,97 @@ on:
   push:
     tags:
       - 'v*'
+  # A tag push reads this file from the tag, so a bug fixed after the tag was
+  # cut can never be applied by re-running that tag's run. Dispatch from a
+  # branch that has the fix and pass the tag instead: every job below builds
+  # and publishes `tag`, not the dispatching ref.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build and publish (e.g. v0.4.1).'
+        required: true
 
 permissions:
   contents: write
+  issues: write
 
 jobs:
+  # Single source of truth for which tag this run is about, and a guard against
+  # dispatching with a branch name by mistake.
+  prepare:
+    runs-on: docker
+    container: alpine:3.20
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+      sha: ${{ steps.resolve.outputs.sha }}
+    steps:
+      - name: install tools
+        run: apk add --no-cache curl jq
+
+      - name: resolve tag
+        id: resolve
+        # RAW_TAG arrives through the environment and is never written into the
+        # script body. A `${{ }}` expression is substituted textually before the
+        # shell parses the line, so `TAG="${{ inputs.tag }}"` with a dispatched
+        # input of `v1";id;"` or `v1$(id)` executes at the assignment, ahead of
+        # any validation below. The env var is passed to the shell as data, so
+        # the checks are the first thing that sees it. This workflow holds
+        # `contents: write` and `issues: write`, so that ordering is the whole
+        # point of the guard rather than a detail of it.
+        env:
+          RAW_TAG: ${{ inputs.tag || github.ref_name }}
+          REPO: ${{ github.repository }}
+          API: ${{ github.server_url }}/api/v1
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          reject() {
+            echo "::error::refusing to release '$RAW_TAG': $1"
+            echo "::error::On workflow_dispatch, pass an existing release tag in the 'tag' input."
+            exit 1
+          }
+          # Allowlist the charset first, so nothing downstream has to reason
+          # about quoting. The name reaches tarball names, the formula, and the
+          # release API as well as git.
+          case "$RAW_TAG" in
+            *[!0-9A-Za-z.+-]*) reject 'contains a character outside [0-9A-Za-z.+-]' ;;
+          esac
+          case "$RAW_TAG" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) reject 'not of the form v<major>.<minor>.<patch>' ;;
+          esac
+
+          # The checks above describe the shape of a string. They do not pin a
+          # ref, and a shape is not an identity: a BRANCH named v1.2.3 satisfies
+          # every one of them, and version-shaped branches are already normal
+          # here (`release/v0.3.0`). Resolving a bare name would then build
+          # branch contents while `publish` attached them to a release tag of
+          # the same name. In a workflow whose entire purpose is recovering a
+          # broken tag release, publishing branch contents as a tag's artifacts
+          # is the specific outcome that would make it worse than useless.
+          #
+          # So require the name to exist in the TAGS collection, which a branch
+          # cannot satisfy, and carry the resolved commit forward. Every job
+          # then checks out `refs/tags/<tag>` and asserts it landed on this sha,
+          # which makes the guarantee structural instead of a pattern match and
+          # also fails closed if the tag moves mid-run.
+          tag_json=$(curl -sf -H "Authorization: token $TOKEN" \
+            "$API/repos/$REPO/tags/$RAW_TAG") \
+            || reject "no tag named '$RAW_TAG' in $REPO (a branch of that name does not count)"
+          SHA=$(printf '%s' "$tag_json" | jq -r '.commit.sha // empty')
+          [ "${#SHA}" -eq 40 ] || reject 'tags API returned no 40-character commit sha'
+          case "$SHA" in
+            *[!0-9a-f]*) reject 'tags API returned a non-hex commit sha' ;;
+          esac
+
+          echo "tag=$RAW_TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${RAW_TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "releasing $RAW_TAG at $SHA"
+
   build:
+    needs: prepare
     strategy:
       fail-fast: false
       matrix:
@@ -45,6 +130,24 @@ jobs:
     steps:
       - name: checkout
         uses: actions/checkout@v4
+        with:
+          # Fully qualified on purpose. A bare name lets git resolve a branch of
+          # the same name; `refs/tags/` cannot.
+          ref: refs/tags/${{ needs.prepare.outputs.tag }}
+
+      - name: assert the checkout is the tag `prepare` resolved
+        env:
+          EXPECTED_SHA: ${{ needs.prepare.outputs.sha }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -eu
+          ACTUAL=$(git rev-parse HEAD)
+          if [ "$ACTUAL" != "$EXPECTED_SHA" ]; then
+            echo "::error::$TAG resolved to $EXPECTED_SHA in prepare but HEAD is $ACTUAL."
+            echo "::error::The tag moved mid-run, or the ref resolved to something else. Refusing to build."
+            exit 1
+          fi
+          echo "building $TAG at $ACTUAL"
 
       # Installs rustup from rustup.rs when absent (the linux container has
       # none; macOS runners already have it) and adds the cross-compile target.
@@ -104,11 +207,16 @@ jobs:
           codesign --verify --verbose=2 "$BIN"
 
       - name: package
+        # `prepare` has already allowlisted TAG's charset, so interpolating it
+        # here would be safe. It still comes through the environment, so the
+        # rule for this file stays greppable: no tag ever lands in a script body.
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           mkdir -p dist
           BIN=target/${{ matrix.target }}/release/fj
           test -x "$BIN" || (echo "binary missing"; exit 1)
-          STAGE=fj-${{ github.ref_name }}-${{ matrix.name }}
+          STAGE=fj-$TAG-${{ matrix.name }}
           mkdir -p "$STAGE"
           cp "$BIN" "$STAGE/"
           cp README.md LICENSE CHANGELOG.md "$STAGE/"
@@ -176,7 +284,7 @@ jobs:
           overwrite: true
 
   publish:
-    needs: build
+    needs: [prepare, build]
     runs-on: docker
     container: alpine:3.20
     # Release artifacts live on our own S3 (hel1). download-artifact-action
@@ -192,8 +300,30 @@ jobs:
     steps:
       - name: install tools
         # nodejs is required by the JS actions in this job (download-artifact,
-        # forgejo-release); the bare alpine image doesn't ship it.
-        run: apk add --no-cache coreutils bash tar zstd gzip nodejs
+        # forgejo-release); the bare alpine image doesn't ship it. git + the
+        # release-notes step need the repo, so checkout needs git too.
+        run: apk add --no-cache coreutils bash tar zstd gzip nodejs git
+
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          # Fully qualified on purpose. A bare name lets git resolve a branch of
+          # the same name; `refs/tags/` cannot.
+          ref: refs/tags/${{ needs.prepare.outputs.tag }}
+
+      - name: assert the checkout is the tag `prepare` resolved
+        env:
+          EXPECTED_SHA: ${{ needs.prepare.outputs.sha }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -eu
+          ACTUAL=$(git rev-parse HEAD)
+          if [ "$ACTUAL" != "$EXPECTED_SHA" ]; then
+            echo "::error::$TAG resolved to $EXPECTED_SHA in prepare but HEAD is $ACTUAL."
+            echo "::error::The tag moved mid-run, or the ref resolved to something else. Refusing to build."
+            exit 1
+          fi
+          echo "building $TAG at $ACTUAL"
 
       - name: fetch artifacts
         uses: https://rasterhub.com/rasterstate/download-artifact-action@v1
@@ -203,23 +333,64 @@ jobs:
 
       - name: combined SHA256SUMS
         run: |
+          set -euo pipefail
           cd dist
           ls -la
           # Concatenate per-artifact sha256 files into a single SHA256SUMS.
           cat *.sha256 | sort > SHA256SUMS
           cat SHA256SUMS
 
+      # The release body was empty on every release before this step existed.
+      # Pull the tag's own CHANGELOG section so the release page says what
+      # changed without a human pasting it.
+      - name: release notes from CHANGELOG
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          # awk exits 2 on a missing file and `pipefail` does propagate that, so
+          # this is not the only thing standing between us and a silent pass.
+          # It is here for the two things `pipefail` does not give: an error that
+          # names the cause rather than a raw awk stderr line that reads like the
+          # section is merely absent, and independence from whether the shell
+          # running this honors `pipefail` at all.
+          test -f CHANGELOG.md || {
+            echo "::error::CHANGELOG.md is not in the checkout at $TAG."
+            echo "::error::Expected it at the repository root of the tagged commit."
+            exit 1
+          }
+          awk -v v="## [$VERSION]" '
+            index($0, v) == 1 { inside = 1; next }
+            inside && /^## \[/ { exit }
+            inside { print }
+          ' CHANGELOG.md | sed -e '/./,$!d' > dist/RELEASE_NOTES.md
+          if [ ! -s dist/RELEASE_NOTES.md ]; then
+            echo "::error::CHANGELOG.md has no '## [$VERSION]' section."
+            echo "::error::Add the section to the tagged commit and re-dispatch."
+            exit 1
+          fi
+          cat dist/RELEASE_NOTES.md
+
       - name: render homebrew formula
         env:
           REPO: ${{ github.repository }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
           HOST: ${{ github.server_url }}
         run: |
           set -euo pipefail
-          VERSION=${TAG#v}
           ARM_SHA=$(awk '/darwin-aarch64\.tar\.gz$/{print $1}' dist/SHA256SUMS)
           X64_SHA=$(awk '/darwin-x86_64\.tar\.gz$/{print $1}' dist/SHA256SUMS)
           LIN_SHA=$(awk '/linux-x86_64\.tar\.gz$/{print $1}' dist/SHA256SUMS)
+          # A missing matrix leg used to render `sha256 ""` and publish a
+          # formula that could never install. Refuse instead.
+          for pair in "darwin-aarch64:$ARM_SHA" "darwin-x86_64:$X64_SHA" "linux-x86_64:$LIN_SHA"; do
+            if [ -z "${pair#*:}" ]; then
+              echo "::error::no sha256 for ${pair%%:*} in dist/SHA256SUMS; refusing to render a formula with a hole in it."
+              exit 1
+            fi
+          done
           BASE="$HOST/$REPO/releases/download/$TAG"
           mkdir -p homebrew-out
           cat > homebrew-out/fj.rb <<RUBY
@@ -248,12 +419,11 @@ jobs:
             end
 
             def install
-              target = if OS.mac?
-                Hardware::CPU.arm? ? "darwin-aarch64" : "darwin-x86_64"
-              else
-                "linux-x86_64"
-              end
-              cd "fj-#{version}-#{target}"
+              # The tarball has a single top-level dir (fj-v<version>-<target>/)
+              # and Homebrew auto-cds into it before running install, so install
+              # directly. An explicit cd here fails twice over: the directory is
+              # already the working directory, and its name carries the tag's "v"
+              # that #{version} does not.
               bin.install "fj"
               pkgshare.install "README.md", "LICENSE", "CHANGELOG.md"
             end
@@ -273,9 +443,84 @@ jobs:
       - name: publish release
         uses: https://rasterhub.com/rasterstate/forgejo-release-action@v1
         with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          body_path: dist/RELEASE_NOTES.md
+          # A pattern that matches nothing used to pass quietly, which is how a
+          # release ships with fewer assets than it should.
+          fail_on_unmatched_files: true
           files: |
             dist/fj-*.tar.gz
             dist/SHA256SUMS
             homebrew-out/fj.rb
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Forgejo surfaces a pushed tag as a published release immediately, so a build
+  # that fails leaves a real-looking release with zero assets and nothing says
+  # so. v0.4.1 sat like that from 2026-07-22 until fj#232 noticed. Demote it and
+  # file an issue instead of failing silently.
+  guard:
+    needs: [prepare, build, publish]
+    if: always() && needs.prepare.result == 'success' && (needs.build.result != 'success' || needs.publish.result != 'success')
+    runs-on: docker
+    container: alpine:3.20
+    steps:
+      - name: install tools
+        run: apk add --no-cache curl jq
+
+      - name: demote the release and open an issue
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          REPO: ${{ github.repository }}
+          API: ${{ github.server_url }}/api/v1
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_number }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          PUBLISH_RESULT: ${{ needs.publish.result }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          auth="Authorization: token $TOKEN"
+
+          rel=$(curl -sf -H "$auth" "$API/repos/$REPO/releases/tags/$TAG" || echo '{}')
+          rel_id=$(echo "$rel" | jq -r '.id // empty')
+          assets=$(echo "$rel" | jq -r '(.assets // []) | length')
+
+          if [ -n "$rel_id" ] && [ "$assets" = "0" ]; then
+            echo "Release $TAG has no assets; marking it draft so it stops advertising itself."
+            body="The release job for \`$TAG\` failed and no artifacts were published. Do not install this version. See $RUN_URL."
+            curl -sf -X PATCH -H "$auth" -H 'Content-Type: application/json' \
+              -d "$(jq -n --arg b "$body" '{draft: true, prerelease: true, body: $b}')" \
+              "$API/repos/$REPO/releases/$rel_id" > /dev/null
+          else
+            echo "Release $TAG has $assets asset(s); leaving its state alone."
+          fi
+
+          title="release $TAG failed: no installable artifacts"
+          existing=$(curl -sf -H "$auth" "$API/repos/$REPO/issues?state=open&type=issues&limit=50" \
+            | jq -r --arg t "$title" '[.[] | select(.title == $t)] | length')
+          if [ "$existing" != "0" ]; then
+            echo "Issue already open for $TAG; not filing a duplicate."
+            exit 0
+          fi
+
+          # Built with printf rather than a heredoc on purpose. This job installs
+          # only curl and jq, so it runs under ash: `read -d ''` does not exist
+          # there, and an indented `EOF` does not close a `<<EOF` heredoc, which
+          # would hang or swallow the rest of the script. A job that only ever
+          # runs when the release has already failed is the worst place to
+          # depend on either.
+          issue=$(printf '%s\n' \
+            "The release workflow for \`$TAG\` did not publish artifacts." \
+            "" \
+            "- build: $BUILD_RESULT" \
+            "- publish: $PUBLISH_RESULT" \
+            "- run: $RUN_URL" \
+            "" \
+            "Until this is resolved, \`brew install fj\` serves whatever the tap" \
+            "last pinned, which is the previous release. After fixing the cause," \
+            "re-release without moving the tag: dispatch the release workflow from" \
+            "the default branch with \`tag: $TAG\`.")
+          curl -sf -X POST -H "$auth" -H 'Content-Type: application/json' \
+            -d "$(jq -n --arg t "$title" --arg b "$issue" '{title: $t, body: $b}')" \
+            "$API/repos/$REPO/issues" > /dev/null
+          echo "::error::release $TAG published no artifacts; filed an issue."
