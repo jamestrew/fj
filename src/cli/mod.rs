@@ -24,6 +24,7 @@ pub mod label;
 mod list;
 pub mod milestone;
 pub mod org;
+mod paging;
 pub mod pr;
 mod pr_args;
 pub(crate) mod pr_comment;
@@ -202,24 +203,14 @@ pub async fn run(cli: Cli) -> Result<()> {
     crate::client::set_debug(cli.debug);
     crate::output::set_color_choice(cli.color, config::no_color_enabled());
     crate::output::set_json_fields(cli.json_fields.as_deref());
-    // Page commands whose output can run long. Pass `cli.no_pager` through
-    // explicitly so we don't have to mutate the process environment to opt
-    // out, which would be a process-wide side effect and an unsafe set_var.
-    let _pager = match &cli.command {
-        // `run watch` streams live; paging would buffer it. Never page it.
-        Command::Run(rc) if matches!(rc.command, workflow_run::RunSub::Watch(_)) => None,
-        Command::Repo(_)
-        | Command::Issue(_)
-        | Command::Pr(_)
-        | Command::Release(_)
-        | Command::Search(_)
-        | Command::Status(_)
-        | Command::Label(_)
-        | Command::Milestone(_)
-        | Command::Tag(_)
-        | Command::Run(_)
-        | Command::Api(_) => crate::output::pager::maybe_start(cli.no_pager),
-        _ => None,
+    // Page only the commands whose output can genuinely run long (see
+    // `paging::should_page`). Pass `cli.no_pager` through explicitly so we
+    // don't have to mutate the process environment to opt out, which would be
+    // a process-wide side effect and an unsafe set_var.
+    let _pager = if paging::should_page(&cli.command) {
+        crate::output::pager::maybe_start(cli.no_pager)
+    } else {
+        None
     };
 
     // Run the command, racing it against Ctrl+C. On SIGINT we return an error
