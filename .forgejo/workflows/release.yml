@@ -27,7 +27,11 @@ jobs:
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
       version: ${{ steps.resolve.outputs.version }}
+      sha: ${{ steps.resolve.outputs.sha }}
     steps:
+      - name: install tools
+        run: apk add --no-cache curl jq
+
       - name: resolve tag
         id: resolve
         # RAW_TAG arrives through the environment and is never written into the
@@ -40,6 +44,9 @@ jobs:
         # point of the guard rather than a detail of it.
         env:
           RAW_TAG: ${{ inputs.tag || github.ref_name }}
+          REPO: ${{ github.repository }}
+          API: ${{ github.server_url }}/api/v1
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -eu
           reject() {
@@ -47,9 +54,9 @@ jobs:
             echo "::error::On workflow_dispatch, pass an existing release tag in the 'tag' input."
             exit 1
           }
-          # Allowlist first. The tag reaches `git checkout`, tarball names, the
-          # formula, and the release API; bounding the charset once is cheaper
-          # and more durable than auditing each of those.
+          # Allowlist the charset first, so nothing downstream has to reason
+          # about quoting. The name reaches tarball names, the formula, and the
+          # release API as well as git.
           case "$RAW_TAG" in
             *[!0-9A-Za-z.+-]*) reject 'contains a character outside [0-9A-Za-z.+-]' ;;
           esac
@@ -57,9 +64,34 @@ jobs:
             v[0-9]*.[0-9]*.[0-9]*) ;;
             *) reject 'not of the form v<major>.<minor>.<patch>' ;;
           esac
+
+          # The checks above describe the shape of a string. They do not pin a
+          # ref, and a shape is not an identity: a BRANCH named v1.2.3 satisfies
+          # every one of them, and version-shaped branches are already normal
+          # here (`release/v0.3.0`). Resolving a bare name would then build
+          # branch contents while `publish` attached them to a release tag of
+          # the same name. In a workflow whose entire purpose is recovering a
+          # broken tag release, publishing branch contents as a tag's artifacts
+          # is the specific outcome that would make it worse than useless.
+          #
+          # So require the name to exist in the TAGS collection, which a branch
+          # cannot satisfy, and carry the resolved commit forward. Every job
+          # then checks out `refs/tags/<tag>` and asserts it landed on this sha,
+          # which makes the guarantee structural instead of a pattern match and
+          # also fails closed if the tag moves mid-run.
+          tag_json=$(curl -sf -H "Authorization: token $TOKEN" \
+            "$API/repos/$REPO/tags/$RAW_TAG") \
+            || reject "no tag named '$RAW_TAG' in $REPO (a branch of that name does not count)"
+          SHA=$(printf '%s' "$tag_json" | jq -r '.commit.sha // empty')
+          [ "${#SHA}" -eq 40 ] || reject 'tags API returned no 40-character commit sha'
+          case "$SHA" in
+            *[!0-9a-f]*) reject 'tags API returned a non-hex commit sha' ;;
+          esac
+
           echo "tag=$RAW_TAG" >> "$GITHUB_OUTPUT"
           echo "version=${RAW_TAG#v}" >> "$GITHUB_OUTPUT"
-          echo "releasing $RAW_TAG"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "releasing $RAW_TAG at $SHA"
 
   build:
     needs: prepare
@@ -99,7 +131,23 @@ jobs:
       - name: checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.prepare.outputs.tag }}
+          # Fully qualified on purpose. A bare name lets git resolve a branch of
+          # the same name; `refs/tags/` cannot.
+          ref: refs/tags/${{ needs.prepare.outputs.tag }}
+
+      - name: assert the checkout is the tag `prepare` resolved
+        env:
+          EXPECTED_SHA: ${{ needs.prepare.outputs.sha }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -eu
+          ACTUAL=$(git rev-parse HEAD)
+          if [ "$ACTUAL" != "$EXPECTED_SHA" ]; then
+            echo "::error::$TAG resolved to $EXPECTED_SHA in prepare but HEAD is $ACTUAL."
+            echo "::error::The tag moved mid-run, or the ref resolved to something else. Refusing to build."
+            exit 1
+          fi
+          echo "building $TAG at $ACTUAL"
 
       # Installs rustup from rustup.rs when absent (the linux container has
       # none; macOS runners already have it) and adds the cross-compile target.
@@ -259,7 +307,23 @@ jobs:
       - name: checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.prepare.outputs.tag }}
+          # Fully qualified on purpose. A bare name lets git resolve a branch of
+          # the same name; `refs/tags/` cannot.
+          ref: refs/tags/${{ needs.prepare.outputs.tag }}
+
+      - name: assert the checkout is the tag `prepare` resolved
+        env:
+          EXPECTED_SHA: ${{ needs.prepare.outputs.sha }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -eu
+          ACTUAL=$(git rev-parse HEAD)
+          if [ "$ACTUAL" != "$EXPECTED_SHA" ]; then
+            echo "::error::$TAG resolved to $EXPECTED_SHA in prepare but HEAD is $ACTUAL."
+            echo "::error::The tag moved mid-run, or the ref resolved to something else. Refusing to build."
+            exit 1
+          fi
+          echo "building $TAG at $ACTUAL"
 
       - name: fetch artifacts
         uses: https://rasterhub.com/rasterstate/download-artifact-action@v1
