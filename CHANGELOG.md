@@ -6,6 +6,23 @@ All notable changes will be recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **The pager no longer swallows short, write, and machine output.** The
+  decision to page was made per top-level command family, so every subcommand
+  under `repo`, `issue`, `pr`, `release`, `label`, `milestone`, `tag`, `run`,
+  `search`, `status`, and `api` was piped into `less`, including one-line write
+  confirmations (`pr merge`, `issue close`, `repo star`, `tag create`, ...),
+  fixed status blocks (`fj status`, `fj pr status`), short reads (`tag view`,
+  `milestone view`, `repo topics`), and every `--json` and `--web` invocation.
+  Destructive commands that prompt for confirmation (`repo delete`,
+  `release delete`, `tag delete`) were prompting on a stdout already redirected
+  into the pager. Paging is now decided per subcommand by
+  `cli::paging::should_page`, which pages only genuinely long read-only views:
+  list and view commands, `pr diff` / `commits` / `files` / `checks`,
+  `run log`, `search`, and `fj api` GET dumps. `--no-pager`, `FJ_NO_PAGER`,
+  `FJ_PAGER` / `PAGER`, and the non-TTY check are unchanged.
+
 ## [0.4.1] - 2026-07-22
 
 ### Fixed

@@ -71,6 +71,14 @@ FJ_PAGER='less -R' fj repo list  # don't auto-quit
 FJ_PAGER=cat fj repo list        # disable paging
 ```
 
+Only long read-only output is paged in the first place: list and view
+commands, `pr diff` / `commits` / `files` / `checks`, `run log`, `search`,
+and `fj api` GET dumps. Status blocks (`fj status`, `fj pr status`),
+writes and their confirmations, short reads like `tag view`, and any
+`--json` or `--web` output always go straight to the terminal. If your
+`$PAGER` lacks `-F` it will still trap those, which is why fj's own
+default keeps it.
+
 ## `error: unexpected argument '-R' found`
 
 Some `fj repo` subcommands take a positional `repo` arg AND accept `-R`

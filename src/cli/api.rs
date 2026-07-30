@@ -136,7 +136,7 @@ fn error_body_text(value: &Value) -> Result<String> {
     output::json_text(value)
 }
 
-fn pick_method(args: &ApiArgs) -> Result<Method> {
+pub(super) fn pick_method(args: &ApiArgs) -> Result<Method> {
     if let Some(m) = &args.method {
         return Method::from_bytes(m.to_uppercase().as_bytes())
             .with_context(|| format!("invalid HTTP method '{m}'"));

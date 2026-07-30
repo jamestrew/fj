@@ -162,8 +162,21 @@ Limitations, surfaced to the user rather than hidden:
 
 ## Pager
 
-When `cli::run` dispatches a command whose output can run long (list,
-view, diff, search, status, api), it calls
+Two independent decisions gate the pager.
+
+`cli::paging::should_page(&command)` answers "should this command page at
+all?" It is a pure function of the parsed command tree, so it is unit
+tested without a terminal. It says yes only for genuinely long,
+read-only, human-facing list and view output: `repo`/`issue`/`pr`/
+`release`/`label`/`milestone`/`tag`/`run` list and view, `pr diff` /
+`commits` / `files` / `checks`, `run log`, `search`, and `fj api` GET
+dumps. It says no for status and summary blocks (`fj status`,
+`fj pr status`), for every write and its confirmation (which may also
+prompt on the terminal we would otherwise have redirected), for short
+single-value reads (`tag view`, `milestone view`, `repo topics`), and for
+any machine or browser mode (`--json`, `--web`, `api --silent`).
+
+When it says yes, `cli::run` calls
 `output::pager::maybe_start(force_disabled)`. That function:
 
 1. Bails if stdout isn't a TTY or `--no-pager` / `FJ_NO_PAGER` is set.
