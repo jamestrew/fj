@@ -81,8 +81,16 @@ branch with an explicit `--force-with-lease`, then the PR bases are re-synced
 targeting the branch below them). Without this the branches above are still
 parented on the pre-squash commit, their PRs show the landed diff a second
 time, and you have to repair the stack by hand. If the replay conflicts, the
-rebase is rolled back, nothing is force-pushed, no PR is retargeted, and ship
-stops with the commands to finish by hand.
+rebase is rolled back, nothing is force-pushed, and ship stops with the
+commands to finish by hand.
+
+The PR directly above the landed item still moves to the trunk even then. The
+item below it has merged, so the branch that PR was targeting is going away
+whatever happened to the replay, and a PR pointed at a deleted branch is a
+worse end state than the one `--no-restack` would have produced. Only the
+replay is rolled back; the retarget is not. If instead a force-push or a
+re-point fails partway through the remainder, the branches already pushed stay
+pushed and the error names what is left to finish by hand.
 
 A merge-commit land (the default) leaves the original commits reachable from
 the trunk, so nothing has to be replayed; only the next PR's base moves.
@@ -93,11 +101,21 @@ pre-flight that supports it: ship then merges through the API alone and leaves
 the branches above each squash-landed item for you to rebase and force-push.
 
 **Between merges**, once something has landed, ship re-checks the next item
-before merging it: still open, still mergeable, still approved, and still at a
-head fj put there. If the ground shifted (someone pushed to the branch, a
-review flipped, the merge stopped being clean) it stops cleanly, says what
-already landed, and leaves the rest for a later run. Re-running is safe:
-merged items are skipped.
+before merging it: still open, still mergeable, still approved, and still at
+the head fj most recently put there. If the ground shifted (someone pushed to
+the branch, a review flipped, the merge stopped being clean) it stops cleanly,
+says what already landed, and leaves the rest for a later run. Re-running is
+safe: merged items are skipped.
+
+Forgejo refreshes a PR's head and re-computes its mergeability asynchronously,
+so just after a restack it can still be serving the pre-restack head. That is a
+lagging read, not somebody else's push, and ship treats the two differently: a
+head fj itself superseded is re-read a few times with a short backoff, while a
+head fj never pushed stops the run immediately. Nothing on a stale record is
+judged in the meantime, because its `mergeable` was computed for the old head
+against the base that has since merged away. If the forge never catches up
+within the retry budget, ship stops rather than merging on a snapshot it knows
+is out of date.
 
 One deliberate exception: when ship has just force-pushed a branch itself, the
 CI it re-armed is not re-gated, because the tree was already approved and

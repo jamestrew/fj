@@ -1543,8 +1543,8 @@ fn observe_stack(
 /// there; `--force` skips that pass entirely, so this list is the only thing
 /// standing between a shifted head and a merge. A head fj could not read is
 /// therefore a refusal, not an empty expectation: an empty one makes
-/// `revalidate_blocker`'s head-moved guard vacuous, which is exactly how the
-/// bottom item could land before a stale lease was ever rejected.
+/// `revalidate`'s head-moved guard vacuous, which is exactly how the bottom
+/// item could land before a stale lease was ever rejected.
 fn forced_expected_heads(
     pending: &[usize],
     numbers: &[u64],
@@ -1644,10 +1644,51 @@ impl ExpectedHead {
         }
         self.restacked = true;
     }
+
+    /// The head fj most recently put on the branch, and the only one the forge
+    /// should be reporting once it has caught up.
+    fn current(&self) -> Option<&str> {
+        self.shas.last().map(String::as_str)
+    }
+
+    /// A sha fj put there but has since replaced. Distinct from a sha fj never
+    /// pushed: this one means the forge has not observed the force-push yet,
+    /// not that the ground shifted.
+    fn superseded(&self, sha: &str) -> bool {
+        self.shas.iter().any(|s| s == sha) && self.current() != Some(sha)
+    }
+}
+
+/// The verdict on an item re-checked just before its merge.
+///
+/// The two failure modes are deliberately separate: one is worth re-reading,
+/// the other never is.
+#[derive(Debug, PartialEq)]
+enum Revalidation {
+    /// Go ahead and merge.
+    Ready,
+    /// The forge is still serving a snapshot from before fj's force-push.
+    /// Nothing in that snapshot can be trusted, so re-read rather than judge
+    /// on it. Terminal if the forge never catches up.
+    Stale(String),
+    /// A hard stop. Re-reading will not change it.
+    Blocked(String),
+}
+
+impl Revalidation {
+    /// The reason to stop, if this verdict is terminal. A `Stale` verdict is
+    /// only terminal once the retry budget is spent, which is the caller's
+    /// business; by then "the forge never caught up" is itself a blocker.
+    fn blocker(self) -> Option<String> {
+        match self {
+            Revalidation::Ready => None,
+            Revalidation::Stale(r) | Revalidation::Blocked(r) => Some(r),
+        }
+    }
 }
 
 /// Re-validate an item just before merging it, once something below it has
-/// landed. Returns the blocking reason, or `None` to go ahead.
+/// landed.
 ///
 /// `gated` is false under `--force`, which drops the review/checks gate but
 /// never the structural checks: a PR that closed, stopped merging cleanly, or
@@ -1658,29 +1699,47 @@ impl ExpectedHead {
 /// and green before the replay, so the checks gate is not re-applied to it.
 /// (`--auto`, the planned follow-up, is what will let a stack wait for the
 /// re-armed checks instead.)
-fn revalidate_blocker(pr: &EntryPr, expected: &ExpectedHead, gated: bool) -> Option<String> {
-    if !expected.shas.is_empty() && !expected.shas.contains(&pr.head_sha) {
-        return Some(format!(
-            "its head moved to {} after the ship plan was made (expected {})",
-            short_sha(&pr.head_sha),
-            short_sha(expected.shas.last().expect("non-empty"))
-        ));
+///
+/// A head fj superseded with its own force-push is `Stale`, not `Ready`: every
+/// other field on that PR record was computed for the pre-restack head against
+/// the pre-retarget base, so judging `state`, `mergeable` or the checks off it
+/// would be reading a snapshot of a shape that no longer exists.
+fn revalidate(pr: &EntryPr, expected: &ExpectedHead, gated: bool) -> Revalidation {
+    if let Some(current) = expected.current() {
+        if pr.head_sha != current {
+            if expected.restacked && expected.superseded(&pr.head_sha) {
+                return Revalidation::Stale(format!(
+                    "the forge still reports its pre-restack head {}, not the {} fj \
+                     force-pushed onto the new trunk tip",
+                    short_sha(&pr.head_sha),
+                    short_sha(current)
+                ));
+            }
+            return Revalidation::Blocked(format!(
+                "its head moved to {} after the ship plan was made (expected {})",
+                short_sha(&pr.head_sha),
+                short_sha(current)
+            ));
+        }
     }
     if pr.state != "open" {
-        return Some(format!("its pull request is no longer open ({})", pr.state));
+        return Revalidation::Blocked(format!("its pull request is no longer open ({})", pr.state));
     }
     if pr.mergeable == Some(false) {
-        return Some("it no longer merges cleanly into its base".to_string());
+        return Revalidation::Blocked("it no longer merges cleanly into its base".to_string());
     }
     if !gated {
-        return None;
+        return Revalidation::Ready;
     }
     let checks = if expected.restacked {
         None
     } else {
         pr.checks.as_deref()
     };
-    shippable(&pr.review, checks, &pr.state).err()
+    match shippable(&pr.review, checks, &pr.state).err() {
+        Some(reason) => Revalidation::Blocked(reason),
+        None => Revalidation::Ready,
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1937,20 +1996,25 @@ async fn ship(args: ShipArgs, host: Option<&str>) -> Result<()> {
         // anything landed, and a merge can change what sits above it.
         if landed_this_run {
             let entry = expected.entry(i).or_default();
-            let mut blocker = None;
+            let mut verdict = Revalidation::Ready;
             for attempt in 0..REVALIDATE_ATTEMPTS {
                 let pr = enrich_pr(&ctx.client, &ctx.owner, &ctx.name, number)
                     .await
                     .ok_or_else(|| {
                         anyhow::anyhow!("could not re-fetch PR #{number} for '{branch}'")
                     })?;
-                blocker = revalidate_blocker(&pr, entry, !args.force);
-                if blocker.is_none() || !entry.restacked || attempt + 1 == REVALIDATE_ATTEMPTS {
+                verdict = revalidate(&pr, entry, !args.force);
+                // Only a stale read is worth re-reading. `Ready` merges, and a
+                // `Blocked` verdict is a real shift that waiting cannot undo.
+                if !matches!(verdict, Revalidation::Stale(_)) || attempt + 1 == REVALIDATE_ATTEMPTS
+                {
                     break;
                 }
                 tokio::time::sleep(REVALIDATE_BACKOFF).await;
             }
-            if let Some(reason) = blocker {
+            // A forge that never caught up is a blocker in its own right: fj
+            // would otherwise merge on a snapshot it knows is out of date.
+            if let Some(reason) = verdict.blocker() {
                 eprint!("{}", stopped_message(&branch, &reason, &merged));
                 bail!("'{branch}' (PR #{number}) is no longer ready to merge: {reason}");
             }
@@ -2796,7 +2860,7 @@ mod tests {
     /// `ship` reads PR heads from one unpaginated page of open PRs. A stack
     /// whose PRs sit outside that page left *both* head guards with nothing to
     /// check: the pre-flight's comparison fell through a catch-all, and
-    /// `--force` handed `revalidate_blocker` an empty expectation. A stale
+    /// `--force` handed `revalidate` an empty expectation. A stale
     /// bottom item therefore passed the pre-flight, squash-landed, and only
     /// then failed mid-restack on a rejected lease, with the bottom already
     /// merged and the stack half-repaired. Both guards now refuse first.
@@ -2882,8 +2946,12 @@ mod tests {
         let entry = expected.get(&0).expect("bottom item");
         assert_eq!(entry.shas, vec![git(&work, &["rev-parse", "u/s-1"])]);
         let moved = entry_pr("open", "approved", Some("success"), Some(true));
-        // `entry_pr`'s head is a sha fj never validated or pushed.
-        assert!(revalidate_blocker(&moved, entry, false)
+        // `entry_pr`'s head is a sha fj never validated or pushed, so this is
+        // Blocked rather than Stale: there was no force-push to lag behind.
+        let verdict = revalidate(&moved, entry, false);
+        assert!(matches!(verdict, Revalidation::Blocked(_)));
+        assert!(verdict
+            .blocker()
             .expect("a moved head must stop --force")
             .contains("its head moved to"));
     }
@@ -2955,7 +3023,7 @@ mod tests {
     fn revalidate_lets_an_unchanged_ready_item_through() {
         let pr = entry_pr("open", "approved", Some("success"), Some(true));
         let expected = ExpectedHead::validated("sha-validated");
-        assert_eq!(revalidate_blocker(&pr, &expected, true), None);
+        assert_eq!(revalidate(&pr, &expected, true), Revalidation::Ready);
     }
 
     #[test]
@@ -2963,10 +3031,12 @@ mod tests {
         // The item below landed and this one now conflicts with the trunk.
         let pr = entry_pr("open", "approved", Some("success"), Some(false));
         let expected = ExpectedHead::validated("sha-validated");
-        let reason = revalidate_blocker(&pr, &expected, true).expect("should stop");
+        let reason = revalidate(&pr, &expected, true)
+            .blocker()
+            .expect("should stop");
         assert!(reason.contains("no longer merges cleanly"));
         // Still enforced under --force: the merge would fail anyway.
-        assert!(revalidate_blocker(&pr, &expected, false).is_some());
+        assert!(revalidate(&pr, &expected, false).blocker().is_some());
     }
 
     #[test]
@@ -2974,7 +3044,9 @@ mod tests {
         let mut pr = entry_pr("open", "approved", Some("success"), Some(true));
         pr.head_sha = "sha-theirs".into();
         let expected = ExpectedHead::validated("sha-validated");
-        let reason = revalidate_blocker(&pr, &expected, true).expect("should stop");
+        let reason = revalidate(&pr, &expected, true)
+            .blocker()
+            .expect("should stop");
         assert!(reason.contains("its head moved to sha-thei"));
     }
 
@@ -2982,7 +3054,9 @@ mod tests {
     fn revalidate_stops_when_the_pr_is_no_longer_open() {
         let pr = entry_pr("closed", "approved", Some("success"), None);
         let expected = ExpectedHead::validated("sha-validated");
-        let reason = revalidate_blocker(&pr, &expected, true).expect("should stop");
+        let reason = revalidate(&pr, &expected, true)
+            .blocker()
+            .expect("should stop");
         assert!(reason.contains("no longer open (closed)"));
     }
 
@@ -2990,15 +3064,17 @@ mod tests {
     fn revalidate_stops_when_the_review_or_checks_regressed() {
         let expected = ExpectedHead::validated("sha-validated");
         let pr = entry_pr("open", "changes_requested", Some("success"), Some(true));
-        assert!(revalidate_blocker(&pr, &expected, true)
+        assert!(revalidate(&pr, &expected, true)
+            .blocker()
             .expect("should stop")
             .contains("changes_requested"));
         let pr = entry_pr("open", "approved", Some("failure"), Some(true));
-        assert!(revalidate_blocker(&pr, &expected, true)
+        assert!(revalidate(&pr, &expected, true)
+            .blocker()
             .expect("should stop")
             .contains("checks not green"));
         // --force drops the review/checks gate but keeps the rest.
-        assert_eq!(revalidate_blocker(&pr, &expected, false), None);
+        assert_eq!(revalidate(&pr, &expected, false), Revalidation::Ready);
     }
 
     #[test]
@@ -3010,19 +3086,111 @@ mod tests {
         // doing, not the ground shifting.
         let mut pr = entry_pr("open", "approved", Some("pending"), Some(true));
         pr.head_sha = "sha-restacked".into();
-        assert_eq!(revalidate_blocker(&pr, &expected, true), None);
+        assert_eq!(revalidate(&pr, &expected, true), Revalidation::Ready);
         // The review gate still applies to the restacked head.
         pr.review = "changes_requested".into();
-        assert!(revalidate_blocker(&pr, &expected, true).is_some());
+        assert!(revalidate(&pr, &expected, true).blocker().is_some());
         // A head fj did not push is still a shift, restack or no restack.
         let mut theirs = entry_pr("open", "approved", Some("pending"), Some(true));
         theirs.head_sha = "sha-theirs".into();
-        assert!(revalidate_blocker(&theirs, &expected, true).is_some());
-        // The pre-restack head still counts as fj's own: Forgejo can lag a
-        // moment behind the force-push.
+        assert!(revalidate(&theirs, &expected, true).blocker().is_some());
+    }
+
+    #[test]
+    fn revalidate_treats_a_superseded_head_as_a_lagging_forge_not_a_pass() {
+        // The regression this guards: the pre-restack sha stays in the
+        // acceptance set, so `contains` used to return Ready and the retry
+        // loop broke on the first read. A stale read must be Stale, which is
+        // what makes the caller re-read instead of merging.
+        let mut expected = ExpectedHead::validated("sha-validated");
+        expected.pushed("sha-restacked");
         let mut lagging = entry_pr("open", "approved", Some("success"), Some(true));
         lagging.head_sha = "sha-validated".into();
-        assert_eq!(revalidate_blocker(&lagging, &expected, true), None);
+        let verdict = revalidate(&lagging, &expected, true);
+        assert!(
+            matches!(verdict, Revalidation::Stale(_)),
+            "a superseded head is the forge lagging, not a ready item: {verdict:?}"
+        );
+        // Nothing on that snapshot is judged: the item is not merged, and the
+        // reason names both shas so the terminal message is actionable.
+        let reason = verdict
+            .blocker()
+            .expect("stale is terminal once retries run out");
+        assert!(reason.contains("pre-restack head sha-vali"));
+        assert!(reason.contains("sha-rest"));
+    }
+
+    #[test]
+    fn revalidate_does_not_treat_a_stale_read_as_stale_without_a_restack() {
+        // No force-push happened, so there is exactly one expected sha and a
+        // mismatch can only be somebody else. This is what keeps the common
+        // path free of the retry latency.
+        let expected = ExpectedHead::validated("sha-validated");
+        let mut pr = entry_pr("open", "approved", Some("success"), Some(true));
+        pr.head_sha = "sha-theirs".into();
+        assert!(matches!(
+            revalidate(&pr, &expected, true),
+            Revalidation::Blocked(_)
+        ));
+        // And the matching head is Ready with no retry.
+        let ready = entry_pr("open", "approved", Some("success"), Some(true));
+        assert_eq!(revalidate(&ready, &expected, true), Revalidation::Ready);
+    }
+
+    #[test]
+    fn revalidate_judges_nothing_off_a_stale_snapshot() {
+        // Every other field on a pre-restack record was computed for the old
+        // head against the base that has since merged away. A stale
+        // `mergeable: true` must not be read as "still merges cleanly".
+        let mut expected = ExpectedHead::validated("sha-validated");
+        expected.pushed("sha-restacked");
+        let mut lagging = entry_pr("open", "approved", Some("success"), Some(true));
+        lagging.head_sha = "sha-validated".into();
+        assert!(matches!(
+            revalidate(&lagging, &expected, true),
+            Revalidation::Stale(_)
+        ));
+        // Same verdict under --force: this is a structural check, not a gate.
+        assert!(matches!(
+            revalidate(&lagging, &expected, false),
+            Revalidation::Stale(_)
+        ));
+    }
+
+    #[test]
+    fn revalidate_stale_resolves_to_ready_once_the_forge_catches_up() {
+        // The retry budget exists for exactly this: the same PR, read again.
+        let mut expected = ExpectedHead::validated("sha-validated");
+        expected.pushed("sha-restacked");
+        let mut pr = entry_pr("open", "approved", Some("pending"), Some(true));
+        pr.head_sha = "sha-validated".into();
+        assert!(matches!(
+            revalidate(&pr, &expected, true),
+            Revalidation::Stale(_)
+        ));
+        pr.head_sha = "sha-restacked".into();
+        assert_eq!(revalidate(&pr, &expected, true), Revalidation::Ready);
+    }
+
+    #[test]
+    fn revalidate_lag_tolerance_does_not_compound_down_the_stack() {
+        // Each land restacks again, so an entry deep in the stack accumulates
+        // several shas fj pushed. Only the newest may pass; every earlier one
+        // is the forge lagging, however many rounds ago fj pushed it.
+        let mut expected = ExpectedHead::validated("sha-validated");
+        expected.pushed("sha-restack-1");
+        expected.pushed("sha-restack-2");
+        for stale in ["sha-validated", "sha-restack-1"] {
+            let mut pr = entry_pr("open", "approved", Some("success"), Some(true));
+            pr.head_sha = stale.into();
+            assert!(
+                matches!(revalidate(&pr, &expected, true), Revalidation::Stale(_)),
+                "{stale} is superseded and must not pass"
+            );
+        }
+        let mut current = entry_pr("open", "approved", Some("success"), Some(true));
+        current.head_sha = "sha-restack-2".into();
+        assert_eq!(revalidate(&current, &expected, true), Revalidation::Ready);
     }
 
     #[test]
@@ -3034,9 +3202,9 @@ mod tests {
         // the gate stays the floor if anything else ever constructs one.
         let expected = ExpectedHead::validated("");
         let pr = entry_pr("open", "approved", Some("success"), Some(true));
-        assert_eq!(revalidate_blocker(&pr, &expected, true), None);
+        assert_eq!(revalidate(&pr, &expected, true), Revalidation::Ready);
         let pr = entry_pr("open", "none", Some("success"), Some(true));
-        assert!(revalidate_blocker(&pr, &expected, true).is_some());
+        assert!(revalidate(&pr, &expected, true).blocker().is_some());
     }
 
     #[test]
@@ -3146,6 +3314,11 @@ mod tests {
 
     /// A replay that can't be applied rolls back and touches nothing: no moved
     /// refs, no force-push, no retargeted PRs.
+    ///
+    /// Scoped to `restack_onto_trunk` itself. Ship's caller still re-points the
+    /// PR directly above the landed item at the trunk afterwards, because that
+    /// item's base branch has merged away regardless of the replay; see the
+    /// `Err` arm in `ship`.
     #[tokio::test]
     async fn restack_onto_trunk_rolls_back_and_retargets_nothing_on_conflict() {
         use crate::gitfixture::{
