@@ -38,6 +38,27 @@ async fn auth_header_sent() {
 }
 
 #[tokio::test]
+async fn anonymous_client_omits_auth_header() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/version"))
+        .and(|req: &wiremock::Request| !req.headers.contains_key("authorization"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "version": "15.0.6+gitea-1.22.0"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let base = Url::parse(&format!("{}/api/v1/", server.uri())).expect("base url");
+    let c = Client::anonymous_for_base_url(base).expect("anonymous client");
+    let res: serde_json::Value = c
+        .json(Method::GET, "/api/v1/version", &[], None::<&()>)
+        .await
+        .expect("ok");
+    assert_eq!(res["version"], "15.0.6+gitea-1.22.0");
+}
+
+#[tokio::test]
 async fn retries_on_5xx_and_succeeds() {
     let server = MockServer::start().await;
     // First two attempts: 503. Third: 200.
@@ -675,8 +696,9 @@ async fn fjord_client_routes_through_gateway_with_bearer() {
         .mount(&server)
         .await;
 
-    let c = Client::for_base_url_with_scheme(base, "jwt-token".into(), AuthScheme::FjordBearer)
-        .expect("client");
+    let c =
+        Client::for_base_url_with_scheme(base, Some("jwt-token".into()), AuthScheme::FjordBearer)
+            .expect("client");
     // Existing call sites use `/api/v1/<path>`; verify that survives the
     // gateway re-base. The Client's `url()` strips the `/api/v1/` prefix
     // before joining against the base, so the result is the gateway-routed
@@ -1046,6 +1068,24 @@ async fn run_logs_falls_back_to_loki_task_container_logs() {
     let loki = MockServer::start().await;
 
     Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/runs"))
+        .and(query_param("page", "1"))
+        .and(query_param("limit", "50"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "workflow_runs": [{ "id": 5600, "index_in_repo": 56, "status": "failure" }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/runs/5600/jobs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "id": 9001, "name": "build", "status": "failure" }
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
         .and(path("/api/v1/repos/o/r/actions/tasks"))
         .and(query_param("run", "56"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"tasks": [
@@ -1061,7 +1101,7 @@ async fn run_logs_falls_back_to_loki_task_container_logs() {
         .mount(&server)
         .await;
     Mock::given(method("GET"))
-        .and(path("/api/v1/repos/o/r/actions/runs/56/jobs/0/logs"))
+        .and(path("/api/v1/repos/o/r/actions/jobs/9001/logs"))
         .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
         .expect(1)
         .mount(&server)
@@ -1112,6 +1152,7 @@ async fn run_logs_falls_back_to_loki_task_container_logs() {
     assert_eq!(logs.source, "loki");
     assert_eq!(logs.jobs.len(), 1);
     assert_eq!(logs.jobs[0].task_id, Some(123));
+    assert_eq!(logs.jobs[0].job_id, Some(9001));
     assert_eq!(logs.jobs[0].name, "build");
     assert_eq!(logs.jobs[0].lines[0].message, "first line");
     assert_eq!(logs.jobs[0].lines[1].message, "second line");
@@ -1122,6 +1163,25 @@ async fn run_logs_uses_selected_task_id_for_loki_query() {
     let server = MockServer::start().await;
     let loki = MockServer::start().await;
 
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/runs"))
+        .and(query_param("page", "1"))
+        .and(query_param("limit", "50"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "workflow_runs": [{ "id": 5700, "index_in_repo": 57, "status": "failure" }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/runs/5700/jobs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "id": 9101, "name": "lint", "status": "success" },
+            { "id": 9102, "name": "test", "status": "failure" }
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
     Mock::given(method("GET"))
         .and(path("/api/v1/repos/o/r/actions/tasks"))
         .and(query_param("run", "57"))
@@ -1145,7 +1205,7 @@ async fn run_logs_uses_selected_task_id_for_loki_query() {
         .mount(&server)
         .await;
     Mock::given(method("GET"))
-        .and(path("/api/v1/repos/o/r/actions/runs/57/jobs/1/logs"))
+        .and(path("/api/v1/repos/o/r/actions/jobs/9102/logs"))
         .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
         .expect(1)
         .mount(&server)
@@ -1184,7 +1244,162 @@ async fn run_logs_uses_selected_task_id_for_loki_query() {
     assert_eq!(logs.jobs.len(), 1);
     assert_eq!(logs.jobs[0].job, 1);
     assert_eq!(logs.jobs[0].task_id, Some(456));
+    assert_eq!(logs.jobs[0].job_id, Some(9102));
     assert_eq!(logs.jobs[0].lines[0].stream.as_deref(), Some("stderr"));
+}
+
+#[tokio::test]
+async fn run_logs_reads_forgejo_api_job_logs_by_job_id() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/runs"))
+        .and(query_param("page", "1"))
+        .and(query_param("limit", "50"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "workflow_runs": [{ "id": 1200, "index_in_repo": 12, "status": "failure" }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/runs/1200/jobs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "id": 101, "name": "build", "status": "success", "attempt": 2 },
+            { "id": 102, "name": "test", "status": "failure", "task_id": 999 }
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/tasks"))
+        .and(query_param("run", "12"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/jobs/102/logs"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("line one\nline two\n"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let c = client_for(&server).await;
+    let logs = crate::api::workflow::fetch_run_logs(&c, "o", "r", 12, Some(1), None, false)
+        .await
+        .expect("logs");
+    assert_eq!(logs.source, "forgejo-api");
+    assert_eq!(logs.jobs.len(), 1);
+    assert_eq!(logs.jobs[0].job, 1);
+    assert_eq!(logs.jobs[0].job_id, Some(102));
+    assert_eq!(logs.jobs[0].task_id, None);
+    assert_eq!(logs.jobs[0].name, "test");
+    assert_eq!(logs.jobs[0].status, "failure");
+    assert_eq!(logs.jobs[0].lines[0].message, "line one");
+}
+
+#[tokio::test]
+async fn run_logs_resolves_run_number_beyond_first_page() {
+    let server = MockServer::start().await;
+    let next_url = format!(
+        "{}/api/v1/repos/o/r/actions/runs?page=2&limit=50",
+        server.uri()
+    );
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/runs"))
+        .and(query_param("page", "1"))
+        .and(query_param("limit", "50"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Link", format!(r#"<{next_url}>; rel="next""#).as_str())
+                .set_body_json(json!({
+                    "workflow_runs": [{ "id": 1000, "index_in_repo": 100, "status": "success" }]
+                })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/runs"))
+        .and(query_param("page", "2"))
+        .and(query_param("limit", "50"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "workflow_runs": [{ "id": 5100, "index_in_repo": 51, "status": "success" }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/runs/5100/jobs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "id": 51001, "name": "verify", "status": "success" }
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/tasks"))
+        .and(query_param("run", "51"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/jobs/51001/logs"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("late-page log\n"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let c = client_for(&server).await;
+    let logs = crate::api::workflow::fetch_run_logs(&c, "o", "r", 51, None, None, false)
+        .await
+        .expect("logs");
+    assert_eq!(logs.jobs.len(), 1);
+    assert_eq!(logs.jobs[0].job_id, Some(51001));
+    assert_eq!(logs.jobs[0].lines[0].message, "late-page log");
+}
+
+#[tokio::test]
+async fn run_logs_jobs_api_404_names_forgejo_version() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/runs"))
+        .and(query_param("page", "1"))
+        .and(query_param("limit", "50"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "workflow_runs": [{ "id": 1200, "index_in_repo": 12, "status": "failure" }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/runs/1200/jobs"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("Not found."))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/version"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "version": "15.0.6+gitea-1.22.0"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let c = client_for(&server).await;
+    let err = crate::api::workflow::fetch_run_logs(&c, "o", "r", 12, None, None, false)
+        .await
+        .expect_err("LTS should get a capability error");
+    let msg = err.to_string();
+    assert!(msg.contains("run #12"), "got: {msg}");
+    assert!(msg.contains("15.0.6+gitea-1.22.0"), "got: {msg}");
+    assert!(msg.contains("does not expose"), "got: {msg}");
+    assert!(msg.contains("rasterstate/fj#103"), "got: {msg}");
 }
 
 #[tokio::test]
@@ -5512,7 +5727,8 @@ async fn pat_host_401_is_never_refreshed() {
 
     let base = Url::parse(&format!("{}/api/v1/", server.uri())).unwrap();
     let c =
-        Client::for_base_url_with_scheme(base, "pat-token".into(), super::AuthScheme::Pat).unwrap();
+        Client::for_base_url_with_scheme(base, Some("pat-token".into()), super::AuthScheme::Pat)
+            .unwrap();
 
     let err = c
         .json::<serde_json::Value, _>(Method::GET, "/api/v1/user", &[], None::<&()>)

@@ -55,7 +55,7 @@ pub(crate) fn build_probe_client(host: &str, cfg: &Host, token: &str) -> Result<
     let resolved = ResolvedHost {
         name: host.to_string(),
         host: cfg.clone(),
-        token: token.to_string(),
+        token: Some(token.to_string()),
     };
     Client::new(resolved)
 }
