@@ -12,28 +12,29 @@ use crate::config::hosts::{api_base_path, AuthKind, Host, Hosts};
 pub struct ResolvedHost {
     pub name: String,
     pub host: Host,
-    pub token: String,
+    pub token: Option<String>,
 }
 
 /// Look up the host config and token for the host the user is targeting.
 pub fn resolve(host_flag: Option<&str>) -> Result<ResolvedHost> {
     let hosts = Hosts::load()?;
-    let name = hosts.resolve_host(host_flag)?.to_string();
-    let host_cfg = hosts
-        .hosts
-        .get(&name)
-        .cloned()
-        .ok_or_else(|| anyhow!("host '{name}' not configured"))?;
+    let (name, host_cfg) = if let Some(name) = host_flag {
+        let host_cfg = hosts.hosts.get(name).cloned().unwrap_or_else(|| Host {
+            git_protocol: "https".into(),
+            ..Default::default()
+        });
+        (name.to_string(), host_cfg)
+    } else {
+        let name = hosts.resolve_host(None)?.to_string();
+        let host_cfg = hosts
+            .hosts
+            .get(&name)
+            .cloned()
+            .ok_or_else(|| anyhow!("host '{name}' not configured"))?;
+        (name, host_cfg)
+    };
     let token = match host_cfg.auth_kind {
-        AuthKind::Pat => match auth::env_token() {
-            Some(token) => token,
-            None => auth::load_token(&name)?.ok_or_else(|| {
-                anyhow!(
-                    "no token stored for host '{name}'. Run `fj auth login --host {name}` \
-                     or set FJ_TOKEN for this process."
-                )
-            })?,
-        },
+        AuthKind::Pat => auth::env_token().or(auth::load_token(&name)?),
         AuthKind::FjordAccount => {
             let fa = host_cfg.fjord_account.as_ref().ok_or_else(|| {
                 anyhow!(
@@ -41,12 +42,12 @@ pub fn resolve(host_flag: Option<&str>) -> Result<ResolvedHost> {
                      remove and re-run `fj auth login --fjord`"
                 )
             })?;
-            auth::load_fjord_bearer(&fa.platform_url)?.ok_or_else(|| {
+            Some(auth::load_fjord_bearer(&fa.platform_url)?.ok_or_else(|| {
                 anyhow!(
                     "no Fjord Account session stored for '{}'. Run `fj auth login --fjord` again.",
                     fa.platform_url
                 )
-            })?
+            })?)
         }
     };
     Ok(ResolvedHost {

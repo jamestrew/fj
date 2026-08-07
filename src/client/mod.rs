@@ -83,7 +83,7 @@ pub struct Client {
     /// The outgoing bearer/PAT. Behind a lock (shared across clones) so the
     /// silent-refresh path can swap in a freshly minted Fjord access token on a
     /// 401 and have every later request, and every clone, pick it up.
-    token: Arc<RwLock<String>>,
+    token: Arc<RwLock<Option<String>>>,
     auth_scheme: AuthScheme,
     /// The fjord-platform origin for a Fjord-Account host, used to drive the
     /// silent OIDC refresh on a 401. `None` for PAT hosts (their tokens are not
@@ -151,14 +151,19 @@ impl Client {
     /// PAT-style auth; use `for_base_url_with_scheme` to override.
     #[cfg(test)]
     pub fn for_base_url(base_url: Url, token: String) -> Result<Self> {
-        Self::for_base_url_with_scheme(base_url, token, AuthScheme::Pat)
+        Self::for_base_url_with_scheme(base_url, Some(token), AuthScheme::Pat)
+    }
+
+    #[cfg(test)]
+    pub fn anonymous_for_base_url(base_url: Url) -> Result<Self> {
+        Self::for_base_url_with_scheme(base_url, None, AuthScheme::Pat)
     }
 
     /// Like `for_base_url` but lets tests pick the auth scheme.
     #[cfg(test)]
     pub fn for_base_url_with_scheme(
         base_url: Url,
-        token: String,
+        token: Option<String>,
         auth_scheme: AuthScheme,
     ) -> Result<Self> {
         let host = base_url.host_str().map(str::to_string).unwrap_or_default();
@@ -188,7 +193,8 @@ impl Client {
         token: String,
         refresh_hook: RefreshHook,
     ) -> Result<Self> {
-        let mut client = Self::for_base_url_with_scheme(base_url, token, AuthScheme::FjordBearer)?;
+        let mut client =
+            Self::for_base_url_with_scheme(base_url, Some(token), AuthScheme::FjordBearer)?;
         client.refresh_hook = Some(refresh_hook);
         Ok(client)
     }
@@ -211,7 +217,7 @@ impl Client {
 
     /// A snapshot of the current bearer/PAT. Cloned out from behind the lock so
     /// callers never hold the guard across an await.
-    fn current_token(&self) -> String {
+    fn current_token(&self) -> Option<String> {
         self.token
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -224,7 +230,7 @@ impl Client {
         *self
             .token
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = token;
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(token);
     }
 
     /// Which `Authorization` shape this client emits. Used by call sites
@@ -239,13 +245,15 @@ impl Client {
     /// scheme: `token <pat>` for PAT-mode hosts, `Bearer <jwt>` for
     /// Fjord-Account-mode hosts. Returns an `HeaderValue` so the caller
     /// can plug it into any `HeaderMap` directly.
-    pub fn auth_header_value(&self) -> Result<HeaderValue> {
-        let token = self.current_token();
+    pub fn auth_header_value(&self) -> Result<Option<HeaderValue>> {
+        let Some(token) = self.current_token() else {
+            return Ok(None);
+        };
         let raw = match self.auth_scheme {
             AuthScheme::Pat => format!("token {token}"),
             AuthScheme::FjordBearer => format!("Bearer {token}"),
         };
-        HeaderValue::from_str(&raw).map_err(|_| {
+        HeaderValue::from_str(&raw).map(Some).map_err(|_| {
             anyhow!(
                 "stored credential for host '{}' contains characters that can't appear in an HTTP header. Re-run `fj auth login` with a clean token.",
                 self.host
@@ -271,7 +279,9 @@ impl Client {
 
     fn auth_headers(&self) -> Result<HeaderMap> {
         let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, self.auth_header_value()?);
+        if let Some(auth) = self.auth_header_value()? {
+            headers.insert(AUTHORIZATION, auth);
+        }
         headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
         headers.insert(
             USER_AGENT,
@@ -480,7 +490,9 @@ impl Client {
         let Some(platform_url) = self.platform_url.as_deref() else {
             return Ok(None);
         };
-        let current = self.current_token();
+        let Some(current) = self.current_token() else {
+            return Ok(None);
+        };
         if fjord::oidc::valid_refresh_token(platform_url, &current)?.is_none() {
             return Ok(None);
         }

@@ -366,7 +366,10 @@ pub async fn upload_asset(
         .mime_str("application/octet-stream")?;
     let form = reqwest::multipart::Form::new().part("attachment", part);
     let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert(reqwest::header::AUTHORIZATION, client.auth_header_value()?);
+    let auth = client
+        .auth_header_value()?
+        .ok_or_else(|| anyhow::anyhow!("issue asset upload requires an authenticated host"))?;
+    headers.insert(reqwest::header::AUTHORIZATION, auth);
     let res = client
         .http()
         .post(url)

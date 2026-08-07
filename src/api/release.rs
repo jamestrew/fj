@@ -165,7 +165,10 @@ pub async fn upload_asset(
     // Pull the Authorization header straight from the client so it picks
     // up the right scheme (PAT vs Fjord bearer) without this call site
     // needing to know which one is active.
-    headers.insert(reqwest::header::AUTHORIZATION, client.auth_header_value()?);
+    let auth = client
+        .auth_header_value()?
+        .ok_or_else(|| anyhow::anyhow!("release asset upload requires an authenticated host"))?;
+    headers.insert(reqwest::header::AUTHORIZATION, auth);
     let res = client
         .http()
         .post(url)
