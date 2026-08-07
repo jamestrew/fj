@@ -721,6 +721,102 @@ fn clean_loki_line(line: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    fn test_client() -> Client {
+        Client::anonymous_for_base_url(Url::parse("http://127.0.0.1/api/v1/").unwrap()).unwrap()
+    }
+
+    #[derive(Clone)]
+    struct FakeLogSource {
+        available: bool,
+        mode: FakeMode,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[derive(Clone)]
+    enum FakeMode {
+        Ok(&'static str),
+        Unavailable(&'static str),
+        Other(&'static str),
+    }
+
+    impl FakeLogSource {
+        fn ok(source: &'static str) -> Self {
+            Self {
+                available: true,
+                mode: FakeMode::Ok(source),
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn unavailable(message: &'static str) -> Self {
+            Self {
+                available: true,
+                mode: FakeMode::Unavailable(message),
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn disabled() -> Self {
+            Self {
+                available: false,
+                mode: FakeMode::Ok("disabled"),
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn other(message: &'static str) -> Self {
+            Self {
+                available: true,
+                mode: FakeMode::Other(message),
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl LogSource for FakeLogSource {
+        fn available(&self) -> bool {
+            self.available
+        }
+
+        fn fetch<'a>(
+            &'a self,
+            req: LogRequest<'a>,
+        ) -> Pin<Box<dyn Future<Output = LogSourceResult<JobLogs>> + Send + 'a>> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                match self.mode {
+                    FakeMode::Ok(source) => Ok(JobLogs {
+                        job: req.job,
+                        task_id: req.task.and_then(|task| task.id_u64().ok()),
+                        job_id: req.api_job.map(|job| job.id),
+                        name: source.into(),
+                        status: req
+                            .api_job
+                            .map(|job| job.status.clone())
+                            .unwrap_or_default(),
+                        lines: vec![LogLine {
+                            timestamp: None,
+                            stream: None,
+                            message: format!("{source}-{}", req.job),
+                        }],
+                    }),
+                    FakeMode::Unavailable(message) => {
+                        Err(LogSourceError::Unavailable(message.into()))
+                    }
+                    FakeMode::Other(message) => Err(LogSourceError::Other(anyhow!(message))),
+                }
+            })
+        }
+    }
 
     #[test]
     fn parses_array_task_response() {
@@ -730,6 +826,78 @@ mod tests {
         .unwrap();
         assert_eq!(tasks[0].id_u64().unwrap(), 123);
         assert_eq!(tasks[0].display_name(0), "build");
+    }
+
+    #[test]
+    fn parses_task_response_envelope_variants_and_fallback_fields() {
+        for key in ["workflow_tasks", "jobs"] {
+            let tasks = parse_workflow_tasks(serde_json::json!({
+                key: [{
+                    "id": 42,
+                    "display_title": "fallback title",
+                    "conclusion": "cancelled",
+                    "created": "2026-08-07T05:00:00Z",
+                    "updated": "2026-08-07T05:05:00Z"
+                }]
+            }))
+            .unwrap();
+            assert_eq!(tasks[0].id, "42");
+            assert_eq!(tasks[0].display_name(0), "fallback title");
+            assert_eq!(tasks[0].display_status(), "cancelled");
+            assert!(tasks[0].created_at.is_some());
+            assert!(tasks[0].updated_at.is_some());
+        }
+    }
+
+    #[test]
+    fn parse_task_response_rejects_unknown_shape_and_bad_rows() {
+        let err = parse_workflow_tasks(serde_json::json!({"unexpected": []})).unwrap_err();
+        assert!(err.to_string().contains("unexpected workflow task list"));
+
+        let err = parse_workflow_tasks(serde_json::json!([{"id": []}])).unwrap_err();
+        assert!(err.to_string().contains("decoding workflow task"));
+    }
+
+    #[test]
+    fn run_logs_status_prefers_failure_then_cancelled_then_timeout() {
+        let logs = RunLogs {
+            source: "test".into(),
+            jobs: vec![job("success"), job("failure"), job("cancelled")],
+        };
+        assert_eq!(logs.status(), Some("failure"));
+
+        let logs = RunLogs {
+            source: "test".into(),
+            jobs: vec![job("success"), job("cancelled"), job("timed_out")],
+        };
+        assert_eq!(logs.status(), Some("cancelled"));
+
+        let logs = RunLogs {
+            source: "test".into(),
+            jobs: vec![job("success"), job("timed_out")],
+        };
+        assert_eq!(logs.status(), Some("timed_out"));
+    }
+
+    #[test]
+    fn run_logs_status_handles_all_success_and_unknown() {
+        let logs = RunLogs {
+            source: "test".into(),
+            jobs: vec![job("success"), job("skipped")],
+        };
+        assert_eq!(logs.status(), Some("success"));
+
+        let logs = RunLogs {
+            source: "test".into(),
+            jobs: vec![job("queued"), job("")],
+        };
+        assert_eq!(logs.status(), Some("queued"));
+
+        let logs = RunLogs {
+            source: "test".into(),
+            jobs: Vec::new(),
+        };
+        assert_eq!(logs.status(), Some("success"));
     }
 
     #[test]
@@ -747,8 +915,309 @@ mod tests {
     }
 
     #[test]
+    fn selected_tasks_reports_index_errors_and_keeps_all_when_not_failed_only() {
+        let tasks = parse_workflow_tasks(serde_json::json!({"tasks": [
+            {"id": 1, "name": "a", "status": "success"},
+            {"id": 2, "name": "b", "status": "failure"}
+        ]}))
+        .unwrap();
+        let selected = selected_tasks(&tasks, None, false).unwrap();
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected_tasks(&tasks, Some(1), true).unwrap()[0].1.id, "2");
+
+        let err = selected_tasks(&tasks, Some(9), false).unwrap_err();
+        assert!(err.to_string().contains("out of range"));
+    }
+
+    #[test]
+    fn selected_jobs_filters_by_failure_and_reports_index_errors() {
+        let jobs = vec![
+            WorkflowRunJob {
+                id: 1,
+                attempt: 0,
+                name: "build".into(),
+                status: "success".into(),
+            },
+            WorkflowRunJob {
+                id: 2,
+                attempt: 3,
+                name: String::new(),
+                status: "failure".into(),
+            },
+            WorkflowRunJob {
+                id: 3,
+                attempt: 0,
+                name: "lint".into(),
+                status: "skipped".into(),
+            },
+        ];
+
+        let selected = selected_jobs(&jobs, None, true).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].0, 1);
+        assert_eq!(selected[0].1.display_name(1), "job 1");
+        assert_eq!(selected_jobs(&jobs, Some(0), true).unwrap()[0].1.id, 1);
+
+        let err = selected_jobs(&jobs, Some(7), false).unwrap_err();
+        assert!(err.to_string().contains("out of range"));
+    }
+
+    #[test]
+    fn task_window_uses_recorded_bounds_with_padding() {
+        let task = parse_workflow_tasks(serde_json::json!([{
+            "id": 1,
+            "started": "2026-08-07T05:00:00Z",
+            "stopped": "2026-08-07T05:05:00Z"
+        }]))
+        .unwrap()
+        .remove(0);
+
+        let (start, end) = task_window(&task);
+        assert_eq!(start, "1786078200000000000");
+        assert_eq!(end, "1786079700000000000");
+    }
+
+    #[test]
+    fn loki_response_flattens_streams_and_cleans_lines() {
+        let response: LokiResponse = serde_json::from_value(serde_json::json!({
+            "data": {
+                "result": [
+                    {
+                        "stream": {"stream": "stderr"},
+                        "values": [["10", "{\"log\":\"err\\n\"}"]]
+                    },
+                    {
+                        "stream": {},
+                        "values": [["11", "plain\r\n"]]
+                    }
+                ]
+            }
+        }))
+        .unwrap();
+        let lines = response.into_lines();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].timestamp, "10");
+        assert_eq!(lines[0].stream.as_deref(), Some("stderr"));
+        assert_eq!(clean_loki_line(&lines[0].message), "err");
+        assert_eq!(lines[1].stream, None);
+        assert_eq!(clean_loki_line(&lines[1].message), "plain");
+    }
+
+    #[test]
+    fn response_suffix_formats_only_non_empty_bodies() {
+        assert_eq!(response_suffix(" \n\t"), "");
+        assert_eq!(response_suffix(" no such job \n"), ": no such job");
+    }
+
+    #[tokio::test]
+    async fn fetch_sources_uses_forgejo_when_all_selected_jobs_have_logs() {
+        let client = test_client();
+        let forgejo = FakeLogSource::ok("forgejo");
+        let loki = FakeLogSource::ok("loki");
+        let tasks = parse_workflow_tasks(serde_json::json!([
+            {"id": 10, "name": "a", "status": "success"},
+            {"id": 11, "name": "b", "status": "failure"}
+        ]))
+        .unwrap();
+        let jobs = vec![
+            WorkflowRunJob {
+                id: 100,
+                attempt: 1,
+                name: "a".into(),
+                status: "success".into(),
+            },
+            WorkflowRunJob {
+                id: 101,
+                attempt: 1,
+                name: "b".into(),
+                status: "failure".into(),
+            },
+        ];
+
+        let logs = fetch_run_logs_with_sources(
+            &client, "o", "r", 12, None, None, false, &forgejo, &loki, &tasks, &jobs,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(logs.source, "forgejo-api");
+        assert_eq!(logs.jobs.len(), 2);
+        assert_eq!(forgejo.calls(), 2);
+        assert_eq!(loki.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn fetch_sources_falls_back_to_loki_after_forgejo_unavailable() {
+        let client = test_client();
+        let forgejo = FakeLogSource::unavailable("no native logs");
+        let loki = FakeLogSource::ok("loki");
+        let tasks = parse_workflow_tasks(serde_json::json!([
+            {"id": 10, "name": "a", "status": "success"},
+            {"id": 11, "name": "b", "status": "failure"},
+            {"id": 12, "name": "c", "status": "skipped"}
+        ]))
+        .unwrap();
+        let jobs = vec![
+            WorkflowRunJob {
+                id: 100,
+                attempt: 1,
+                name: "a".into(),
+                status: "success".into(),
+            },
+            WorkflowRunJob {
+                id: 101,
+                attempt: 1,
+                name: "b".into(),
+                status: "failure".into(),
+            },
+            WorkflowRunJob {
+                id: 102,
+                attempt: 1,
+                name: "c".into(),
+                status: "skipped".into(),
+            },
+        ];
+
+        let logs = fetch_run_logs_with_sources(
+            &client, "o", "r", 12, None, None, true, &forgejo, &loki, &tasks, &jobs,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(logs.source, "loki");
+        assert_eq!(logs.jobs.len(), 1);
+        assert_eq!(logs.jobs[0].job, 1);
+        assert_eq!(logs.jobs[0].task_id, Some(11));
+        assert_eq!(logs.jobs[0].job_id, Some(101));
+        assert_eq!(forgejo.calls(), 1);
+        assert_eq!(loki.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn fetch_sources_returns_none_for_empty_selection() {
+        let client = test_client();
+        let forgejo = FakeLogSource::ok("forgejo");
+        let loki = FakeLogSource::ok("loki");
+        let jobs = vec![WorkflowRunJob {
+            id: 100,
+            attempt: 1,
+            name: "a".into(),
+            status: "success".into(),
+        }];
+
+        let logs = fetch_run_logs_with_sources(
+            &client,
+            "o",
+            "r",
+            12,
+            None,
+            None,
+            true,
+            &forgejo,
+            &loki,
+            &[],
+            &jobs,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(logs.source, "none");
+        assert!(logs.jobs.is_empty());
+        assert_eq!(forgejo.calls(), 0);
+        assert_eq!(loki.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn fetch_sources_reports_missing_loki_and_other_errors() {
+        let client = test_client();
+        let jobs = vec![WorkflowRunJob {
+            id: 100,
+            attempt: 1,
+            name: "a".into(),
+            status: "failure".into(),
+        }];
+        let tasks = parse_workflow_tasks(serde_json::json!([
+            {"id": 10, "name": "a", "status": "failure"}
+        ]))
+        .unwrap();
+
+        let err = fetch_run_logs_with_sources(
+            &client,
+            "o",
+            "r",
+            12,
+            None,
+            None,
+            false,
+            &FakeLogSource::unavailable("no native logs"),
+            &FakeLogSource::disabled(),
+            &tasks,
+            &jobs,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("no workflow log source"));
+
+        let err = fetch_run_logs_with_sources(
+            &client,
+            "o",
+            "r",
+            12,
+            None,
+            None,
+            false,
+            &FakeLogSource::other("forgejo broke"),
+            &FakeLogSource::ok("loki"),
+            &tasks,
+            &jobs,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.to_string(), "forgejo broke");
+    }
+
+    #[tokio::test]
+    async fn fetch_sources_requires_tasks_for_loki_fallback() {
+        let client = test_client();
+        let jobs = vec![WorkflowRunJob {
+            id: 100,
+            attempt: 1,
+            name: "a".into(),
+            status: "failure".into(),
+        }];
+
+        let err = fetch_run_logs_with_sources(
+            &client,
+            "o",
+            "r",
+            12,
+            None,
+            None,
+            false,
+            &FakeLogSource::unavailable("no native logs"),
+            &FakeLogSource::ok("loki"),
+            &[],
+            &jobs,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("workflow task metadata"));
+    }
+
+    #[test]
     fn cleans_docker_json_log_lines() {
         assert_eq!(clean_loki_line(r#"{"log":"hello\n"}"#), "hello");
         assert_eq!(clean_loki_line("plain\n"), "plain");
+    }
+
+    fn job(status: &str) -> JobLogs {
+        JobLogs {
+            job: 0,
+            task_id: None,
+            job_id: None,
+            name: "job".into(),
+            status: status.into(),
+            lines: Vec::new(),
+        }
     }
 }

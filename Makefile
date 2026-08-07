@@ -124,7 +124,7 @@ coverage-html:
 # in CI (see .forgejo/workflows/ci.yml) so a regression fails the build.
 COV_MIN ?= 0
 coverage-strict:
-	cargo +nightly llvm-cov --all --summary-only \
+	RUSTFLAGS="--cfg coverage_nightly" cargo +nightly llvm-cov --all --summary-only \
 		--fail-under-lines $(COV_MIN) --ignore-filename-regex '$(COV_IGNORE)'
 
 coverage-strict-html:
