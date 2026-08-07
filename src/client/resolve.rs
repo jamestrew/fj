@@ -34,7 +34,13 @@ pub fn resolve(host_flag: Option<&str>) -> Result<ResolvedHost> {
         (name, host_cfg)
     };
     let token = match host_cfg.auth_kind {
-        AuthKind::Pat => auth::env_token().or(auth::load_token(&name)?),
+        AuthKind::Pat => {
+            if let Some(token) = auth::env_token() {
+                Some(token)
+            } else {
+                auth::load_token(&name)?
+            }
+        }
         AuthKind::FjordAccount => {
             let fa = host_cfg.fjord_account.as_ref().ok_or_else(|| {
                 anyhow!(
@@ -124,7 +130,7 @@ fn web_base_path(path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_base_url, web_base_url};
+    use super::{build_base_url, resolve, web_base_url};
     use crate::config::hosts::{AuthKind, FjordAccount, Host};
 
     fn host_with_api_base(api: Option<&str>) -> Host {
@@ -190,5 +196,32 @@ mod tests {
             url.join("owner/repo/issues").unwrap().as_str(),
             "https://forge.example/base/owner/repo/issues"
         );
+    }
+
+    #[test]
+    fn explicit_host_uses_env_token_without_reading_token_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_dir = dir.path().join("config-file");
+        std::fs::write(&not_a_dir, "not a directory").unwrap();
+
+        let old_config = std::env::var_os("XDG_CONFIG_HOME");
+        let old_token = std::env::var_os("FJ_TOKEN");
+        std::env::set_var("XDG_CONFIG_HOME", &not_a_dir);
+        std::env::set_var("FJ_TOKEN", "env-token");
+
+        let resolved = resolve(Some("git.example.com"));
+
+        match old_config {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        match old_token {
+            Some(value) => std::env::set_var("FJ_TOKEN", value),
+            None => std::env::remove_var("FJ_TOKEN"),
+        }
+
+        let resolved = resolved.expect("env token should avoid store read");
+        assert_eq!(resolved.name, "git.example.com");
+        assert_eq!(resolved.token.as_deref(), Some("env-token"));
     }
 }

@@ -406,7 +406,15 @@ async fn resolve_run_api_id(
     name: &str,
     run_number: u64,
 ) -> Result<u64> {
-    let runs = crate::api::workflow_run::list_runs(client, owner, name, 50).await?;
+    let runs = crate::api::workflow_run::list_runs_filtered(
+        client,
+        owner,
+        name,
+        50,
+        true,
+        &crate::api::workflow_run::RunListFilters::default(),
+    )
+    .await?;
     runs.iter()
         .find(|run| run.run_number == run_number)
         .map(|run| run.id)

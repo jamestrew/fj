@@ -1300,6 +1300,69 @@ async fn run_logs_reads_forgejo_api_job_logs_by_job_id() {
 }
 
 #[tokio::test]
+async fn run_logs_resolves_run_number_beyond_first_page() {
+    let server = MockServer::start().await;
+    let next_url = format!(
+        "{}/api/v1/repos/o/r/actions/runs?page=2&limit=50",
+        server.uri()
+    );
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/runs"))
+        .and(query_param("page", "1"))
+        .and(query_param("limit", "50"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Link", format!(r#"<{next_url}>; rel="next""#).as_str())
+                .set_body_json(json!({
+                    "workflow_runs": [{ "id": 1000, "index_in_repo": 100, "status": "success" }]
+                })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/runs"))
+        .and(query_param("page", "2"))
+        .and(query_param("limit", "50"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "workflow_runs": [{ "id": 5100, "index_in_repo": 51, "status": "success" }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/runs/5100/jobs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "id": 51001, "name": "verify", "status": "success" }
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/tasks"))
+        .and(query_param("run", "51"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/jobs/51001/logs"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("late-page log\n"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let c = client_for(&server).await;
+    let logs = crate::api::workflow::fetch_run_logs(&c, "o", "r", 51, None, None, false)
+        .await
+        .expect("logs");
+    assert_eq!(logs.jobs.len(), 1);
+    assert_eq!(logs.jobs[0].job_id, Some(51001));
+    assert_eq!(logs.jobs[0].lines[0].message, "late-page log");
+}
+
+#[tokio::test]
 async fn run_logs_jobs_api_404_names_forgejo_version() {
     let server = MockServer::start().await;
 
