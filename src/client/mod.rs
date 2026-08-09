@@ -564,7 +564,7 @@ impl Client {
         let headers = res.headers().clone();
         let text = res.text().await.context("reading list response body")?;
         // Forgejo returns `null` for some empty list endpoints. Normalize.
-        let items: Vec<T> = decode_list(&text)?;
+        let items: Vec<T> = decode_list(&text, path, query)?;
         Ok(Page::from_headers(items, &headers))
     }
 
@@ -622,7 +622,7 @@ impl Client {
             // `null` (or empty) body rather than `[]`. Normalize it exactly as
             // `get_page` does, so a large-`--limit` walk doesn't error where a
             // single page would have succeeded.
-            let mut items: Vec<T> = decode_list(&text)?;
+            let mut items: Vec<T> = decode_list(&text, &current_path, &current_query)?;
             if items.is_empty() {
                 break;
             }
@@ -671,13 +671,37 @@ impl Client {
 /// Decode a Forgejo list-response body, normalizing the `null`/empty bodies
 /// some endpoints return for an empty collection into an empty `Vec`. Shared
 /// by `get_page` and `get_all` so both tolerate the same shapes.
-fn decode_list<T: DeserializeOwned>(text: &str) -> Result<Vec<T>> {
+fn decode_list<T: DeserializeOwned>(
+    text: &str,
+    path: &str,
+    query: &[(String, String)],
+) -> Result<Vec<T>> {
     let t = text.trim();
     if t.is_empty() || t == "null" {
         Ok(Vec::new())
     } else {
-        serde_json::from_str(t).context("decoding JSON list response")
+        let mut de = serde_json::Deserializer::from_str(t);
+        serde_path_to_error::deserialize(&mut de).map_err(|err| {
+            anyhow!(
+                "decoding JSON list response from GET {} failed at field {}: {}",
+                endpoint_for_error(path, query),
+                err.path(),
+                err.inner()
+            )
+        })
     }
+}
+
+fn endpoint_for_error(path: &str, query: &[(String, String)]) -> String {
+    if query.is_empty() {
+        return path.to_string();
+    }
+    let params = query
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{path}?{params}")
 }
 
 fn is_idempotent(m: &Method) -> bool {
