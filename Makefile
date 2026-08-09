@@ -125,9 +125,11 @@ coverage-html:
 COV_MIN ?= 0
 COV_TOOLCHAIN ?= nightly-2026-08-07
 coverage-strict:
+	cargo +$(COV_TOOLCHAIN) llvm-cov clean --workspace
 	RUSTFLAGS="--cfg coverage_nightly" cargo +$(COV_TOOLCHAIN) llvm-cov --all --summary-only \
 		--no-rustc-wrapper --fail-under-lines $(COV_MIN) --ignore-filename-regex '$(COV_IGNORE)'
 
 coverage-strict-html:
+	cargo +$(COV_TOOLCHAIN) llvm-cov clean --workspace
 	cargo +$(COV_TOOLCHAIN) llvm-cov --all --open --no-rustc-wrapper \
 		--ignore-filename-regex '$(COV_IGNORE)'
