@@ -13,7 +13,10 @@ pub struct CombinedStatus {
     pub state: String,
     #[serde(default)]
     pub sha: String,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::api::serde_util::deserialize_null_to_default"
+    )]
     pub statuses: Vec<CommitStatus>,
     #[serde(default)]
     pub total_count: u64,
@@ -78,5 +81,18 @@ mod tests {
         assert_eq!(status.state, "");
         assert!(status.statuses.is_empty());
         assert_eq!(status.total_count, 0);
+    }
+
+    #[test]
+    fn combined_status_decodes_null_statuses_as_empty() {
+        let status: CombinedStatus = serde_json::from_value(serde_json::json!({
+            "state": "",
+            "sha": "abc123",
+            "total_count": 0,
+            "statuses": null
+        }))
+        .unwrap();
+        assert_eq!(status.sha, "abc123");
+        assert!(status.statuses.is_empty());
     }
 }

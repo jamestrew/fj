@@ -115,7 +115,7 @@ pub async fn checks(args: InspectArgs, host: Option<&str>) -> Result<()> {
         }
     }
     if cs.statuses.is_empty() {
-        println!("(no per-check statuses reported)");
+        println!("no checks reported on {}", pr.head.sha);
         return Ok(());
     }
     let rows: Vec<Vec<String>> = cs
