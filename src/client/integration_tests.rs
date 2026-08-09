@@ -2410,6 +2410,90 @@ async fn pull_list_decodes_and_sends_state_limit() {
 }
 
 #[tokio::test]
+async fn pull_list_decodes_negative_id_requested_reviewer() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/pulls"))
+        .and(query_param("state", "open"))
+        .and(query_param("limit", "30"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!([
+                    {
+                        "id": 245, "number": 245,
+                        "title": "Handle null PR check status lists",
+                        "state": "open",
+                        "user": { "id": 3, "login": "stephen" },
+                        "requested_reviewers": [
+                            {
+                                "id": -2,
+                                "login": "forgejo-actions",
+                                "email": "noreply@forgejo.org",
+                                "created": "1970-01-01T00:00:00Z"
+                            }
+                        ],
+                        "html_url": "https://x/o/r/pulls/245",
+                        "head": { "ref": "fix/241-null-pr-check-statuses", "sha": "aaa" },
+                        "base": { "ref": "main", "sha": "bbb" },
+                        "created_at": "2026-08-09T00:00:00Z",
+                        "updated_at": "2026-08-09T00:01:00Z"
+                    }
+                ]))
+                .insert_header("X-Total-Count", "1"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let page = crate::api::pull::list(&c, "o", "r", crate::api::pull::ListOptions::default())
+        .await
+        .expect("list decodes Forgejo system reviewer ids");
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].number, 245);
+    assert_eq!(page.items[0].requested_reviewers[0].id, -2);
+    assert_eq!(
+        page.items[0].requested_reviewers[0].login,
+        "forgejo-actions"
+    );
+}
+
+#[tokio::test]
+async fn pull_list_decode_error_names_endpoint_and_field() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/pulls"))
+        .and(query_param("state", "open"))
+        .and(query_param("limit", "30"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {
+                "id": -245, "number": 245, "title": "Bad id",
+                "state": "open", "user": { "id": 3, "login": "stephen" },
+                "html_url": "https://x/o/r/pulls/245",
+                "head": { "ref": "fix/negative", "sha": "aaa" },
+                "base": { "ref": "main", "sha": "bbb" },
+                "created_at": "2026-08-09T00:00:00Z",
+                "updated_at": "2026-08-09T00:01:00Z"
+            }
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let err = match crate::api::pull::list(&c, "o", "r", crate::api::pull::ListOptions::default())
+        .await
+    {
+        Ok(_) => panic!("list should reject invalid pull id"),
+        Err(err) => err,
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("GET /api/v1/repos/o/r/pulls?state=open&limit=30"),
+        "{msg}"
+    );
+    assert!(msg.contains("field [0].id"), "{msg}");
+}
+
+#[tokio::test]
 async fn pull_list_sends_label_ids_and_poster() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
