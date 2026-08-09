@@ -109,9 +109,9 @@ audit:
 #     handlers inside those mixed files, via #[cfg_attr(coverage_nightly,
 #     coverage(off))] on every cli `async fn`. This is the number that
 #     reflects intent most precisely (only tested helpers + the api/client/
-#     util layers count). ~76%. Needs a nightly toolchain with
-#     llvm-tools-preview: `rustup toolchain install nightly && rustup
-#     component add llvm-tools-preview --toolchain nightly`.
+#     util layers count). ~76%. Needs the pinned nightly toolchain with
+#     llvm-tools-preview: `rustup toolchain install $(COV_TOOLCHAIN) &&
+#     rustup component add llvm-tools-preview --toolchain $(COV_TOOLCHAIN)`.
 coverage:
 	cargo llvm-cov --all --summary-only --ignore-filename-regex '$(COV_IGNORE)'
 
@@ -123,9 +123,10 @@ coverage-html:
 # COV_MIN is the minimum line coverage; 0 locally (pure report), set higher
 # in CI (see .forgejo/workflows/ci.yml) so a regression fails the build.
 COV_MIN ?= 0
+COV_TOOLCHAIN ?= nightly-2026-08-07
 coverage-strict:
-	RUSTFLAGS="--cfg coverage_nightly" cargo +nightly llvm-cov --all --summary-only \
+	RUSTFLAGS="--cfg coverage_nightly" cargo +$(COV_TOOLCHAIN) llvm-cov --all --summary-only \
 		--fail-under-lines $(COV_MIN) --ignore-filename-regex '$(COV_IGNORE)'
 
 coverage-strict-html:
-	cargo +nightly llvm-cov --all --open --ignore-filename-regex '$(COV_IGNORE)'
+	cargo +$(COV_TOOLCHAIN) llvm-cov --all --open --ignore-filename-regex '$(COV_IGNORE)'
