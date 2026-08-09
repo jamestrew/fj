@@ -1886,6 +1886,7 @@ async fn repo_get_decodes_single_repo() {
             "clone_url": "https://x/o/r.git",
             "ssh_url": "git@x:o/r.git",
             "default_branch": "main",
+            "default_merge_style": "squash",
             "stars_count": 7,
             "updated_at": "2026-05-30T00:00:00Z"
         })))
@@ -1897,6 +1898,7 @@ async fn repo_get_decodes_single_repo() {
     assert_eq!(repo.id, 42);
     assert_eq!(repo.full_name, "o/r");
     assert_eq!(repo.default_branch, "main");
+    assert_eq!(repo.default_merge_style.as_deref(), Some("squash"));
     assert_eq!(repo.stars_count, 7);
 }
 
@@ -2940,7 +2942,7 @@ async fn run_merge_diagnose(server: &MockServer, number: u64, style: &str) -> Op
     let pr = crate::api::pull::get(&c, "o", "r", number)
         .await
         .expect("get pull");
-    crate::cli::pr_merge_check::diagnose_merge_failure(&c, "o", "r", &pr, style).await
+    crate::cli::pr_merge_check::diagnose_merge_failure(&c, "o", "r", &pr, style, None).await
 }
 
 #[tokio::test]

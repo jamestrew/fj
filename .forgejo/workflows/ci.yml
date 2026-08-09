@@ -107,10 +107,17 @@ jobs:
       - name: install cargo-llvm-cov
         run: cargo install cargo-llvm-cov --locked
 
+      - name: coverage environment
+        # Local and CI currently disagree by 14 points on the same make target;
+        # this prints the effective environment so the enforced floor is reproducible.
+        run: |
+          cargo +nightly --version
+          rustc +nightly --version
+          cargo llvm-cov --version
+          printf 'RUSTFLAGS=%s\n' "${RUSTFLAGS:-}"
+          rustup show active-toolchain
+
       - name: coverage-strict (fails under the floor)
-        # The runner currently still counts some regions marked coverage(off),
-        # so keep the enforced floor aligned with the runner's report while the
-        # Makefile remains the local intent-precise view.
         run: make coverage-strict COV_MIN=71
 
   live-e2e:

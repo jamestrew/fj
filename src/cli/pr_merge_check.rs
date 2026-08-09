@@ -47,6 +47,8 @@ pub struct MergeFacts {
     pub failing_checks: Vec<(String, String)>,
     /// Branch protection blocks merging an out-of-date branch.
     pub block_on_outdated: bool,
+    /// Raw merge rejection from Forgejo, when available.
+    pub merge_error: Option<String>,
 }
 
 /// The single most actionable reason the merge was blocked, or `None` when
@@ -104,6 +106,20 @@ pub fn diagnose(f: &MergeFacts) -> Option<String> {
             f.number, f.base
         ));
     }
+    if let Some(message) = f.merge_error.as_deref() {
+        if message.contains("PushRejected") {
+            let mut out = format!(
+                "merge style \"{}\" was rejected by the protected branch: {message}",
+                f.style
+            );
+            if f.style == "merge" {
+                out.push_str(
+                    "\n  note: style \"merge\" places the PR branch's own commits on the base branch, so protected branches that require signed commits verify those contributor commits. style \"squash\" creates one server-side commit instead.",
+                );
+            }
+            return Some(out);
+        }
+    }
     None
 }
 
@@ -135,6 +151,7 @@ pub async fn diagnose_merge_failure(
     name: &str,
     pull: &Pull,
     style: &str,
+    merge_error: Option<&str>,
 ) -> Option<String> {
     let base = bare_branch(&pull.base.ref_).to_string();
 
@@ -148,6 +165,7 @@ pub async fn diagnose_merge_failure(
         draft: pull.draft,
         mergeable: pull.mergeable,
         style_allowed: true,
+        merge_error: merge_error.map(str::to_string),
         ..Default::default()
     };
 
@@ -334,6 +352,29 @@ mod tests {
         let mut f = base_facts();
         f.block_on_outdated = true;
         assert!(diagnose(&f).unwrap().contains("may be behind main"));
+    }
+
+    #[test]
+    fn push_rejected_names_merge_style() {
+        let mut f = base_facts();
+        f.style = "merge".into();
+        f.merge_error = Some(
+            "conflict: PushRejected with remote message: Forgejo: branch develop is protected from unverified commit abc123"
+                .into(),
+        );
+        let msg = diagnose(&f).unwrap();
+        assert!(
+            msg.contains("merge style \"merge\" was rejected"),
+            "got: {msg}"
+        );
+        assert!(
+            msg.contains("protected from unverified commit"),
+            "got: {msg}"
+        );
+        assert!(
+            msg.contains("style \"squash\" creates one server-side commit"),
+            "got: {msg}"
+        );
     }
 
     #[test]
