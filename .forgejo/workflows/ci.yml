@@ -117,6 +117,8 @@ jobs:
           rustc +nightly-2026-08-07 --version
           cargo llvm-cov --version
           printf 'RUSTFLAGS=%s\n' "${RUSTFLAGS:-}"
+          printf 'CARGO_ENCODED_RUSTFLAGS=%s\n' "${CARGO_ENCODED_RUSTFLAGS:-}"
+          printf 'RUSTC_WRAPPER=%s\n' "${RUSTC_WRAPPER:-}"
           rustup show active-toolchain
 
       - name: coverage-strict (fails under the floor)
