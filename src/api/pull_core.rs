@@ -327,6 +327,16 @@ impl MergeStyle {
             MergeStyle::Squash => "squash",
         }
     }
+
+    pub fn from_str(style: &str) -> Option<Self> {
+        match style {
+            "merge" => Some(MergeStyle::Merge),
+            "rebase" => Some(MergeStyle::Rebase),
+            "rebase-merge" => Some(MergeStyle::RebaseMerge),
+            "squash" => Some(MergeStyle::Squash),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]

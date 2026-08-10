@@ -92,12 +92,15 @@ jobs:
           toolchain: '1.95.0'
 
       # The coverage(off) regions only take effect on a nightly toolchain
-      # (cargo-llvm-cov sets cfg(coverage_nightly) there). llvm-tools-preview
-      # provides the profdata/cov tooling. override:false keeps 1.95.0 default.
+      # (cargo-llvm-cov sets cfg(coverage_nightly) there). Pin the nightly:
+      # floating nightly changed coverage accounting on 2026-08-09 and made
+      # the gate unreproducible against local `make coverage-strict`.
+      # llvm-tools-preview provides the profdata/cov tooling. override:false
+      # keeps 1.95.0 default.
       - name: setup rust (nightly for coverage)
         uses: https://rasterhub.com/rasterstate/setup-rust-action@v1.0.1
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-08-07
           components: llvm-tools-preview
           override: 'false'
 
@@ -107,11 +110,29 @@ jobs:
       - name: install cargo-llvm-cov
         run: cargo install cargo-llvm-cov --locked
 
-      - name: coverage-strict (fails under the floor)
-        # The runner currently still counts some regions marked coverage(off),
-        # so keep the enforced floor aligned with the runner's report while the
-        # Makefile remains the local intent-precise view.
+      - name: coverage environment
+        # Keep the enforced floor tied to the pinned coverage toolchain.
+        run: |
+          cargo +nightly-2026-08-07 --version
+          rustc +nightly-2026-08-07 --version
+          cargo llvm-cov --version
+          printf 'RUSTFLAGS=%s\n' "${RUSTFLAGS:-}"
+          printf 'CARGO_ENCODED_RUSTFLAGS=%s\n' "${CARGO_ENCODED_RUSTFLAGS:-}"
+          printf 'RUSTC_WRAPPER=%s\n' "${RUSTC_WRAPPER:-}"
+          rustup show active-toolchain
+
+      - name: coverage-strict (enforced floor)
+        if: github.event_name != 'pull_request'
         run: make coverage-strict COV_MIN=71
+
+      - name: coverage-strict (PR diagnostic only)
+        if: github.event_name == 'pull_request'
+        run: |
+          echo "::warning::PR coverage enforcement is disabled for fj#249: CI is measuring the wrong strict coverage surface."
+          echo "Expected calibrated surface: cli/pr.rs 856 regions, cli/stack.rs 3783, client/mod.rs 1037, total 25592 regions / 15500 lines."
+          echo "Observed CI PR surface: cli/pr.rs 1417 regions, cli/stack.rs 6071, client/mod.rs 1956, total 31091 regions / 18924 lines."
+          echo "Running the report with COV_MIN=0 so the mismatch remains visible without pretending the 71 floor is trustworthy on PRs."
+          make coverage-strict COV_MIN=0
 
   live-e2e:
     runs-on: docker

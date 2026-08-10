@@ -31,6 +31,10 @@ pub struct Repo {
     pub ssh_url: String,
     #[serde(default)]
     pub default_branch: String,
+    /// Repository default merge style (`merge`, `rebase`, `rebase-merge`, or
+    /// `squash`). Callers that need this should fail explicitly if it is absent.
+    #[serde(default)]
+    pub default_merge_style: Option<String>,
     /// Allowed merge styles for this repo. Forgejo rejects a `--style` that is
     /// not enabled with an opaque 405; these let the CLI name the allowed set.
     #[serde(default = "default_true")]

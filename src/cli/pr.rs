@@ -295,8 +295,8 @@ pub struct MergeArgs {
     /// Pull request number
     pub number: u64,
     /// Merge method to use
-    #[arg(long, value_enum, default_value_t = MergeStyleArg::Merge)]
-    pub style: MergeStyleArg,
+    #[arg(long, value_enum)]
+    pub style: Option<MergeStyleArg>,
     /// Title for the merge commit
     #[arg(long)]
     pub title: Option<String>,
@@ -945,7 +945,10 @@ async fn merge(args: MergeArgs, host: Option<&str>) -> Result<()> {
         };
     }
 
-    let style: api::pull::MergeStyle = args.style.into();
+    let style = match args.style {
+        Some(style) => style.into(),
+        None => repo_default_merge_style(&ctx).await?,
+    };
     let res = api::pull::merge(
         &ctx.client,
         &ctx.owner,
@@ -995,6 +998,7 @@ async fn merge(args: MergeArgs, host: Option<&str>) -> Result<()> {
                     &ctx.name,
                     &pr,
                     style.as_str(),
+                    Some(&e.to_string()),
                 )
                 .await
                 {
@@ -1013,6 +1017,36 @@ async fn merge(args: MergeArgs, host: Option<&str>) -> Result<()> {
             Err(e)
         }
     }
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn repo_default_merge_style(
+    ctx: &crate::cli::context::RepoContext,
+) -> Result<api::pull::MergeStyle> {
+    let repo = api::repo::get(&ctx.client, &ctx.owner, &ctx.name)
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "no --style given and the repo default_merge_style could not be read for {}/{}: {e}",
+                ctx.owner,
+                ctx.name
+            )
+        })?;
+    let Some(raw) = repo.default_merge_style.as_deref() else {
+        return Err(anyhow!(
+            "no --style given and the repo default_merge_style could not be read for {}/{}",
+            ctx.owner,
+            ctx.name
+        ));
+    };
+    api::pull::MergeStyle::from_str(raw).ok_or_else(|| {
+        anyhow!(
+            "no --style given and {}/{} reports unsupported default_merge_style {:?}; supported styles: merge, rebase, rebase-merge, squash",
+            ctx.owner,
+            ctx.name,
+            raw
+        )
+    })
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -1175,18 +1209,18 @@ mod tests {
             }) => {
                 assert_eq!(a.number, 12);
                 assert!(a.delete_branch);
-                assert!(matches!(a.style, MergeStyleArg::Squash));
+                assert!(matches!(a.style, Some(MergeStyleArg::Squash)));
             }
             other => panic!("expected pr merge, got {other:?}"),
         }
-        // defaults: no delete, merge-commit style
+        // defaults: no delete, style resolved from the repository at runtime.
         let cli = Cli::try_parse_from(["fj", "pr", "merge", "3"]).expect("should parse");
         if let Command::Pr(PrCmd {
             command: PrSub::Merge(a),
         }) = cli.command
         {
             assert!(!a.delete_branch);
-            assert!(matches!(a.style, MergeStyleArg::Merge));
+            assert!(a.style.is_none());
         }
     }
 
@@ -1202,7 +1236,7 @@ mod tests {
             }) => {
                 assert!(a.auto);
                 assert!(!a.disable_auto);
-                assert!(matches!(a.style, MergeStyleArg::Squash));
+                assert!(matches!(a.style, Some(MergeStyleArg::Squash)));
             }
             other => panic!("expected pr merge, got {other:?}"),
         }
@@ -1225,6 +1259,170 @@ mod tests {
         assert!(
             Cli::try_parse_from(["fj", "pr", "merge", "12", "--auto", "--disable-auto"]).is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn omitted_merge_style_uses_repo_default() {
+        use serde_json::json;
+        use url::Url;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/o/r"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": 1,
+                "name": "r",
+                "full_name": "o/r",
+                "owner": { "id": 1, "login": "o" },
+                "html_url": "https://x/o/r",
+                "clone_url": "https://x/o/r.git",
+                "ssh_url": "git@x:o/r.git",
+                "default_branch": "main",
+                "default_merge_style": "squash",
+                "updated_at": "2026-05-30T00:00:00Z"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let base = Url::parse(&format!("{}/api/v1/", server.uri())).expect("base");
+        let ctx = crate::cli::context::RepoContext {
+            client: crate::client::Client::for_base_url(base, "test-token".into()).unwrap(),
+            host: "mock".into(),
+            web_base: None,
+            owner: "o".into(),
+            name: "r".into(),
+        };
+        let style = repo_default_merge_style(&ctx).await.expect("style");
+        assert!(matches!(style, api::pull::MergeStyle::Squash));
+    }
+
+    #[tokio::test]
+    async fn omitted_merge_style_fails_when_repo_default_is_absent() {
+        use serde_json::json;
+        use url::Url;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/o/r"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": 1,
+                "name": "r",
+                "full_name": "o/r",
+                "owner": { "id": 1, "login": "o" },
+                "html_url": "https://x/o/r",
+                "clone_url": "https://x/o/r.git",
+                "ssh_url": "git@x:o/r.git",
+                "default_branch": "main",
+                "updated_at": "2026-05-30T00:00:00Z"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let base = Url::parse(&format!("{}/api/v1/", server.uri())).expect("base");
+        let ctx = crate::cli::context::RepoContext {
+            client: crate::client::Client::for_base_url(base, "test-token".into()).unwrap(),
+            host: "mock".into(),
+            web_base: None,
+            owner: "o".into(),
+            name: "r".into(),
+        };
+        let err = repo_default_merge_style(&ctx)
+            .await
+            .expect_err("missing default must fail");
+        assert!(
+            err.to_string()
+                .contains("no --style given and the repo default_merge_style could not be read"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn omitted_merge_style_fails_when_repo_default_is_unsupported() {
+        use serde_json::json;
+        use url::Url;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for default_merge_style in ["manually-merged", "fast-forward-only"] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/api/v1/repos/o/r"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "id": 1,
+                    "name": "r",
+                    "full_name": "o/r",
+                    "owner": { "id": 1, "login": "o" },
+                    "html_url": "https://x/o/r",
+                    "clone_url": "https://x/o/r.git",
+                    "ssh_url": "git@x:o/r.git",
+                    "default_branch": "main",
+                    "default_merge_style": default_merge_style,
+                    "updated_at": "2026-05-30T00:00:00Z"
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let base = Url::parse(&format!("{}/api/v1/", server.uri())).expect("base");
+            let ctx = crate::cli::context::RepoContext {
+                client: crate::client::Client::for_base_url(base, "test-token".into()).unwrap(),
+                host: "mock".into(),
+                web_base: None,
+                owner: "o".into(),
+                name: "r".into(),
+            };
+            let err = repo_default_merge_style(&ctx)
+                .await
+                .expect_err("unsupported default must fail");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&format!(
+                    "unsupported default_merge_style {default_merge_style:?}"
+                )),
+                "got: {msg}"
+            );
+            assert!(
+                msg.contains("supported styles: merge, rebase, rebase-merge, squash"),
+                "got: {msg}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn omitted_merge_style_fails_when_repo_default_cannot_be_fetched() {
+        use url::Url;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/o/r"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("temporary failure"))
+            .expect(3)
+            .mount(&server)
+            .await;
+        let base = Url::parse(&format!("{}/api/v1/", server.uri())).expect("base");
+        let ctx = crate::cli::context::RepoContext {
+            client: crate::client::Client::for_base_url(base, "test-token".into()).unwrap(),
+            host: "mock".into(),
+            web_base: None,
+            owner: "o".into(),
+            name: "r".into(),
+        };
+        let err = repo_default_merge_style(&ctx)
+            .await
+            .expect_err("repo fetch failure must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(
+                "no --style given and the repo default_merge_style could not be read for o/r"
+            ),
+            "got: {msg}"
+        );
+        assert!(msg.contains("temporary failure"), "got: {msg}");
     }
 
     #[test]
