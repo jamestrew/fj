@@ -288,6 +288,130 @@ pub async fn list_instances(platform_url: &str, bearer: &str) -> Result<Vec<Forg
     Ok(typed.instances)
 }
 
+/// The Commons, as `GET /api/v1/me/commons` reports it.
+///
+/// Mirrors `fjord-android`'s `account/ForgeInstance.kt` (`CommonsInfo`)
+/// deliberately, field for field. fj and the phone apps disagreeing about what
+/// the Commons is would become someone's bug later, and the app is the older
+/// implementation, so it is the reference.
+///
+/// Note what is NOT here: no token, no credential of any kind. The gateway
+/// mints a per-user forge token server-side on each proxied call and attaches
+/// it there; nothing minted is ever sent to a client. That is why fj cannot
+/// extend the revocation window even in principle, and why nothing from this
+/// response is cached to disk.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CommonsInfo {
+    pub url: String,
+    pub name: String,
+    #[serde(rename = "gatewayForgeId", default)]
+    pub gateway_forge_id: Option<String>,
+    #[serde(default)]
+    pub membership: CommonsMembership,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CommonsMembership {
+    #[serde(default)]
+    pub joined: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CommonsResponse {
+    #[serde(default)]
+    commons: Option<CommonsInfo>,
+}
+
+impl CommonsInfo {
+    /// The Commons as a switchable instance, or `None` when it cannot be one.
+    ///
+    /// The three refusals match the app's `toSwitchableInstance()` exactly: no
+    /// gateway id, no public url, or not joined. The joined check is the one
+    /// that matters operationally, since offering an instance the account
+    /// cannot use produces a 403 from the gateway at the moment the user tries
+    /// to do work, which is the worst place to learn it.
+    pub fn to_switchable_instance(&self) -> Option<ForgeInstance> {
+        let id = self
+            .gateway_forge_id
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())?;
+        let public_url = Some(self.url.clone()).filter(|s| !s.trim().is_empty())?;
+        if !self.membership.joined {
+            return None;
+        }
+        let display_name = if self.name.trim().is_empty() {
+            "Fjord Commons".to_string()
+        } else {
+            self.name.clone()
+        };
+        Some(ForgeInstance {
+            id: id.to_string(),
+            display_name,
+            slug: "commons".to_string(),
+            region: Some("shared".to_string()),
+            plan: Some("commons".to_string()),
+            state: Some("ready".to_string()),
+            public_url: Some(public_url),
+            created_at: None,
+        })
+    }
+}
+
+/// GET `/api/v1/me/commons`.
+///
+/// The Commons is intentionally absent from `/me/forge-instances` (it is not an
+/// instance the account owns), so this is the only way a client learns it has a
+/// gateway id at all. The phone apps have called it since before fj existed;
+/// this is fj catching up rather than a new mechanism.
+///
+/// Absent-endpoint handling is deliberate: a platform older than this endpoint
+/// answers 404, and so does a platform with the Commons feature flag off. Both
+/// mean "no Commons here", which is today's behaviour, so both map to `Ok(None)`
+/// rather than to an error. A user who explicitly asks for Commons gets a clear
+/// message from the caller; a user who did not ask sees no change.
+pub async fn fetch_commons(platform_url: &str, bearer: &str) -> Result<Option<CommonsInfo>> {
+    let url = format!("{platform_url}/api/v1/me/commons");
+    let http = http_client()?;
+    let mut headers = HeaderMap::new();
+    headers.insert(USER_AGENT, HeaderValue::from_static(user_agent()));
+    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {bearer}"))
+            .map_err(|_| anyhow!("stored Fjord bearer contains invalid header chars"))?,
+    );
+    let res = http
+        .get(&url)
+        .headers(headers)
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?;
+    let status = res.status();
+    if status == StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if status == StatusCode::UNAUTHORIZED {
+        // Bare marker, same contract as list_instances: the caller downcasts
+        // it, refreshes once, and retries before surfacing anything.
+        return Err(SessionExpired.into());
+    }
+    let headers = res.headers().clone();
+    let text = res
+        .text()
+        .await
+        .with_context(|| format!("reading me/commons response (HTTP {status})"))?;
+    if !status.is_success() {
+        return Err(anyhow!(
+            "fjord-platform returned HTTP {status} from {url}: {}",
+            preview(&text)
+        ));
+    }
+    ensure_json_platform_response("me/commons endpoint", status, Some(&headers), &text)?;
+    let parsed: CommonsResponse =
+        serde_json::from_str(&text).context("decoding me/commons JSON")?;
+    Ok(parsed.commons)
+}
+
 /// Build the Forgejo-API base URL the `Client` uses when routing through
 /// the gateway. Always ends with `/api/v1/` so existing call sites that
 /// pass `/api/v1/<path>` strip-and-join cleanly.
