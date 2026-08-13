@@ -66,12 +66,12 @@ pub async fn run(cmd: InstancesCmd, top_host: Option<&str>) -> Result<()> {
 ///
 /// This refresh stays here (rather than folding into the shared `Client`'s new
 /// central refresh) because `fj instances` talks to the platform's
-/// `/api/v1/me/forge-instances` endpoint via [`fjord::list_instances`], NOT
-/// through `Client` (which is scoped to a single forge gateway). The two paths
-/// are independent; the `Client` refresh covers `fj api`/`pr`/`issue`/etc.
-#[cfg_attr(coverage_nightly, coverage(off))]
-/// The instance list plus the raw Commons response, so a caller can tell the
-/// three states apart: joined (an extra instance), not joined (a `CommonsInfo`
+/// `/api/v1/me/forge-instances` and `/api/v1/me/commons` endpoints directly,
+/// NOT through `Client` (which is scoped to a single forge gateway). The two
+/// paths are independent; the `Client` refresh covers `fj api`/`pr`/`issue`.
+///
+/// Returns the instance list plus the raw Commons response, so a caller can
+/// tell the three states apart: joined (an extra instance), not joined (a `CommonsInfo`
 /// that yields no instance), and no Commons on this platform (`None`).
 ///
 /// The Commons is appended rather than merged into `/me/forge-instances`,
