@@ -11,10 +11,29 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+fn git_command() -> Command {
+    let mut cmd = Command::new("git");
+    // Hooks can run tests with repository-scoped Git environment variables set.
+    // Those variables override `-C` and explicit init paths, making temp-repo
+    // fixtures operate on the real checkout instead.
+    for key in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_PREFIX",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    ] {
+        cmd.env_remove(key);
+    }
+    cmd
+}
+
 /// True when git is present and new enough for `rebase --update-refs` (2.38),
 /// which everything here depends on. Tests skip themselves when it isn't.
 pub fn git_supports_update_refs() -> bool {
-    let Ok(out) = Command::new("git").arg("--version").output() else {
+    let Ok(out) = git_command().arg("--version").output() else {
         return false;
     };
     if !out.status.success() {
@@ -35,7 +54,7 @@ pub fn git_supports_update_refs() -> bool {
 
 /// Run git in `dir`, asserting it succeeded, and return trimmed stdout.
 pub fn git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
+    let out = git_command()
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -52,7 +71,7 @@ pub fn git(dir: &Path, args: &[&str]) -> String {
 /// Initialize a repo at `dir` with a deterministic local configuration.
 pub fn init_repo(dir: &Path) {
     std::fs::create_dir_all(dir).expect("create repo dir");
-    let out = Command::new("git")
+    let out = git_command()
         .args(["init", "--quiet", "--initial-branch=main"])
         .arg(dir)
         .output()
@@ -63,7 +82,7 @@ pub fn init_repo(dir: &Path) {
 
 /// Initialize a bare repo at `dir`, to stand in for the forge's remote.
 pub fn init_bare(dir: &Path) {
-    let out = Command::new("git")
+    let out = git_command()
         .args(["init", "--quiet", "--bare", "--initial-branch=main"])
         .arg(dir)
         .output()
@@ -73,7 +92,7 @@ pub fn init_bare(dir: &Path) {
 
 /// Clone `src` to `dest` and pin the clone's config.
 pub fn clone_repo(src: &Path, dest: &Path) {
-    let out = Command::new("git")
+    let out = git_command()
         .args(["clone", "--quiet"])
         .arg(src)
         .arg(dest)

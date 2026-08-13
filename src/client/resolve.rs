@@ -33,14 +33,9 @@ pub fn resolve(host_flag: Option<&str>) -> Result<ResolvedHost> {
             .ok_or_else(|| anyhow!("host '{name}' not configured"))?;
         (name, host_cfg)
     };
+    let allow_generic_env = generic_env_allowed_for_resolved_host(&hosts, &name, host_flag);
     let token = match host_cfg.auth_kind {
-        AuthKind::Pat => {
-            if let Some(token) = auth::env_token() {
-                Some(token)
-            } else {
-                auth::load_token(&name)?
-            }
-        }
+        AuthKind::Pat => pat_token_for_resolved_host(&name, allow_generic_env)?,
         AuthKind::FjordAccount => {
             let fa = host_cfg.fjord_account.as_ref().ok_or_else(|| {
                 anyhow!(
@@ -61,6 +56,29 @@ pub fn resolve(host_flag: Option<&str>) -> Result<ResolvedHost> {
         host: host_cfg,
         token,
     })
+}
+
+fn generic_env_allowed_for_resolved_host(
+    hosts: &Hosts,
+    name: &str,
+    host_flag: Option<&str>,
+) -> bool {
+    if host_flag.is_none() {
+        return true;
+    }
+    matches!(hosts.resolve_host(None), Ok(default) if default == name)
+}
+
+fn pat_token_for_resolved_host(name: &str, allow_generic_env: bool) -> Result<Option<String>> {
+    if let Some(token) = auth::env_token_for_host(name) {
+        return Ok(Some(token));
+    }
+    if allow_generic_env {
+        if let Some(token) = auth::env_token() {
+            return Ok(Some(token));
+        }
+    }
+    auth::load_token(name)
 }
 
 /// Construct the `/api/v1`-rooted base URL for a PAT host. Older configs only
@@ -132,6 +150,9 @@ fn web_base_path(path: &str) -> String {
 mod tests {
     use super::{build_base_url, resolve, web_base_url};
     use crate::config::hosts::{AuthKind, FjordAccount, Host};
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn host_with_api_base(api: Option<&str>) -> Host {
         Host {
@@ -198,30 +219,118 @@ mod tests {
         );
     }
 
+    struct EnvRestore {
+        key: String,
+        old: Option<std::ffi::OsString>,
+    }
+
+    impl EnvRestore {
+        fn set(key: impl Into<String>, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let key = key.into();
+            let old = std::env::var_os(&key);
+            std::env::set_var(&key, value);
+            Self { key, old }
+        }
+
+        fn remove(key: impl Into<String>) -> Self {
+            let key = key.into();
+            let old = std::env::var_os(&key);
+            std::env::remove_var(&key);
+            Self { key, old }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            match &self.old {
+                Some(value) => std::env::set_var(&self.key, value),
+                None => std::env::remove_var(&self.key),
+            }
+        }
+    }
+
+    fn write_hosts_config(config_home: &std::path::Path, current: &str) {
+        let dir = config_home.join("fj");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("hosts.toml"),
+            format!(
+                r#"current = "{current}"
+
+[hosts."rasterhub.com"]
+git_protocol = "https"
+
+[hosts."commons.fjord.host"]
+git_protocol = "https"
+"#
+            ),
+        )
+        .unwrap();
+    }
+
     #[test]
-    fn explicit_host_uses_env_token_without_reading_token_store() {
+    fn default_host_can_use_generic_env_token_without_reading_token_store() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        write_hosts_config(dir.path(), "rasterhub.com");
+
+        let _config = EnvRestore::set("XDG_CONFIG_HOME", dir.path());
+        let _token = EnvRestore::set("FJ_TOKEN", "env-token");
+
+        let resolved = resolve(None).expect("default host may use generic FJ_TOKEN");
+        assert_eq!(resolved.name, "rasterhub.com");
+        assert_eq!(resolved.token.as_deref(), Some("env-token"));
+    }
+
+    #[test]
+    fn explicit_host_ignores_generic_env_token() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        write_hosts_config(dir.path(), "rasterhub.com");
+
+        let _config = EnvRestore::set("XDG_CONFIG_HOME", dir.path());
+        let _token = EnvRestore::set("FJ_TOKEN", "env-token");
+        let _host_token = EnvRestore::remove(crate::auth::host_env_token_var("commons.fjord.host"));
+
+        let resolved = resolve(Some("commons.fjord.host"))
+            .expect("explicit configured host should still resolve");
+        assert_eq!(resolved.name, "commons.fjord.host");
+        assert_eq!(resolved.token, None);
+    }
+
+    #[test]
+    fn explicit_default_host_can_use_generic_env_token_without_reading_token_store() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        write_hosts_config(dir.path(), "rasterhub.com");
+
+        let _config = EnvRestore::set("XDG_CONFIG_HOME", dir.path());
+        let _token = EnvRestore::set("FJ_TOKEN", "env-token");
+        let _host_token = EnvRestore::remove(crate::auth::host_env_token_var("rasterhub.com"));
+
+        let resolved =
+            resolve(Some("rasterhub.com")).expect("explicit default host may use generic FJ_TOKEN");
+        assert_eq!(resolved.name, "rasterhub.com");
+        assert_eq!(resolved.token.as_deref(), Some("env-token"));
+    }
+
+    #[test]
+    fn explicit_host_can_use_host_scoped_env_token_without_reading_token_store() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let not_a_dir = dir.path().join("config-file");
         std::fs::write(&not_a_dir, "not a directory").unwrap();
 
-        let old_config = std::env::var_os("XDG_CONFIG_HOME");
-        let old_token = std::env::var_os("FJ_TOKEN");
-        std::env::set_var("XDG_CONFIG_HOME", &not_a_dir);
-        std::env::set_var("FJ_TOKEN", "env-token");
+        let _config = EnvRestore::set("XDG_CONFIG_HOME", &not_a_dir);
+        let _token = EnvRestore::set("FJ_TOKEN", "wrong-host-token");
+        let _host_token = EnvRestore::set(
+            crate::auth::host_env_token_var("git.example.com"),
+            "host-env-token",
+        );
 
-        let resolved = resolve(Some("git.example.com"));
-
-        match old_config {
-            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
-            None => std::env::remove_var("XDG_CONFIG_HOME"),
-        }
-        match old_token {
-            Some(value) => std::env::set_var("FJ_TOKEN", value),
-            None => std::env::remove_var("FJ_TOKEN"),
-        }
-
-        let resolved = resolved.expect("env token should avoid store read");
+        let resolved = resolve(Some("git.example.com"))
+            .expect("host-scoped env token should avoid store read");
         assert_eq!(resolved.name, "git.example.com");
-        assert_eq!(resolved.token.as_deref(), Some("env-token"));
+        assert_eq!(resolved.token.as_deref(), Some("host-env-token"));
     }
 }

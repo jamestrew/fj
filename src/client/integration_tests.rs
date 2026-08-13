@@ -537,6 +537,42 @@ async fn fjord_sign_in_success() {
     }
 }
 
+#[tokio::test]
+async fn fjord_sign_in_html_response_points_at_platform_url() {
+    use crate::fjord::{sign_in, SignInRequest};
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/sign-in"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/html")
+                .set_body_string("<!DOCTYPE html><title>Sign in</title>"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let err = sign_in(
+        &server.uri(),
+        &SignInRequest {
+            email: "alice@example.com",
+            password: "hunter2",
+            totp_code: None,
+            recovery_code: None,
+        },
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("HTML page"), "got: {err}");
+    assert!(err.contains("--platform-url"), "got: {err}");
+}
+
+#[test]
+fn fjord_default_platform_url_is_production() {
+    assert_eq!(crate::fjord::DEFAULT_PLATFORM_URL, "https://fjord.sh");
+}
+
 /// `POST /api/v1/sign-in` returns `kind:totp-required` when the password
 /// is correct but the account has TOTP enrolled. The CLI must NOT treat
 /// this as success.

@@ -230,7 +230,7 @@ pub async fn run(cli: Cli) -> Result<()> {
 
 async fn dispatch(command: Command, host: Option<&str>) -> Result<()> {
     match command {
-        Command::Auth(cmd) => auth::run(cmd).await,
+        Command::Auth(cmd) => auth::run(cmd, host).await,
         Command::Instances(cmd) => instances::run(cmd, host).await,
         Command::Repo(cmd) => repo::run(cmd, host).await,
         Command::Issue(cmd) => issue::run(cmd, host).await,
@@ -318,6 +318,49 @@ mod tests {
     #[test]
     fn command_tree_is_internally_consistent() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn fjord_login_parses_when_generic_env_token_is_set() {
+        let old = std::env::var_os("FJ_TOKEN");
+        std::env::set_var("FJ_TOKEN", "env-token");
+        let parsed = Cli::try_parse_from(["fj", "auth", "login", "--fjord"]);
+        match old {
+            Some(value) => std::env::set_var("FJ_TOKEN", value),
+            None => std::env::remove_var("FJ_TOKEN"),
+        }
+        let cli = parsed.expect("FJ_TOKEN must not synthesize --token and conflict with --fjord");
+        match cli.command {
+            Command::Auth(auth::AuthCmd {
+                command: auth::AuthSub::Login(args),
+            }) => {
+                assert!(args.fjord);
+                assert!(args.token.is_none());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_clear_parses_when_generic_env_session_is_set() {
+        let old = std::env::var_os("FJ_SESSION");
+        std::env::set_var("FJ_SESSION", "cookieval");
+        let parsed = Cli::try_parse_from(["fj", "auth", "session", "--clear"]);
+        match old {
+            Some(value) => std::env::set_var("FJ_SESSION", value),
+            None => std::env::remove_var("FJ_SESSION"),
+        }
+        let cli =
+            parsed.expect("FJ_SESSION must not synthesize --cookie and conflict with --clear");
+        match cli.command {
+            Command::Auth(auth::AuthCmd {
+                command: auth::AuthSub::Session(args),
+            }) => {
+                assert!(args.clear);
+                assert!(args.cookie.is_none());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 
     #[test]

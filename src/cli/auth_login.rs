@@ -30,8 +30,10 @@ fn resolve_login_mode(args: &LoginArgs, stdin_is_tty: bool) -> LoginMode {
     if args.fjord {
         return LoginMode::Fjord;
     }
-    // `--token` also binds FJ_TOKEN, so an env-provided token lands here too.
-    let pat_input_given = args.host.is_some() || args.token.is_some() || args.with_token;
+    let pat_input_given = args.host.is_some()
+        || args.token.is_some()
+        || args.with_token
+        || token_store::env_token().is_some();
     if pat_input_given {
         return LoginMode::Pat;
     }
@@ -756,16 +758,13 @@ fn settle_outcome(o: crate::fjord::SignInResponse) -> Result<crate::fjord::SignI
 #[cfg_attr(coverage_nightly, coverage(off))]
 fn read_token(args: &LoginArgs) -> Result<String> {
     if let Some(t) = &args.token {
-        // `--token` also binds FJ_TOKEN. If the value didn't come from the
-        // environment it was passed on the command line, where it lands in
-        // `ps` output and shell history. Nudge toward the safe inputs.
-        let from_env = std::env::var("FJ_TOKEN").ok().as_deref() == Some(t.as_str());
-        if !from_env {
-            eprintln!(
-                "warning: passing --token on the command line exposes it in shell history and `ps`; prefer `--with-token` (stdin) or the interactive prompt"
-            );
-        }
+        eprintln!(
+            "warning: passing --token on the command line exposes it in shell history and `ps`; prefer `--with-token` (stdin) or the interactive prompt"
+        );
         return Ok(t.clone());
+    }
+    if let Some(t) = token_store::env_token() {
+        return Ok(t);
     }
     if args.with_token {
         use std::io::Read;
@@ -847,6 +846,53 @@ fn normalize_pat_host(raw: &str) -> Result<(String, Option<String>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn login_args() -> LoginArgs {
+        LoginArgs {
+            host: None,
+            token: None,
+            with_token: false,
+            git_protocol: "https".into(),
+            fjord: false,
+            manual: false,
+            device: false,
+            platform_url: None,
+        }
+    }
+
+    struct EnvRestore {
+        key: &'static str,
+        old: Option<std::ffi::OsString>,
+    }
+
+    impl EnvRestore {
+        fn set(key: &'static str, value: &str) -> Self {
+            let old = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, old }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            match &self.old {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    #[test]
+    fn fjord_mode_wins_over_generic_env_token() {
+        let _token = EnvRestore::set("FJ_TOKEN", "env-token");
+        let mut args = login_args();
+        args.fjord = true;
+
+        assert_eq!(resolve_login_mode(&args, false), LoginMode::Fjord);
+
+        let args = login_args();
+        assert_eq!(resolve_login_mode(&args, false), LoginMode::Pat);
+    }
 
     #[test]
     fn choose_oidc_capture_precedence() {

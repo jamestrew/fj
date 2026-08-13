@@ -110,10 +110,12 @@ pub async fn probe_strategy(platform_url: &str) -> Result<AuthStrategy> {
         .await
         .with_context(|| format!("GET {url}"))?;
     let status = res.status();
+    let headers = res.headers().clone();
     let text = res
         .text()
         .await
         .with_context(|| format!("reading auth-status body (HTTP {status})"))?;
+    super::ensure_json_platform_response("auth-status endpoint", status, Some(&headers), &text)?;
     let body: AuthStatusBody = serde_json::from_str(&text).with_context(|| {
         format!(
             "decoding auth-status (HTTP {status}); body was: {}",
@@ -614,10 +616,12 @@ async fn post_token(platform_url: &str, form: &[(&str, &str)]) -> Result<TokenRe
         .await
         .with_context(|| format!("POST {url}"))?;
     let status = res.status();
+    let headers = res.headers().clone();
     let text = res
         .text()
         .await
         .with_context(|| format!("reading token response (HTTP {status})"))?;
+    super::ensure_json_platform_response("token endpoint", status, Some(&headers), &text)?;
     if !status.is_success() {
         return Err(anyhow!(
             "token endpoint returned HTTP {status}: {}",
@@ -696,10 +700,17 @@ pub async fn request_device_authorization(
         .await
         .with_context(|| format!("POST {url}"))?;
     let status = res.status();
+    let headers = res.headers().clone();
     let text = res
         .text()
         .await
         .with_context(|| format!("reading device-authorization response (HTTP {status})"))?;
+    super::ensure_json_platform_response(
+        "device-authorization endpoint",
+        status,
+        Some(&headers),
+        &text,
+    )?;
     if !status.is_success() {
         return Err(anyhow!(
             "device-authorization endpoint returned HTTP {status}: {}",
@@ -766,10 +777,12 @@ pub async fn poll_device_token(
         .await
         .with_context(|| format!("POST {url}"))?;
     let status = res.status();
+    let headers = res.headers().clone();
     let text = res
         .text()
         .await
         .with_context(|| format!("reading device-token response (HTTP {status})"))?;
+    super::ensure_json_platform_response("device-token endpoint", status, Some(&headers), &text)?;
     if status.is_success() {
         let tokens = serde_json::from_str::<TokenResponse>(&text).with_context(|| {
             format!("decoding device-token response: {}", super::preview(&text))
@@ -1557,6 +1570,27 @@ mod tests {
             assert_eq!(auth.user_code, "WXYZ-ABCD");
             assert_eq!(auth.expires_in, 600);
             assert_eq!(auth.interval, 5);
+        }
+
+        #[tokio::test]
+        async fn device_authorization_html_response_points_at_platform_url() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/oauth/device_authorization"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/html")
+                        .set_body_string("<!DOCTYPE html><title>Sign in</title>"),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let err = request_device_authorization(&server.uri(), "fj-cli", Some("openid"))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("HTML page"), "got: {err}");
+            assert!(err.contains("--platform-url"), "got: {err}");
         }
 
         /// One poll maps each RFC 8628 §3.5 outcome. A public client sends the

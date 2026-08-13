@@ -21,7 +21,7 @@ use url::Url;
 pub mod oidc;
 
 /// Default fjord-platform deployment users sign in against.
-pub const DEFAULT_PLATFORM_URL: &str = "https://forgejo-site.pages.dev";
+pub const DEFAULT_PLATFORM_URL: &str = "https://fjord.sh";
 
 /// Marker error: a Fjord-Account call got HTTP 401. Returned bare (never
 /// wrapped with `.context()`) so callers can `downcast_ref` it and decide
@@ -156,10 +156,12 @@ pub async fn sign_in(platform_url: &str, req: &SignInRequest<'_>) -> Result<Sign
     // alongside the discriminant in the body. We decode the body either
     // way; the HTTP status is informational.
     let status = res.status();
+    let headers = res.headers().clone();
     let text = res
         .text()
         .await
         .with_context(|| format!("reading sign-in response body (HTTP {status})"))?;
+    ensure_json_platform_response("sign-in endpoint", status, Some(&headers), &text)?;
     // 4xx / 5xx without a parseable body becomes an explicit error.
     serde_json::from_str::<SignInResponse>(&text).with_context(|| {
         format!(
@@ -167,6 +169,38 @@ pub async fn sign_in(platform_url: &str, req: &SignInRequest<'_>) -> Result<Sign
             preview(&text)
         )
     })
+}
+
+pub(crate) fn ensure_json_platform_response(
+    label: &str,
+    status: StatusCode,
+    headers: Option<&HeaderMap>,
+    text: &str,
+) -> Result<()> {
+    let content_type = headers
+        .and_then(|headers| headers.get(reqwest::header::CONTENT_TYPE))
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let trimmed = text.trim_start();
+    let html_body = trimmed
+        .get(..trimmed.len().min(64))
+        .map(|prefix| prefix.to_ascii_lowercase())
+        .is_some_and(|prefix| prefix.starts_with("<!doctype html") || prefix.starts_with("<html"));
+    let non_json_content_type =
+        !content_type.is_empty() && !content_type.to_ascii_lowercase().contains("json");
+    if html_body || non_json_content_type {
+        let kind = if html_body {
+            "an HTML page"
+        } else {
+            "a non-JSON response"
+        };
+        return Err(anyhow!(
+            "{label} returned {kind} rather than the Fjord platform API (HTTP {status}); \
+             check `--platform-url`. Body starts: {}",
+            preview(text)
+        ));
+    }
+    Ok(())
 }
 
 fn preview(s: &str) -> String {
@@ -230,6 +264,7 @@ pub async fn list_instances(platform_url: &str, bearer: &str) -> Result<Vec<Forg
         // can downcast it, silently refresh, and retry before surfacing this.
         return Err(SessionExpired.into());
     }
+    let headers = res.headers().clone();
     let text = res
         .text()
         .await
@@ -240,6 +275,7 @@ pub async fn list_instances(platform_url: &str, bearer: &str) -> Result<Vec<Forg
             preview(&text)
         ));
     }
+    ensure_json_platform_response("forge-instances endpoint", status, Some(&headers), &text)?;
     // Paragon returns 200 with an empty list, OR (on a misconfigured
     // adapter) with no "instances" key at all. Tolerate both shapes.
     let parsed: serde_json::Value =

@@ -93,13 +93,10 @@ fn store_token_with_entry_and_file_path(
     }
 }
 
-/// Look up the token for `host`: first `FJ_TOKEN`, then keychain, then file.
+/// Look up the persisted token for `host`: keychain, then file.
 /// Returns `Ok(None)` when not present rather than an error so callers can
 /// prompt for login.
 pub fn load_token(host: &str) -> Result<Option<String>> {
-    if let Some(token) = env_token() {
-        return Ok(Some(token));
-    }
     load_persisted_token(host)
 }
 
@@ -188,6 +185,66 @@ pub fn env_token() -> Option<String> {
         .ok()
         .map(|token| token.trim().to_string())
         .filter(|token| !token.is_empty())
+}
+
+/// Return a host-scoped ephemeral PAT from `FJ_TOKEN_<HOST>` when present.
+///
+/// The host part is a byte-for-byte uppercase hex encoding prefixed with `H`,
+/// so `rasterhub.com` maps to `FJ_TOKEN_H7261737465726875622E636F6D`.
+/// Unlike the legacy host-agnostic `FJ_TOKEN`, this is safe to honor even when
+/// a command targets an explicit `--host`.
+pub fn env_token_for_host(host: &str) -> Option<String> {
+    std::env::var(host_env_token_var(host))
+        .ok()
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty())
+}
+
+pub fn host_env_token_var(host: &str) -> String {
+    format!("FJ_TOKEN_{}", host_env_suffix(host))
+}
+
+fn host_env_suffix(host: &str) -> String {
+    let mut suffix = String::with_capacity(1 + host.len() * 2);
+    suffix.push('H');
+    for byte in host.bytes() {
+        use std::fmt::Write;
+        let _ = write!(suffix, "{byte:02X}");
+    }
+    suffix
+}
+
+pub fn host_env_session_var(host: &str) -> String {
+    format!("FJ_SESSION_{}", host_env_suffix(host))
+}
+
+pub fn env_session_for_host(host: &str) -> Option<String> {
+    std::env::var(host_env_session_var(host))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+pub fn session_cookie_for_host(host: &str, allow_generic_env: bool) -> Result<Option<String>> {
+    if let Some(cookie) = env_session_for_host(host) {
+        return Ok(Some(cookie));
+    }
+    if allow_generic_env {
+        if let Some(cookie) = env_session() {
+            return Ok(Some(cookie));
+        }
+    }
+    load_session_cookie(host)
+}
+
+pub fn env_session_for_import(host: &str, allow_generic_env: bool) -> Option<String> {
+    env_session_for_host(host).or_else(|| {
+        if allow_generic_env {
+            env_session()
+        } else {
+            None
+        }
+    })
 }
 
 fn load_file_store(path: &Path) -> Result<FileTokenStore> {
@@ -328,13 +385,10 @@ pub fn store_session_cookie(host: &str, cookie: &str) -> Result<TokenStoreLocati
     store_token(&session_keychain_key(host), cookie)
 }
 
-/// Load the web session cookie for `host`: first `FJ_SESSION`, then keychain,
-/// then file. `Ok(None)` when absent so callers can point the user at
-/// `fj auth session`.
+/// Load the persisted web session cookie for `host`. Environment overrides are
+/// resolved by callers that know whether generic process-scoped credentials are
+/// safe for the selected host.
 pub fn load_session_cookie(host: &str) -> Result<Option<String>> {
-    if let Some(cookie) = env_session() {
-        return Ok(Some(cookie));
-    }
     load_persisted_token(&session_keychain_key(host))
 }
 
@@ -395,6 +449,20 @@ mod tests {
     }
 
     #[test]
+    fn host_scoped_env_session_is_named_from_host() {
+        let var = host_env_session_var("commons.fjord.host");
+        assert_eq!(var, "FJ_SESSION_H636F6D6D6F6E732E666A6F72642E686F7374");
+        std::env::set_var(&var, "  scoped-cookie  ");
+        assert_eq!(
+            env_session_for_host("commons.fjord.host").as_deref(),
+            Some("scoped-cookie")
+        );
+        std::env::set_var(&var, "   ");
+        assert_eq!(env_session_for_host("commons.fjord.host"), None);
+        std::env::remove_var(var);
+    }
+
+    #[test]
     fn env_token_trims_and_rejects_empty() {
         std::env::set_var("FJ_TOKEN", "  abc  ");
         assert_eq!(env_token().as_deref(), Some("abc"));
@@ -402,6 +470,32 @@ mod tests {
         assert_eq!(env_token(), None);
         std::env::remove_var("FJ_TOKEN");
         assert_eq!(env_token(), None);
+    }
+
+    #[test]
+    fn host_scoped_env_token_is_named_from_host() {
+        let var = host_env_token_var("commons.fjord.host");
+        assert_eq!(var, "FJ_TOKEN_H636F6D6D6F6E732E666A6F72642E686F7374");
+        std::env::set_var(&var, "  scoped  ");
+        assert_eq!(
+            env_token_for_host("commons.fjord.host").as_deref(),
+            Some("scoped")
+        );
+        std::env::set_var(&var, "   ");
+        assert_eq!(env_token_for_host("commons.fjord.host"), None);
+        std::env::remove_var(var);
+    }
+
+    #[test]
+    fn host_scoped_env_vars_do_not_collapse_punctuation() {
+        assert_ne!(
+            host_env_token_var("foo-bar.com"),
+            host_env_token_var("foo.bar.com")
+        );
+        assert_ne!(
+            host_env_session_var("foo-bar.com"),
+            host_env_session_var("foo.bar.com")
+        );
     }
 
     #[test]

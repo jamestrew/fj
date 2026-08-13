@@ -44,7 +44,7 @@ pub struct SessionArgs {
     pub host: Option<String>,
     /// The `i_like_gitea` session cookie value, copied from a signed-in
     /// browser. Prefer `--with-cookie` (stdin) to keep it out of shell history.
-    #[arg(long, env = "FJ_SESSION", hide_env_values = true)]
+    #[arg(long, hide_env_values = true)]
     pub cookie: Option<String>,
     /// Read the cookie value from stdin.
     #[arg(long, conflicts_with = "cookie")]
@@ -95,7 +95,7 @@ pub struct LoginArgs {
     #[arg(long)]
     pub host: Option<String>,
     /// Pass the token as a flag instead of through stdin / interactive prompt.
-    #[arg(long, env = "FJ_TOKEN", hide_env_values = true)]
+    #[arg(long, hide_env_values = true)]
     pub token: Option<String>,
     /// Read the token from stdin (useful for piping `cat token.txt | fj auth login --with-token`).
     #[arg(long, conflicts_with = "token")]
@@ -156,23 +156,63 @@ pub struct SwitchArgs {
     pub host: String,
 }
 
-pub async fn run(cmd: AuthCmd) -> Result<()> {
+pub async fn run(cmd: AuthCmd, global_host: Option<&str>) -> Result<()> {
     match cmd.command {
-        AuthSub::Login(args) => auth_login::login(args).await,
-        AuthSub::Status(args) => status(args).await,
-        AuthSub::Logout(args) => logout(args),
+        AuthSub::Login(mut args) => {
+            if args.host.is_none() {
+                args.host = global_host.map(str::to_string);
+            }
+            auth_login::login(args).await
+        }
+        AuthSub::Status(args) => status(args, global_host).await,
+        AuthSub::Logout(args) => logout(args, global_host),
         AuthSub::List => list(),
         AuthSub::Switch(args) => switch(args),
-        AuthSub::Token(args) => token(args),
-        AuthSub::Refresh(args) => refresh(args).await,
-        AuthSub::Session(args) => session(args),
-        AuthSub::SetupGit(args) => auth_setup_git::setup_git(args),
+        AuthSub::Token(args) => token(args, global_host),
+        AuthSub::Refresh(args) => refresh(args, global_host).await,
+        AuthSub::Session(args) => session(args, global_host),
+        AuthSub::SetupGit(args) => {
+            let args = SetupGitArgs {
+                host: effective_host(args.host, global_host),
+                ..args
+            };
+            auth_setup_git::setup_git(args)
+        }
     }
 }
 
-fn session(args: SessionArgs) -> Result<()> {
+fn effective_host(local: Option<String>, global: Option<&str>) -> Option<String> {
+    local.or_else(|| global.map(str::to_string))
+}
+
+fn generic_env_allowed_for_resolved_host(
+    hosts: &Hosts,
+    host: &str,
+    explicit_host: Option<&str>,
+) -> bool {
+    if explicit_host.is_none() {
+        return true;
+    }
+    matches!(hosts.resolve_host(None), Ok(default) if default == host)
+}
+
+fn pat_env_token_for_status(host: &str, allow_generic_env: bool) -> Option<String> {
+    token_store::env_token_for_host(host).or_else(|| {
+        if allow_generic_env {
+            token_store::env_token()
+        } else {
+            None
+        }
+    })
+}
+
+fn session(mut args: SessionArgs, global_host: Option<&str>) -> Result<()> {
+    args.host = effective_host(args.host, global_host);
     let hosts = Hosts::load()?;
+    let explicit_host = args.host.clone();
     let host = hosts.resolve_host(args.host.as_deref())?.to_string();
+    let allow_generic_env =
+        generic_env_allowed_for_resolved_host(&hosts, &host, explicit_host.as_deref());
 
     if args.clear {
         token_store::delete_session_cookie(&host)?;
@@ -187,10 +227,14 @@ fn session(args: SessionArgs) -> Result<()> {
         let mut buf = String::new();
         std::io::stdin().read_to_string(&mut buf)?;
         buf.trim().to_string()
+    } else if let Some(cookie) = token_store::env_session_for_import(&host, allow_generic_env) {
+        cookie
     } else {
         return Err(anyhow!(
-            "pass the session cookie via --cookie, or --with-cookie to read it from stdin. \
-             Copy the `i_like_gitea` cookie value from a signed-in browser."
+            "pass the session cookie via --cookie, --with-cookie to read it from stdin, \
+             or FJ_SESSION for the default host / {} for this host. \
+             Copy the `i_like_gitea` cookie value from a signed-in browser.",
+            token_store::host_env_session_var(&host)
         ));
     };
     if cookie.is_empty() {
@@ -210,8 +254,9 @@ fn session(args: SessionArgs) -> Result<()> {
     Ok(())
 }
 
-fn token(args: TokenArgs) -> Result<()> {
+fn token(mut args: TokenArgs, global_host: Option<&str>) -> Result<()> {
     use std::io::IsTerminal;
+    args.host = effective_host(args.host, global_host);
     let hosts = Hosts::load()?;
     let host_name = hosts.resolve_host(args.host.as_deref())?.to_string();
     let cfg = hosts
@@ -243,7 +288,8 @@ fn token(args: TokenArgs) -> Result<()> {
     Ok(())
 }
 
-async fn refresh(args: RefreshArgs) -> Result<()> {
+async fn refresh(mut args: RefreshArgs, global_host: Option<&str>) -> Result<()> {
+    args.host = effective_host(args.host, global_host);
     let hosts = Hosts::load()?;
     let host = hosts.resolve_host(args.host.as_deref())?.to_string();
     let cfg = hosts
@@ -320,22 +366,33 @@ async fn refresh(args: RefreshArgs) -> Result<()> {
     Ok(())
 }
 
-async fn status(args: StatusArgs) -> Result<()> {
+async fn status(args: StatusArgs, global_host: Option<&str>) -> Result<()> {
     let hosts = Hosts::load()?;
     if hosts.hosts.is_empty() {
         println!("You are not signed in to any Forgejo hosts. Run `fj auth login`.");
         return Ok(());
     }
-    for (name, host) in &hosts.hosts {
-        let current_marker = if hosts.current.as_deref() == Some(name) {
+    let selected: Vec<String> = if let Some(host_name) = global_host {
+        vec![hosts.resolve_host(Some(host_name))?.to_string()]
+    } else {
+        hosts.hosts.keys().cloned().collect()
+    };
+    for name in selected {
+        let host = hosts
+            .hosts
+            .get(&name)
+            .ok_or_else(|| anyhow!("host '{name}' not configured"))?;
+        let allow_generic_env = generic_env_allowed_for_resolved_host(&hosts, &name, global_host);
+        let current_marker = if hosts.current.as_deref() == Some(name.as_str()) {
             output::bold(" (current)")
         } else {
             String::new()
         };
-        println!("{}{current_marker}", output::bold(name));
+        println!("{}{current_marker}", output::bold(&name));
         let token_present = match host.auth_kind {
             crate::config::hosts::AuthKind::Pat => {
-                token_store::env_token().is_some() || token_store::load_token(name)?.is_some()
+                pat_env_token_for_status(&name, allow_generic_env).is_some()
+                    || token_store::load_token(&name)?.is_some()
             }
             crate::config::hosts::AuthKind::FjordAccount => host
                 .fjord_account
@@ -396,9 +453,9 @@ async fn status(args: StatusArgs) -> Result<()> {
             "  ✓ Token: {}",
             if token_present {
                 if matches!(host.auth_kind, crate::config::hosts::AuthKind::Pat)
-                    && token_store::env_token().is_some()
+                    && pat_env_token_for_status(&name, allow_generic_env).is_some()
                 {
-                    "present in FJ_TOKEN"
+                    "present in environment"
                 } else {
                     "present in token store"
                 }
@@ -408,7 +465,8 @@ async fn status(args: StatusArgs) -> Result<()> {
         );
         // Web session (cookie) for the log/rerun routes is separate from the
         // API token: a host can have a valid PAT and still lack a session.
-        let session_present = token_store::load_session_cookie(name)?.is_some();
+        let session_present =
+            token_store::session_cookie_for_host(&name, allow_generic_env)?.is_some();
         let session_label = if session_present {
             "present (Actions log + rerun routes)".to_string()
         } else {
@@ -425,7 +483,8 @@ async fn status(args: StatusArgs) -> Result<()> {
             } else {
                 let t = match host.auth_kind {
                     crate::config::hosts::AuthKind::Pat => {
-                        token_store::env_token().or(token_store::load_token(name)?)
+                        pat_env_token_for_status(&name, allow_generic_env)
+                            .or(token_store::load_token(&name)?)
                     }
                     crate::config::hosts::AuthKind::FjordAccount => host
                         .fjord_account
@@ -443,7 +502,8 @@ async fn status(args: StatusArgs) -> Result<()> {
     Ok(())
 }
 
-fn logout(args: LogoutArgs) -> Result<()> {
+fn logout(mut args: LogoutArgs, global_host: Option<&str>) -> Result<()> {
+    args.host = effective_host(args.host, global_host);
     let mut hosts = Hosts::load()?;
     let target = match args.host {
         Some(h) => h,

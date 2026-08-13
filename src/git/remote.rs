@@ -2,8 +2,6 @@
 //! reading git remotes. Used so `fj pr list` (etc.) work without `-R` inside
 //! a clone.
 
-use std::process::Command;
-
 use anyhow::{anyhow, Context, Result};
 
 /// A parsed `owner/name` plus the hostname it lives on.
@@ -65,7 +63,7 @@ pub fn discover(preferred_host: Option<&str>) -> Result<RemoteRepo> {
 }
 
 fn list_remotes() -> Result<Vec<(String, String)>> {
-    let out = Command::new("git")
+    let out = super::command()
         .args(["remote", "-v"])
         .output()
         .context("running `git remote -v`")?;

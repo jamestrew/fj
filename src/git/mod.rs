@@ -10,9 +10,25 @@ pub use remote::discover;
 #[allow(unused_imports)]
 pub use remote::{parse_remote, RemoteRepo};
 
+pub(crate) fn command() -> Command {
+    let mut cmd = Command::new("git");
+    for key in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_PREFIX",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    ] {
+        cmd.env_remove(key);
+    }
+    cmd
+}
+
 /// Spawn `git` synchronously and surface the exit status as an error.
 pub fn run(args: &[&str]) -> Result<()> {
-    let status = Command::new("git")
+    let status = command()
         .args(args)
         .status()
         .with_context(|| "spawning git (is it installed and on PATH?)")?;
@@ -25,7 +41,7 @@ pub fn run(args: &[&str]) -> Result<()> {
 /// Read a value from the current repo's local git config. Returns None if the
 /// key is unset or we're not inside a git repo.
 pub fn config_get_local(key: &str) -> Option<String> {
-    let out = Command::new("git")
+    let out = command()
         .args(["config", "--local", "--get", key])
         .output()
         .ok()?;
@@ -49,7 +65,7 @@ pub fn config_set_local(key: &str, value: &str) -> Result<()> {
 /// Unset a local git config value. Tolerates the key not being set (git's
 /// exit code 5), so it's idempotent.
 pub fn config_unset_local(key: &str) -> Result<()> {
-    let status = Command::new("git")
+    let status = command()
         .args(["config", "--local", "--unset", key])
         .status()
         .with_context(|| "spawning git config --unset")?;
@@ -83,7 +99,7 @@ pub fn checkout(branch: &str) -> Result<()> {
 
 /// Current branch name, or None when detached HEAD or not inside a repo.
 pub fn current_branch() -> Option<String> {
-    let out = Command::new("git")
+    let out = command()
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
         .output()
         .ok()?;
@@ -101,10 +117,7 @@ pub fn current_branch() -> Option<String> {
 /// `(dirty, changed_file_count)` from `git status --porcelain`. None if we
 /// can't run git / aren't in a repo.
 pub fn working_tree_status() -> Option<(bool, usize)> {
-    let out = Command::new("git")
-        .args(["status", "--porcelain"])
-        .output()
-        .ok()?;
+    let out = command().args(["status", "--porcelain"]).output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -115,7 +128,7 @@ pub fn working_tree_status() -> Option<(bool, usize)> {
 /// non-zero (surfacing stderr). Caller must ensure no `-`-leading arg is
 /// passed from untrusted input (see `reject_dash_lead`).
 pub fn output(args: &[&str]) -> Result<String> {
-    let out = Command::new("git")
+    let out = command()
         .args(args)
         .output()
         .with_context(|| "spawning git (is it installed and on PATH?)")?;
@@ -132,10 +145,7 @@ pub fn output(args: &[&str]) -> Result<String> {
 /// The repo's git directory (e.g. `.git`), or None when not in a repo. Used
 /// to anchor fj's local-only state under `<git-dir>/fj/`.
 pub fn git_dir() -> Option<PathBuf> {
-    let out = Command::new("git")
-        .args(["rev-parse", "--git-dir"])
-        .output()
-        .ok()?;
+    let out = command().args(["rev-parse", "--git-dir"]).output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -157,10 +167,7 @@ pub fn remote_url() -> Option<String> {
 /// None when neither is set or we aren't in a repo.
 pub fn primary_remote() -> Option<(String, String)> {
     for name in ["upstream", "origin"] {
-        if let Ok(out) = Command::new("git")
-            .args(["remote", "get-url", name])
-            .output()
-        {
+        if let Ok(out) = command().args(["remote", "get-url", name]).output() {
             if out.status.success() {
                 let u = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 if !u.is_empty() {
@@ -174,7 +181,7 @@ pub fn primary_remote() -> Option<(String, String)> {
 
 /// True if `rev` resolves to something in this repo (branch, tag, sha).
 pub fn rev_exists(rev: &str) -> bool {
-    Command::new("git")
+    command()
         .args(["rev-parse", "--verify", "--quiet", rev])
         .output()
         .map(|o| o.status.success())
@@ -187,7 +194,7 @@ pub fn rev_exists(rev: &str) -> bool {
 pub fn push(remote: &str, branch: &str) -> Result<()> {
     reject_dash_lead("remote", remote)?;
     reject_dash_lead("branch name", branch)?;
-    let out = Command::new("git")
+    let out = command()
         .args(["push", remote, branch])
         .output()
         .with_context(|| "spawning git push")?;
@@ -319,7 +326,7 @@ pub fn is_ancestor(ancestor: &str, descendant: &str) -> bool {
     {
         return false;
     }
-    Command::new("git")
+    command()
         .args(["merge-base", "--is-ancestor", ancestor, descendant])
         .status()
         .map(|s| s.success())
@@ -349,7 +356,7 @@ pub fn commit_fixup(target: &str, files: &[String]) -> Result<()> {
 /// rebase never opens an editor.
 pub fn rebase_autosquash_update_refs(base: &str) -> Result<()> {
     reject_dash_lead("base", base)?;
-    let status = Command::new("git")
+    let status = command()
         .args([
             "-c",
             "sequence.editor=:",
@@ -373,7 +380,7 @@ pub fn rebase_autosquash_update_refs(base: &str) -> Result<()> {
 /// Abort an in-progress rebase, best effort (`git rebase --abort`). Errors are
 /// swallowed: it's only called on a recovery path.
 pub fn rebase_abort() {
-    let _ = Command::new("git").args(["rebase", "--abort"]).status();
+    let _ = command().args(["rebase", "--abort"]).status();
 }
 
 /// A git repository addressed by path rather than by the process's current
@@ -405,7 +412,7 @@ impl Repo {
     }
 
     fn command(&self, args: &[&str]) -> Command {
-        let mut c = Command::new("git");
+        let mut c = command();
         c.arg("-C").arg(&self.dir).args(args);
         c
     }
@@ -629,7 +636,7 @@ pub fn apply_patch(patch: &str, check_only: bool) -> Result<()> {
     if check_only {
         args.push("--check");
     }
-    let mut child = Command::new("git")
+    let mut child = command()
         .args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -668,7 +675,7 @@ pub fn commit(message: &str) -> Result<()> {
 /// `(ahead, behind)` of HEAD relative to its upstream `@{u}`. None when there
 /// is no upstream configured or we aren't in a repo.
 pub fn ahead_behind_upstream() -> Option<(u32, u32)> {
-    let out = Command::new("git")
+    let out = command()
         .args(["rev-list", "--left-right", "--count", "@{u}...HEAD"])
         .output()
         .ok()?;
