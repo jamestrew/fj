@@ -686,6 +686,178 @@ async fn fjord_list_instances_happy_path() {
     assert_eq!(instances[1].state.as_deref(), Some("provisioning"));
 }
 
+/// `GET /api/v1/me/commons`, joined: the Commons becomes a switchable
+/// instance carrying the gateway forge id, which is the id every later call
+/// routes through. Field-for-field the same synthesis fjord-android does in
+/// `account/ForgeInstance.kt`.
+#[tokio::test]
+async fn fjord_commons_joined_becomes_an_instance() {
+    use crate::fjord::fetch_commons;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/me/commons"))
+        .and(header("authorization", "Bearer alice-bearer"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "commons": {
+                "url": "https://commons.fjord.host",
+                "name": "Fjord Commons",
+                "memberCount": 42,
+                "gatewayForgeId": "forge-commons-1",
+                "membership": { "joined": true, "namespace": "alice" }
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let commons = fetch_commons(&server.uri(), "alice-bearer")
+        .await
+        .expect("ok")
+        .expect("commons present");
+    let instance = commons
+        .to_switchable_instance()
+        .expect("joined commons is switchable");
+    assert_eq!(instance.id, "forge-commons-1");
+    assert_eq!(instance.slug, "commons");
+    assert_eq!(instance.display_name, "Fjord Commons");
+    assert_eq!(
+        instance.public_url.as_deref(),
+        Some("https://commons.fjord.host")
+    );
+    assert_eq!(instance.state.as_deref(), Some("ready"));
+}
+
+/// Not joined: the account can see that a Commons exists and cannot use it,
+/// so it must NOT become an instance. Offering it would turn a clear "you have
+/// not joined" into a 403 from the gateway at the moment the user tries to open
+/// a PR, which is the worst place to find out.
+#[tokio::test]
+async fn fjord_commons_not_joined_is_not_switchable() {
+    use crate::fjord::fetch_commons;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/me/commons"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "commons": {
+                "url": "https://commons.fjord.host",
+                "name": "Fjord Commons",
+                "gatewayForgeId": "forge-commons-1",
+                "membership": { "joined": false }
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let commons = fetch_commons(&server.uri(), "alice-bearer")
+        .await
+        .expect("ok")
+        .expect("commons present");
+    assert!(!commons.membership.joined);
+    // The information survives for the caller's message even though the
+    // instance does not.
+    assert!(commons.to_switchable_instance().is_none());
+    assert_eq!(commons.url, "https://commons.fjord.host");
+}
+
+/// Joined but with no gateway id: the platform knows about the Commons and
+/// cannot route to it yet. Same refusal, since an instance with no id has no
+/// gateway path to construct.
+#[tokio::test]
+async fn fjord_commons_without_gateway_id_is_not_switchable() {
+    use crate::fjord::fetch_commons;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/me/commons"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "commons": {
+                "url": "https://commons.fjord.host",
+                "name": "Fjord Commons",
+                "gatewayForgeId": "",
+                "membership": { "joined": true }
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let commons = fetch_commons(&server.uri(), "alice-bearer")
+        .await
+        .expect("ok")
+        .expect("commons present");
+    assert!(commons.to_switchable_instance().is_none());
+}
+
+/// A platform older than this endpoint, or one with the Commons feature off,
+/// answers 404. That is "no Commons here", which is today's behaviour, so it
+/// must be `Ok(None)` and not an error: `fj instances` has to keep working
+/// against an older platform.
+#[tokio::test]
+async fn fjord_commons_404_is_none_not_an_error() {
+    use crate::fjord::fetch_commons;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/me/commons"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let commons = fetch_commons(&server.uri(), "alice-bearer")
+        .await
+        .expect("404 must not be an error");
+    assert!(commons.is_none());
+}
+
+/// A 200 with `{"commons": null}` (feature on, nothing to report) is also None
+/// rather than a decode failure.
+#[tokio::test]
+async fn fjord_commons_null_body_is_none() {
+    use crate::fjord::fetch_commons;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/me/commons"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "commons": null })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let commons = fetch_commons(&server.uri(), "alice-bearer")
+        .await
+        .expect("ok");
+    assert!(commons.is_none());
+}
+
+/// A 401 surfaces as the bare `SessionExpired` marker, the same contract
+/// `list_instances` has, so the caller can refresh once and retry rather than
+/// showing the user an error for an expired session it could have renewed.
+#[tokio::test]
+async fn fjord_commons_401_is_session_expired() {
+    use crate::fjord::{fetch_commons, SessionExpired};
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/me/commons"))
+        .respond_with(ResponseTemplate::new(401).set_body_string("unauthorized"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let err = fetch_commons(&server.uri(), "alice-bearer")
+        .await
+        .expect_err("401 should error");
+    assert!(err.downcast_ref::<SessionExpired>().is_some());
+}
+
+/// The gateway path built for the Commons is the ordinary one. Nothing about
+/// the Commons is special after synthesis, which is the point: `fj api` and
+/// `fj pr create` need no Commons-specific branch.
+#[test]
+fn commons_routes_through_the_ordinary_gateway_path() {
+    use crate::fjord::gateway_base_url;
+    let url = gateway_base_url("https://platform.example", "forge-commons-1").expect("url");
+    assert_eq!(
+        url.as_str(),
+        "https://platform.example/api/v1/forge-gateway/forge-commons-1/api/v1/"
+    );
+}
+
 /// Paragon's 404 (no instances provisioned yet) maps to an empty list
 /// rather than an error, so the CLI can print a friendly "no instances yet"
 /// message rather than an exception trace.

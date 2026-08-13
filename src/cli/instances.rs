@@ -66,25 +66,82 @@ pub async fn run(cmd: InstancesCmd, top_host: Option<&str>) -> Result<()> {
 ///
 /// This refresh stays here (rather than folding into the shared `Client`'s new
 /// central refresh) because `fj instances` talks to the platform's
-/// `/api/v1/me/forge-instances` endpoint via [`fjord::list_instances`], NOT
-/// through `Client` (which is scoped to a single forge gateway). The two paths
-/// are independent; the `Client` refresh covers `fj api`/`pr`/`issue`/etc.
+/// `/api/v1/me/forge-instances` and `/api/v1/me/commons` endpoints directly,
+/// NOT through `Client` (which is scoped to a single forge gateway). The two
+/// paths are independent; the `Client` refresh covers `fj api`/`pr`/`issue`.
+///
+/// Returns the instance list plus the raw Commons response, so a caller can
+/// tell the three states apart: joined (an extra instance), not joined (a `CommonsInfo`
+/// that yields no instance), and no Commons on this platform (`None`).
+///
+/// The Commons is appended rather than merged into `/me/forge-instances`,
+/// because it is not an instance the account owns and the platform is explicit
+/// that it is not in that list. A `None` from the Commons call is not an error:
+/// an older platform, or one with the feature off, answers 404 and the user
+/// gets exactly today's behaviour.
+///
+/// The Commons call is made every time and its result is never persisted.
+/// `membership.joined` can change without fj hearing about it, and a cached
+/// "joined" would offer an instance the account can no longer use. It is also
+/// the reason nothing here needs an expiry: fj stores no credential from this
+/// path at all, since the gateway mints and attaches the forge token
+/// server-side per call.
 #[cfg_attr(coverage_nightly, coverage(off))]
-async fn fetch_instances(platform_url: &str, bearer: &str) -> Result<Vec<ForgeInstance>> {
-    match fjord::list_instances(platform_url, bearer).await {
-        Ok(instances) => Ok(instances),
+async fn fetch_instances_with_commons(
+    platform_url: &str,
+    bearer: &str,
+) -> Result<(Vec<ForgeInstance>, Option<fjord::CommonsInfo>)> {
+    let (mut instances, commons) = match tokio::try_join!(
+        fjord::list_instances(platform_url, bearer),
+        fjord::fetch_commons(platform_url, bearer)
+    ) {
+        Ok(pair) => pair,
         Err(e) => {
+            // One refresh covers both calls: they share the bearer, so a 401
+            // from either means the same session expired.
             let expired = e.downcast_ref::<fjord::SessionExpired>().is_some();
             if expired && fjord::oidc::valid_refresh_token(platform_url, bearer)?.is_some() {
                 let fresh = fjord::oidc::refresh_session(platform_url)
                     .await
                     .with_context(|| format!("{e}; automatic session refresh failed"))?;
-                fjord::list_instances(platform_url, &fresh).await
+                tokio::try_join!(
+                    fjord::list_instances(platform_url, &fresh),
+                    fjord::fetch_commons(platform_url, &fresh)
+                )?
             } else {
-                Err(e)
+                return Err(e);
             }
         }
+    };
+
+    // Guard against the platform ever listing the Commons in both places: the
+    // app carries the same check, and a duplicate would make `instances use`
+    // ambiguous.
+    if let Some(instance) = commons.as_ref().and_then(|c| c.to_switchable_instance()) {
+        if !instances.iter().any(|i| i.id == instance.id) {
+            instances.push(instance);
+        }
     }
+    Ok((instances, commons))
+}
+
+/// The note shown when the platform advertises a Commons the account has not
+/// joined. Without it, `fj instances` looks identical to a platform that has no
+/// Commons at all, which reads as "no such forge" rather than "not yours yet".
+fn commons_hint(commons: Option<&fjord::CommonsInfo>) -> Option<String> {
+    let c = commons?;
+    if c.membership.joined {
+        return None;
+    }
+    let name = if c.name.trim().is_empty() {
+        "the Fjord Commons"
+    } else {
+        c.name.trim()
+    };
+    Some(format!(
+        "{name} is available at {} but this account has not joined it, so it is not listed above.",
+        c.url
+    ))
 }
 
 /// Look up the active Fjord-Account host config + bearer. Errors clearly
@@ -122,9 +179,10 @@ async fn list(host_flag: Option<&str>, json: bool) -> Result<()> {
         .fjord_account
         .as_ref()
         .expect("resolve_fjord guarantees fjord_account is Some");
-    let instances = fetch_instances(&fa.platform_url, &bearer)
+    let (instances, commons) = fetch_instances_with_commons(&fa.platform_url, &bearer)
         .await
         .with_context(|| format!("listing forge instances at {}", fa.platform_url))?;
+    let hint = commons_hint(commons.as_ref());
 
     if json {
         return output::print_json(&serde_json::to_value(serializable_list(&instances))?);
@@ -135,6 +193,12 @@ async fn list(host_flag: Option<&str>, json: bool) -> Result<()> {
             "(no Forgejo instances yet for this account at {})",
             fa.platform_url
         );
+        // Printed before the provisioning hint: a user with no instances who
+        // has not joined the Commons is being told about the wrong thing
+        // otherwise.
+        if let Some(hint) = &hint {
+            println!("{}", output::dim(hint));
+        }
         println!(
             "{}",
             output::dim(
@@ -170,6 +234,9 @@ async fn list(host_flag: Option<&str>, json: bool) -> Result<()> {
         &rows,
     );
     print!("{table}");
+    if let Some(hint) = &hint {
+        println!("{}", output::dim(hint));
+    }
     Ok(())
 }
 
@@ -203,13 +270,28 @@ async fn use_instance(host_flag: Option<&str>, args: UseArgs) -> Result<()> {
     // Refresh the list and look up by id or slug. We do this fetch every
     // time rather than letting the user pick something stale; instance ids
     // are stable but plans / states aren't.
-    let instances = fetch_instances(&fa.platform_url, &bearer)
+    let (instances, commons) = fetch_instances_with_commons(&fa.platform_url, &bearer)
         .await
         .with_context(|| format!("listing forge instances at {}", fa.platform_url))?;
     let target = instances
         .iter()
         .find(|i| i.id == args.id_or_slug || i.slug == args.id_or_slug)
         .ok_or_else(|| {
+            // Asking for the Commons by name deserves the real reason. Without
+            // this, "not joined" and "this platform has no Commons" both come
+            // back as "no instance matches", which sends the user looking for a
+            // typo instead of at a join link.
+            if args.id_or_slug.eq_ignore_ascii_case("commons") {
+                if let Some(hint) = commons_hint(commons.as_ref()) {
+                    return anyhow!("{hint}");
+                }
+                if commons.is_none() {
+                    return anyhow!(
+                        "this platform ({}) does not advertise a Commons.",
+                        fa.platform_url
+                    );
+                }
+            }
             anyhow!(
                 "no instance matches '{}'. Run `fj instances list` to see what's available.",
                 args.id_or_slug
