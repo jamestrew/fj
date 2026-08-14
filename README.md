@@ -133,12 +133,13 @@ fj auth login --fjord --platform-url http://localhost:5180   # staging / local d
 A Fjord Account session under OIDC keeps a refresh token, so it renews silently
 (and on demand via `fj auth refresh`).
 
-### Web session for Actions logs and reruns
+### Web session for cookie-gated Actions routes
 
-The Forgejo Actions **log** and **rerun** web routes reject a PAT and
-authenticate by browser session cookie only (fj#103). To use `fj run log` /
-`fj run view --log` / `fj run rerun` on a private repo, import the
-`i_like_gitea` cookie from a signed-in browser:
+`fj run logs` and `fj run view --log` read job logs through Forgejo's
+token-authenticated Actions API on supported Forgejo builds. The remaining
+human-facing Actions routes, including `fj run watch` and `fj run rerun`, are
+cookie-gated on rasterhub (fj#103). To use those browser-backed routes on a
+private repo, import the `i_like_gitea` cookie from a signed-in browser:
 
 ```sh
 fj auth session --with-cookie                # paste the cookie on stdin (kept out of history)
@@ -180,8 +181,8 @@ fj release create v1.2.3 \
 **Inspect an Actions run:**
 
 ```sh
-fj run view 42 --log-failed              # failed steps across every job
-fj run view 42 --log --job 1             # one job's full log
+fj run logs 42 --failed                  # failed jobs in the run
+fj run logs 42 --job 1                   # one job's full log
 fj run download 42 --list --json         # artifacts as JSON
 ```
 

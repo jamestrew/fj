@@ -26,7 +26,8 @@ pub enum RunSub {
     /// View a workflow run, or its logs with `--log` / `--log-failed`.
     View(ViewArgs),
     /// Print a workflow run's logs.
-    Log(LogArgs),
+    #[command(alias = "log")]
+    Logs(LogArgs),
     /// Stream a run's logs live until the job finishes.
     Watch(WatchArgs),
     /// List or download a run's artifacts.
@@ -187,7 +188,7 @@ pub async fn run(cmd: RunCmd, host: Option<&str>) -> Result<()> {
     match cmd.command {
         RunSub::List(args) => list(args, host).await,
         RunSub::View(args) => view(args, host).await,
-        RunSub::Log(args) => log(args, host).await,
+        RunSub::Logs(args) => log(args, host).await,
         RunSub::Watch(args) => watch(args, host).await,
         RunSub::Download(args) => workflow_artifact::download(args, host).await,
         RunSub::Rerun(args) => rerun(args, host).await,
@@ -969,6 +970,27 @@ mod tests {
         assert_eq!(args.branch.as_deref(), Some("main"));
         assert_eq!(args.event.as_deref(), Some("push"));
         assert_eq!(args.workflow.as_deref(), Some("ci.yml"));
+    }
+
+    #[test]
+    fn run_logs_parses_and_log_remains_alias() {
+        use clap::Parser;
+
+        for subcommand in ["logs", "log"] {
+            let cli = crate::cli::Cli::try_parse_from([
+                "fj", "run", subcommand, "56", "--job", "1", "--failed",
+            ])
+            .expect("should parse");
+            let crate::cli::Command::Run(RunCmd {
+                command: RunSub::Logs(args),
+            }) = cli.command
+            else {
+                panic!("expected run logs command");
+            };
+            assert_eq!(args.run_id, 56);
+            assert_eq!(args.job, Some(1));
+            assert!(args.failed);
+        }
     }
 
     #[test]

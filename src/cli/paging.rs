@@ -160,7 +160,7 @@ fn run_pages(sub: &workflow_run::RunSub) -> bool {
     match sub {
         S::List(a) => !a.json,
         S::View(a) => !a.json,
-        S::Log(a) => !a.json,
+        S::Logs(a) => !a.json,
         // `run watch` streams live; paging would buffer it until the job ends.
         S::Watch(_) => false,
         // Artifact listing is a handful of rows; downloading writes files and
