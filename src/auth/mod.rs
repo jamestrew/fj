@@ -33,9 +33,10 @@ const FJORD_REFRESH_PREFIX: &str = "fjord-refresh:";
 
 /// Prefix on the keychain key that flags a stored Forgejo **web session
 /// cookie** (the `i_like_gitea` value) rather than a PAT. The web frontend
-/// log/rerun routes authenticate by session cookie only and reject a PAT
-/// (fj#103); a session imported with `fj auth session` is stored under this
-/// disjoint key so it can never clobber, or be clobbered by, the host's PAT.
+/// watch/rerun/cancel routes authenticate by session cookie only and reject a
+/// PAT (fj#103); a session imported with `fj auth session` is stored under
+/// this disjoint key so it can never clobber, or be clobbered by, the host's
+/// PAT.
 const SESSION_PREFIX: &str = "session:";
 
 #[derive(Debug, Clone, PartialEq, Eq)]

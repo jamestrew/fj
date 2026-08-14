@@ -30,8 +30,8 @@ pub enum AuthSub {
     Token(TokenArgs),
     /// Re-verify the stored token. Replaces it if a new one is given.
     Refresh(RefreshArgs),
-    /// Import a Forgejo web session cookie for the cookie-gated Actions log
-    /// and rerun routes (a PAT is rejected there; see fj#103).
+    /// Import a Forgejo web session cookie for cookie-gated Actions web routes
+    /// such as watch/rerun/cancel (a PAT is rejected there; see fj#103).
     Session(SessionArgs),
     /// Install a git credential helper that uses fj's stored token.
     SetupGit(SetupGitArgs),
@@ -248,9 +248,7 @@ fn session(mut args: SessionArgs, global_host: Option<&str>) -> Result<()> {
             path.display()
         );
     }
-    println!(
-        "✓ Imported web session for {host}. Cookie-gated Actions log and rerun routes will use it."
-    );
+    println!("✓ Imported web session for {host}. Cookie-gated Actions web routes will use it.");
     Ok(())
 }
 
@@ -463,14 +461,16 @@ async fn status(args: StatusArgs, global_host: Option<&str>) -> Result<()> {
                 "missing"
             }
         );
-        // Web session (cookie) for the log/rerun routes is separate from the
+        // Web session (cookie) for Actions web routes is separate from the
         // API token: a host can have a valid PAT and still lack a session.
         let session_present =
             token_store::session_cookie_for_host(&name, allow_generic_env)?.is_some();
         let session_label = if session_present {
-            "present (Actions log + rerun routes)".to_string()
+            "present (Actions web routes)".to_string()
         } else {
-            output::dim("none (run `fj auth session` to enable Actions logs on private repos)")
+            output::dim(
+                "none (run `fj auth session` to enable Actions watch/rerun on private repos)",
+            )
         };
         println!("  Web session: {session_label}");
         if args.show_token {

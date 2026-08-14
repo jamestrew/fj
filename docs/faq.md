@@ -157,10 +157,13 @@ Files: `hosts.toml`, `aliases.toml`, `config.toml`.
 ## How do I read Actions run logs?
 
 ```sh
-fj run list                 # find the run number in the `#` column
-fj run view 56 --log        # full log of every job in the run
-fj run view 56 --log-failed # failed steps, across every job that failed
-fj run watch 56             # stream the log live until the job ends
+fj run list                  # find the run number in the `#` column
+fj run logs 56               # full log of every job in the run
+fj run logs 56 --failed      # logs for jobs that did not finish green
+fj run logs 56 --job 1       # one job by zero-based job index
+fj run view 56 --log         # compatibility path for full logs
+fj run view 56 --log-failed  # compatibility path for failed-job logs
+fj run watch 56              # stream the web UI log live until the job ends
 ```
 
 By default `--log` spans all of a run's jobs, and `--log-failed` shows
@@ -171,14 +174,15 @@ default; pin one with `--attempt <n>`.
 
 Two things to know, because they look like bugs but aren't:
 
-- Forgejo's REST API has no log endpoint. `fj` reads logs from the same
-  web routes the browser Actions UI uses (see `docs/architecture.md` →
-  "Actions run logs"). This is why log commands work even though
-  `fj api /repos/.../actions/runs/N/logs` returns 404.
+- `fj run logs` maps the `#` run number to an internal run id with
+  `/api/v1/repos/.../actions/runs`, maps the job index through
+  `/actions/runs/{id}/jobs`, then reads `/actions/jobs/{job_id}/logs`.
+  A personal access token is sufficient on supported Forgejo builds.
 - "logs are no longer available for this run" means Forgejo pruned them
   after its retention period. They're gone server-side; there's nothing
   `fj` can fetch.
 
-Logs are not available for hosts logged in with a Fjord Account: the
-gateway only proxies `/api/v1`, not the web routes. Use a host with a
-personal access token.
+`fj run watch`, plain `fj run view`, `rerun`, and `cancel` still use web
+routes. Those are not available for hosts logged in through a Fjord Account
+gateway, which only proxies `/api/v1`; use a host with a personal access token
+for those commands.

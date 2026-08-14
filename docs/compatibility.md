@@ -47,7 +47,7 @@ no-`/api/v1` capability we looked at:
 
 | Capability | Web route? | Reachable with a PAT? | In `fj` |
 | --- | --- | --- | --- |
-| Run logs (`run view --log`, `watch`) | yes (read) | yes | ✅ implemented |
+| Run logs (`run logs`, `run view --log`) | yes (read) | yes | ✅ implemented |
 | Run summary (`run view`) | yes (read) | yes | ✅ implemented |
 | Artifact **list** (`run download --list`) | yes, returns JSON (read) | yes | ✅ implemented |
 | Artifact **download** (`run download`) | documented `.../artifacts/{name}` (read) | likely (unverified) | ⚠️ implemented, see note |
@@ -81,9 +81,11 @@ Reads (`fj run list`, `fj run view`, `--log`, `watch`, `run download
 --list`, `workflow list`) work, but most go through Forgejo's **web**
 routes (or the contents API), not the Actions `/api/v1` surface, which
 only exposes run list/get plus secrets, variables, and workflow dispatch.
-See `docs/architecture.md` → "Actions run logs". A Fjord-Account gateway
-proxies only `/api/v1`, so the whole `fj run` / `fj workflow` group needs
-a personal-access-token host.
+See `docs/architecture.md` → "Actions run logs". API-backed `fj run logs` uses
+the token-authenticated Actions API when the Forgejo server exposes it. A
+Fjord-Account gateway proxies only `/api/v1`, so web-route commands such as
+`run watch`, plain `run view`, `rerun`, and `cancel` still need a
+personal-access-token host.
 
 ## Forgejo-only endpoints
 
