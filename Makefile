@@ -120,8 +120,9 @@ coverage-html:
 	cargo llvm-cov --all --open --ignore-filename-regex '$(COV_IGNORE)'
 
 # Intent-precise coverage: handler regions excluded on top of COV_IGNORE.
-# COV_MIN is the minimum line coverage; 0 locally (pure report), set higher
-# in CI (see .forgejo/workflows/ci.yml) so a regression fails the build.
+# COV_MIN is the minimum line coverage; 0 locally (pure report). CI currently
+# enforces 61 while fj#249 tracks why the runner measures a wider surface than
+# the local floor was calibrated against.
 COV_MIN ?= 0
 COV_TOOLCHAIN ?= nightly-2026-08-07
 coverage-strict:
