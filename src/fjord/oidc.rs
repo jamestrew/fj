@@ -26,9 +26,9 @@ use anyhow::{anyhow, Context, Result};
 use base64::Engine as _;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, USER_AGENT};
 use serde::{Deserialize, Serialize};
-use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 use crate::auth as token_store;
 
@@ -55,6 +55,13 @@ const CALLBACK_PORTS: &[u16] = &[47017, 47018, 47019, 47020];
 /// Paragon's authorization-code TTL (5 minutes): a code minted right at the
 /// deadline would already be dead, so there is no point waiting longer.
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// How long a single accepted connection gets to send its request line before
+/// the CLI gives up on it and goes back to accepting. Connections are handled
+/// one at a time, so a socket that connects and then stalls (a browser
+/// preconnect, a port scanner) would otherwise hold the loopback open ahead of
+/// the real redirect forever; this caps that to a bounded delay.
+const REQUEST_LINE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Resolve the OIDC client id: `FJ_OIDC_CLIENT_ID` if set and non-empty, else
 /// [`DEFAULT_CLIENT_ID`].
@@ -227,41 +234,47 @@ impl LoopbackServer {
         ))
     }
 
-    /// Block (on a blocking thread) until the browser hits the redirect, then
-    /// return the authorization `code`. Verifies the returned `state` matches
-    /// `expected_state` (CSRF) and surfaces a provider `error=` verbatim.
+    /// Wait until the browser hits the redirect, then return the authorization
+    /// `code`. Verifies the returned `state` matches `expected_state` (CSRF)
+    /// and surfaces a provider `error=` verbatim.
+    ///
+    /// Async all the way down, deliberately. `cli::run` races every command
+    /// against SIGINT, and only a cancellable future lets Ctrl+C actually end
+    /// the process: a `spawn_blocking` accept loop keeps running after the
+    /// select drops it, and dropping the tokio runtime waits for blocking
+    /// tasks, so the CLI would print `error: interrupted` and then sit there
+    /// until [`CALLBACK_TIMEOUT`] elapsed.
     pub async fn wait_for_code(self, expected_state: String) -> Result<String> {
-        let listener = self.listener;
-        let deadline = Instant::now() + CALLBACK_TIMEOUT;
-        tokio::task::spawn_blocking(move || accept_code(&listener, &expected_state, deadline))
+        self.listener
+            .set_nonblocking(true)
+            .context("configuring loopback listener")?;
+        let listener = tokio::net::TcpListener::from_std(self.listener)
+            .context("registering the loopback listener with the runtime")?;
+        tokio::time::timeout(CALLBACK_TIMEOUT, accept_code(&listener, &expected_state))
             .await
-            .context("loopback callback task panicked")?
+            .unwrap_or_else(|_| {
+                Err(anyhow!(
+                    "timed out waiting for the browser sign-in to complete"
+                ))
+            })
     }
 }
 
-/// Poll the loopback listener until a `/callback` request carrying `code` (or
-/// `error`) arrives, or the deadline passes.
-fn accept_code(listener: &TcpListener, expected_state: &str, deadline: Instant) -> Result<String> {
-    listener
-        .set_nonblocking(true)
-        .context("configuring loopback listener")?;
+/// Accept loopback connections until one carries a `/callback` request with a
+/// `code` (or `error`). The overall deadline lives in the caller's
+/// [`tokio::time::timeout`], so this loop is free to await indefinitely.
+async fn accept_code(listener: &tokio::net::TcpListener, expected_state: &str) -> Result<String> {
     loop {
-        if Instant::now() >= deadline {
-            return Err(anyhow!(
-                "timed out waiting for the browser sign-in to complete"
-            ));
-        }
-        match listener.accept() {
-            Ok((stream, _)) => match handle_connection(stream, expected_state)? {
-                Some(code) => return Ok(code),
-                // A stray hit (favicon, empty path): keep waiting for the real
-                // redirect rather than aborting the whole sign-in.
-                None => continue,
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            Err(e) => return Err(anyhow!("accepting loopback connection: {e}")),
+        let (stream, _) = listener
+            .accept()
+            .await
+            .context("accepting loopback connection")?;
+        match handle_connection(stream, expected_state).await? {
+            Some(code) => return Ok(code),
+            // A stray hit (favicon, empty path, a browser preconnect that never
+            // sends a request): keep waiting for the real redirect rather than
+            // aborting the whole sign-in.
+            None => continue,
         }
     }
 }
@@ -270,31 +283,40 @@ fn accept_code(listener: &TcpListener, expected_state: &str, deadline: Instant) 
 /// page back to the browser. Returns `Ok(Some(code))` on success, `Ok(None)`
 /// for an unrelated request to ignore, and `Err` for a provider error or a
 /// state mismatch (which must abort the sign-in).
-fn handle_connection(stream: std::net::TcpStream, expected_state: &str) -> Result<Option<String>> {
-    let mut reader = BufReader::new(&stream);
+async fn handle_connection(
+    stream: tokio::net::TcpStream,
+    expected_state: &str,
+) -> Result<Option<String>> {
+    let mut reader = tokio::io::BufReader::new(stream);
     let mut request_line = String::new();
-    reader
-        .read_line(&mut request_line)
-        .context("reading loopback request")?;
+    // Bounded: a socket that connects and then says nothing (browsers open
+    // speculative preconnects) must not starve the real redirect behind it.
+    match tokio::time::timeout(REQUEST_LINE_TIMEOUT, reader.read_line(&mut request_line)).await {
+        Ok(res) => {
+            res.context("reading loopback request")?;
+        }
+        Err(_) => return Ok(None),
+    }
+    let stream = reader.into_inner();
     // "GET /callback?code=…&state=… HTTP/1.1"
     let target = request_line.split_whitespace().nth(1).unwrap_or("");
     match parse_callback(target) {
         CallbackOutcome::Ignore => {
-            write_page(stream, CallbackPage::NotFound);
+            write_page(stream, CallbackPage::NotFound).await;
             Ok(None)
         }
         CallbackOutcome::Error(msg) => {
-            write_page(stream, CallbackPage::Failed);
+            write_page(stream, CallbackPage::Failed).await;
             Err(anyhow!("sign-in was denied by the provider: {msg}"))
         }
         CallbackOutcome::Code { code, state } => {
             if state != expected_state {
-                write_page(stream, CallbackPage::StateMismatch);
+                write_page(stream, CallbackPage::StateMismatch).await;
                 return Err(anyhow!(
                     "OAuth state mismatch on the callback; aborting to avoid a possible CSRF"
                 ));
             }
-            write_page(stream, CallbackPage::Success);
+            write_page(stream, CallbackPage::Success).await;
             Ok(Some(code))
         }
     }
@@ -543,15 +565,15 @@ fn render_callback_page(page: CallbackPage) -> String {
 /// Write a branded [`CallbackPage`] back to the browser over the loopback
 /// socket. Best-effort: a write failure never aborts sign-in (the code is
 /// already captured), it just means the browser tab shows its own error.
-fn write_page(mut stream: std::net::TcpStream, page: CallbackPage) {
+async fn write_page(mut stream: tokio::net::TcpStream, page: CallbackPage) {
     let body = render_callback_page(page);
     let response = format!(
         "HTTP/1.1 {}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         page.http_status(),
         body.len()
     );
-    let _ = stream.write_all(response.as_bytes());
-    let _ = stream.flush();
+    let _ = stream.write_all(response.as_bytes()).await;
+    let _ = stream.flush().await;
 }
 
 /// A successful `/oauth/token` response (both the code and refresh grants).
@@ -1006,6 +1028,39 @@ pub fn bearer_identity(access_token: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression (Ctrl+C hang): `wait_for_code` must be cancellable. It used
+    /// to drive its accept loop from `spawn_blocking`, which keeps running
+    /// after `cli::run`'s SIGINT select drops the future, and dropping a tokio
+    /// runtime waits for blocking tasks. `fj auth login` therefore printed
+    /// `error: interrupted` and then sat there for the rest of
+    /// [`CALLBACK_TIMEOUT`]. Asserting on shutdown latency is what catches
+    /// that: awaiting the future looks identical either way.
+    #[test]
+    fn cancelling_wait_for_code_does_not_stall_runtime_shutdown() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        rt.block_on(async {
+            let server = LoopbackServer::bind().expect("bind loopback");
+            // Cancel the wait the way the SIGINT select does.
+            let cancelled = tokio::time::timeout(
+                Duration::from_millis(50),
+                server.wait_for_code("state".to_string()),
+            )
+            .await;
+            assert!(cancelled.is_err(), "nothing connected, so it must time out");
+        });
+        let start = Instant::now();
+        rt.shutdown_timeout(Duration::from_secs(2));
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "runtime shutdown stalled for {:?} after the wait was cancelled; \
+             an accept loop is still running on a blocking thread",
+            start.elapsed()
+        );
+    }
 
     #[test]
     fn pkce_challenge_matches_rfc7636_vector() {
