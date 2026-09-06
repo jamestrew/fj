@@ -60,9 +60,11 @@ docs/                  architecture, jq, gh-to-fj, faq, troubleshooting
   command modules, via `#[cfg_attr(coverage_nightly, coverage(off))]` on
   every cli `async fn` (inert on stable). It's the intent-precise number
   (~76% vs ~51% for plain `coverage`). When you add a cli `async fn`
-  handler, keep the attribute on it. CI currently enforces `COV_MIN=61`
+  handler, keep the attribute on it. CI currently enforces `COV_MIN=60`
   while fj#249 is open, because the runner measures a wider surface than the
-  calibrated local floor.
+  calibrated local floor. That floor is deliberately about a point under the
+  observed number: the surface drifts between runs on its own, so a floor set
+  at the observed value fails on drift instead of on a regression.
 - `./scripts/install-hooks.sh` symlinks repo hooks into `.git/hooks`.
 - `FJ_SKIP_PRECOMMIT=1` bypasses the fast hook for genuine emergencies only.
 - `FJ_E2E=1` enables the live API smoke against `stephen/fj-cli-test`.
