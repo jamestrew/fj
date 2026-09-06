@@ -200,6 +200,12 @@ pub struct CompletionArgs {
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
+    // Before anything that can park this thread in a syscall. The select
+    // below is the graceful path; this is the backstop for when the command
+    // future stops being pollable and the select never gets another look in.
+    // See `crate::interrupt`.
+    crate::interrupt::arm();
+
     crate::client::set_debug(cli.debug);
     crate::output::set_color_choice(cli.color, config::no_color_enabled());
     crate::output::set_json_fields(cli.json_fields.as_deref());

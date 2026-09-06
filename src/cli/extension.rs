@@ -73,6 +73,7 @@ async fn list() -> Result<()> {
 
 async fn invoke(args: RunArgs) -> Result<()> {
     let prog = format!("fj-{}", args.name);
+    let _foreground = crate::interrupt::ForegroundChild::enter();
     let status = std::process::Command::new(&prog)
         .args(&args.args)
         .status()?;

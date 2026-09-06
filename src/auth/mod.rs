@@ -8,13 +8,13 @@ use keyring::Entry;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    fs::{self, OpenOptions},
+    fs::{self},
     io::Write,
     path::{Path, PathBuf},
 };
 
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 
 const SERVICE: &str = "fj";
 
@@ -274,22 +274,55 @@ fn delete_file_token(path: &Path, host: &str) -> Result<()> {
     Ok(())
 }
 
+/// Rewrite the token store atomically.
+///
+/// Truncate-then-write left the store at zero bytes between `open` and
+/// `write_all`, so anything that stopped the process in that window destroyed
+/// every token rather than the one being changed. `fj auth login` reaches this
+/// through the error path of a keychain call that can hang, which is exactly
+/// when a user reaches for Ctrl+C, and the interrupt backstop exits the process
+/// from another thread without unwinding this one.
+///
+/// A temporary file in the same directory, fsynced, then renamed over the
+/// target: rename is atomic, so a reader (or a crash, or a force-exit) sees the
+/// old contents or the new ones and never an empty file. The window stops
+/// existing rather than being made smaller, which is why this is the fix rather
+/// than widening the shutdown grace.
+///
+/// The temp file is created 0600 by `tempfile` and set again explicitly before
+/// the rename, so the secret is never briefly world-readable under a permissive
+/// umask, and the target inherits the mode through the rename.
 fn write_file_store(path: &Path, store: &FileTokenStore) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    }
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     let text = toml::to_string_pretty(store).context("serializing token store")?;
-    set_file_store_permissions(path)?;
 
-    let mut options = OpenOptions::new();
-    options.create(true).truncate(true).write(true);
+    // Same directory as the target, because rename is only atomic within one
+    // filesystem and a temp dir can be on another.
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("creating a temporary file in {}", parent.display()))?;
     #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options
-        .open(path)
-        .with_context(|| format!("opening {} for token storage", path.display()))?;
-    file.write_all(text.as_bytes())
+    tmp.as_file()
+        .set_permissions(fs::Permissions::from_mode(0o600))
+        .with_context(|| {
+            format!(
+                "setting permissions on the temporary {} file",
+                path.display()
+            )
+        })?;
+    tmp.write_all(text.as_bytes())
         .with_context(|| format!("writing {}", path.display()))?;
+    // Before the rename, so a crash after it cannot leave the new name pointing
+    // at unflushed content.
+    tmp.as_file()
+        .sync_all()
+        .with_context(|| format!("flushing {}", path.display()))?;
+    tmp.persist(path)
+        .map_err(|e| e.error)
+        .with_context(|| format!("replacing {}", path.display()))?;
     set_file_store_permissions(path)?;
     Ok(())
 }
@@ -402,6 +435,60 @@ pub fn delete_session_cookie(host: &str) -> Result<()> {
 mod tests {
     use super::*;
     use std::fmt;
+
+    /// Regression for the truncate-then-write window: rewriting the token store
+    /// must REPLACE the file, not empty it and refill it.
+    ///
+    /// Observed through a read handle opened before the write. Replacement by
+    /// rename leaves that handle on the old inode, so it still sees the old
+    /// bytes; truncate-in-place would show the handle the new (or, mid-write,
+    /// an empty) file. That is the mechanism that makes the write atomic, so it
+    /// is what this asserts, and it fails deterministically if the write goes
+    /// back to `OpenOptions::truncate`.
+    #[test]
+    fn write_file_store_replaces_the_file_instead_of_truncating_it() {
+        use std::io::Read;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tokens.toml");
+
+        let mut first = FileTokenStore::default();
+        first.tokens.insert("a.example".into(), "aaaa".into());
+        first.tokens.insert("b.example".into(), "bbbb".into());
+        write_file_store(&path, &first).expect("first write");
+        let original = fs::read_to_string(&path).expect("read original");
+        assert!(original.contains("a.example") && original.contains("b.example"));
+
+        // Opened BEFORE the rewrite, and deliberately kept open across it.
+        let mut held = fs::File::open(&path).expect("hold a read handle");
+
+        let mut second = FileTokenStore::default();
+        second.tokens.insert("b.example".into(), "bbbb".into());
+        write_file_store(&path, &second).expect("second write");
+
+        let mut through_held = String::new();
+        held.read_to_string(&mut through_held).expect("read held");
+        assert_eq!(
+            through_held, original,
+            "the pre-existing handle must still see the old store; seeing anything \
+             else means the target was rewritten in place, which is the window that \
+             can leave it empty"
+        );
+
+        let now = fs::read_to_string(&path).expect("read new");
+        assert!(now.contains("b.example"), "the new store must be readable");
+        assert!(
+            !now.contains("a.example"),
+            "the new store must not carry the removed host"
+        );
+        assert!(!now.is_empty(), "the store must never be left empty");
+
+        #[cfg(unix)]
+        {
+            let mode = fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "the replacement must keep the store private");
+        }
+    }
 
     #[derive(Debug)]
     struct TestKeychainCause(&'static str);

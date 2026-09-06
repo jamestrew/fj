@@ -43,6 +43,7 @@ pub fn edit_text(template_name: &str, initial_contents: &str) -> Result<String> 
         .next()
         .ok_or_else(|| anyhow!("editor command is empty"))?;
     let extra_args: Vec<&str> = parts.collect();
+    let _foreground = crate::interrupt::ForegroundChild::enter();
     let status = Command::new(program)
         .args(&extra_args)
         .arg(&tmp_path)

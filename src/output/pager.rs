@@ -14,6 +14,33 @@ mod imp {
     use std::os::fd::IntoRawFd;
     use std::os::unix::io::AsRawFd;
     use std::process::{Child, Command, Stdio};
+    use std::sync::atomic::{AtomicI32, Ordering};
+
+    /// The live guard's saved stdout fd and pager pid, mirrored here so the
+    /// SIGINT backstop in `crate::interrupt` can put the terminal back when it
+    /// force-exits without the guard's `Drop` ever running. `-1` is "none".
+    ///
+    /// Whichever of `abandon` and `Drop` gets there first swaps these out, so
+    /// the restore happens exactly once.
+    static LIVE_SAVED_STDOUT: AtomicI32 = AtomicI32::new(-1);
+    static LIVE_PAGER_PID: AtomicI32 = AtomicI32::new(-1);
+
+    /// Restore stdout and stop the pager, for the interrupt path only. SIGTERM
+    /// rather than SIGKILL: `less` restores the terminal modes it changed only
+    /// if it is allowed to shut down normally.
+    pub fn abandon() {
+        let saved = LIVE_SAVED_STDOUT.swap(-1, Ordering::SeqCst);
+        let pid = LIVE_PAGER_PID.swap(-1, Ordering::SeqCst);
+        if saved >= 0 {
+            unsafe {
+                libc::dup2(saved, libc::STDOUT_FILENO);
+                libc::close(saved);
+            }
+        }
+        if pid > 0 {
+            unsafe { libc::kill(pid, libc::SIGTERM) };
+        }
+    }
 
     pub struct PagerGuard {
         /// Saved copy of the original stdout fd so we can restore it before
@@ -28,6 +55,11 @@ mod imp {
             use std::io::Write;
             let _ = std::io::stdout().flush();
 
+            // Take the restore duty away from the interrupt backstop: from here
+            // on this Drop owns it.
+            LIVE_SAVED_STDOUT.store(-1, Ordering::SeqCst);
+            LIVE_PAGER_PID.store(-1, Ordering::SeqCst);
+
             if let Some(saved) = self.saved_stdout.take() {
                 unsafe {
                     libc::dup2(saved, libc::STDOUT_FILENO);
@@ -35,6 +67,10 @@ mod imp {
                 }
             }
             if let Some(mut c) = self.child.take() {
+                // The command is done writing and the user is scrolling now, so
+                // Ctrl+C belongs to the pager. `less` absorbs it deliberately;
+                // the backstop must not turn that into an exit.
+                let _foreground = crate::interrupt::ForegroundChild::enter();
                 let _ = c.wait();
             }
         }
@@ -94,6 +130,9 @@ mod imp {
         }
         let _ = stdin.into_raw_fd();
 
+        LIVE_SAVED_STDOUT.store(saved, Ordering::SeqCst);
+        LIVE_PAGER_PID.store(child.id() as i32, Ordering::SeqCst);
+
         Some(PagerGuard {
             saved_stdout: Some(saved),
             child: Some(child),
@@ -113,8 +152,12 @@ mod imp {
     pub fn maybe_start(_force_disabled: bool) -> Option<PagerGuard> {
         None
     }
+
+    /// No pager to abandon on this platform.
+    pub fn abandon() {}
 }
 
+pub use imp::abandon;
 pub use imp::maybe_start;
 #[allow(unused_imports)]
 pub use imp::PagerGuard;

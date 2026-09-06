@@ -16,6 +16,7 @@ mod git;
 /// plumbing (`stack ship`'s restack).
 #[cfg(test)]
 mod gitfixture;
+mod interrupt;
 mod output;
 
 use std::process::{Command, ExitCode};

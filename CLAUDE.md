@@ -116,6 +116,18 @@ docs/                  architecture, jq, gh-to-fj, faq, troubleshooting
   it gets its own keychain prompt. Tests that need keychain access are
   the wiremock-backed ones in `src/client/integration_tests.rs`, which
   bypass the keychain via `Client::for_base_url`.
+- Ctrl+C has two mechanisms, in `crate::interrupt`. `cli::run` selects the
+  command future against `ctrl_c()` (graceful: destructors run), and a
+  spawned backstop force-exits 130 if that select is still wedged 250 ms
+  later. The select alone is not enough because the keychain and the
+  synchronous stdin reads park the `block_on` thread in a syscall, and
+  tokio has already taken SIGINT's default disposition away. If you add a
+  `Command::status()` that inherits our stdio, wrap it in
+  `interrupt::ForegroundChild::enter()` so the backstop stands down and the
+  child gets to interpret its own SIGINT. Nothing on the shutdown path may
+  run on the blocking pool: dropping the runtime waits for `spawn_blocking`
+  tasks, and that wait is the original hang (fj#257). `spawn_blocking` is
+  still the right tool elsewhere.
 - `fj auth setup-git` interpolates the hostname into a shell-evaluated
   credential helper string. The host is validated against a strict DNS
   pattern (`validate_hostname` in `cli/auth.rs`) before interpolation.

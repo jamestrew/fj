@@ -51,6 +51,7 @@ pub(crate) fn setup_git(args: super::auth::SetupGitArgs) -> Result<()> {
 }
 
 fn run_git_config(key: &str, value: &str) -> Result<()> {
+    let _foreground = crate::interrupt::ForegroundChild::enter();
     let status = std::process::Command::new("git")
         .args(["config", "--global", key, value])
         .status()

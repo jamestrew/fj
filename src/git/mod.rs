@@ -28,6 +28,7 @@ pub(crate) fn command() -> Command {
 
 /// Spawn `git` synchronously and surface the exit status as an error.
 pub fn run(args: &[&str]) -> Result<()> {
+    let _foreground = crate::interrupt::ForegroundChild::enter();
     let status = command()
         .args(args)
         .status()
@@ -65,6 +66,7 @@ pub fn config_set_local(key: &str, value: &str) -> Result<()> {
 /// Unset a local git config value. Tolerates the key not being set (git's
 /// exit code 5), so it's idempotent.
 pub fn config_unset_local(key: &str) -> Result<()> {
+    let _foreground = crate::interrupt::ForegroundChild::enter();
     let status = command()
         .args(["config", "--local", "--unset", key])
         .status()
@@ -326,6 +328,7 @@ pub fn is_ancestor(ancestor: &str, descendant: &str) -> bool {
     {
         return false;
     }
+    let _foreground = crate::interrupt::ForegroundChild::enter();
     command()
         .args(["merge-base", "--is-ancestor", ancestor, descendant])
         .status()
@@ -356,6 +359,7 @@ pub fn commit_fixup(target: &str, files: &[String]) -> Result<()> {
 /// rebase never opens an editor.
 pub fn rebase_autosquash_update_refs(base: &str) -> Result<()> {
     reject_dash_lead("base", base)?;
+    let _foreground = crate::interrupt::ForegroundChild::enter();
     let status = command()
         .args([
             "-c",
@@ -380,6 +384,7 @@ pub fn rebase_autosquash_update_refs(base: &str) -> Result<()> {
 /// Abort an in-progress rebase, best effort (`git rebase --abort`). Errors are
 /// swallowed: it's only called on a recovery path.
 pub fn rebase_abort() {
+    let _foreground = crate::interrupt::ForegroundChild::enter();
     let _ = command().args(["rebase", "--abort"]).status();
 }
 

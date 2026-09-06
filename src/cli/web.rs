@@ -6,6 +6,7 @@ use anyhow::{anyhow, Context, Result};
 
 pub fn open(url: &str) -> Result<()> {
     let (program, args) = picker();
+    let _foreground = crate::interrupt::ForegroundChild::enter();
     let status = Command::new(program)
         .args(args)
         .arg(url)
