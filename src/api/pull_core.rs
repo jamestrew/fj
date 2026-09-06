@@ -16,7 +16,10 @@ pub struct Pull {
     pub id: u64,
     pub number: u64,
     pub title: String,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::api::serde_util::deserialize_null_to_default"
+    )]
     pub body: String,
     pub state: String,
     pub user: User,
@@ -356,8 +359,8 @@ struct MergeBody<'a> {
     merge_when_checks_succeed: bool,
 }
 
-/// Optional knobs for [`merge`]. Defaults: auto title/message, keep branch,
-/// merge now.
+/// Optional knobs for [`merge`]. Defaults: auto title, PR body as message,
+/// keep branch, merge now.
 #[derive(Debug, Clone, Default)]
 pub struct MergeOptions<'a> {
     pub title: Option<&'a str>,
@@ -380,10 +383,18 @@ pub async fn merge(
         "{}/pulls/{number}/merge",
         crate::api::repo_path(owner, name)
     );
+    let default_message;
+    let message = match opts.message {
+        Some(message) => Some(message),
+        None => {
+            default_message = get(client, owner, name, number).await?.body;
+            Some(default_message.as_str())
+        }
+    };
     let body = MergeBody {
         do_: style.as_str(),
         title: opts.title,
-        message: opts.message,
+        message,
         delete_branch_after_merge: opts.delete_branch,
         merge_when_checks_succeed: opts.auto,
     };

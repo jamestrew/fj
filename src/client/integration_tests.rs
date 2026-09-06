@@ -2888,6 +2888,29 @@ async fn pull_get_decodes_single_pull() {
 }
 
 #[tokio::test]
+async fn pull_get_decodes_null_body_as_empty() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/pulls/12"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 1, "number": 12, "title": "Add feature",
+            "body": null, "state": "open",
+            "user": { "id": 1, "login": "alice" },
+            "html_url": "https://x/o/r/pulls/12",
+            "head": { "ref": "feature", "sha": "aaa" },
+            "base": { "ref": "main", "sha": "bbb" },
+            "created_at": "2026-05-30T00:00:00Z",
+            "updated_at": "2026-05-30T00:01:00Z"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let pr = crate::api::pull::get(&c, "o", "r", 12).await.expect("get");
+    assert_eq!(pr.body, "");
+}
+
+#[tokio::test]
 async fn pull_create_posts_title_head_base() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -3054,12 +3077,130 @@ async fn pull_merge_posts_do_and_squash_fields() {
 }
 
 #[tokio::test]
+async fn pull_merge_defaults_message_to_pull_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/pulls/12"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 1, "number": 12, "title": "Add feature",
+            "body": "full PR description\n\nwith details", "state": "open",
+            "user": { "id": 1, "login": "alice" },
+            "html_url": "https://x/o/r/pulls/12",
+            "head": { "ref": "feature", "sha": "aaa" },
+            "base": { "ref": "main", "sha": "bbb" },
+            "created_at": "2026-05-30T00:00:00Z",
+            "updated_at": "2026-05-30T00:01:00Z"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/pulls/12/merge"))
+        .and(body_json(json!({
+            "Do": "squash",
+            "MergeMessageField": "full PR description\n\nwith details"
+        })))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    crate::api::pull::merge(
+        &c,
+        "o",
+        "r",
+        12,
+        crate::api::pull::MergeStyle::Squash,
+        &crate::api::pull::MergeOptions::default(),
+    )
+    .await
+    .expect("merge");
+}
+
+#[tokio::test]
+async fn pull_merge_explicit_empty_message_overrides_pull_body_default() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/pulls/12"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/pulls/12/merge"))
+        .and(body_json(json!({
+            "Do": "squash",
+            "MergeMessageField": ""
+        })))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    crate::api::pull::merge(
+        &c,
+        "o",
+        "r",
+        12,
+        crate::api::pull::MergeStyle::Squash,
+        &crate::api::pull::MergeOptions {
+            message: Some(""),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("merge");
+}
+
+#[tokio::test]
+async fn pull_merge_defaults_null_pull_body_to_empty_message() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/pulls/12"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 1, "number": 12, "title": "Add feature",
+            "body": null, "state": "open",
+            "user": { "id": 1, "login": "alice" },
+            "html_url": "https://x/o/r/pulls/12",
+            "head": { "ref": "feature", "sha": "aaa" },
+            "base": { "ref": "main", "sha": "bbb" },
+            "created_at": "2026-05-30T00:00:00Z",
+            "updated_at": "2026-05-30T00:01:00Z"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/pulls/12/merge"))
+        .and(body_json(json!({
+            "Do": "squash",
+            "MergeMessageField": ""
+        })))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    crate::api::pull::merge(
+        &c,
+        "o",
+        "r",
+        12,
+        crate::api::pull::MergeStyle::Squash,
+        &crate::api::pull::MergeOptions::default(),
+    )
+    .await
+    .expect("merge");
+}
+
+#[tokio::test]
 async fn pull_merge_sets_delete_branch_after_merge_when_requested() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/v1/repos/o/r/pulls/7/merge"))
         .and(body_json(json!({
             "Do": "merge",
+            "MergeMessageField": "",
             "delete_branch_after_merge": true
         })))
         .respond_with(ResponseTemplate::new(200))
@@ -3074,6 +3215,7 @@ async fn pull_merge_sets_delete_branch_after_merge_when_requested() {
         7,
         crate::api::pull::MergeStyle::Merge,
         &crate::api::pull::MergeOptions {
+            message: Some(""),
             delete_branch: true,
             ..Default::default()
         },
@@ -3101,7 +3243,10 @@ async fn pull_merge_surfaces_forgejo_message_on_405() {
         "r",
         9,
         crate::api::pull::MergeStyle::Squash,
-        &crate::api::pull::MergeOptions::default(),
+        &crate::api::pull::MergeOptions {
+            message: Some(""),
+            ..Default::default()
+        },
     )
     .await
     .expect_err("merge should fail");
@@ -3111,10 +3256,26 @@ async fn pull_merge_surfaces_forgejo_message_on_405() {
 #[tokio::test]
 async fn pull_merge_auto_posts_merge_when_checks_succeed() {
     let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/pulls/12"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 1, "number": 12, "title": "Add feature",
+            "body": "auto merge body", "state": "open",
+            "user": { "id": 1, "login": "alice" },
+            "html_url": "https://x/o/r/pulls/12",
+            "head": { "ref": "feature", "sha": "aaa" },
+            "base": { "ref": "main", "sha": "bbb" },
+            "created_at": "2026-05-30T00:00:00Z",
+            "updated_at": "2026-05-30T00:01:00Z"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
     Mock::given(method("POST"))
         .and(path("/api/v1/repos/o/r/pulls/12/merge"))
         .and(body_json(json!({
             "Do": "squash",
+            "MergeMessageField": "auto merge body",
             "merge_when_checks_succeed": true
         })))
         .respond_with(ResponseTemplate::new(200))
