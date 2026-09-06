@@ -1062,6 +1062,134 @@ mod tests {
         );
     }
 
+    /// Loopback tests bind one of the four fixed [`CALLBACK_PORTS`], so they
+    /// are serialised against each other. Poisoning is recovered rather than
+    /// propagated: a panic in one loopback test should fail that test, not
+    /// cascade into the rest.
+    fn loopback_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Drive one real HTTP request line at the loopback listener, the way the
+    /// browser's redirect arrives. Deliberately a real socket: the point of
+    /// these tests is the accept/read/dispatch path, which
+    /// `parse_callback_*` cannot reach.
+    async fn send_callback(port: u16, target: &str) {
+        let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect to the loopback listener");
+        sock.write_all(format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").as_bytes())
+            .await
+            .expect("write the request line");
+        sock.flush().await.expect("flush the request line");
+    }
+
+    /// The happy path, end to end over a real socket: a redirect carrying the
+    /// `state` this attempt generated yields the authorization code.
+    #[test]
+    fn loopback_callback_with_matching_state_returns_the_code() {
+        let _guard = loopback_lock();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        rt.block_on(async {
+            let server = LoopbackServer::bind().expect("bind loopback");
+            let port = server.listener.local_addr().expect("local addr").port();
+            let waiting = tokio::spawn(server.wait_for_code("the-state".to_string()));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            send_callback(port, "/callback?code=the-code&state=the-state").await;
+            let code = tokio::time::timeout(Duration::from_secs(10), waiting)
+                .await
+                .expect("the callback must be served well inside the timeout")
+                .expect("the wait task must not panic")
+                .expect("a matching state must yield the code");
+            assert_eq!(code, "the-code");
+        });
+    }
+
+    /// CSRF guard, over a real socket. A redirect whose `state` is not the one
+    /// this attempt generated must abort the sign-in rather than return its
+    /// code, and the error must not echo either state or the code back.
+    #[test]
+    fn loopback_callback_with_mismatched_state_aborts_as_csrf() {
+        let _guard = loopback_lock();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        rt.block_on(async {
+            let server = LoopbackServer::bind().expect("bind loopback");
+            let port = server.listener.local_addr().expect("local addr").port();
+            let waiting = tokio::spawn(server.wait_for_code("the-state".to_string()));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            send_callback(port, "/callback?code=the-code&state=not-the-state").await;
+            let err = tokio::time::timeout(Duration::from_secs(10), waiting)
+                .await
+                .expect("the callback must be served well inside the timeout")
+                .expect("the wait task must not panic")
+                .expect_err("a mismatched state must abort the sign-in");
+            let rendered = err.to_string();
+            assert!(
+                rendered.contains("state mismatch"),
+                "the abort must name the CSRF check, got: {rendered}"
+            );
+            assert!(
+                !rendered.contains("the-code") && !rendered.contains("not-the-state"),
+                "the abort must not echo the code or the presented state, got: {rendered}"
+            );
+        });
+    }
+
+    /// A socket that connects and then says nothing (browsers open speculative
+    /// preconnects) must not starve the redirect queued behind it. Connections
+    /// are handled one at a time, so without the [`REQUEST_LINE_TIMEOUT`] bound
+    /// the silent socket holds the loop forever and the sign-in fails at
+    /// [`CALLBACK_TIMEOUT`] with the real redirect never read.
+    ///
+    /// Runs on a paused clock, so it asserts the timer fires without spending
+    /// [`REQUEST_LINE_TIMEOUT`] of real time. That needs `tokio::time::Instant`
+    /// rather than `std`'s, which does not follow the virtual clock. The
+    /// production constant is untouched: shrinking it to suit a test would
+    /// weaken the thing under test.
+    #[test]
+    fn a_silent_connection_is_dropped_and_the_redirect_behind_it_still_lands() {
+        let _guard = loopback_lock();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .expect("build runtime");
+        rt.block_on(async {
+            let server = LoopbackServer::bind().expect("bind loopback");
+            let port = server.listener.local_addr().expect("local addr").port();
+            let waiting = tokio::spawn(server.wait_for_code("the-state".to_string()));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            // Connect and send nothing, holding the socket open for the whole
+            // test. The clock starts here because REQUEST_LINE_TIMEOUT starts
+            // when this connection is accepted, not when the redirect arrives.
+            let started = tokio::time::Instant::now();
+            let _silent = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("open the silent connection");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            send_callback(port, "/callback?code=queued-behind&state=the-state").await;
+            let code = tokio::time::timeout(REQUEST_LINE_TIMEOUT * 3, waiting)
+                .await
+                .expect("the redirect behind a silent socket must still be served")
+                .expect("the wait task must not panic")
+                .expect("the queued redirect must yield its code");
+            assert_eq!(code, "queued-behind");
+            assert!(
+                started.elapsed() >= REQUEST_LINE_TIMEOUT,
+                "the silent socket should have been held until REQUEST_LINE_TIMEOUT, \
+                 but the redirect landed after only {:?}",
+                started.elapsed()
+            );
+        });
+    }
+
     #[test]
     fn pkce_challenge_matches_rfc7636_vector() {
         // RFC 7636 Appendix B.
