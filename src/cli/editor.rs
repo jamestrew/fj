@@ -158,21 +158,54 @@ pub fn prompt_line(label: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
 
-    // Mutates process-global env so it's serial-only and ignored by default.
+    fn editor_env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        saved: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let saved = env::var(key).ok();
+            unsafe { env::set_var(key, value) };
+            Self { key, saved }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let saved = env::var(key).ok();
+            unsafe { env::remove_var(key) };
+            Self { key, saved }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.saved {
+                    Some(value) => env::set_var(self.key, value),
+                    None => env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    // Mutates process-global env while checking editor precedence.
     // Run with `cargo test -- --ignored --test-threads=1`.
     #[test]
     #[ignore]
     fn editor_command_uses_visual_first() {
-        let saved_visual = env::var("VISUAL").ok();
-        let saved_editor = env::var("EDITOR").ok();
+        let _guard = editor_env_lock();
+        let _saved_visual = EnvVarGuard::set("VISUAL", "code -w");
+        let _saved_editor = EnvVarGuard::set("EDITOR", "nano");
         // SAFETY: tests modifying env are intrinsically racy. The fj test suite
         // doesn't run them in parallel against editor_command, and we restore
         // on exit. Acceptable for a hermetic CI environment.
-        unsafe {
-            env::set_var("VISUAL", "code -w");
-            env::set_var("EDITOR", "nano");
-        }
         assert_eq!(editor_command(), "code -w");
         unsafe {
             env::remove_var("VISUAL");
@@ -182,37 +215,59 @@ mod tests {
             env::remove_var("EDITOR");
         }
         assert_eq!(editor_command(), "vi");
-        unsafe {
-            if let Some(v) = saved_visual {
-                env::set_var("VISUAL", v);
-            }
-            if let Some(v) = saved_editor {
-                env::set_var("EDITOR", v);
-            }
-        }
     }
 
-    // Marked #[ignore] because spawning a real subprocess from the test
-    // harness occasionally hangs on macOS depending on how cargo wired up
-    // stdin/stdout. Run with `cargo test -- --ignored` to exercise it.
+    // Spawning a real subprocess from the test harness occasionally hangs on
+    // macOS depending on how cargo wired up stdin/stdout.
     #[test]
-    #[ignore]
+    #[cfg_attr(target_os = "macos", ignore)]
     #[cfg(unix)]
     fn edit_text_with_true_returns_initial() {
         // `/usr/bin/true` is a no-op command that always exits 0. Using it as
         // the "editor" means we get the initial contents back unchanged.
         // We use the absolute path to avoid hangs when test runners have an
         // odd PATH that resolves `true` to something else.
-        let saved = env::var("EDITOR").ok();
-        unsafe { env::set_var("EDITOR", "/usr/bin/true") };
+        let _guard = editor_env_lock();
+        let _saved_visual = EnvVarGuard::unset("VISUAL");
+        let _saved = EnvVarGuard::set("EDITOR", "/usr/bin/true");
         let out = edit_text("FJ_TEST.md", "hello world\n").unwrap();
         assert_eq!(out, "hello world");
-        unsafe {
-            match saved {
-                Some(v) => env::set_var("EDITOR", v),
-                None => env::remove_var("EDITOR"),
-            }
-        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn edit_text_returns_what_the_editor_wrote() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = editor_env_lock();
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = dir.path().join("editor");
+        fs::write(
+            &script,
+            "#!/bin/sh\nprintf 'edited by the fake editor\\n\\n' > \"$1\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let _saved_visual = EnvVarGuard::unset("VISUAL");
+        let _saved = EnvVarGuard::set("EDITOR", script.to_str().unwrap());
+        let out = edit_text("FJ_GATE.md", "seed contents\n").unwrap();
+        assert_eq!(out, "edited by the fake editor");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn edit_text_errors_when_the_editor_exits_nonzero() {
+        let _guard = editor_env_lock();
+        let _saved_visual = EnvVarGuard::unset("VISUAL");
+        let _saved = EnvVarGuard::set("EDITOR", "/bin/false");
+
+        let err = edit_text("FJ_GATE.md", "seed contents\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("editor `/bin/false` exited with status"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[test]

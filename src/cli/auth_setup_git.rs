@@ -128,6 +128,36 @@ fn validate_username(user: &str) -> Result<()> {
 #[cfg(test)]
 mod setup_git_tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    fn git_config_env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        saved: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set_path(key: &'static str, value: &std::path::Path) -> Self {
+            let saved = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, saved }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.saved {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
 
     #[test]
     fn rejects_shell_metacharacters_in_hostname() {
@@ -173,6 +203,35 @@ mod setup_git_tests {
     fn accepts_normal_usernames() {
         assert!(validate_username("alice").is_ok());
         assert!(validate_username("alice.bob_123").is_ok());
+    }
+
+    #[test]
+    fn run_git_config_writes_to_the_redirected_global_config() {
+        let _guard = git_config_env_lock();
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = dir.path().join("gitconfig");
+        let _saved = EnvVarGuard::set_path("GIT_CONFIG_GLOBAL", &cfg);
+
+        run_git_config("credential.https://gate.invalid.helper", "!f() { :; }; f").unwrap();
+
+        let written = std::fs::read_to_string(&cfg).unwrap();
+        assert!(written.contains("[credential \"https://gate.invalid\"]"));
+        assert!(written.contains("!f() { :; }; f"));
+    }
+
+    #[test]
+    fn run_git_config_reports_a_failing_git_config() {
+        let _guard = git_config_env_lock();
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = dir.path().join("gitconfig");
+        let _saved = EnvVarGuard::set_path("GIT_CONFIG_GLOBAL", &cfg);
+
+        let err = run_git_config("nosection", "value").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("`git config --global nosection ...` failed with status"),
+            "unexpected error: {msg}"
+        );
     }
 
     /// Regression test for issue #1: git appends the operation name
