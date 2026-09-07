@@ -41,6 +41,47 @@ All notable changes will be recorded here. The format follows
 - `stack ship --json` now reports the branches restacked after each item
   (`restacked`), and `stack review --json` carries each PR's head sha
   (`head_sha`). Both fields are additive.
+- **`fj run logs` prints Actions job logs.** The singular `fj run log` stays as
+  an alias, so existing invocations keep working. A personal access token is
+  enough for log reads on this Forgejo build; the auth docs no longer claim a
+  browser session cookie is required. A session is still needed for the
+  cookie-gated web routes, `run watch`, `run rerun`, and `run cancel`.
+- **`fj instances` lists the Fjord Commons.** `fj` read only
+  `/me/forge-instances`, which by design excludes the Commons, so there was no
+  instance id to address and no way to reach it. The Commons is now read
+  alongside your own instances and routed through the platform gateway, with no
+  personal access token anywhere: the gateway mints the forge token server-side
+  and nothing minted reaches the client. A Commons you have not joined is
+  withheld from `instances use` but still named in `fj instances`, on a dimmed
+  line, so "not joined" does not read as "no such forge".
+- **Host-scoped `FJ_TOKEN_<HOST>` and `FJ_SESSION_<HOST>`.** The host suffix is
+  `H` followed by the uppercase hex of the host bytes, so `rasterhub.com` is
+  `FJ_TOKEN_H7261737465726875622E636F6D`. The encoding is injective, so
+  `foo-bar.com` and `foo.bar.com` cannot collide onto one variable, and CI can
+  set a credential for one host without enumerating the rest.
+
+### Changed
+
+- **`fj pr merge` follows the repository's default merge style.** An omitted
+  `--style` resolved to `merge` regardless of how the repository was
+  configured, so merging from the CLI could produce a merge commit on a repo
+  whose web UI squashes. It now reads the repository's `default_merge_style`,
+  and fails explicitly if that cannot be read or is not a style fj supports
+  rather than falling back to a guess. **Scripts that relied on the implicit
+  `merge` need `--style merge` spelled out.** Merge-style is also reported in
+  push-rejection diagnostics, so a signed-commit protection failure is no
+  longer misread as something else.
+- **A generic `FJ_TOKEN` is no longer sent to a host it was not meant for.**
+  It used to be picked up for any host. It is now accepted for the default or
+  current host, including when you spell that same host with `--host`, and
+  ignored when `--host` names a different configured host. Use
+  `FJ_TOKEN_<HOST>` for that case. `FJ_SESSION` follows the same rule.
+- **The default Fjord platform URL is `https://fjord.sh`,** replacing the old
+  preview URL. An HTML response on a platform call now names `--platform-url`
+  instead of surfacing an opaque JSON decode error.
+- **Global `--host` reaches the auth subcommands.** `fj auth status`, `token`,
+  `refresh`, `session`, `logout`, and `setup-git` now honor it, so
+  `fj auth status --host X` reports host `X` alone.
 
 ### Fixed
 
@@ -58,6 +99,81 @@ All notable changes will be recorded here. The format follows
   list and view commands, `pr diff` / `commits` / `files` / `checks`,
   `run log`, `search`, and `fj api` GET dumps. `--no-pager`, `FJ_NO_PAGER`,
   `FJ_PAGER` / `PAGER`, and the non-TTY check are unchanged.
+- **`fj pr merge` no longer discards the pull request description.** With no
+  `--message`, fj sent an empty merge-commit body, and Forgejo does not fall
+  back to the description the way its web merge dialog does. Every pull request
+  merged through the CLI therefore landed with its body gone, silently: the
+  merge succeeded and the commit looked normal. The message now defaults to the
+  pull request body. An explicit `--message` still wins, and `--message ""`
+  still produces a deliberately empty body.
+- **Ctrl+C works when fj is blocked in a synchronous call.** SIGINT was raced
+  against the command future, so it only took effect while that future was
+  still pollable. Several paths parked the thread inside a blocking syscall for
+  an unbounded time, and because tokio had already replaced SIGINT's default
+  disposition the signal did not terminate the process either: Ctrl+C was not
+  slow, it was inert. The two confirmed states were an OS keychain read waiting
+  on an authorization dialog it cannot present (over ssh, in CI, from a git
+  hook, which is what deadlocked the pre-push hook) and the synchronous stdin
+  reads behind `--body -`, `--input -`, `--with-token`, and the interactive
+  Fjord Account prompts. A backstop now gives the graceful path 250 ms to
+  unwind and then exits 130. A child that owns the terminal's foreground
+  process group still gets to decide what SIGINT means, so `less` absorbing it
+  is unaffected.
+- **Ctrl+C exits during an OIDC sign-in.** `fj auth login` waited for the
+  loopback redirect on a blocking task, so an interrupted sign-in printed
+  `error: interrupted` and left the process alive. The wait is now async and
+  actually cancellable. A stalled connection no longer wedges the sign-in
+  either: a socket that connected and sent nothing (a browser preconnect, a
+  port scanner) blocked the accept loop forever and the real redirect behind it
+  was never served. Request lines are now bounded at 10s, and the overall 300s
+  budget also covers connection handling.
+- **`FJ_TOKEN` no longer blocks `fj auth login --fjord`.** The variable was
+  bound to `--token` by clap, so having one set forced the token flow even when
+  `--fjord` was spelled out. Explicit `--fjord` now wins. `FJ_SESSION` was
+  bound to `fj auth session --cookie` the same way, where it conflicted with
+  `--clear`; that binding is gone too.
+- **`fj pr checks` handles a head with no reported checks.** Forgejo returns
+  `statuses: null` there, which failed to decode. It now prints
+  `no checks reported on <sha>` and exits 0; `--json` still emits a normal
+  combined-status object with `statuses: []`.
+- **`fj run view --log` reads logs on Forgejo 16.** Logs are resolved through
+  the run-jobs and job-log APIs, and displayed run numbers are mapped to API
+  run ids first, including for runs past the first page. `FJ_TOKEN` precedence
+  is preserved, so an env-token-only environment does not touch an unreadable
+  token store. A Forgejo 15.x host, which does not expose the
+  token-authenticated job log API, is now reported as such by version rather
+  than as a parse error.
+- **`fj pr list` and `fj pr view` decode Forgejo's system actors.** Forgejo
+  uses negative sentinel user ids (`-1` for Ghost, `-2` for `forgejo-actions`),
+  and the shared `User` model read `id` as unsigned, so any repository with a
+  system actor as reviewer, assignee, poster, or author failed the whole decode
+  with `invalid value: integer -2, expected u64`. The field is signed now,
+  which covers every actor position at once.
+- **A failed list decode names where it failed.** List responses are decoded
+  through `serde_path_to_error`, so the message carries the endpoint and the
+  JSON field path (for example `GET /api/v1/repos/o/r/pulls?...` and
+  `field [0].id`) instead of only the type error.
+- **Tag releases publish their assets, and the generated Homebrew formula
+  installs.** The `v0.4.1` release was published with zero assets, so
+  `brew install fj` served 0.3.0 from 22 to 30 July: one build leg failed, and
+  re-running could not recover because artifact keys are scoped by run id, so
+  the legs that had already uploaded hit "artifact already exists" and the
+  publish job never ran. The assets were uploaded on 30 July by the recovery
+  dispatch these changes made possible, and the tap has served 0.4.1 since.
+  Artifacts are overwritten on a re-run now, and a release can be re-run by
+  `workflow_dispatch` with a `tag` input, from a branch carrying a fix, without
+  moving the tag. The formula could not have installed even if publish had run:
+  it did `cd fj-<version>-<target>`, but Homebrew has already entered the
+  tarball's top-level directory and that directory keeps the tag's `v` prefix,
+  which the formula's version drops, so `brew install` ended in
+  `Errno::ENOENT: chdir_path`. Three failures that used to pass quietly now
+  stop the run: a missing matrix leg rendering `sha256 ""`, an asset glob
+  matching nothing, and a missing CHANGELOG section for the tag (release
+  bodies were always empty, and are now taken from that section). A dispatched
+  tag also reaches the shell as data rather than as a substituted expression,
+  must exist in the repository's tags, and is checked out as `refs/tags/<tag>`
+  with the resolved sha asserted in every job, so a branch sharing a
+  version-shaped name cannot be built and published as if it were the tag.
 
 ## [0.4.1] - 2026-07-22
 
