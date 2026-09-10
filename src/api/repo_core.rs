@@ -31,8 +31,9 @@ pub struct Repo {
     pub ssh_url: String,
     #[serde(default)]
     pub default_branch: String,
-    /// Repository default merge style (`merge`, `rebase`, `rebase-merge`, or
-    /// `squash`). Callers that need this should fail explicitly if it is absent.
+    /// Repository default merge style (`merge`, `rebase`, `rebase-merge`,
+    /// `squash`, or `fast-forward-only`). Callers that need this should fail
+    /// explicitly if it is absent.
     #[serde(default)]
     pub default_merge_style: Option<String>,
     /// Allowed merge styles for this repo. Forgejo rejects a `--style` that is
@@ -45,6 +46,8 @@ pub struct Repo {
     pub allow_rebase_explicit: bool,
     #[serde(default = "default_true")]
     pub allow_squash_merge: bool,
+    #[serde(default = "default_true")]
+    pub allow_fast_forward_only_merge: bool,
     #[serde(default)]
     pub stars_count: u64,
     #[serde(default)]
@@ -63,13 +66,14 @@ fn default_true() -> bool {
 
 impl Repo {
     /// Whether `style` (a [`MergeStyle::as_str`] value: `merge`, `rebase`,
-    /// `rebase-merge`, `squash`) is enabled for this repo.
+    /// `rebase-merge`, `squash`, `fast-forward-only`) is enabled for this repo.
     pub fn allows_style(&self, style: &str) -> bool {
         match style {
             "merge" => self.allow_merge_commits,
             "rebase" => self.allow_rebase,
             "rebase-merge" => self.allow_rebase_explicit,
             "squash" => self.allow_squash_merge,
+            "fast-forward-only" => self.allow_fast_forward_only_merge,
             _ => true,
         }
     }
@@ -88,6 +92,9 @@ impl Repo {
         }
         if self.allow_squash_merge {
             out.push("squash");
+        }
+        if self.allow_fast_forward_only_merge {
+            out.push("fast-forward-only");
         }
         out
     }

@@ -2095,6 +2095,7 @@ async fn repo_get_decodes_single_repo() {
             "ssh_url": "git@x:o/r.git",
             "default_branch": "main",
             "default_merge_style": "squash",
+            "allow_fast_forward_only_merge": true,
             "stars_count": 7,
             "updated_at": "2026-05-30T00:00:00Z"
         })))
@@ -2107,6 +2108,8 @@ async fn repo_get_decodes_single_repo() {
     assert_eq!(repo.full_name, "o/r");
     assert_eq!(repo.default_branch, "main");
     assert_eq!(repo.default_merge_style.as_deref(), Some("squash"));
+    assert!(repo.allows_style("fast-forward-only"));
+    assert!(repo.allowed_styles().contains(&"fast-forward-only"));
     assert_eq!(repo.stars_count, 7);
 }
 
@@ -3225,6 +3228,67 @@ async fn pull_merge_sets_delete_branch_after_merge_when_requested() {
 }
 
 #[tokio::test]
+async fn pull_merge_fast_forward_only_posts_style_without_commit_message_fields() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/pulls/12"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/pulls/12/merge"))
+        .and(body_json(json!({
+            "Do": "fast-forward-only"
+        })))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    crate::api::pull::merge(
+        &c,
+        "o",
+        "r",
+        12,
+        crate::api::pull::MergeStyle::FastForwardOnly,
+        &crate::api::pull::MergeOptions::default(),
+    )
+    .await
+    .expect("merge");
+}
+
+#[tokio::test]
+async fn pull_merge_fast_forward_only_rejects_commit_message_fields_locally() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/pulls/12/merge"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let err = crate::api::pull::merge(
+        &c,
+        "o",
+        "r",
+        12,
+        crate::api::pull::MergeStyle::FastForwardOnly,
+        &crate::api::pull::MergeOptions {
+            message: Some("unused"),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect_err("fast-forward-only should reject message fields");
+    assert!(
+        err.to_string()
+            .contains("fast-forward-only merge does not create a merge commit"),
+        "got: {err}"
+    );
+}
+
+#[tokio::test]
 async fn pull_merge_surfaces_forgejo_message_on_405() {
     // Regression for fj#159/#160: a non-mergeable merge must not collapse to a
     // bare "405 Method Not Allowed"; the Forgejo `message` has to survive.
@@ -3417,6 +3481,7 @@ async fn diagnose_reports_disabled_merge_style() {
             "default_branch": "main",
             "allow_merge_commits": false, "allow_rebase": false,
             "allow_rebase_explicit": false, "allow_squash_merge": true,
+            "allow_fast_forward_only_merge": false,
             "updated_at": "2026-05-30T00:00:00Z"
         })))
         .mount(&server)

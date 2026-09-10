@@ -76,7 +76,7 @@ called out.
 | `gh pr review N --request-changes`| `fj pr review N --event request-changes` |                                          |
 | `gh pr status`                    | `fj pr status`                    |                                                 |
 | `gh pr checkout N`                | `fj pr checkout N`                |                                                 |
-| `gh pr merge N`                   | `fj pr merge N`                   | `--style merge|rebase|rebase-merge|squash`.     |
+| `gh pr merge N`                   | `fj pr merge N`                   | `--style merge|rebase|rebase-merge|squash|fast-forward-only`. |
 | `gh pr merge N --auto`            | `fj pr merge N --auto`            | Schedules a server-side merge once required checks pass; merges now if already green. Honors `--style` / `--title` / `--message` / `--delete-branch`. |
 | `gh pr merge N --disable-auto`    | `fj pr merge N --disable-auto`    | Cancels a pending scheduled merge.              |
 | `gh pr lock N` / `unlock N`        | `fj pr lock N` / `unlock N`       | `lock` accepts `--reason off-topic|too-heated|resolved|spam`. |

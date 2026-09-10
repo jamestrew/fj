@@ -100,7 +100,25 @@ pub fn diagnose(f: &MergeFacts) -> Option<String> {
             f.number, f.required_approvals, f.approvals
         ));
     }
+    if let Some(message) = f.merge_error.as_deref() {
+        if f.style == "fast-forward-only"
+            && (message.contains("Not possible to fast-forward")
+                || message.contains("can not be merged")
+                || message.contains("cannot be merged"))
+        {
+            return Some(format!(
+                "PR #{} is not a fast-forward onto {}; rebase the branch onto {}, wait for CI, then retry.",
+                f.number, f.base, f.base
+            ));
+        }
+    }
     if f.block_on_outdated {
+        if f.style == "fast-forward-only" {
+            return Some(format!(
+                "PR #{} is not a fast-forward onto {}; rebase the branch onto {}, wait for CI, then retry.",
+                f.number, f.base, f.base
+            ));
+        }
         return Some(format!(
             "PR #{} may be behind {}; run fj pr update-branch, wait for CI, then retry.",
             f.number, f.base
@@ -352,6 +370,16 @@ mod tests {
         let mut f = base_facts();
         f.block_on_outdated = true;
         assert!(diagnose(&f).unwrap().contains("may be behind main"));
+    }
+
+    #[test]
+    fn fast_forward_only_rejection_names_non_fast_forward() {
+        let mut f = base_facts();
+        f.style = "fast-forward-only".into();
+        f.merge_error = Some("405 Method Not Allowed: The pull request can not be merged".into());
+        let msg = diagnose(&f).unwrap();
+        assert!(msg.contains("not a fast-forward onto main"), "got: {msg}");
+        assert!(msg.contains("wait for CI"), "got: {msg}");
     }
 
     #[test]

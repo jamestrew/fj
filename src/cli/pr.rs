@@ -1041,7 +1041,7 @@ async fn repo_default_merge_style(
     };
     api::pull::MergeStyle::from_str(raw).ok_or_else(|| {
         anyhow!(
-            "no --style given and {}/{} reports unsupported default_merge_style {:?}; supported styles: merge, rebase, rebase-merge, squash",
+            "no --style given and {}/{} reports unsupported default_merge_style {:?}; supported styles: merge, rebase, rebase-merge, squash, fast-forward-only",
             ctx.owner,
             ctx.name,
             raw
@@ -1299,6 +1299,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn omitted_merge_style_accepts_fast_forward_only_repo_default() {
+        use serde_json::json;
+        use url::Url;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/o/r"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": 1,
+                "name": "r",
+                "full_name": "o/r",
+                "owner": { "id": 1, "login": "o" },
+                "html_url": "https://x/o/r",
+                "clone_url": "https://x/o/r.git",
+                "ssh_url": "git@x:o/r.git",
+                "default_branch": "main",
+                "default_merge_style": "fast-forward-only",
+                "updated_at": "2026-05-30T00:00:00Z"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let base = Url::parse(&format!("{}/api/v1/", server.uri())).expect("base");
+        let ctx = crate::cli::context::RepoContext {
+            client: crate::client::Client::for_base_url(base, "test-token".into()).unwrap(),
+            host: "mock".into(),
+            web_base: None,
+            owner: "o".into(),
+            name: "r".into(),
+        };
+        let style = repo_default_merge_style(&ctx).await.expect("style");
+        assert!(matches!(style, api::pull::MergeStyle::FastForwardOnly));
+    }
+
+    #[tokio::test]
     async fn omitted_merge_style_fails_when_repo_default_is_absent() {
         use serde_json::json;
         use url::Url;
@@ -1347,7 +1384,7 @@ mod tests {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        for default_merge_style in ["manually-merged", "fast-forward-only"] {
+        for default_merge_style in ["manually-merged"] {
             let server = MockServer::start().await;
             Mock::given(method("GET"))
                 .and(path("/api/v1/repos/o/r"))
@@ -1385,7 +1422,9 @@ mod tests {
                 "got: {msg}"
             );
             assert!(
-                msg.contains("supported styles: merge, rebase, rebase-merge, squash"),
+                msg.contains(
+                    "supported styles: merge, rebase, rebase-merge, squash, fast-forward-only"
+                ),
                 "got: {msg}"
             );
         }

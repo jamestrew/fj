@@ -1279,8 +1279,8 @@ async fn absorb(args: AbsorbArgs, _host: Option<&str>) -> Result<()> {
 
 // ── stack ship ─────────────────────────────────────────────────────────────
 
-/// The Forgejo merge styles bridge 1:1 with `fjord_core`'s, so the surfaces
-/// agree on the token sent to the API.
+/// Stack ships only the merge styles that `fjord_core` models. `fj pr merge`
+/// has extra one-off styles that are handled outside stack planning.
 impl From<fjord_core::workflows::stack::MergeStyle> for MergeStyle {
     fn from(s: fjord_core::workflows::stack::MergeStyle) -> Self {
         use fjord_core::workflows::stack::MergeStyle as Core;
@@ -1301,6 +1301,7 @@ impl From<MergeStyle> for fjord_core::workflows::stack::MergeStyle {
             MergeStyle::Rebase => Core::Rebase,
             MergeStyle::RebaseMerge => Core::RebaseMerge,
             MergeStyle::Squash => Core::Squash,
+            MergeStyle::FastForwardOnly => Core::Merge,
         }
     }
 }
@@ -1379,11 +1380,12 @@ fn stopped_message(branch: &str, reason: &str, merged: &[String]) -> String {
 /// Whether a merge style rewrites the commits it lands. A squash (or rebase)
 /// land replaces the item's commits with new ones, so every branch above it is
 /// still parented on history that no longer exists on the trunk and has to be
-/// replayed. A merge commit keeps the original commits reachable, so the
-/// branches above stay valid and only their PR bases move.
+/// replayed. A merge commit and a fast-forward-only merge keep the original
+/// commits reachable, so the branches above stay valid and only their PR bases
+/// move.
 fn rewrites_history(style: MergeStyle) -> bool {
     match style {
-        MergeStyle::Merge => false,
+        MergeStyle::Merge | MergeStyle::FastForwardOnly => false,
         MergeStyle::Squash | MergeStyle::Rebase | MergeStyle::RebaseMerge => true,
     }
 }

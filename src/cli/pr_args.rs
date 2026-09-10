@@ -39,6 +39,7 @@ pub enum MergeStyleArg {
     Rebase,
     RebaseMerge,
     Squash,
+    FastForwardOnly,
 }
 
 impl From<MergeStyleArg> for MergeStyle {
@@ -48,6 +49,7 @@ impl From<MergeStyleArg> for MergeStyle {
             MergeStyleArg::Rebase => MergeStyle::Rebase,
             MergeStyleArg::RebaseMerge => MergeStyle::RebaseMerge,
             MergeStyleArg::Squash => MergeStyle::Squash,
+            MergeStyleArg::FastForwardOnly => MergeStyle::FastForwardOnly,
         }
     }
 }
@@ -115,6 +117,10 @@ mod tests {
         assert!(matches!(
             MergeStyle::from(MergeStyleArg::Squash),
             MergeStyle::Squash
+        ));
+        assert!(matches!(
+            MergeStyle::from(MergeStyleArg::FastForwardOnly),
+            MergeStyle::FastForwardOnly
         ));
     }
 

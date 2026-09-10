@@ -313,12 +313,13 @@ pub async fn diff_text(client: &Client, owner: &str, name: &str, number: u64) ->
     Ok(res.text().await?)
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MergeStyle {
     Merge,
     Rebase,
     RebaseMerge,
     Squash,
+    FastForwardOnly,
 }
 
 impl MergeStyle {
@@ -328,6 +329,7 @@ impl MergeStyle {
             MergeStyle::Rebase => "rebase",
             MergeStyle::RebaseMerge => "rebase-merge",
             MergeStyle::Squash => "squash",
+            MergeStyle::FastForwardOnly => "fast-forward-only",
         }
     }
 
@@ -337,6 +339,7 @@ impl MergeStyle {
             "rebase" => Some(MergeStyle::Rebase),
             "rebase-merge" => Some(MergeStyle::RebaseMerge),
             "squash" => Some(MergeStyle::Squash),
+            "fast-forward-only" => Some(MergeStyle::FastForwardOnly),
             _ => None,
         }
     }
@@ -383,12 +386,24 @@ pub async fn merge(
         "{}/pulls/{number}/merge",
         crate::api::repo_path(owner, name)
     );
+    if style == MergeStyle::FastForwardOnly {
+        if opts.title.is_some() {
+            return Err(anyhow!("fast-forward-only merge does not create a merge commit, so --title is not supported"));
+        }
+        if opts.message.is_some() {
+            return Err(anyhow!("fast-forward-only merge does not create a merge commit, so --message is not supported"));
+        }
+    }
     let default_message;
-    let message = match opts.message {
-        Some(message) => Some(message),
-        None => {
-            default_message = get(client, owner, name, number).await?.body;
-            Some(default_message.as_str())
+    let message = if style == MergeStyle::FastForwardOnly {
+        None
+    } else {
+        match opts.message {
+            Some(message) => Some(message),
+            None => {
+                default_message = get(client, owner, name, number).await?.body;
+                Some(default_message.as_str())
+            }
         }
     };
     let body = MergeBody {
@@ -487,6 +502,11 @@ mod tests {
         assert_eq!(MergeStyle::Rebase.as_str(), "rebase");
         assert_eq!(MergeStyle::RebaseMerge.as_str(), "rebase-merge");
         assert_eq!(MergeStyle::Squash.as_str(), "squash");
+        assert_eq!(MergeStyle::FastForwardOnly.as_str(), "fast-forward-only");
+        assert!(matches!(
+            MergeStyle::from_str("fast-forward-only"),
+            Some(MergeStyle::FastForwardOnly)
+        ));
     }
 
     fn ev(type_: &str) -> TimelineEvent {
