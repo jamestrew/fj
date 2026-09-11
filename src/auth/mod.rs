@@ -1,7 +1,8 @@
 //! Token storage. Tokens prefer the OS keychain under service `fj`, keyed by
 //! hostname (PAT mode) or by `fjord-account:<platform-url>` (Fjord Account
 //! mode). On headless systems without a usable keychain, fj falls back to a
-//! 0600 TOML file in the XDG config directory.
+//! 0600 TOML file in the XDG config directory. `FJ_NO_KEYCHAIN=1` skips the
+//! keychain outright and uses that file store alone.
 
 use anyhow::{Context, Result};
 use keyring::Entry;
@@ -55,6 +56,18 @@ fn entry(host: &str) -> keyring::Result<Entry> {
     Entry::new(SERVICE, host)
 }
 
+/// Whether to skip the OS keychain and use only the file store.
+///
+/// Set `FJ_NO_KEYCHAIN=1` for a run that must not touch it. Two cases need
+/// that. A macOS keychain item's ACL names the binaries allowed to read it, so
+/// a freshly built or differently signed `fj` is not on the list and the lookup
+/// blocks in securityd waiting for an approval a headless session can never
+/// give: the process hangs rather than failing. And a test that asserts fj did
+/// not read the token store can only prove it by making the read impossible.
+fn keychain_disabled() -> bool {
+    std::env::var_os("FJ_NO_KEYCHAIN").is_some_and(|value| !value.is_empty() && value != "0")
+}
+
 fn token_file_path() -> Result<PathBuf> {
     Ok(crate::config::config_dir()?.join("tokens.toml"))
 }
@@ -67,7 +80,12 @@ pub fn fjord_keychain_key(platform_url: &str) -> String {
 
 /// Save a token for `host`. Replaces any existing entry.
 pub fn store_token(host: &str, token: &str) -> Result<TokenStoreLocation> {
-    store_token_with_entry_and_file_path(host, token, entry(host), &token_file_path()?)
+    let file_path = token_file_path()?;
+    if keychain_disabled() {
+        store_file_token(&file_path, host, token)?;
+        return Ok(TokenStoreLocation::File(file_path));
+    }
+    store_token_with_entry_and_file_path(host, token, entry(host), &file_path)
 }
 
 fn store_token_with_entry_and_file_path(
@@ -102,7 +120,11 @@ pub fn load_token(host: &str) -> Result<Option<String>> {
 }
 
 fn load_persisted_token(host: &str) -> Result<Option<String>> {
-    load_persisted_token_from_entry_and_file_path(host, entry(host), &token_file_path()?)
+    let file_path = token_file_path()?;
+    if keychain_disabled() {
+        return load_file_token(&file_path, host);
+    }
+    load_persisted_token_from_entry_and_file_path(host, entry(host), &file_path)
 }
 
 fn load_persisted_token_from_entry_and_file_path(
@@ -339,6 +361,9 @@ fn set_file_store_permissions(path: &Path) -> Result<()> {
 
 pub fn delete_token(host: &str) -> Result<()> {
     let file_path = token_file_path()?;
+    if keychain_disabled() {
+        return delete_file_token(&file_path, host);
+    }
     match entry(host) {
         Ok(entry) => match entry.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => {}

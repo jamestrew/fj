@@ -85,6 +85,24 @@ All notable changes will be recorded here. The format follows
 
 ### Fixed
 
+- **`cargo test --all` now passes on macOS.** Four defects kept it from
+  finishing there, and each one was a test reading the developer's real machine
+  instead of its own scratch state. `ProjectDirs` ignores `XDG_CONFIG_HOME` on
+  macOS, so tests that thought they had redirected the config directory were
+  loading the real `hosts.toml`; when that named a host whose token lives in the
+  login keychain, the lookup then blocked forever in securityd, because a
+  keychain item's ACL names the binaries allowed to read it and a freshly built
+  test binary is not one of them. `FJ_CONFIG_DIR` and `FJ_NO_KEYCHAIN` give
+  those tests, and any scripted run that wants its own state, a way to say so.
+  The editor test hardcoded `/bin/false`, which exists on Linux but not on
+  macOS, so it asserted on a spawn failure rather than the nonzero exit it was
+  written for. And the loopback sign-in test drove real sockets on a paused
+  clock, which cannot work: tokio's auto-advance does not wait for socket
+  readiness, so it jumped the clock past the five-minute callback deadline while
+  the silent connection was still in the accept queue. That one now runs on the
+  real clock with the request-line bound shortened for the test; the shipped
+  ten-second bound is unchanged.
+
 - **The pager no longer swallows short, write, and machine output.** The
   decision to page was made per top-level command family, so every subcommand
   under `repo`, `issue`, `pr`, `release`, `label`, `milestone`, `tag`, `run`,

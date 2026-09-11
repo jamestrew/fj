@@ -274,7 +274,8 @@ git_protocol = "https"
         let dir = tempfile::tempdir().unwrap();
         write_hosts_config(dir.path(), "rasterhub.com");
 
-        let _config = EnvRestore::set("XDG_CONFIG_HOME", dir.path());
+        let _config = EnvRestore::set("FJ_CONFIG_DIR", dir.path().join("fj"));
+        let _no_keychain = EnvRestore::set("FJ_NO_KEYCHAIN", "1");
         let _token = EnvRestore::set("FJ_TOKEN", "env-token");
 
         let resolved = resolve(None).expect("default host may use generic FJ_TOKEN");
@@ -288,7 +289,8 @@ git_protocol = "https"
         let dir = tempfile::tempdir().unwrap();
         write_hosts_config(dir.path(), "rasterhub.com");
 
-        let _config = EnvRestore::set("XDG_CONFIG_HOME", dir.path());
+        let _config = EnvRestore::set("FJ_CONFIG_DIR", dir.path().join("fj"));
+        let _no_keychain = EnvRestore::set("FJ_NO_KEYCHAIN", "1");
         let _token = EnvRestore::set("FJ_TOKEN", "env-token");
         let _host_token = EnvRestore::remove(crate::auth::host_env_token_var("commons.fjord.host"));
 
@@ -304,7 +306,8 @@ git_protocol = "https"
         let dir = tempfile::tempdir().unwrap();
         write_hosts_config(dir.path(), "rasterhub.com");
 
-        let _config = EnvRestore::set("XDG_CONFIG_HOME", dir.path());
+        let _config = EnvRestore::set("FJ_CONFIG_DIR", dir.path().join("fj"));
+        let _no_keychain = EnvRestore::set("FJ_NO_KEYCHAIN", "1");
         let _token = EnvRestore::set("FJ_TOKEN", "env-token");
         let _host_token = EnvRestore::remove(crate::auth::host_env_token_var("rasterhub.com"));
 
@@ -321,7 +324,8 @@ git_protocol = "https"
         let not_a_dir = dir.path().join("config-file");
         std::fs::write(&not_a_dir, "not a directory").unwrap();
 
-        let _config = EnvRestore::set("XDG_CONFIG_HOME", &not_a_dir);
+        let _config = EnvRestore::set("FJ_CONFIG_DIR", &not_a_dir);
+        let _no_keychain = EnvRestore::set("FJ_NO_KEYCHAIN", "1");
         let _token = EnvRestore::set("FJ_TOKEN", "wrong-host-token");
         let _host_token = EnvRestore::set(
             crate::auth::host_env_token_var("git.example.com"),

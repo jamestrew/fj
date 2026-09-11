@@ -63,6 +63,29 @@ const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 /// the real redirect forever; this caps that to a bounded delay.
 const REQUEST_LINE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Test-only override for [`REQUEST_LINE_TIMEOUT`], in milliseconds; zero means
+/// no override. Proving the bound fires needs a silent socket and a real
+/// listener, and a paused clock cannot drive that: tokio's auto-advance does
+/// not wait for socket readiness, so it jumps straight past [`CALLBACK_TIMEOUT`]
+/// while the silent connection is still sitting in the accept queue. Shortening
+/// the bound for the test instead keeps the production value at ten seconds and
+/// keeps the assertion about the timer, not the clock.
+#[cfg(test)]
+static REQUEST_LINE_TIMEOUT_OVERRIDE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// The request-line bound this run applies.
+fn request_line_timeout() -> Duration {
+    #[cfg(test)]
+    {
+        let millis = REQUEST_LINE_TIMEOUT_OVERRIDE_MS.load(std::sync::atomic::Ordering::SeqCst);
+        if millis > 0 {
+            return Duration::from_millis(millis);
+        }
+    }
+    REQUEST_LINE_TIMEOUT
+}
+
 /// Resolve the OIDC client id: `FJ_OIDC_CLIENT_ID` if set and non-empty, else
 /// [`DEFAULT_CLIENT_ID`].
 pub fn client_id() -> String {
@@ -291,7 +314,7 @@ async fn handle_connection(
     let mut request_line = String::new();
     // Bounded: a socket that connects and then says nothing (browsers open
     // speculative preconnects) must not starve the real redirect behind it.
-    match tokio::time::timeout(REQUEST_LINE_TIMEOUT, reader.read_line(&mut request_line)).await {
+    match tokio::time::timeout(request_line_timeout(), reader.read_line(&mut request_line)).await {
         Ok(res) => {
             res.context("reading loopback request")?;
         }
@@ -1075,6 +1098,27 @@ mod tests {
     /// browser's redirect arrives. Deliberately a real socket: the point of
     /// these tests is the accept/read/dispatch path, which
     /// `parse_callback_*` cannot reach.
+    /// Shortens the request-line bound for one test and restores it on drop.
+    /// Callers hold `loopback_lock()`, so the override is never observed by
+    /// another test.
+    struct RequestLineTimeoutOverride;
+
+    impl RequestLineTimeoutOverride {
+        fn set(value: Duration) -> Self {
+            REQUEST_LINE_TIMEOUT_OVERRIDE_MS.store(
+                u64::try_from(value.as_millis()).expect("a test bound fits in u64 milliseconds"),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            Self
+        }
+    }
+
+    impl Drop for RequestLineTimeoutOverride {
+        fn drop(&mut self) {
+            REQUEST_LINE_TIMEOUT_OVERRIDE_MS.store(0, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     async fn send_callback(port: u16, target: &str) {
         let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
@@ -1148,42 +1192,40 @@ mod tests {
     /// the silent socket holds the loop forever and the sign-in fails at
     /// [`CALLBACK_TIMEOUT`] with the real redirect never read.
     ///
-    /// Runs on a paused clock, so it asserts the timer fires without spending
-    /// [`REQUEST_LINE_TIMEOUT`] of real time. That needs `tokio::time::Instant`
-    /// rather than `std`'s, which does not follow the virtual clock. The
-    /// production constant is untouched: shrinking it to suit a test would
+    /// Runs on the real clock against real sockets, with the bound shortened
+    /// through [`REQUEST_LINE_TIMEOUT_OVERRIDE_MS`] so it costs milliseconds.
+    /// The production constant is untouched: shrinking it to suit a test would
     /// weaken the thing under test.
     #[test]
     fn a_silent_connection_is_dropped_and_the_redirect_behind_it_still_lands() {
         let _guard = loopback_lock();
-        let rt = tokio::runtime::Builder::new_current_thread()
+        let bound = Duration::from_millis(250);
+        let _timeout = RequestLineTimeoutOverride::set(bound);
+        let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
-            .start_paused(true)
             .build()
             .expect("build runtime");
         rt.block_on(async {
             let server = LoopbackServer::bind().expect("bind loopback");
             let port = server.listener.local_addr().expect("local addr").port();
             let waiting = tokio::spawn(server.wait_for_code("the-state".to_string()));
-            tokio::time::sleep(Duration::from_millis(50)).await;
             // Connect and send nothing, holding the socket open for the whole
-            // test. The clock starts here because REQUEST_LINE_TIMEOUT starts
-            // when this connection is accepted, not when the redirect arrives.
-            let started = tokio::time::Instant::now();
+            // test. The bound starts when this connection is accepted, not when
+            // the redirect arrives, and the listen queue preserves the order.
+            let started = std::time::Instant::now();
             let _silent = tokio::net::TcpStream::connect(("127.0.0.1", port))
                 .await
                 .expect("open the silent connection");
-            tokio::time::sleep(Duration::from_millis(50)).await;
             send_callback(port, "/callback?code=queued-behind&state=the-state").await;
-            let code = tokio::time::timeout(REQUEST_LINE_TIMEOUT * 3, waiting)
+            let code = tokio::time::timeout(bound * 40, waiting)
                 .await
                 .expect("the redirect behind a silent socket must still be served")
                 .expect("the wait task must not panic")
                 .expect("the queued redirect must yield its code");
             assert_eq!(code, "queued-behind");
             assert!(
-                started.elapsed() >= REQUEST_LINE_TIMEOUT,
-                "the silent socket should have been held until REQUEST_LINE_TIMEOUT, \
+                started.elapsed() >= bound,
+                "the silent socket should have been held for the request-line bound, \
                  but the redirect landed after only {:?}",
                 started.elapsed()
             );
