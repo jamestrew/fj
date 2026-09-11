@@ -258,14 +258,25 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn edit_text_errors_when_the_editor_exits_nonzero() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // A script rather than `/bin/false`, which exists on Linux but not on
+        // macOS (`false` ships in /usr/bin there). Hardcoding the Linux path
+        // made this assert on a spawn failure instead of on the nonzero exit
+        // the test is about.
         let _guard = editor_env_lock();
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = dir.path().join("editor");
+        fs::write(&script, "#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
         let _saved_visual = EnvVarGuard::unset("VISUAL");
-        let _saved = EnvVarGuard::set("EDITOR", "/bin/false");
+        let _saved = EnvVarGuard::set("EDITOR", script.to_str().unwrap());
 
         let err = edit_text("FJ_GATE.md", "seed contents\n").unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("editor `/bin/false` exited with status"),
+            msg.contains("exited with status"),
             "unexpected error: {msg}"
         );
     }

@@ -19,17 +19,33 @@ const FJ: &str = env!("CARGO_BIN_EXE_fj");
 /// `LLVM_PROFILE_FILE` down to spawned binaries, and clearing it would drop
 /// this test's coverage of the very functions it exists to reach.
 fn spawn(cfg: &Path, args: &[&str], stdin: Stdio) -> Child {
-    Command::new(FJ)
+    let mut command = Command::new(FJ);
+    scratch_env(&mut command, cfg);
+    command
         .args(args)
-        .env("XDG_CONFIG_HOME", cfg)
-        .env_remove("FJ_TOKEN")
-        .env_remove("FJ_SESSION")
-        .env_remove("BW_SESSION")
         .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn fj")
+}
+
+/// Point a child at the scratch store and keep it off the developer's real one.
+///
+/// `XDG_CONFIG_HOME` alone does not do that: `ProjectDirs` ignores it on macOS
+/// and resolves to `~/Library/Application Support`, so the child read the real
+/// `hosts.toml`, found no `a.example`, and then blocked in securityd on a
+/// keychain item whose ACL does not name this freshly built binary.
+/// `FJ_CONFIG_DIR` names the store outright and `FJ_NO_KEYCHAIN` keeps the
+/// lookup in the file store, where this test put the tokens.
+fn scratch_env<'a>(command: &'a mut Command, cfg: &Path) -> &'a mut Command {
+    command
+        .env("XDG_CONFIG_HOME", cfg)
+        .env("FJ_CONFIG_DIR", cfg.join("fj"))
+        .env("FJ_NO_KEYCHAIN", "1")
+        .env_remove("FJ_TOKEN")
+        .env_remove("FJ_SESSION")
+        .env_remove("BW_SESSION")
 }
 
 fn sigint(child: &Child) {
@@ -175,13 +191,11 @@ fn a_guarded_child_spawn_completes_and_writes_only_inside_the_scratch_home() {
     let cfg = tempfile::tempdir().expect("tempdir");
     write_store(&cfg.path().join("fj"));
 
-    let out = Command::new(FJ)
+    let mut command = Command::new(FJ);
+    scratch_env(&mut command, cfg.path());
+    let out = command
         .args(["auth", "setup-git", "--host", "a.example"])
-        .env("XDG_CONFIG_HOME", cfg.path())
         .env("HOME", home.path())
-        .env_remove("FJ_TOKEN")
-        .env_remove("FJ_SESSION")
-        .env_remove("BW_SESSION")
         .stdin(Stdio::null())
         .output()
         .expect("run fj auth setup-git");
@@ -208,13 +222,11 @@ fn setup_git_dry_run_spawns_nothing_and_writes_nothing() {
     let cfg = tempfile::tempdir().expect("tempdir");
     write_store(&cfg.path().join("fj"));
 
-    let out = Command::new(FJ)
+    let mut command = Command::new(FJ);
+    scratch_env(&mut command, cfg.path());
+    let out = command
         .args(["auth", "setup-git", "--host", "a.example", "--dry-run"])
-        .env("XDG_CONFIG_HOME", cfg.path())
         .env("HOME", home.path())
-        .env_remove("FJ_TOKEN")
-        .env_remove("FJ_SESSION")
-        .env_remove("BW_SESSION")
         .stdin(Stdio::null())
         .output()
         .expect("run fj auth setup-git --dry-run");

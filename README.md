@@ -265,6 +265,8 @@ can open results in the browser.
 | OS keychain, service `fj`, key = hostname | Preferred persistent API token store |
 | `$XDG_CONFIG_HOME/fj/tokens.toml` | 0600 fallback token store when the OS keychain is unavailable |
 | `FJ_TOKEN` | Process-scoped token override for headless/CI jobs; checked before persistent stores |
+| `FJ_CONFIG_DIR` | Overrides the config directory outright, whatever the platform default would be |
+| `FJ_NO_KEYCHAIN` | Set to `1` to skip the OS keychain and use the `tokens.toml` file store alone |
 
 ## Contributing
 
