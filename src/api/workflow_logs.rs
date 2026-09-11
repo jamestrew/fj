@@ -161,7 +161,7 @@ impl WorkflowTask {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
 pub struct WorkflowRunJob {
     #[serde(default)]
     pub id: u64,
@@ -171,6 +171,11 @@ pub struct WorkflowRunJob {
     pub name: String,
     #[serde(default)]
     pub status: String,
+    /// Runner task id. Forgejo 16 reports it inline on the jobs route, which
+    /// is the only cheap way to name the task without listing every task in
+    /// the repository.
+    #[serde(default)]
+    pub task_id: Option<u64>,
 }
 
 impl WorkflowRunJob {
@@ -239,7 +244,9 @@ impl LogSource for ForgejoApiLogSource {
                 .collect();
             Ok(JobLogs {
                 job: req.job,
-                task_id: req.task.and_then(|task| task.id_u64().ok()),
+                task_id: api_job
+                    .task_id
+                    .or_else(|| req.task.and_then(|task| task.id_u64().ok())),
                 job_id: Some(api_job.id),
                 name: req
                     .api_job
@@ -348,9 +355,12 @@ pub async fn fetch_run_logs(
 ) -> Result<RunLogs> {
     let run_id = resolve_run_api_id(client, owner, name, run).await?;
     let api_jobs = list_run_jobs_api(client, owner, name, run, run_id).await?;
-    let tasks = list_run_tasks(client, owner, name, run)
-        .await
-        .unwrap_or_default();
+    let tasks = RemoteTasks {
+        client,
+        owner,
+        name,
+        run,
+    };
     fetch_run_logs_with_sources(
         client,
         owner,
@@ -381,9 +391,12 @@ pub(crate) async fn fetch_run_logs_with_loki_base(
 ) -> Result<RunLogs> {
     let run_id = resolve_run_api_id(client, owner, name, run).await?;
     let api_jobs = list_run_jobs_api(client, owner, name, run, run_id).await?;
-    let tasks = list_run_tasks(client, owner, name, run)
-        .await
-        .unwrap_or_default();
+    let tasks = RemoteTasks {
+        client,
+        owner,
+        name,
+        run,
+    };
     fetch_run_logs_with_sources(
         client,
         owner,
@@ -479,6 +492,44 @@ fn response_suffix(body: &str) -> String {
     }
 }
 
+/// Supplies the run's task metadata, but only when something asks for it.
+///
+/// `GET /actions/tasks` ignores its `run` filter on Forgejo 16, so it answers
+/// with every task in the repository: measured at 3.2 MB and ~30 s on a
+/// moderately busy repo. Only the Loki fallback needs that metadata (for the
+/// per-task container name and the query window), so the native API path must
+/// never pay for it.
+pub(crate) trait TaskSource: Send + Sync {
+    fn load(&self) -> Pin<Box<dyn Future<Output = Vec<WorkflowTask>> + Send + '_>>;
+}
+
+/// Tasks already in hand, which is how tests and callers with a cached list
+/// supply them.
+impl TaskSource for Vec<WorkflowTask> {
+    fn load(&self) -> Pin<Box<dyn Future<Output = Vec<WorkflowTask>> + Send + '_>> {
+        Box::pin(async move { self.clone() })
+    }
+}
+
+/// Tasks fetched from the server on first ask. A failure degrades to an empty
+/// list, which the Loki fallback reports as missing task metadata.
+pub(crate) struct RemoteTasks<'a> {
+    pub client: &'a Client,
+    pub owner: &'a str,
+    pub name: &'a str,
+    pub run: u64,
+}
+
+impl TaskSource for RemoteTasks<'_> {
+    fn load(&self) -> Pin<Box<dyn Future<Output = Vec<WorkflowTask>> + Send + '_>> {
+        Box::pin(async move {
+            list_run_tasks(self.client, self.owner, self.name, self.run)
+                .await
+                .unwrap_or_default()
+        })
+    }
+}
+
 pub async fn list_run_tasks(
     client: &Client,
     owner: &str,
@@ -507,6 +558,10 @@ pub fn parse_workflow_tasks(value: Value) -> Result<Vec<WorkflowTask>> {
         array.clone()
     } else if let Some(array) = value.get("jobs").and_then(Value::as_array) {
         array.clone()
+    } else if let Some(array) = value.get("workflow_runs").and_then(Value::as_array) {
+        // Forgejo 16 wraps the task list in `workflow_runs` despite the
+        // entries being tasks. Measured on 16.0.3.
+        array.clone()
     } else {
         return Err(anyhow!("unexpected workflow task list response shape"));
     };
@@ -528,7 +583,7 @@ async fn fetch_run_logs_with_sources(
     failed_only: bool,
     forgejo: &impl LogSource,
     loki: &impl LogSource,
-    tasks: &[WorkflowTask],
+    tasks: &dyn TaskSource,
     api_jobs: &[WorkflowRunJob],
 ) -> Result<RunLogs> {
     let selected = selected_jobs(api_jobs, job, failed_only)?;
@@ -549,7 +604,7 @@ async fn fetch_run_logs_with_sources(
                 name,
                 job: index,
                 attempt,
-                task: tasks.get(index),
+                task: None,
                 api_job: Some(api_job),
             };
             match forgejo.fetch(req).await {
@@ -573,6 +628,7 @@ async fn fetch_run_logs_with_sources(
         return Err(anyhow!("no workflow log source is available"));
     }
 
+    let tasks = tasks.load().await;
     let mut jobs = Vec::with_capacity(selected.len());
     for &(index, api_job) in &selected {
         let task = tasks.get(index).ok_or_else(|| {
@@ -782,6 +838,31 @@ mod tests {
         }
     }
 
+    /// Counts how many times the log path asked for task metadata.
+    #[derive(Default)]
+    struct CountingTasks {
+        loads: Arc<AtomicUsize>,
+    }
+
+    impl CountingTasks {
+        fn loads(&self) -> usize {
+            self.loads.load(Ordering::SeqCst)
+        }
+    }
+
+    impl TaskSource for CountingTasks {
+        fn load(&self) -> Pin<Box<dyn Future<Output = Vec<WorkflowTask>> + Send + '_>> {
+            Box::pin(async move {
+                self.loads.fetch_add(1, Ordering::SeqCst);
+                parse_workflow_tasks(serde_json::json!([
+                    {"id": 10, "name": "a", "status": "failure"},
+                    {"id": 11, "name": "b", "status": "failure"}
+                ]))
+                .unwrap()
+            })
+        }
+    }
+
     impl LogSource for FakeLogSource {
         fn available(&self) -> bool {
             self.available
@@ -830,7 +911,7 @@ mod tests {
 
     #[test]
     fn parses_task_response_envelope_variants_and_fallback_fields() {
-        for key in ["workflow_tasks", "jobs"] {
+        for key in ["workflow_tasks", "jobs", "workflow_runs"] {
             let tasks = parse_workflow_tasks(serde_json::json!({
                 key: [{
                     "id": 42,
@@ -856,6 +937,83 @@ mod tests {
 
         let err = parse_workflow_tasks(serde_json::json!([{"id": []}])).unwrap_err();
         assert!(err.to_string().contains("decoding workflow task"));
+    }
+
+    #[tokio::test]
+    async fn remote_tasks_are_not_loaded_when_forgejo_serves_logs() {
+        // The task list is the expensive call, so the native API path has to
+        // finish without ever asking for it. `test_client` points at a dead
+        // address: a load attempt would error, not hang on a real request.
+        let client = test_client();
+        let jobs = vec![WorkflowRunJob {
+            id: 100,
+            attempt: 1,
+            name: "a".into(),
+            status: "failure".into(),
+            task_id: Some(77),
+        }];
+        let counting = CountingTasks::default();
+
+        let logs = fetch_run_logs_with_sources(
+            &client,
+            "o",
+            "r",
+            12,
+            None,
+            None,
+            false,
+            &FakeLogSource::ok("forgejo"),
+            &FakeLogSource::ok("loki"),
+            &counting,
+            &jobs,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(logs.source, "forgejo-api");
+        assert_eq!(counting.loads(), 0);
+    }
+
+    #[tokio::test]
+    async fn remote_tasks_are_loaded_once_for_the_loki_fallback() {
+        let client = test_client();
+        let jobs = vec![
+            WorkflowRunJob {
+                id: 100,
+                attempt: 1,
+                name: "a".into(),
+                status: "failure".into(),
+                task_id: None,
+            },
+            WorkflowRunJob {
+                id: 101,
+                attempt: 1,
+                name: "b".into(),
+                status: "failure".into(),
+                task_id: None,
+            },
+        ];
+        let counting = CountingTasks::default();
+
+        let logs = fetch_run_logs_with_sources(
+            &client,
+            "o",
+            "r",
+            12,
+            None,
+            None,
+            false,
+            &FakeLogSource::unavailable("no native logs"),
+            &FakeLogSource::ok("loki"),
+            &counting,
+            &jobs,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(logs.source, "loki");
+        assert_eq!(logs.jobs.len(), 2);
+        assert_eq!(counting.loads(), 1);
     }
 
     #[test]
@@ -937,18 +1095,21 @@ mod tests {
                 attempt: 0,
                 name: "build".into(),
                 status: "success".into(),
+                task_id: None,
             },
             WorkflowRunJob {
                 id: 2,
                 attempt: 3,
                 name: String::new(),
                 status: "failure".into(),
+                task_id: None,
             },
             WorkflowRunJob {
                 id: 3,
                 attempt: 0,
                 name: "lint".into(),
                 status: "skipped".into(),
+                task_id: None,
             },
         ];
 
@@ -1025,12 +1186,14 @@ mod tests {
                 attempt: 1,
                 name: "a".into(),
                 status: "success".into(),
+                task_id: None,
             },
             WorkflowRunJob {
                 id: 101,
                 attempt: 1,
                 name: "b".into(),
                 status: "failure".into(),
+                task_id: None,
             },
         ];
 
@@ -1063,18 +1226,21 @@ mod tests {
                 attempt: 1,
                 name: "a".into(),
                 status: "success".into(),
+                task_id: None,
             },
             WorkflowRunJob {
                 id: 101,
                 attempt: 1,
                 name: "b".into(),
                 status: "failure".into(),
+                task_id: None,
             },
             WorkflowRunJob {
                 id: 102,
                 attempt: 1,
                 name: "c".into(),
                 status: "skipped".into(),
+                task_id: None,
             },
         ];
 
@@ -1103,6 +1269,7 @@ mod tests {
             attempt: 1,
             name: "a".into(),
             status: "success".into(),
+            task_id: None,
         }];
 
         let logs = fetch_run_logs_with_sources(
@@ -1115,7 +1282,7 @@ mod tests {
             true,
             &forgejo,
             &loki,
-            &[],
+            &Vec::new(),
             &jobs,
         )
         .await
@@ -1135,6 +1302,7 @@ mod tests {
             attempt: 1,
             name: "a".into(),
             status: "failure".into(),
+            task_id: None,
         }];
         let tasks = parse_workflow_tasks(serde_json::json!([
             {"id": 10, "name": "a", "status": "failure"}
@@ -1184,6 +1352,7 @@ mod tests {
             attempt: 1,
             name: "a".into(),
             status: "failure".into(),
+            task_id: None,
         }];
 
         let err = fetch_run_logs_with_sources(
@@ -1196,7 +1365,7 @@ mod tests {
             false,
             &FakeLogSource::unavailable("no native logs"),
             &FakeLogSource::ok("loki"),
-            &[],
+            &Vec::new(),
             &jobs,
         )
         .await

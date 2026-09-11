@@ -1367,6 +1367,91 @@ async fn run_logs_falls_back_to_loki_task_container_logs() {
 }
 
 #[tokio::test]
+async fn run_logs_reads_forgejo_16_workflow_runs_task_envelope() {
+    // Forgejo 16 answers `/actions/tasks` with a `workflow_runs` key even
+    // though the entries are tasks. Measured on 16.0.3; before this shape was
+    // accepted the Loki fallback aborted with "unexpected workflow task list
+    // response shape".
+    let server = MockServer::start().await;
+    let loki = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/runs"))
+        .and(query_param("page", "1"))
+        .and(query_param("limit", "50"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "workflow_runs": [{ "id": 5800, "index_in_repo": 58, "status": "failure" }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/runs/5800/jobs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "id": 9201, "name": "build", "status": "failure" }
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/tasks"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"workflow_runs": [
+                {
+                    "id": 321,
+                    "name": "build",
+                    "status": "failure",
+                    "started": "2026-07-03T00:00:00Z",
+                    "stopped": "2026-07-03T00:05:00Z"
+                }
+            ]})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/jobs/9201/logs"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/loki/api/v1/query_range"))
+        .and(query_param(
+            "query",
+            r#"{job="docker", container=~"/FORGEJO-ACTIONS-TASK-321-.*"}"#,
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "status": "success",
+            "data": { "resultType": "streams", "result": [{
+                "stream": {"stream": "stdout"},
+                "values": [["1793577200000000000", "envelope line"]]
+            }]}
+        })))
+        .expect(1)
+        .mount(&loki)
+        .await;
+
+    let c = client_for(&server).await;
+    let logs = crate::api::workflow::fetch_run_logs_with_loki_base(
+        &c,
+        "o",
+        "r",
+        58,
+        None,
+        None,
+        false,
+        &loki.uri(),
+    )
+    .await
+    .expect("logs");
+
+    assert_eq!(logs.source, "loki");
+    assert_eq!(logs.jobs[0].task_id, Some(321));
+    assert_eq!(logs.jobs[0].lines[0].message, "envelope line");
+}
+
+#[tokio::test]
 async fn run_logs_uses_selected_task_id_for_loki_query() {
     let server = MockServer::start().await;
     let loki = MockServer::start().await;
@@ -1479,11 +1564,12 @@ async fn run_logs_reads_forgejo_api_job_logs_by_job_id() {
         .expect(1)
         .mount(&server)
         .await;
+    // The task list is unfiltered and multi-megabyte on Forgejo 16, so the
+    // native log path must never reach for it.
     Mock::given(method("GET"))
         .and(path("/api/v1/repos/o/r/actions/tasks"))
-        .and(query_param("run", "12"))
         .respond_with(ResponseTemplate::new(404))
-        .expect(1)
+        .expect(0)
         .mount(&server)
         .await;
     Mock::given(method("GET"))
@@ -1501,7 +1587,7 @@ async fn run_logs_reads_forgejo_api_job_logs_by_job_id() {
     assert_eq!(logs.jobs.len(), 1);
     assert_eq!(logs.jobs[0].job, 1);
     assert_eq!(logs.jobs[0].job_id, Some(102));
-    assert_eq!(logs.jobs[0].task_id, None);
+    assert_eq!(logs.jobs[0].task_id, Some(999));
     assert_eq!(logs.jobs[0].name, "test");
     assert_eq!(logs.jobs[0].status, "failure");
     assert_eq!(logs.jobs[0].lines[0].message, "line one");
@@ -1549,9 +1635,8 @@ async fn run_logs_resolves_run_number_beyond_first_page() {
         .await;
     Mock::given(method("GET"))
         .and(path("/api/v1/repos/o/r/actions/tasks"))
-        .and(query_param("run", "51"))
         .respond_with(ResponseTemplate::new(404))
-        .expect(1)
+        .expect(0)
         .mount(&server)
         .await;
     Mock::given(method("GET"))
@@ -1737,7 +1822,7 @@ async fn run_logs_private_repo_404_reports_token_auth_rejection() {
         .await
         .expect_err("private web-route 404 should be classified via run list");
     let msg = err.to_string();
-    assert!(msg.contains("rejected API token auth"), "got: {msg}");
+    assert!(msg.contains("do not accept an API token"), "got: {msg}");
     assert!(msg.contains("cookie/CSRF"), "got: {msg}");
     assert!(msg.contains("rasterstate/fj#103"), "got: {msg}");
     assert!(
@@ -1777,7 +1862,7 @@ async fn run_logs_missing_run_404_keeps_missing_message() {
         "got: {msg}"
     );
     assert!(msg.contains("fj run list"), "got: {msg}");
-    assert!(!msg.contains("rejected API token auth"), "got: {msg}");
+    assert!(!msg.contains("do not accept an API token"), "got: {msg}");
 }
 
 #[tokio::test]
