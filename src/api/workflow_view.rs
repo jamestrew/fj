@@ -10,15 +10,26 @@ use crate::client::Client;
 //
 // THIS SECTION IS DELIBERATELY DIFFERENT FROM EVERY OTHER API MODULE.
 //
-// Forgejo's `/api/v1` exposes almost nothing for Actions runs. Verified
-// against 15.0.2 / gitea-1.22: `/actions/runs/{id}` (single run),
+// What Forgejo's `/api/v1` exposes for Actions runs depends on the server
+// version, and fj supports both the LTS and the stable line.
+//
+// Verified against 15.0.2 / gitea-1.22: `/actions/runs/{id}` (single run),
 // `/actions/runs/{id}/jobs`, `/actions/jobs/{id}/logs`, and
 // `/actions/runs/{id}/logs` all 404. The only documented run surface is the
-// `/actions/tasks` list plus `rerun` / `cancel`. Both the per-run SUMMARY and
-// the LOGS live exclusively behind the web frontend that the browser Actions
-// UI talks to. So, unlike `list_runs` (an ordinary typed `/api/v1`
-// wrapper), the functions below step OUTSIDE the API and call the
-// human-facing web routes under `/{owner}/{repo}/actions/`.
+// `/actions/tasks` list plus `rerun` / `cancel`.
+//
+// Verified against 16.0.3: `/actions/runs/{id}/jobs` and
+// `/actions/jobs/{id}/logs` both answer a plain API token, so on 16 the LOGS
+// have a real API path and `workflow_logs.rs` prefers it (`{id}` there is the
+// INTERNAL run id, not the per-repo run number). A job with no recorded log
+// still 404s, which is what makes "no logs" distinguishable from "no such
+// route".
+//
+// On every supported version the per-run SUMMARY, and on 15.x the logs too,
+// live behind the web frontend that the browser Actions UI talks to. So,
+// unlike `list_runs` (an ordinary typed `/api/v1` wrapper), the functions
+// below step OUTSIDE the API and call the human-facing web routes under
+// `/{owner}/{repo}/actions/`.
 //
 // `fetch_run_summary` powers `fj run view N`; `fetch_job_logs` /
 // `fetch_run_view` / `latest_attempt` power `--log` and `watch`.
@@ -239,10 +250,10 @@ fn missing_logs_error() -> anyhow::Error {
 
 fn private_log_auth_error(run: u64) -> anyhow::Error {
     anyhow::anyhow!(
-        "cannot read logs for run #{run}: the Forgejo web log route rejected API token auth. \
-         Log retrieval on private repos needs a browser session (cookie/CSRF); an API token \
-         is not accepted by this route. Open the run in the Forgejo web UI for logs; see \
-         rasterstate/fj#103."
+        "cannot read logs for run #{run} over the Forgejo web routes: they need a browser \
+         session (cookie/CSRF) and do not accept an API token. Forgejo 16 serves job logs \
+         over `/api/v1`, which `fj run view {run} --log` uses; on 15.x open the run in the \
+         Forgejo web UI. See rasterstate/fj#103."
     )
 }
 
@@ -448,8 +459,9 @@ mod tests {
         let err = private_log_auth_error(395);
         let msg = err.to_string();
         assert!(msg.contains("run #395"), "{msg}");
-        assert!(msg.contains("rejected API token auth"), "{msg}");
+        assert!(msg.contains("do not accept an API token"), "{msg}");
         assert!(msg.contains("cookie/CSRF"), "{msg}");
+        assert!(msg.contains("--log"), "{msg}");
         assert!(msg.contains("rasterstate/fj#103"), "{msg}");
     }
 }
