@@ -1,6 +1,6 @@
 [package]
 name = "fj"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.95"
 description = "Command-line tool for Forgejo, in the spirit of gh"

@@ -6,6 +6,8 @@ All notable changes will be recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-13
+
 ### Added
 
 - **`fj stack ship` restacks the rest of the stack after a squash land.** A
@@ -59,6 +61,11 @@ All notable changes will be recorded here. The format follows
   `FJ_TOKEN_H7261737465726875622E636F6D`. The encoding is injective, so
   `foo-bar.com` and `foo.bar.com` cannot collide onto one variable, and CI can
   set a credential for one host without enumerating the rest.
+- **`fj pr merge --style fast-forward-only`.** Forgejo's fast-forward-only
+  merge style is accepted both as an explicit `--style` and as a repository's
+  `default_merge_style`, which previously failed as unsupported. A PR that is
+  not a fast-forward onto its base is reported as such, with the rebase to do,
+  instead of a raw forge error.
 
 ### Changed
 
@@ -161,6 +168,13 @@ All notable changes will be recorded here. The format follows
   token store. A Forgejo 15.x host, which does not expose the
   token-authenticated job log API, is now reported as such by version rather
   than as a parse error.
+- **`fj run view --log` no longer downloads every task in the repository on
+  Forgejo 16.** The native job-log path fetched the workflow task list first
+  and discarded it, and on 16 that endpoint ignores its `run` filter: about
+  3 MB and 30 seconds on every log read against a busy repository. The task
+  list is now loaded only by the Loki fallback, which is the one path that
+  needs it, and that fallback also decodes the `workflow_runs` envelope 16
+  returns instead of aborting on an unexpected response shape.
 - **`fj pr list` and `fj pr view` decode Forgejo's system actors.** Forgejo
   uses negative sentinel user ids (`-1` for Ghost, `-2` for `forgejo-actions`),
   and the shared `User` model read `id` as unsigned, so any repository with a
