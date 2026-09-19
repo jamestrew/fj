@@ -7,7 +7,7 @@ use crate::api;
 use crate::auth as token_store;
 use crate::cli::auth::LoginArgs;
 use crate::cli::auth_probe::{build_probe_client, probe_version, warn_on_old_forgejo};
-use crate::config::hosts::{Host, Hosts};
+use crate::config::hosts::{AuthKind, FjordAccount, Host, Hosts};
 use crate::output;
 
 /// Which sign-in flow `fj auth login` runs. `Prompt` means "ask the user"
@@ -112,7 +112,7 @@ async fn login_pat(args: LoginArgs) -> Result<()> {
         git_protocol: git_protocol.clone(),
         web_url: web_url.clone(),
         api_base_path: None,
-        auth_kind: crate::config::hosts::AuthKind::Pat,
+        auth_kind: AuthKind::Pat,
         fjord_account: None,
     };
     let probe_client = build_probe_client(&hostname, &provisional, &token)?;
@@ -134,7 +134,7 @@ async fn login_pat(args: LoginArgs) -> Result<()> {
         git_protocol,
         web_url,
         api_base_path: None,
-        auth_kind: crate::config::hosts::AuthKind::Pat,
+        auth_kind: AuthKind::Pat,
         fjord_account: None,
     };
     hosts.upsert(&hostname, host);
@@ -388,6 +388,30 @@ fn render_device_prompt(
         ))
     );
 }
+/// Build the `fjord_account` block a sign-in persists.
+///
+/// `hosts.upsert` replaces the whole host entry, so anything not carried over
+/// here is lost. The instance selection is the one thing a sign-in has no
+/// business resetting: re-login is the documented recovery from an expired
+/// session, and dropping it means the very next command fails with "no default
+/// Fjord instance selected". Kept pure so both sign-in flows share one answer.
+fn fjord_account_for(platform_url: &str, auth_flow: &str, previous: Option<&Host>) -> FjordAccount {
+    // An instance id is only meaningful to the platform that issued it, so a
+    // previous entry under a different platform URL carries nothing forward.
+    let kept = previous
+        .filter(|host| matches!(host.auth_kind, AuthKind::FjordAccount))
+        .and_then(|host| host.fjord_account.as_ref())
+        .filter(|account| account.platform_url == platform_url);
+
+    FjordAccount {
+        platform_url: platform_url.to_string(),
+        default_instance_id: kept.and_then(|a| a.default_instance_id.clone()),
+        default_instance_display_name: kept.and_then(|a| a.default_instance_display_name.clone()),
+        default_instance_slug: kept.and_then(|a| a.default_instance_slug.clone()),
+        default_instance_public_url: kept.and_then(|a| a.default_instance_public_url.clone()),
+        auth_flow: Some(auth_flow.to_string()),
+    }
+}
 
 /// Default (same-device) code capture: bind the loopback listener, open the
 /// browser to the authorize URL, and wait for the redirect. Returns the
@@ -500,7 +524,6 @@ fn persist_oidc_session(
     platform_url: String,
     tokens: crate::fjord::oidc::TokenResponse,
 ) -> Result<()> {
-    use crate::config::hosts::{AuthKind, FjordAccount, Host};
     use crate::fjord::oidc;
 
     if tokens.refresh_token.is_none() {
@@ -520,14 +543,11 @@ fn persist_oidc_session(
         web_url: None,
         api_base_path: None,
         auth_kind: AuthKind::FjordAccount,
-        fjord_account: Some(FjordAccount {
-            platform_url: platform_url.clone(),
-            default_instance_id: None,
-            default_instance_display_name: None,
-            default_instance_slug: None,
-            default_instance_public_url: None,
-            auth_flow: Some("oidc".to_string()),
-        }),
+        fjord_account: Some(fjord_account_for(
+            &platform_url,
+            "oidc",
+            hosts.hosts.get(&platform_url),
+        )),
     };
     hosts.upsert(&platform_url, host_entry);
     hosts.save()?;
@@ -556,7 +576,6 @@ fn persist_oidc_session(
 /// in practice, but the keychain key is namespaced anyway).
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn login_fjord_credentials(args: LoginArgs, platform_url: String) -> Result<()> {
-    use crate::config::hosts::{AuthKind, FjordAccount};
     use crate::fjord::{sign_in, SignInRequest, SignInResponse};
 
     let email = prompt_email()?;
@@ -622,14 +641,11 @@ async fn login_fjord_credentials(args: LoginArgs, platform_url: String) -> Resul
         web_url: None,
         api_base_path: None,
         auth_kind: AuthKind::FjordAccount,
-        fjord_account: Some(FjordAccount {
-            platform_url: platform_url.clone(),
-            default_instance_id: None,
-            default_instance_display_name: None,
-            default_instance_slug: None,
-            default_instance_public_url: None,
-            auth_flow: Some("credentials".to_string()),
-        }),
+        fjord_account: Some(fjord_account_for(
+            &platform_url,
+            "credentials",
+            hosts.hosts.get(&platform_url),
+        )),
     };
     hosts.upsert(&platform_url, host_entry);
     hosts.save()?;
@@ -858,6 +874,75 @@ mod tests {
             device: false,
             platform_url: None,
         }
+    }
+
+    fn signed_in_host(instance: Option<&str>) -> Host {
+        Host {
+            user: Some("stephen@example.com".into()),
+            git_protocol: "https".into(),
+            web_url: None,
+            api_base_path: None,
+            auth_kind: AuthKind::FjordAccount,
+            fjord_account: Some(FjordAccount {
+                platform_url: "https://fjord.sh".into(),
+                default_instance_id: instance.map(str::to_string),
+                default_instance_display_name: instance.map(|_| "rasterhub.com".to_string()),
+                default_instance_slug: instance.map(|_| "rasterhub-com".to_string()),
+                default_instance_public_url: instance.map(|_| "https://rasterhub.com".to_string()),
+                auth_flow: Some("oidc".into()),
+            }),
+        }
+    }
+
+    #[test]
+    fn signing_in_again_keeps_the_instance_already_selected() {
+        let previous = signed_in_host(Some("819eadfe"));
+
+        let account = fjord_account_for("https://fjord.sh", "oidc", Some(&previous));
+
+        // Re-login is the documented recovery from an expired session. Losing
+        // the selection here means the next command fails with "no default
+        // Fjord instance selected" straight after a successful sign-in.
+        assert_eq!(account.default_instance_id.as_deref(), Some("819eadfe"));
+        assert_eq!(
+            account.default_instance_public_url.as_deref(),
+            Some("https://rasterhub.com")
+        );
+        assert_eq!(account.auth_flow.as_deref(), Some("oidc"));
+    }
+
+    #[test]
+    fn a_first_sign_in_has_no_instance_to_keep() {
+        let account = fjord_account_for("https://fjord.sh", "credentials", None);
+
+        assert_eq!(account.default_instance_id, None);
+        assert_eq!(account.platform_url, "https://fjord.sh");
+        assert_eq!(account.auth_flow.as_deref(), Some("credentials"));
+    }
+
+    #[test]
+    fn signing_in_to_a_different_platform_does_not_inherit_its_instance() {
+        let previous = signed_in_host(Some("819eadfe"));
+
+        // The host entry is keyed by platform URL, but a stale or hand-edited
+        // config can disagree. An instance id is only meaningful to the
+        // platform that issued it.
+        let account = fjord_account_for("https://other.example", "oidc", Some(&previous));
+
+        assert_eq!(account.default_instance_id, None);
+    }
+
+    #[test]
+    fn a_pat_host_at_the_same_key_carries_no_instance_to_keep() {
+        let previous = Host {
+            auth_kind: AuthKind::Pat,
+            fjord_account: None,
+            ..signed_in_host(Some("819eadfe"))
+        };
+
+        let account = fjord_account_for("https://fjord.sh", "oidc", Some(&previous));
+
+        assert_eq!(account.default_instance_id, None);
     }
 
     struct EnvRestore {
