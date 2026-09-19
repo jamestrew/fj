@@ -668,10 +668,7 @@ async fn post_token(platform_url: &str, form: &[(&str, &str)]) -> Result<TokenRe
         .with_context(|| format!("reading token response (HTTP {status})"))?;
     super::ensure_json_platform_response("token endpoint", status, Some(&headers), &text)?;
     if !status.is_success() {
-        return Err(anyhow!(
-            "token endpoint returned HTTP {status}: {}",
-            super::preview(&text)
-        ));
+        return Err(token_error(status, &text));
     }
     serde_json::from_str::<TokenResponse>(&text)
         .with_context(|| format!("decoding token response: {}", super::preview(&text)))
@@ -834,7 +831,7 @@ pub async fn poll_device_token(
         })?;
         return Ok(DevicePoll::Approved(Box::new(tokens)));
     }
-    match parse_device_error(&text).as_deref() {
+    match parse_oauth_error(&text).as_deref() {
         Some("authorization_pending") => Ok(DevicePoll::Pending),
         Some("slow_down") => Ok(DevicePoll::SlowDown),
         Some("access_denied") => Ok(DevicePoll::Denied),
@@ -849,8 +846,9 @@ pub async fn poll_device_token(
     }
 }
 
-/// Pure extraction of the OAuth `error` code from a token-poll body.
-fn parse_device_error(body: &str) -> Option<String> {
+/// Pure extraction of the OAuth `error` code from a token-endpoint body
+/// (RFC 6749 §5.2), shared by the device poll and the code/refresh grants.
+fn parse_oauth_error(body: &str) -> Option<String> {
     serde_json::from_str::<OAuthErrorBody>(body)
         .ok()
         .and_then(|b| b.error)
@@ -953,15 +951,25 @@ pub fn valid_refresh_token(platform_url: &str, current_bearer: &str) -> Result<O
     ))
 }
 
-/// Persist the tokens from a sign-in / refresh: the access token in the Fjord
-/// bearer slot (what every downstream call reads) and, when present, the
-/// refresh token bound to the signing-in account's identity. Returns where the
-/// access token landed so the caller can warn on a file-store fallback.
-pub fn store_tokens(
-    platform_url: &str,
+/// What persisting a token response must do to the stored refresh record.
+#[derive(Debug, PartialEq, Eq)]
+enum RefreshWrite {
+    /// Persist this serialized [`StoredRefresh`] record.
+    Store(String),
+    /// Leave the stored record alone: this issuance carried no refresh token
+    /// and what is already there belongs to this account.
+    Keep,
+    /// Drop the stored record: it belongs to a different account.
+    Delete,
+}
+
+/// Decide what the stored refresh record must become for `tokens`, given the
+/// record currently held for this platform URL. Pure: the identity rule of
+/// fj#219 with none of the I/O.
+fn plan_refresh_write(
     tokens: &TokenResponse,
-) -> Result<token_store::TokenStoreLocation> {
-    let location = token_store::store_fjord_bearer(platform_url, &tokens.access_token)?;
+    existing: Option<&StoredRefresh>,
+) -> Result<RefreshWrite> {
     let identity = bearer_identity(&tokens.access_token);
     match (tokens.refresh_token.as_deref(), identity.as_deref()) {
         // Persist the new refresh token bound to the account that just proved
@@ -972,7 +980,7 @@ pub fn store_tokens(
                 refresh_token: rt.to_string(),
             })
             .context("encoding the refresh token record")?;
-            token_store::store_fjord_refresh(platform_url, &record)?;
+            Ok(RefreshWrite::Store(record))
         }
         // Refresh-less issuance (or an access token we can't attribute to an
         // identity): keep an already-stored token only if it belongs to THIS
@@ -981,15 +989,90 @@ pub fn store_tokens(
         // silently restore it (fj#219).
         _ => {
             let keep = matches!(
-                (stored_refresh(platform_url)?, identity.as_deref()),
+                (existing, identity.as_deref()),
                 (Some(record), Some(id)) if record.identity == id
             );
-            if !keep {
-                token_store::delete_fjord_refresh(platform_url)?;
-            }
+            Ok(if keep {
+                RefreshWrite::Keep
+            } else {
+                RefreshWrite::Delete
+            })
         }
     }
-    Ok(location)
+}
+
+/// Persist a token response through the supplied writers, refresh record
+/// first. Split out from [`store_tokens`] so the ordering and the abort-on-
+/// failure rule are testable without touching the keychain.
+fn store_tokens_with(
+    tokens: &TokenResponse,
+    existing: Option<&StoredRefresh>,
+    write_refresh: impl FnOnce(RefreshWrite) -> Result<()>,
+    write_bearer: impl FnOnce(&str) -> Result<token_store::TokenStoreLocation>,
+) -> Result<token_store::TokenStoreLocation> {
+    // Refresh record first, and abort if it does not land. The token we were
+    // sent is the successor to one the OP has already spent, so an access
+    // bearer stored beside a stale refresh record is a session that works
+    // until its first 401 and is then unrecoverable (fj#272). Failing here
+    // leaves the store untouched and the error tells the user what to do.
+    write_refresh(plan_refresh_write(tokens, existing)?).context(
+        "persisting the rotated Fjord refresh token. The previous one is already spent, so \
+         this session cannot be renewed: run `fj auth login --fjord` to sign in again",
+    )?;
+    write_bearer(&tokens.access_token)
+}
+
+/// Single-flight check: whether a peer process refreshed while we waited for
+/// the lock, yielding the bearer it persisted so we reuse its work instead of
+/// spending our (now stale) refresh token on a replay.
+fn bearer_replaced_by_peer(bearer_before: &str, bearer_now: Option<&str>) -> Option<String> {
+    bearer_now
+        .filter(|now| *now != bearer_before)
+        .map(str::to_string)
+}
+
+/// Classify a non-2xx token-endpoint response into the error to return.
+///
+/// A rotating OP answers a spent, replayed or aged-out grant with
+/// `invalid_grant`. That is terminal: no retry recovers it, and the user has
+/// to sign in again. It comes back as a bare [`super::UnrenewableGrant`] so
+/// callers can propagate it without `.context()` and `main` prints its message
+/// rather than a wrapper's (only the outermost error shows without `--debug`).
+fn token_error(status: reqwest::StatusCode, body: &str) -> anyhow::Error {
+    match parse_oauth_error(body).as_deref() {
+        Some("invalid_grant") => super::UnrenewableGrant.into(),
+        Some(code) => anyhow!(
+            "the token endpoint rejected the request ({code}). Run `fj auth login --fjord` to \
+             sign in again."
+        ),
+        None => anyhow!(
+            "token endpoint returned HTTP {status}: {}",
+            super::preview(body)
+        ),
+    }
+}
+
+/// Persist the tokens from a sign-in / refresh: the access token in the Fjord
+/// bearer slot (what every downstream call reads) and, when present, the
+/// refresh token bound to the signing-in account's identity. Returns where the
+/// access token landed so the caller can warn on a file-store fallback.
+pub fn store_tokens(
+    platform_url: &str,
+    tokens: &TokenResponse,
+) -> Result<token_store::TokenStoreLocation> {
+    let existing = stored_refresh(platform_url)?;
+    store_tokens_with(
+        tokens,
+        existing.as_ref(),
+        |write| match write {
+            RefreshWrite::Store(record) => {
+                token_store::store_fjord_refresh(platform_url, &record).map(|_| ())
+            }
+            RefreshWrite::Keep => Ok(()),
+            RefreshWrite::Delete => token_store::delete_fjord_refresh(platform_url),
+        },
+        |bearer| token_store::store_fjord_bearer(platform_url, bearer),
+    )
 }
 
 /// Silent refresh: load the stored refresh token for the currently signed-in
@@ -998,10 +1081,31 @@ pub fn store_tokens(
 /// credentials-flow or PAT host, an OIDC host signed in before refresh support,
 /// or a token that belongs to a different account) so the caller can tell the
 /// user to sign in again.
+///
+/// Single-flight across processes: the exchange and the persist happen under
+/// [`super::lock`], and a peer that refreshed while we waited short-circuits
+/// the exchange entirely.
 pub async fn refresh_session(platform_url: &str) -> Result<String> {
     let bearer = token_store::load_fjord_bearer(platform_url)?.ok_or_else(|| {
         anyhow!("no Fjord Account session stored for {platform_url}; run `fj auth login --fjord` to sign in again")
     })?;
+
+    // Single-flight across processes. Paragon rotates the refresh token on
+    // every exchange and detects replay, so two fj processes refreshing at
+    // once do not merely race: the loser replays a spent token and the OP
+    // revokes the whole family, taking the winner's new token with it
+    // (fj#272). The lock spans the exchange AND the persist, so no peer can
+    // observe the window where the old token is spent and the new one is not
+    // yet stored.
+    let _guard = super::lock::acquire(platform_url)?;
+
+    // A peer may have completed its refresh while we waited. Reuse the bearer
+    // it persisted instead of spending ours on a guaranteed replay.
+    let current = token_store::load_fjord_bearer(platform_url)?;
+    if let Some(fresh) = bearer_replaced_by_peer(&bearer, current.as_deref()) {
+        return Ok(fresh);
+    }
+
     let refresh_token = valid_refresh_token(platform_url, &bearer)?.ok_or_else(|| {
         anyhow!(
             "no refresh token stored for {platform_url}; run `fj auth login --fjord` to sign in again"
@@ -1564,11 +1668,11 @@ mod tests {
     #[test]
     fn parse_device_error_extracts_code() {
         assert_eq!(
-            parse_device_error(r#"{"error":"authorization_pending"}"#).as_deref(),
+            parse_oauth_error(r#"{"error":"authorization_pending"}"#).as_deref(),
             Some("authorization_pending")
         );
-        assert_eq!(parse_device_error("not json").as_deref(), None);
-        assert_eq!(parse_device_error("{}").as_deref(), None);
+        assert_eq!(parse_oauth_error("not json").as_deref(), None);
+        assert_eq!(parse_oauth_error("{}").as_deref(), None);
     }
 
     #[test]
@@ -1749,8 +1853,11 @@ mod tests {
             assert_eq!(tokens.refresh_token.as_deref(), Some("rotated-refresh"));
         }
 
+        /// A rotating OP answers a spent, replayed or aged-out grant with
+        /// `invalid_grant`. It is terminal, so the message says the sign-in
+        /// cannot be renewed instead of printing the JSON at the user (fj#272).
         #[tokio::test]
-        async fn token_endpoint_error_surfaces_status_and_body() {
+        async fn a_spent_grant_is_reported_as_an_unrenewable_sign_in() {
             let server = MockServer::start().await;
             Mock::given(method("POST"))
                 .and(path("/oauth/token"))
@@ -1763,8 +1870,57 @@ mod tests {
                 .await
                 .unwrap_err()
                 .to_string();
-            assert!(err.contains("400"), "want status in error: {err}");
-            assert!(err.contains("invalid_grant"), "want body in error: {err}");
+            assert!(
+                err.contains("fj auth login --fjord"),
+                "want the recovery in the error: {err}"
+            );
+            assert!(
+                err.contains("can no longer be renewed"),
+                "want the cause named in the error: {err}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_spent_grant_is_recognisable_to_callers_as_terminal() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/oauth/token"))
+                .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                    "error": "invalid_grant",
+                })))
+                .mount(&server)
+                .await;
+
+            let err = exchange_refresh(&server.uri(), "fj-cli", "dead")
+                .await
+                .unwrap_err();
+
+            assert!(
+                err.downcast_ref::<crate::fjord::UnrenewableGrant>()
+                    .is_some(),
+                "the refresh path must be able to propagate it bare: {err:#}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_token_failure_with_no_oauth_error_surfaces_status_and_body() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/oauth/token"))
+                .respond_with(ResponseTemplate::new(502).set_body_json(serde_json::json!({
+                    "message": "upstream exploded",
+                })))
+                .mount(&server)
+                .await;
+            let err = exchange_refresh(&server.uri(), "fj-cli", "dead")
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("502"), "want status in error: {err}");
+            assert!(
+                err.contains("upstream exploded"),
+                "want body in error: {err}"
+            );
         }
 
         // ---- Device Authorization Grant (RFC 8628) ----
@@ -2061,5 +2217,160 @@ mod tests {
             .to_string();
             assert!(err.contains("expired"), "want deadline message: {err}");
         }
+    }
+
+    #[test]
+    fn a_failed_refresh_write_leaves_the_access_bearer_alone() {
+        let tokens = TokenResponse {
+            access_token: fake_bearer(Some("u-A"), None),
+            refresh_token: Some("rotated".into()),
+        };
+        let bearer_written = std::cell::Cell::new(false);
+
+        let result = store_tokens_with(
+            &tokens,
+            None,
+            |_| Err(anyhow!("keychain is locked")),
+            |_| {
+                bearer_written.set(true);
+                Ok(token_store::TokenStoreLocation::Keychain)
+            },
+        );
+
+        assert!(
+            result.is_err(),
+            "a lost refresh token must not report success"
+        );
+        assert!(
+            !bearer_written.get(),
+            "storing a bearer whose refresh token was lost strands the session on the next 401"
+        );
+        let message = format!("{:#}", result.unwrap_err());
+        assert!(
+            message.contains("fj auth login --fjord"),
+            "the error must say how to recover: {message}"
+        );
+    }
+
+    #[test]
+    fn the_refresh_token_is_persisted_before_the_access_bearer() {
+        let tokens = TokenResponse {
+            access_token: fake_bearer(Some("u-A"), None),
+            refresh_token: Some("rotated".into()),
+        };
+        let order = std::cell::RefCell::new(Vec::new());
+
+        store_tokens_with(
+            &tokens,
+            None,
+            |_| {
+                order.borrow_mut().push("refresh");
+                Ok(())
+            },
+            |_| {
+                order.borrow_mut().push("bearer");
+                Ok(token_store::TokenStoreLocation::Keychain)
+            },
+        )
+        .expect("both writes succeed");
+
+        assert_eq!(
+            *order.borrow(),
+            vec!["refresh", "bearer"],
+            "the store must never hold an access token newer than its refresh token"
+        );
+    }
+
+    #[test]
+    fn a_rotation_stores_the_new_token_bound_to_the_account_that_proved_it() {
+        let tokens = TokenResponse {
+            access_token: fake_bearer(Some("u-A"), None),
+            refresh_token: Some("rotated".into()),
+        };
+
+        let plan = plan_refresh_write(&tokens, None).expect("plan");
+
+        let RefreshWrite::Store(record) = plan else {
+            panic!("a rotation must store the new token, got {plan:?}");
+        };
+        let parsed: StoredRefresh = serde_json::from_str(&record).expect("record");
+        assert_eq!(parsed.identity, "u-A");
+        assert_eq!(parsed.refresh_token, "rotated");
+    }
+
+    #[test]
+    fn a_refreshless_issuance_keeps_a_record_belonging_to_the_same_account() {
+        let tokens = TokenResponse {
+            access_token: fake_bearer(Some("u-A"), None),
+            refresh_token: None,
+        };
+        let existing = StoredRefresh {
+            identity: "u-A".into(),
+            refresh_token: "still-good".into(),
+        };
+
+        assert_eq!(
+            plan_refresh_write(&tokens, Some(&existing)).expect("plan"),
+            RefreshWrite::Keep
+        );
+    }
+
+    #[test]
+    fn a_refreshless_issuance_drops_a_record_left_by_another_account() {
+        let tokens = TokenResponse {
+            access_token: fake_bearer(Some("u-B"), None),
+            refresh_token: None,
+        };
+        let existing = StoredRefresh {
+            identity: "u-A".into(),
+            refresh_token: "someone-elses".into(),
+        };
+
+        assert_eq!(
+            plan_refresh_write(&tokens, Some(&existing)).expect("plan"),
+            RefreshWrite::Delete
+        );
+    }
+
+    #[test]
+    fn a_peer_refresh_that_replaced_the_bearer_is_reused_rather_than_exchanged_again() {
+        assert_eq!(
+            bearer_replaced_by_peer("stale", Some("minted-by-the-peer")).as_deref(),
+            Some("minted-by-the-peer")
+        );
+    }
+
+    #[test]
+    fn an_unchanged_or_absent_bearer_means_no_peer_refreshed() {
+        assert_eq!(bearer_replaced_by_peer("stale", Some("stale")), None);
+        assert_eq!(bearer_replaced_by_peer("stale", None), None);
+    }
+
+    #[test]
+    fn a_spent_grant_becomes_the_terminal_marker_error() {
+        let err = token_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":"invalid_grant","error_description":"Invalid or expired grant"}"#,
+        );
+
+        assert!(
+            err.downcast_ref::<crate::fjord::UnrenewableGrant>()
+                .is_some(),
+            "callers must be able to recognise a terminal grant failure: {err:#}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("fj auth login --fjord"),
+            "the marker's own message is what the user sees: {message}"
+        );
+    }
+
+    #[test]
+    fn a_non_oauth_token_failure_still_reports_the_status_and_body() {
+        let err = token_error(reqwest::StatusCode::BAD_GATEWAY, "{\"m\":\"nope\"}");
+        let message = err.to_string();
+
+        assert!(message.contains("502"), "{message}");
+        assert!(message.contains("nope"), "{message}");
     }
 }

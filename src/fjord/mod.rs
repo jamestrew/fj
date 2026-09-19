@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use url::Url;
 
+pub mod lock;
 pub mod oidc;
 
 /// Default fjord-platform deployment users sign in against.
@@ -30,6 +31,21 @@ pub const DEFAULT_PLATFORM_URL: &str = "https://fjord.sh";
 #[derive(Debug, thiserror::Error)]
 #[error("Fjord Account session expired or revoked (HTTP 401). Re-run `fj auth login --fjord`.")]
 pub struct SessionExpired;
+
+/// Marker error: the Fjord Account sign-in can no longer be renewed. The OP
+/// answered the token exchange with `invalid_grant`, which means the refresh
+/// token was spent, replayed, revoked, or aged out. No retry recovers it.
+///
+/// Returned bare so callers can `downcast_ref` it. Callers are free to add
+/// their own `.context()`: `main::error_headline` pulls this message back out
+/// of the chain, because the causes under the outermost one are printed only
+/// with `--debug` and this is the message the user has to act on.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "this Fjord Account sign-in can no longer be renewed (the refresh token was spent, revoked, \
+     or has expired). Run `fj auth login --fjord` to sign in again."
+)]
+pub struct UnrenewableGrant;
 
 fn user_agent() -> &'static str {
     concat!("fj/", env!("CARGO_PKG_VERSION"))

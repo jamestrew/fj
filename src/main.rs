@@ -59,7 +59,11 @@ async fn run_cli(argv: Vec<String>) -> ExitCode {
         Err(err) => return handle_parse_outcome(err),
     };
     if let Err(err) = cli::run(cli).await {
-        eprintln!("{} {err}", owo_colors::OwoColorize::red(&"error:"));
+        eprintln!(
+            "{} {}",
+            owo_colors::OwoColorize::red(&"error:"),
+            error_headline(&err)
+        );
         if client::debug_enabled() {
             let mut source = err.source();
             while let Some(cause) = source {
@@ -70,6 +74,17 @@ async fn run_cli(argv: Vec<String>) -> ExitCode {
         return ExitCode::from(error_exit_code(&err));
     }
     ExitCode::SUCCESS
+}
+
+/// The one line the user reads. Normally the outermost context, since that
+/// describes what fj was actually doing. A session that can no longer be
+/// renewed is the exception: its message is the only one carrying the
+/// recovery, and the causes underneath are printed only with `--debug`, so it
+/// wins over whatever wrapped it.
+fn error_headline(err: &anyhow::Error) -> String {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<fjord::UnrenewableGrant>())
+        .map_or_else(|| err.to_string(), ToString::to_string)
 }
 
 const EXIT_GENERIC: u8 = 1;
@@ -197,6 +212,30 @@ mod tests {
         assert_eq!(
             parse_error_exit_code(ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand),
             2
+        );
+    }
+
+    #[test]
+    fn an_ordinary_failure_is_headlined_by_its_outermost_context() {
+        let err = anyhow::anyhow!("connection reset")
+            .context("refreshing the Fjord Account session")
+            .context("listing pull requests");
+
+        assert_eq!(error_headline(&err), "listing pull requests");
+    }
+
+    #[test]
+    fn a_session_that_cannot_be_renewed_is_headlined_by_its_recovery() {
+        let err = anyhow::Error::from(fjord::UnrenewableGrant)
+            .context("refreshing the Fjord Account session")
+            .context("listing pull requests");
+
+        // The chain is hidden without --debug, so the buried marker has to
+        // reach the one line the user actually reads.
+        let headline = error_headline(&err);
+        assert!(
+            headline.contains("fj auth login --fjord"),
+            "want the recovery in the headline, got: {headline}"
         );
     }
 }
