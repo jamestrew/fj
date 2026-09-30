@@ -42,8 +42,9 @@ pub struct MergeFacts {
     pub allowed_styles: Vec<String>,
     pub required_approvals: i64,
     pub approvals: i64,
-    /// Required status contexts that are not `success`, as `(context, state)`.
-    /// `state` is `missing` when the context reported nothing.
+    /// Required status checks that are not green, as `(context, state)`.
+    /// `context` is the reported check's own name, or the required pattern
+    /// with `state` `missing` when no reported check matched it.
     pub failing_checks: Vec<(String, String)>,
     /// Branch protection blocks merging an out-of-date branch.
     pub block_on_outdated: bool,
@@ -89,6 +90,12 @@ pub fn diagnose(f: &MergeFacts) -> Option<String> {
         ));
     }
     if let Some((ctx, state)) = f.failing_checks.first() {
+        if state == "missing" && is_glob_pattern(ctx) {
+            return Some(format!(
+                "PR #{} is blocked by a required check: no reported check matches the required pattern \"{}\".",
+                f.number, ctx
+            ));
+        }
         return Some(format!(
             "PR #{} is blocked by a required check: \"{}\" is not green (state: {}).",
             f.number, ctx, state
@@ -245,7 +252,8 @@ async fn count_approvals(
     latest.values().filter(|s| *s == "APPROVED").count() as i64
 }
 
-/// Required status contexts that are not `success`, as `(context, state)`.
+/// Required status checks that are not green on `sha`, as `(context, state)`.
+/// See [`required_check_failures`].
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn failing_required(
     client: &crate::client::Client,
@@ -258,21 +266,170 @@ async fn failing_required(
         Ok(cs) => cs,
         Err(_) => return Vec::new(),
     };
-    let mut state_of: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
-    for s in &cs.statuses {
-        state_of.insert(s.context.as_str(), s.status.as_str());
-    }
-    required
-        .iter()
-        .filter_map(|ctx| {
-            let state = state_of.get(ctx.as_str()).copied().unwrap_or("missing");
-            if state == "success" {
-                None
-            } else {
-                Some((ctx.clone(), state.to_string()))
+    required_check_failures(required, &cs.statuses)
+}
+
+/// Evaluate branch protection's `status_check_contexts` against the statuses
+/// reported on a commit, the way Forgejo's merge gate does
+/// (`MergeRequiredContextsCommitStatus` in `services/pull/commit_status.go`).
+///
+/// Each required context is a glob pattern, not a literal name: `*` requires
+/// every reported context to pass and `CI / *` every context with that prefix.
+/// A pattern passes when it matches at least one reported status and every
+/// status it matches is `success` or `skipped` (Forgejo ranks `skipped` above
+/// `success`, so it never lowers the verdict). A pattern that matches nothing
+/// is reported as `(pattern, "missing")`; a matched status that is not green
+/// is reported under its own context name, so the message names the real
+/// check. A pattern that is not a valid glob is ignored, as Forgejo drops it.
+pub fn required_check_failures(
+    required: &[String],
+    statuses: &[api::pull::CommitStatus],
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for pattern in required {
+        let Some(glob) = Glob::compile(pattern) else {
+            continue;
+        };
+        let mut matched = false;
+        for s in statuses.iter().filter(|s| glob.matches(&s.context)) {
+            matched = true;
+            let passing = matches!(s.status.as_str(), "success" | "skipped");
+            if !passing && !out.iter().any(|(ctx, _)| *ctx == s.context) {
+                out.push((s.context.clone(), s.status.clone()));
             }
-        })
-        .collect()
+        }
+        if !matched {
+            out.push((pattern.clone(), "missing".to_string()));
+        }
+    }
+    out
+}
+
+/// True when a required context uses glob syntax rather than naming a check.
+fn is_glob_pattern(p: &str) -> bool {
+    p.contains(['*', '?', '[', '{'])
+}
+
+/// A compiled glob with the syntax Forgejo's `gobwas/glob` accepts for status
+/// contexts (compiled without separators): `*` and `**` match any run of
+/// characters, `?` one character, `[abc]` / `[a-z]` / `[!abc]` a class,
+/// `{a,b}` alternatives, and `\` escapes the next character.
+#[derive(Debug)]
+struct Glob(Vec<Tok>);
+
+#[derive(Debug)]
+enum Tok {
+    Lit(char),
+    Any,
+    One,
+    Class {
+        negated: bool,
+        ranges: Vec<(char, char)>,
+    },
+    Alt(Vec<Glob>),
+}
+
+impl Glob {
+    /// `None` when the pattern is malformed (an unclosed `[` or `{`).
+    fn compile(pattern: &str) -> Option<Glob> {
+        let chars: Vec<char> = pattern.chars().collect();
+        let (glob, rest) = Self::parse(&chars, false)?;
+        rest.is_empty().then_some(glob)
+    }
+
+    /// Parse until the end, or (inside `{}`) until an unescaped `,` or `}`,
+    /// which is left in the returned remainder for the caller.
+    fn parse(mut s: &[char], in_alt: bool) -> Option<(Glob, &[char])> {
+        let mut toks = Vec::new();
+        while let Some((&c, rest)) = s.split_first() {
+            if in_alt && (c == ',' || c == '}') {
+                break;
+            }
+            s = rest;
+            match c {
+                '*' => {
+                    if !matches!(toks.last(), Some(Tok::Any)) {
+                        toks.push(Tok::Any);
+                    }
+                }
+                '?' => toks.push(Tok::One),
+                '\\' => {
+                    let (&e, rest) = s.split_first()?;
+                    toks.push(Tok::Lit(e));
+                    s = rest;
+                }
+                '[' => {
+                    let (negated, mut body) = match s.split_first() {
+                        Some(('!', rest)) => (true, rest),
+                        _ => (false, s),
+                    };
+                    let mut ranges = Vec::new();
+                    loop {
+                        let (&lo, rest) = body.split_first()?;
+                        if lo == ']' {
+                            s = rest;
+                            break;
+                        }
+                        body = rest;
+                        if let ['-', hi, rest @ ..] = body {
+                            if *hi != ']' {
+                                ranges.push((lo, *hi));
+                                body = rest;
+                                continue;
+                            }
+                        }
+                        ranges.push((lo, lo));
+                    }
+                    toks.push(Tok::Class { negated, ranges });
+                }
+                '{' => {
+                    let mut alts = Vec::new();
+                    loop {
+                        let (alt, rest) = Self::parse(s, true)?;
+                        alts.push(alt);
+                        let (&sep, rest) = rest.split_first()?;
+                        s = rest;
+                        if sep == '}' {
+                            break;
+                        }
+                    }
+                    toks.push(Tok::Alt(alts));
+                }
+                _ => toks.push(Tok::Lit(c)),
+            }
+        }
+        Some((Glob(toks), s))
+    }
+
+    fn matches(&self, text: &str) -> bool {
+        let chars: Vec<char> = text.chars().collect();
+        Self::match_from(&self.0, &chars)
+    }
+
+    fn match_from(toks: &[Tok], text: &[char]) -> bool {
+        let Some((tok, rest)) = toks.split_first() else {
+            return text.is_empty();
+        };
+        match tok {
+            Tok::Lit(c) => text.first() == Some(c) && Self::match_from(rest, &text[1..]),
+            Tok::One => !text.is_empty() && Self::match_from(rest, &text[1..]),
+            Tok::Class { negated, ranges } => match text.first() {
+                Some(&c) => {
+                    let hit = ranges.iter().any(|&(lo, hi)| lo <= c && c <= hi);
+                    hit != *negated && Self::match_from(rest, &text[1..])
+                }
+                None => false,
+            },
+            Tok::Any => (0..=text.len()).any(|i| Self::match_from(rest, &text[i..])),
+            Tok::Alt(alts) => alts.iter().any(|alt| {
+                // Splice the alternative in front of the remaining tokens by
+                // trying every split point it could consume.
+                (0..=text.len()).any(|i| {
+                    Self::match_from(&alt.0, &text[..i]) && Self::match_from(rest, &text[i..])
+                })
+            }),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -408,6 +565,174 @@ mod tests {
     #[test]
     fn nothing_specific_is_none() {
         assert!(diagnose(&base_facts()).is_none());
+    }
+
+    fn st(context: &str, status: &str) -> api::pull::CommitStatus {
+        api::pull::CommitStatus {
+            status: status.into(),
+            context: context.into(),
+            description: String::new(),
+            target_url: String::new(),
+            updated_at: None,
+        }
+    }
+
+    fn req(patterns: &[&str]) -> Vec<String> {
+        patterns.iter().map(|p| p.to_string()).collect()
+    }
+
+    #[test]
+    fn star_with_all_green_is_mergeable() {
+        let statuses = vec![
+            st("CI / build (pull_request)", "success"),
+            st("CI / test (pull_request)", "success"),
+            st("lint / fmt (pull_request)", "success"),
+        ];
+        assert!(required_check_failures(&req(&["*"]), &statuses).is_empty());
+        // Nothing else blocks, so diagnosis falls through to the raw error.
+        let mut f = base_facts();
+        f.failing_checks = required_check_failures(&req(&["*"]), &statuses);
+        assert!(diagnose(&f).is_none());
+    }
+
+    #[test]
+    fn star_treats_skipped_as_passing() {
+        // Forgejo ranks `skipped` above `success`, so it never blocks.
+        let statuses = vec![
+            st("CI / build", "success"),
+            st("lint / develop-superset-of-main", "skipped"),
+        ];
+        assert!(required_check_failures(&req(&["*"]), &statuses).is_empty());
+    }
+
+    #[test]
+    fn star_with_one_failing_names_the_real_check() {
+        let statuses = vec![
+            st("CI / build", "success"),
+            st("CI / test", "failure"),
+            st("lint", "success"),
+        ];
+        let failing = required_check_failures(&req(&["*"]), &statuses);
+        assert_eq!(
+            failing,
+            vec![("CI / test".to_string(), "failure".to_string())]
+        );
+        let mut f = base_facts();
+        f.failing_checks = failing;
+        assert_eq!(
+            diagnose(&f).unwrap(),
+            "PR #12 is blocked by a required check: \"CI / test\" is not green (state: failure)."
+        );
+    }
+
+    #[test]
+    fn star_blocks_on_pending_and_warning() {
+        let statuses = vec![st("a", "pending"), st("b", "warning"), st("c", "success")];
+        assert_eq!(
+            required_check_failures(&req(&["*"]), &statuses),
+            vec![
+                ("a".to_string(), "pending".to_string()),
+                ("b".to_string(), "warning".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn star_with_no_statuses_is_missing() {
+        let failing = required_check_failures(&req(&["*"]), &[]);
+        assert_eq!(failing, vec![("*".to_string(), "missing".to_string())]);
+        let mut f = base_facts();
+        f.failing_checks = failing;
+        assert_eq!(
+            diagnose(&f).unwrap(),
+            "PR #12 is blocked by a required check: no reported check matches the required pattern \"*\"."
+        );
+    }
+
+    #[test]
+    fn prefix_pattern_only_gates_its_prefix() {
+        let statuses = vec![
+            st("CI / build", "success"),
+            st("CI / test", "success"),
+            st("advisory / forseti", "failure"),
+        ];
+        assert!(required_check_failures(&req(&["CI / *"]), &statuses).is_empty());
+
+        let statuses = vec![st("CI / build", "success"), st("CI / test", "error")];
+        assert_eq!(
+            required_check_failures(&req(&["CI / *"]), &statuses),
+            vec![("CI / test".to_string(), "error".to_string())]
+        );
+
+        let statuses = vec![st("lint", "success")];
+        assert_eq!(
+            required_check_failures(&req(&["CI / *"]), &statuses),
+            vec![("CI / *".to_string(), "missing".to_string())]
+        );
+    }
+
+    #[test]
+    fn literal_context_unchanged() {
+        let statuses = vec![st("ci/test", "success"), st("ci/lint", "failure")];
+        assert!(required_check_failures(&req(&["ci/test"]), &statuses).is_empty());
+        assert_eq!(
+            required_check_failures(&req(&["ci/lint"]), &statuses),
+            vec![("ci/lint".to_string(), "failure".to_string())]
+        );
+        let failing = required_check_failures(&req(&["ci/build"]), &statuses);
+        assert_eq!(
+            failing,
+            vec![("ci/build".to_string(), "missing".to_string())]
+        );
+        // A literal name keeps the original wording.
+        let mut f = base_facts();
+        f.failing_checks = failing;
+        assert_eq!(
+            diagnose(&f).unwrap(),
+            "PR #12 is blocked by a required check: \"ci/build\" is not green (state: missing)."
+        );
+    }
+
+    #[test]
+    fn overlapping_patterns_report_a_check_once() {
+        let statuses = vec![st("CI / test", "failure")];
+        assert_eq!(
+            required_check_failures(&req(&["*", "CI / *", "CI / test"]), &statuses),
+            vec![("CI / test".to_string(), "failure".to_string())]
+        );
+    }
+
+    #[test]
+    fn invalid_pattern_is_ignored() {
+        let statuses = vec![st("ci", "failure")];
+        assert!(required_check_failures(&req(&["ci["]), &statuses).is_empty());
+    }
+
+    #[test]
+    fn glob_syntax() {
+        let m = |p: &str, t: &str| Glob::compile(p).unwrap().matches(t);
+        assert!(m("*", ""));
+        assert!(m("*", "CI / build (pull_request)"));
+        assert!(m("**", "a/b/c"));
+        assert!(m("CI / *", "CI / build"));
+        assert!(!m("CI / *", "lint / CI / build"));
+        assert!(m("*(pull_request)", "CI / test (pull_request)"));
+        assert!(!m("*(pull_request)", "CI / test (push)"));
+        assert!(m("ci/te?t", "ci/test"));
+        assert!(!m("ci/te?t", "ci/tet"));
+        assert!(m("ci/[bt]est", "ci/test"));
+        assert!(!m("ci/[!bt]est", "ci/test"));
+        assert!(m("v[0-9]", "v7"));
+        assert!(m("{CI,lint} / *", "lint / fmt"));
+        assert!(!m("{CI,lint} / *", "Test / fmt"));
+        assert!(m("a\\*b", "a*b"));
+        assert!(!m("a\\*b", "axb"));
+        assert!(m("ci/test", "ci/test"));
+        assert!(!m("ci/test", "ci/test2"));
+        assert!(Glob::compile("ci[").is_none());
+        assert!(Glob::compile("{a,b").is_none());
+        assert!(is_glob_pattern("*"));
+        assert!(!is_glob_pattern("ci/test"));
     }
 
     #[test]

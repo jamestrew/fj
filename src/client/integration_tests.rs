@@ -3669,6 +3669,90 @@ async fn diagnose_reports_failing_required_check() {
     assert!(msg.contains("pending"), "got: {msg}");
 }
 
+/// Mount a PR whose base requires `status_check_contexts: ["*"]`, with the
+/// given statuses reported on its head commit.
+async fn mount_wildcard_protection(server: &MockServer, number: u64, statuses: serde_json::Value) {
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v1/repos/o/r/pulls/{number}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(merge_diag_pull_json(number, true, false, "open")),
+        )
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 1, "name": "r", "full_name": "o/r",
+            "owner": { "id": 1, "login": "o" },
+            "html_url": "h", "clone_url": "c", "ssh_url": "s",
+            "default_branch": "main",
+            "updated_at": "2026-05-30T00:00:00Z"
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/branch_protections/main"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "branch_name": "main",
+            "enable_status_check": true,
+            "status_check_contexts": ["*"],
+            "required_approvals": 0
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/commits/abc1234/status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "state": "success", "sha": "abc1234", "statuses": statuses
+        })))
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn diagnose_wildcard_required_context_all_green_is_not_a_check_block() {
+    // fj#238: `*` is a glob over every reported context, not a context named
+    // "*". A fully green head must not be reported as a missing check.
+    let server = MockServer::start().await;
+    mount_wildcard_protection(
+        &server,
+        20,
+        json!([
+            { "status": "success", "context": "CI / build (pull_request)" },
+            { "status": "success", "context": "CI / test (pull_request)" },
+            { "status": "skipped", "context": "lint / develop-superset-of-main (pull_request)" }
+        ]),
+    )
+    .await;
+    let msg = run_merge_diagnose(&server, 20, "squash").await;
+    assert!(
+        msg.as_deref().is_none_or(|m| !m.contains("required check")),
+        "got: {msg:?}"
+    );
+}
+
+#[tokio::test]
+async fn diagnose_wildcard_required_context_names_the_failing_check() {
+    let server = MockServer::start().await;
+    mount_wildcard_protection(
+        &server,
+        21,
+        json!([
+            { "status": "success", "context": "CI / build (pull_request)" },
+            { "status": "failure", "context": "CI / test (pull_request)" }
+        ]),
+    )
+    .await;
+    let msg = run_merge_diagnose(&server, 21, "squash")
+        .await
+        .expect("a reason");
+    assert!(
+        msg.contains("\"CI / test (pull_request)\" is not green (state: failure)"),
+        "got: {msg}"
+    );
+}
+
 #[tokio::test]
 async fn diagnose_reports_missing_approvals() {
     let server = MockServer::start().await;
