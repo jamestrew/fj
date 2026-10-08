@@ -9,7 +9,6 @@ use clap::Args;
 
 use crate::api;
 use crate::cli::context::{resolve_repo, RepoFlag};
-use crate::cli::workflow_run::guard_web_routes;
 use crate::output;
 
 #[derive(Debug, Args)]
@@ -35,7 +34,6 @@ pub struct DownloadArgs {
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub async fn download(args: DownloadArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
-    guard_web_routes(&ctx.client)?;
     let arts =
         api::workflow::list_artifacts(&ctx.client, &ctx.owner, &ctx.name, args.run_id).await?;
     if args.json {
@@ -76,14 +74,9 @@ pub async fn download(args: DownloadArgs, host: Option<&str>) -> Result<()> {
             continue;
         }
         let dest = artifact_dest(Path::new(&out), &a.name)?;
-        let bytes = api::workflow::download_artifact(
-            &ctx.client,
-            &ctx.owner,
-            &ctx.name,
-            args.run_id,
-            &a.name,
-        )
-        .await?;
+        let bytes =
+            api::workflow::download_artifact(&ctx.client, &ctx.owner, &ctx.name, args.run_id, a)
+                .await?;
         std::fs::write(&dest, &bytes)?;
         println!("✓ Downloaded {} → {}", a.name, dest.display());
         got += 1;

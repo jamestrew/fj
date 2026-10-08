@@ -25,8 +25,8 @@
 use reqwest::Method;
 
 use super::{
-    api, issue, label, milestone, pr, release, repo, repo_collaborator, repo_deploy_key, search,
-    tag, workflow_run, Command,
+    api, issue, issue_dependency, issue_reaction, issue_time, label, milestone, pr, release, repo,
+    repo_collaborator, repo_deploy_key, search, tag, workflow_run, Command,
 };
 
 /// Should this command's output go through the pager?
@@ -64,6 +64,13 @@ fn repo_pages(sub: &repo::RepoSub) -> bool {
         S::DeployKey(c) => {
             matches!(&c.command, repo_deploy_key::DeployKeySub::List(a) if !a.json)
         }
+        // Commit lists and views are long reads. `repo contents` is not paged:
+        // its output is file bytes meant for a pipe or redirect.
+        S::Commit(c) => match &c.command {
+            super::repo_commit::CommitSub::List(a) => !a.json,
+            super::repo_commit::CommitSub::View(a) => !a.json,
+        },
+        S::Contents(_) => false,
         // Writes, git-driven commands, and short one-off reads.
         S::Clone(_)
         | S::Create(_)
@@ -81,7 +88,8 @@ fn repo_pages(sub: &repo::RepoSub) -> bool {
         | S::Unwatch(_)
         | S::Star(_)
         | S::Unstar(_)
-        | S::SetDefault(_) => false,
+        | S::SetDefault(_)
+        | S::Transfer(_) => false,
     }
 }
 
@@ -90,6 +98,13 @@ fn issue_pages(sub: &issue::IssueSub) -> bool {
     match sub {
         S::List(a) => !a.json && !a.web,
         S::View(a) => !a.json && !a.web,
+        S::Reaction(c) => {
+            matches!(&c.command, issue_reaction::ReactionSub::List(a) if !a.json)
+        }
+        S::Dependency(c) => {
+            matches!(&c.command, issue_dependency::DependencySub::List(a) if !a.json)
+        }
+        S::Time(c) => matches!(&c.command, issue_time::TimeSub::List(a) if !a.json),
         S::Create(_)
         | S::Edit(_)
         | S::Close(_)
@@ -257,9 +272,8 @@ mod tests {
         assert!(!pages(&["fj", "repo", "fork"]));
         assert!(!pages(&["fj", "repo", "branches", "create", "b"]));
         assert!(!pages(&["fj", "repo", "collaborator", "add", "u"]));
-        // `label create` / `label edit` are omitted on purpose: their
-        // `--color` arg collides with the global `--color` id and makes clap
-        // panic during parse. Pre-existing on main, unrelated to paging.
+        assert!(!pages(&["fj", "label", "create", "bug"]));
+        assert!(!pages(&["fj", "label", "edit", "bug"]));
         assert!(!pages(&["fj", "label", "delete", "bug"]));
         assert!(!pages(&["fj", "milestone", "close", "1"]));
         assert!(!pages(&["fj", "tag", "create", "v1"]));

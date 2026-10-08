@@ -9,6 +9,7 @@ use crate::cli::repo_mirror::{MirrorArgs, MirrorSyncArgs};
 use crate::cli::repo_social::{SimpleRepoArgs, StarredArgs};
 use crate::cli::{
     branch, list as list_output, repo_collaborator, repo_deploy_key, repo_mirror, repo_social,
+    repo_topics, repo_transfer,
 };
 use crate::client::Client;
 use crate::config::hosts::Hosts;
@@ -72,6 +73,13 @@ pub enum RepoSub {
     Collaborator(CollaboratorCmd),
     /// Manage repository deploy keys.
     DeployKey(DeployKeyCmd),
+    /// Request, review, accept, or reject a repository ownership transfer.
+    Transfer(repo_transfer::TransferCmd),
+
+    /// List and view commits, with their signature verification state.
+    Commit(crate::cli::repo_commit::CommitCmd),
+    /// Read a file or list a directory at a branch, tag, or commit.
+    Contents(crate::cli::repo_contents::ContentsArgs),
 }
 
 #[derive(Debug, Args)]
@@ -258,12 +266,16 @@ pub enum RepoBranchesSub {
 
 #[derive(Debug, Args)]
 pub struct TopicsArgs {
+    #[command(subcommand)]
+    pub command: Option<repo_topics::TopicsSub>,
     /// Repository as owner/name
     pub repo: Option<String>,
     /// Alias for the positional repo arg
     #[arg(short = 'R', long = "repo")]
     pub repo_flag: Option<String>,
-    /// Set the topic list (comma-separated). Omit to just print.
+    /// Replace the whole topic list (comma-separated) and print the list the
+    /// forge confirms. Omit to just print. Use `add` / `remove` to change
+    /// single topics.
     #[arg(long)]
     pub set: Option<String>,
 }
@@ -294,6 +306,10 @@ pub async fn run(cmd: RepoCmd, host: Option<&str>) -> Result<()> {
         RepoSub::SetDefault(args) => set_default(args).await,
         RepoSub::Collaborator(cmd) => repo_collaborator::collaborator(cmd, host).await,
         RepoSub::DeployKey(cmd) => repo_deploy_key::deploy_key(cmd, host).await,
+        RepoSub::Transfer(cmd) => repo_transfer::transfer(cmd, host).await,
+
+        RepoSub::Commit(cmd) => crate::cli::repo_commit::commit(cmd, host).await,
+        RepoSub::Contents(args) => crate::cli::repo_contents::contents(args, host).await,
     }
 }
 
@@ -635,15 +651,16 @@ async fn list_branches(args: BranchesArgs, host: Option<&str>) -> Result<()> {
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn topics(args: TopicsArgs, host: Option<&str>) -> Result<()> {
+    if let Some(command) = args.command {
+        return repo_topics::run(command, host).await;
+    }
     let ctx = resolve_repo(pick_repo(args.repo.as_ref(), args.repo_flag.as_ref()), host)?;
     if let Some(set) = args.set {
-        let list: Vec<String> = set
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
+        let list = repo_topics::parse_set(&set)?;
         api::repo::set_topics(&ctx.client, &ctx.owner, &ctx.name, &list).await?;
-        println!("✓ Topics set to: {}", list.join(", "));
+        // Print what the forge now holds, not what was asked for.
+        let confirmed = api::repo::list_topics(&ctx.client, &ctx.owner, &ctx.name).await?;
+        println!("✓ Topics set to: {}", repo_topics::topic_list(&confirmed));
         return Ok(());
     }
     let topics = api::repo::list_topics(&ctx.client, &ctx.owner, &ctx.name).await?;

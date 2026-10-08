@@ -378,15 +378,36 @@ pub async fn list_topics(client: &Client, owner: &str, name: &str) -> Result<Vec
 
 pub async fn set_topics(client: &Client, owner: &str, name: &str, topics: &[String]) -> Result<()> {
     let path = format!("{}/topics", crate::api::repo_path(owner, name));
-    let res = client
-        .request(
+    client
+        .send(
             Method::PUT,
             &path,
             &[],
             Some(&serde_json::json!({ "topics": topics })),
         )
         .await?;
-    res.error_for_status()?;
+    Ok(())
+}
+
+fn topic_path(owner: &str, name: &str, topic: &str) -> String {
+    format!(
+        "{}/topics/{}",
+        crate::api::repo_path(owner, name),
+        crate::api::path_segment(topic)
+    )
+}
+
+/// Add one topic, leaving the rest of the set alone.
+pub async fn add_topic(client: &Client, owner: &str, name: &str, topic: &str) -> Result<()> {
+    let path = topic_path(owner, name, topic);
+    client.send(Method::PUT, &path, &[], None::<&()>).await?;
+    Ok(())
+}
+
+/// Remove one topic, leaving the rest of the set alone.
+pub async fn remove_topic(client: &Client, owner: &str, name: &str, topic: &str) -> Result<()> {
+    let path = topic_path(owner, name, topic);
+    client.send(Method::DELETE, &path, &[], None::<&()>).await?;
     Ok(())
 }
 

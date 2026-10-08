@@ -3,8 +3,8 @@ use clap::{Args, Subcommand};
 
 use crate::api;
 use crate::auth as token_store;
-use crate::cli::auth_probe::build_probe_client;
-use crate::cli::{auth_group, auth_login, auth_setup_git};
+use crate::cli::auth_probe::{build_probe_client, probe_server, record_server, server_label};
+use crate::cli::{auth_group, auth_login, auth_proxy, auth_setup_git};
 use crate::config::hosts::Hosts;
 use crate::output;
 
@@ -37,6 +37,10 @@ pub enum AuthSub {
     SetupGit(SetupGitArgs),
     /// Organize hosts into named groups (a label only; auth is unaffected).
     Group(auth_group::GroupCmd),
+    /// Store credentials for a reverse proxy that guards the forge with HTTP
+    /// Basic authentication. Separate from the forge token.
+    #[command(after_long_help = auth_proxy::LONG_HELP)]
+    Proxy(auth_proxy::ProxyArgs),
 }
 
 #[derive(Debug, Args)]
@@ -181,6 +185,10 @@ pub async fn run(cmd: AuthCmd, global_host: Option<&str>) -> Result<()> {
             auth_setup_git::setup_git(args)
         }
         AuthSub::Group(cmd) => auth_group::run(cmd, global_host),
+        AuthSub::Proxy(mut args) => {
+            args.host = effective_host(args.host, global_host);
+            auth_proxy::run(args)
+        }
     }
 }
 
@@ -350,10 +358,23 @@ async fn refresh(mut args: RefreshArgs, global_host: Option<&str>) -> Result<()>
             .ok_or_else(|| anyhow!("no token stored; pass --token to set one"))?,
     };
 
-    let probe = build_probe_client(&host, &cfg, &token)?;
+    let allow_generic_env =
+        generic_env_allowed_for_resolved_host(&hosts, &host, args.host.as_deref());
+    let proxy = crate::client::proxy_credential_for_host(&host, &cfg, allow_generic_env)?;
+    let probe = build_probe_client(&host, &cfg, &token, proxy)?;
     let me = api::user::current(&probe)
         .await
         .context("verifying token against /api/v1/user")?;
+
+    // Re-establish which forge this is: a server can be upgraded (or swapped)
+    // between logins, and commands gate optional routes on what is recorded.
+    let server = probe_server(&probe).await;
+    let mut hosts = hosts;
+    if let Some(entry) = hosts.hosts.get_mut(&host) {
+        record_server(entry, &server);
+        hosts.save()?;
+    }
+    println!("  Server: {}", server_label(&server));
 
     if new_token.is_some() {
         let storage = token_store::store_token(&host, &token)?;
@@ -500,6 +521,12 @@ async fn status(args: StatusArgs, global_host: Option<&str>) -> Result<()> {
                 }
             }
         }
+        for line in auth_proxy::server_and_proxy_lines(
+            host,
+            crate::client::proxy_credential_for_host(&name, host, allow_generic_env)?.is_some(),
+        ) {
+            println!("  {line}");
+        }
         println!("  Git protocol: {}", host.git_protocol);
         if let Some(line) = auth_group::status_line(&hosts, &name) {
             println!("{line}");
@@ -531,6 +558,9 @@ fn logout(mut args: LogoutArgs, global_host: Option<&str>) -> Result<()> {
     match removed.auth_kind {
         crate::config::hosts::AuthKind::Pat => {
             token_store::delete_token(&target)?;
+            // The proxy password is a secret of its own, under its own key.
+            // Logging out forgets it too.
+            token_store::delete_proxy_password(&target)?;
         }
         crate::config::hosts::AuthKind::FjordAccount => {
             if let Some(fa) = removed.fjord_account.as_ref() {

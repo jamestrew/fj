@@ -1,61 +1,71 @@
-//! Token verification + server-version probing shared by login and refresh.
+//! Token verification + server flavor/version probing shared by login and
+//! refresh.
 
 use anyhow::Result;
 
-use crate::client::{Client, ResolvedHost};
+use crate::client::capability::{self, ServerInfo};
+use crate::client::{Client, ProxyCredential, ResolvedHost};
 use crate::config::hosts::Host;
 use crate::output;
 
+/// Establish which forge is on the other end and print what the user needs
+/// to know about it: a floor warning for an old Forgejo, a plain note for a
+/// host that could not be identified, nothing for a Gitea. Never fails.
 #[cfg_attr(coverage_nightly, coverage(off))]
-pub(crate) async fn probe_version(client: &Client) -> Result<String> {
-    #[derive(serde::Deserialize)]
-    struct V {
-        version: String,
+pub(crate) async fn probe_server(client: &Client) -> ServerInfo {
+    let info = client.server_info().await;
+    for line in probe_messages(&info) {
+        eprintln!("{line}");
     }
-    let v: V = client
-        .json(reqwest::Method::GET, "/api/v1/version", &[], None::<&()>)
-        .await?;
-    Ok(v.version)
+    info
 }
 
-/// `version_string` looks like "7.0.16+gitea-1.21.11" or "1.21.11". We warn
-/// when the leading numeric component looks pre-7.x. Anything we can't parse
-/// gets a silent pass since exotic Forgejo-likes still mostly work.
-pub(crate) fn warn_on_old_forgejo(version_string: &str) {
-    if let Some(msg) = version_warning(version_string) {
-        eprintln!("{} {msg}", output::bold("warning:"));
+/// The lines `probe_server` prints. Pure: the flavor decides, never the bare
+/// version string, so a Gitea 1.x is not told it is below the Forgejo floor.
+fn probe_messages(info: &ServerInfo) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(msg) = capability::floor_warning(info) {
+        lines.push(format!("{} {msg}", output::bold("warning:")));
+    }
+    if let Some(msg) = capability::unidentified_note(info) {
+        lines.push(format!("{} {msg}", output::bold("note:")));
+    }
+    lines
+}
+
+/// Record what the probe established on the host entry. An unidentified
+/// result is stored as such (with whatever version string the shared route
+/// gave) so `fj auth status` can say so instead of guessing.
+pub(crate) fn record_server(host: &mut Host, info: &ServerInfo) {
+    host.flavor = Some(info.flavor.as_str().to_string());
+    host.server_version = (!info.raw.is_empty()).then(|| info.raw.clone());
+}
+
+/// "Forgejo 16.0.4+gitea-1.22.0", "Gitea 1.27.3", or "unidentified forge
+/// (reports 1.21.11)". For the login line and `fj auth status`.
+pub(crate) fn server_label(info: &ServerInfo) -> String {
+    use crate::client::Flavor;
+    match (info.flavor, info.raw.is_empty()) {
+        (Flavor::Unidentified, true) => info.flavor.label().to_string(),
+        (Flavor::Unidentified, false) => {
+            format!("{} (reports {})", info.flavor.label(), info.raw)
+        }
+        (flavor, true) => format!("{} (version unknown)", flavor.label()),
+        (flavor, false) => format!("{} {}", flavor.label(), info.raw),
     }
 }
 
-/// Pure helper. Returns the human-readable warning (without the "warning:"
-/// prefix) when the server's version is older than the fj baseline. Returns
-/// `None` when the version is unparseable or fresh enough.
-fn version_warning(version_string: &str) -> Option<String> {
-    if version_string.is_empty() {
-        return None;
-    }
-    let head = version_string
-        .split(|c: char| !(c.is_ascii_digit() || c == '.'))
-        .next()
-        .unwrap_or("");
-    let major: u32 = head
-        .split('.')
-        .next()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    if major == 0 || major >= 7 {
-        return None;
-    }
-    Some(format!(
-        "server reports version `{version_string}`, which is older than the Forgejo 7.x baseline fj is tested against. Some commands (pr ready, repo mirror-sync, search code, milestone) may 404. See docs/compatibility.md."
-    ))
-}
-
-pub(crate) fn build_probe_client(host: &str, cfg: &Host, token: &str) -> Result<Client> {
+pub(crate) fn build_probe_client(
+    host: &str,
+    cfg: &Host,
+    token: &str,
+    proxy: Option<ProxyCredential>,
+) -> Result<Client> {
     let resolved = ResolvedHost {
         name: host.to_string(),
         host: cfg.clone(),
         token: Some(token.to_string()),
+        proxy,
     };
     Client::new(resolved)
 }
@@ -63,27 +73,76 @@ pub(crate) fn build_probe_client(host: &str, cfg: &Host, token: &str) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::capability::{classify, RouteAnswer};
+    use crate::client::Flavor;
 
     #[test]
-    fn version_warning_fires_on_old() {
-        assert!(version_warning("1.21.11").is_some());
-        assert!(version_warning("5.0.0").is_some());
-        assert!(version_warning("6.0.0+gitea-1.20.0").is_some());
+    fn old_forgejo_gets_the_floor_warning() {
+        let info = ServerInfo::new(Flavor::Forgejo, "6.0.0+gitea-1.20.0");
+        let lines = probe_messages(&info);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("older than the Forgejo 7.x baseline"));
     }
 
     #[test]
-    fn version_warning_silent_on_modern() {
-        assert!(version_warning("7.0.16+gitea-1.21.11").is_none());
-        assert!(version_warning("8.0.0").is_none());
-        assert!(version_warning("10.5.2-beta").is_none());
+    fn current_gitea_is_never_told_it_is_pre_7() {
+        // The regression this module exists for: Gitea 1.27.3 has a leading
+        // major of 1, which the old check read as an ancient Forgejo.
+        let info = classify(
+            &RouteAnswer::NotFound,
+            &RouteAnswer::Ok(Some("1.27.3".into())),
+        );
+        assert_eq!(info.flavor, Flavor::Gitea);
+        assert!(probe_messages(&info).is_empty());
     }
 
     #[test]
-    fn version_warning_silent_on_unparseable() {
-        assert!(version_warning("").is_none());
-        assert!(version_warning("totally-unknown").is_none());
-        // Hardcoded 0.x major never triggers the warning either (likely a
-        // dev / preview build we don't want to be noisy about).
-        assert!(version_warning("0.99.0").is_none());
+    fn modern_forgejo_is_silent() {
+        let info = ServerInfo::new(Flavor::Forgejo, "16.0.4+gitea-1.22.0");
+        assert!(probe_messages(&info).is_empty());
+    }
+
+    #[test]
+    fn unidentified_host_gets_a_note_not_a_floor_warning() {
+        let info = classify(
+            &RouteAnswer::Inconclusive,
+            &RouteAnswer::Ok(Some("1.21.11".into())),
+        );
+        let lines = probe_messages(&info);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("could not identify"));
+        assert!(!lines[0].contains("older than"));
+    }
+
+    #[test]
+    fn record_server_persists_flavor_and_raw_version() {
+        let mut host = Host::default();
+        record_server(&mut host, &ServerInfo::new(Flavor::Gitea, "1.27.3"));
+        assert_eq!(host.flavor.as_deref(), Some("gitea"));
+        assert_eq!(host.server_version.as_deref(), Some("1.27.3"));
+
+        record_server(&mut host, &ServerInfo::unidentified());
+        assert_eq!(host.flavor.as_deref(), Some("unidentified"));
+        assert_eq!(host.server_version, None);
+    }
+
+    #[test]
+    fn server_label_names_the_forge() {
+        assert_eq!(
+            server_label(&ServerInfo::new(Flavor::Forgejo, "16.0.4+gitea-1.22.0")),
+            "Forgejo 16.0.4+gitea-1.22.0"
+        );
+        assert_eq!(
+            server_label(&ServerInfo::new(Flavor::Gitea, "1.27.3")),
+            "Gitea 1.27.3"
+        );
+        assert_eq!(
+            server_label(&ServerInfo::new(Flavor::Gitea, "")),
+            "Gitea (version unknown)"
+        );
+        assert_eq!(
+            server_label(&ServerInfo::unidentified()),
+            "unidentified forge"
+        );
     }
 }

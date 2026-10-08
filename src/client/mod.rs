@@ -1,13 +1,15 @@
+pub mod capability;
 pub mod error;
 #[cfg(test)]
 mod integration_tests;
 pub mod pagination;
+pub mod proxy;
 mod resolve;
 
 use resolve::build_base_url;
-pub use resolve::{resolve, web_base_url, ResolvedHost};
+pub use resolve::{proxy_credential_for_host, resolve, web_base_url, ResolvedHost};
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -23,7 +25,10 @@ pub(crate) fn debug_enabled() -> bool {
 }
 
 use anyhow::{anyhow, Context, Result};
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
+use reqwest::header::{
+    HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, LOCATION, PROXY_AUTHORIZATION,
+    USER_AGENT,
+};
 use reqwest::{Method, Response, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -32,8 +37,10 @@ use url::Url;
 use crate::config::hosts::AuthKind;
 use crate::fjord;
 
+pub use capability::{Capability, Flavor, ServerInfo, Support};
 pub use error::ApiError;
 pub use pagination::Page;
+pub use proxy::{PatTransport, ProxyCredential, ProxyMode};
 
 /// Which HTTP `Authorization` shape a `Client` uses on outgoing requests.
 /// `Pat` is the historical Forgejo PAT scheme (`Authorization: token <pat>`).
@@ -89,8 +96,58 @@ pub struct Client {
     /// silent OIDC refresh on a 401. `None` for PAT hosts (their tokens are not
     /// refreshable) and for Fjord hosts we lack platform config for.
     platform_url: Option<String>,
+    /// Credential for a reverse proxy in front of this host, if the user
+    /// configured one. Never sent until the proxy asks for it.
+    proxy: Option<Arc<ProxyCredential>>,
+    /// Which header the proxy asked for (a `ProxyMode` as `u8`). Shared across
+    /// clones so one challenge teaches every later request in the process.
+    proxy_mode: Arc<AtomicU8>,
+    /// Plain client used for the one credential-free hop when the strict
+    /// redirect policy (active only with a proxy credential) stops a
+    /// cross-origin redirect.
+    redirect_http: Option<reqwest::Client>,
+    /// Flavor and version learned by the lazy probe, once per process.
+    server: Arc<RwLock<Option<ServerInfo>>>,
+    /// What hosts.toml recorded at login or refresh. Used only when the live
+    /// probe cannot identify the server.
+    server_seed: Option<ServerInfo>,
     #[cfg(test)]
     refresh_hook: Option<RefreshHook>,
+}
+
+fn same_origin(a: &Url, b: &Url) -> bool {
+    a.scheme() == b.scheme()
+        && a.host_str()
+            .zip(b.host_str())
+            .is_some_and(|(x, y)| x.eq_ignore_ascii_case(y))
+        && a.port_or_known_default() == b.port_or_known_default()
+}
+
+/// Build the HTTP client. `strict_redirects` is set when a proxy credential is
+/// configured: reqwest strips `Authorization` on a cross-origin redirect but
+/// knows nothing about `X-Forge-Authorization`, so with a proxy credential we
+/// stop at the origin boundary and make that hop ourselves with no credential.
+fn build_http(strict_redirects: bool) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .user_agent(default_user_agent())
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(60));
+    if strict_redirects {
+        builder = builder.redirect(reqwest::redirect::Policy::custom(|attempt| {
+            let stays = attempt
+                .previous()
+                .last()
+                .is_some_and(|prev| same_origin(prev, attempt.url()));
+            if !stays {
+                attempt.stop()
+            } else if attempt.previous().len() >= 10 {
+                attempt.error("too many redirects")
+            } else {
+                attempt.follow()
+            }
+        }));
+    }
+    builder.build().context("building HTTP client")
 }
 
 impl Client {
@@ -123,12 +180,28 @@ impl Client {
                 )
             }
         };
-        let http = reqwest::Client::builder()
-            .user_agent(default_user_agent())
-            .connect_timeout(Duration::from_secs(15))
-            .timeout(Duration::from_secs(60))
-            .build()
-            .context("building HTTP client")?;
+        // A proxy credential only ever applies to a direct PAT host.
+        let proxy = resolved
+            .proxy
+            .filter(|_| auth_scheme == AuthScheme::Pat)
+            .map(Arc::new);
+        let http = build_http(proxy.is_some())?;
+        let redirect_http = match proxy {
+            Some(_) => Some(build_http(false)?),
+            None => None,
+        };
+        let server_seed = resolved
+            .host
+            .flavor
+            .as_deref()
+            .map(Flavor::parse)
+            .filter(|flavor| *flavor != Flavor::Unidentified)
+            .map(|flavor| {
+                ServerInfo::new(
+                    flavor,
+                    resolved.host.server_version.as_deref().unwrap_or(""),
+                )
+            });
         Ok(Self {
             http,
             host: resolved.name,
@@ -136,6 +209,11 @@ impl Client {
             token: Arc::new(RwLock::new(resolved.token)),
             auth_scheme,
             platform_url,
+            proxy,
+            proxy_mode: Arc::new(AtomicU8::new(ProxyMode::Direct.to_u8())),
+            redirect_http,
+            server: Arc::new(RwLock::new(None)),
+            server_seed,
             #[cfg(test)]
             refresh_hook: None,
         })
@@ -167,12 +245,7 @@ impl Client {
         auth_scheme: AuthScheme,
     ) -> Result<Self> {
         let host = base_url.host_str().map(str::to_string).unwrap_or_default();
-        let http = reqwest::Client::builder()
-            .user_agent(default_user_agent())
-            .connect_timeout(Duration::from_secs(15))
-            .timeout(Duration::from_secs(60))
-            .build()
-            .context("building HTTP client")?;
+        let http = build_http(false)?;
         Ok(Self {
             http,
             host,
@@ -180,8 +253,34 @@ impl Client {
             token: Arc::new(RwLock::new(token)),
             auth_scheme,
             platform_url: None,
+            proxy: None,
+            proxy_mode: Arc::new(AtomicU8::new(ProxyMode::Direct.to_u8())),
+            redirect_http: None,
+            server: Arc::new(RwLock::new(None)),
+            server_seed: None,
             refresh_hook: None,
         })
+    }
+
+    /// Attach a reverse-proxy credential to a test client, with the same
+    /// strict redirect policy `Client::new` applies.
+    #[cfg(test)]
+    pub fn with_proxy(mut self, cred: ProxyCredential) -> Result<Self> {
+        self.http = build_http(true)?;
+        self.redirect_http = Some(build_http(false)?);
+        self.proxy = Some(Arc::new(cred));
+        Ok(self)
+    }
+
+    /// Pretend the flavor probe already ran, so a test can pin the server
+    /// without mocking the version routes.
+    #[cfg(test)]
+    pub fn with_server_info(self, info: ServerInfo) -> Self {
+        *self
+            .server
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(info);
+        self
     }
 
     /// A `FjordBearer` client whose silent-refresh path is driven by a supplied
@@ -261,6 +360,106 @@ impl Client {
         })
     }
 
+    /// The same client with no forge token attached. For the few unversioned
+    /// web routes fj still reads on servers without an API equivalent: those
+    /// routes authenticate with a browser session cookie, a token does nothing
+    /// there, so none is sent. A configured proxy credential is kept, because
+    /// it belongs to the proxy and not to the forge.
+    pub fn without_credentials(&self) -> Client {
+        let mut anonymous = self.clone();
+        anonymous.token = Arc::new(RwLock::new(None));
+        anonymous
+    }
+
+    /// Flavor and version of the server, probed at most once per process (two
+    /// GETs at worst). When the live probe cannot identify the server, the
+    /// value recorded in hosts.toml at login or refresh is used instead.
+    pub async fn server_info(&self) -> ServerInfo {
+        let cached = self
+            .server
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(info) = cached {
+            return info;
+        }
+        let probed = capability::probe(self).await;
+        let info = match (&probed.flavor, &self.server_seed) {
+            (Flavor::Unidentified, Some(seed)) => seed.clone(),
+            _ => probed,
+        };
+        *self
+            .server
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(info.clone());
+        info
+    }
+
+    fn proxy_mode(&self) -> ProxyMode {
+        ProxyMode::from_u8(self.proxy_mode.load(Ordering::Relaxed))
+    }
+
+    /// Headers for the multipart upload call sites that build their own
+    /// request (`release upload`, issue attachments). Carries the forge token
+    /// and, once a proxy challenge has been seen in this process, the proxy
+    /// credential in the header the proxy asked for.
+    pub fn upload_auth_headers(&self, what: &str) -> Result<HeaderMap> {
+        let auth = self
+            .auth_header_value()?
+            .ok_or_else(|| anyhow!("{what} requires an authenticated host"))?;
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, auth);
+        if let Some(cred) = self.proxy.as_deref() {
+            if cred.pat_transport == PatTransport::Query && self.proxy_mode() == ProxyMode::Basic {
+                return Err(anyhow!(
+                    "{what} is not supported through a reverse proxy with the `query` token \
+                     transport: the token would have to ride in the upload URL. Switch to the \
+                     header transport with `fj auth proxy --host {} --pat-transport header`.",
+                    self.host
+                ));
+            }
+            self.apply_proxy(&mut headers, cred, self.proxy_mode());
+        }
+        Ok(headers)
+    }
+
+    /// Rewrite `headers` for the proxy mode in force. Returns the forge token
+    /// to append as a query pair when the `query` transport is selected.
+    fn apply_proxy(
+        &self,
+        headers: &mut HeaderMap,
+        cred: &ProxyCredential,
+        mode: ProxyMode,
+    ) -> Option<String> {
+        if mode == ProxyMode::Direct || !proxy::transport_is_safe(&self.base) {
+            return None;
+        }
+        let basic = cred.basic_header()?;
+        match mode {
+            ProxyMode::Direct => None,
+            ProxyMode::ProxyAuthorization => {
+                headers.insert(PROXY_AUTHORIZATION, basic);
+                None
+            }
+            ProxyMode::Basic => {
+                // The proxy owns `Authorization`, so the forge token moves.
+                let pat = headers.remove(AUTHORIZATION);
+                headers.insert(AUTHORIZATION, basic);
+                match cred.pat_transport {
+                    PatTransport::Header => {
+                        if let Some(mut pat) = pat {
+                            pat.set_sensitive(true);
+                            headers
+                                .insert(HeaderName::from_static(proxy::FORWARDED_AUTH_HEADER), pat);
+                        }
+                        None
+                    }
+                    PatTransport::Query => self.current_token(),
+                }
+            }
+        }
+    }
+
     /// Whether `url` is the same origin (scheme + host + port) as the
     /// configured API base. The auth token is only ever attached to requests
     /// that pass this check, so an absolute URL handed to `fj api` (or any
@@ -269,12 +468,7 @@ impl Client {
     /// `build_base_url`), so requiring the scheme to match the base also
     /// rejects `fj api http://<same-host>/…`.
     fn is_trusted_url(&self, url: &Url) -> bool {
-        url.scheme() == self.base.scheme()
-            && url
-                .host_str()
-                .zip(self.base.host_str())
-                .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
-            && url.port_or_known_default() == self.base.port_or_known_default()
+        same_origin(url, &self.base)
     }
 
     fn auth_headers(&self) -> Result<HeaderMap> {
@@ -346,9 +540,59 @@ impl Client {
             log_request(&method, &url, query, body);
         }
 
-        let res = self
-            .send_once(&method, &url, query, body, extra, trusted)
+        // A reverse proxy only ever fronts a direct PAT host, and its
+        // credential is only ever sent same-origin.
+        let proxy_capable = trusted && self.auth_scheme == AuthScheme::Pat;
+        let mut mode = if proxy_capable && self.proxy.is_some() {
+            self.proxy_mode()
+        } else {
+            ProxyMode::Direct
+        };
+        let mut res = self
+            .send_once(&method, &url, query, body, extra, trusted, mode)
             .await?;
+
+        if proxy_capable {
+            if let Some(wanted) = proxy::challenge(res.status(), res.headers()) {
+                let status = res.status();
+                if self.proxy.is_none() {
+                    return Err(proxy::missing_credential_error(&self.host, status));
+                }
+                if !proxy::transport_is_safe(&self.base) {
+                    return Err(proxy::unsafe_transport_error(&self.host));
+                }
+                if wanted == mode {
+                    // We already sent the credential in the header it asked for.
+                    return Err(proxy::rejected_credential_error(&self.host, status));
+                }
+                // The proxy answered this request itself, so the forge never
+                // saw it. Replaying it once with the credential cannot apply
+                // anything twice, which is why this is safe even for the POST
+                // and PATCH requests the transient-failure retry never repeats.
+                self.proxy_mode.store(wanted.to_u8(), Ordering::Relaxed);
+                mode = wanted;
+                if debug_enabled() {
+                    eprintln!(
+                        "← {status} {}: proxy challenge, retrying once with the proxy credential",
+                        proxy::redact_url(&url)
+                    );
+                }
+                res = self
+                    .send_once(&method, &url, query, body, extra, trusted, mode)
+                    .await?;
+                if proxy::challenge(res.status(), res.headers()).is_some() {
+                    return Err(proxy::rejected_credential_error(&self.host, res.status()));
+                }
+            }
+            if mode == ProxyMode::Basic && res.status() == StatusCode::UNAUTHORIZED {
+                let transport = self
+                    .proxy
+                    .as_deref()
+                    .map(|cred| cred.pat_transport)
+                    .unwrap_or_default();
+                return Err(proxy::forge_rejected_error(&self.host, transport));
+            }
+        }
 
         // Transparent Fjord-Account session refresh. On a 401 for a host we
         // signed the request to with a Fjord bearer, silently renew the access
@@ -364,10 +608,13 @@ impl Client {
             if let Some(fresh) = self.refresh_bearer().await? {
                 self.set_token(fresh);
                 if debug_enabled() {
-                    eprintln!("← 401 {url}: refreshed Fjord session, retrying once");
+                    eprintln!(
+                        "← 401 {}: refreshed Fjord session, retrying once",
+                        proxy::redact_url(&url)
+                    );
                 }
                 return self
-                    .send_once(&method, &url, query, body, extra, trusted)
+                    .send_once(&method, &url, query, body, extra, trusted, mode)
                     .await;
             }
         }
@@ -379,6 +626,7 @@ impl Client {
     /// lives one level up in [`request_with_headers`] so it happens at most once
     /// per logical request. The `Authorization` header is (re)built from the
     /// current token on every call, so a post-refresh retry uses the new token.
+    #[allow(clippy::too_many_arguments)]
     async fn send_once(
         &self,
         method: &Method,
@@ -387,10 +635,14 @@ impl Client {
         body: Option<&serde_json::Value>,
         extra: &HeaderMap,
         trusted: bool,
+        mode: ProxyMode,
     ) -> Result<Response> {
         let mut headers = self.auth_headers()?;
+        let mut query_token: Option<String> = None;
         if !trusted {
             headers.remove(AUTHORIZATION);
+        } else if let Some(cred) = self.proxy.as_deref() {
+            query_token = self.apply_proxy(&mut headers, cred, mode);
         }
         for (k, v) in extra.iter() {
             headers.insert(k.clone(), v.clone());
@@ -407,6 +659,11 @@ impl Client {
             .request(method.clone(), url.clone())
             .headers(headers)
             .query(query);
+        if let Some(token) = &query_token {
+            // Opt-in `query` transport only. Every place this URL could be
+            // printed goes through `proxy::redact_url`.
+            builder = builder.query(&[("token", token.as_str())]);
+        }
         if let Some(body) = body {
             builder = builder.json(body);
         }
@@ -432,7 +689,11 @@ impl Client {
                         });
                         let wait = wait.min(std::time::Duration::from_secs(30));
                         if debug_enabled() {
-                            eprintln!("← 429 {} (rate-limited, sleeping {:?})", res.url(), wait);
+                            eprintln!(
+                                "← 429 {} (rate-limited, sleeping {:?})",
+                                proxy::redact_url(res.url()),
+                                wait
+                            );
                         }
                         tokio::time::sleep(wait).await;
                         continue;
@@ -441,7 +702,7 @@ impl Client {
                         if debug_enabled() {
                             eprintln!(
                                 "← {status} {} (retrying after backoff, attempt {}/{})",
-                                res.url(),
+                                proxy::redact_url(res.url()),
                                 attempt + 1,
                                 retries
                             );
@@ -450,11 +711,18 @@ impl Client {
                         continue;
                     }
                     if debug_enabled() {
-                        eprintln!("← {status} {}", res.url());
+                        eprintln!("← {status} {}", proxy::redact_url(res.url()));
                     }
-                    return Ok(res);
+                    return self.follow_cross_origin(method, res).await;
                 }
                 Err(e) => {
+                    // reqwest prints the request URL in its error. With the
+                    // query transport that URL carries the token, so drop it.
+                    let e = if query_token.is_some() {
+                        e.without_url()
+                    } else {
+                        e
+                    };
                     if attempt + 1 < retries {
                         if debug_enabled() {
                             eprintln!(
@@ -472,6 +740,41 @@ impl Client {
             }
         }
         Err(last_err.unwrap_or_else(|| anyhow!("retries exhausted")))
+    }
+
+    /// With a proxy credential configured the HTTP client refuses to follow a
+    /// redirect to another origin, because `X-Forge-Authorization` would ride
+    /// along. Make that one hop here with no credential at all, which is what
+    /// reqwest's default policy amounts to for `Authorization` anyway.
+    async fn follow_cross_origin(&self, method: &Method, res: Response) -> Result<Response> {
+        let Some(plain) = &self.redirect_http else {
+            return Ok(res);
+        };
+        if !res.status().is_redirection() || !matches!(method.as_str(), "GET" | "HEAD") {
+            return Ok(res);
+        }
+        let Some(target) = res
+            .headers()
+            .get(LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|loc| res.url().join(loc).ok())
+        else {
+            return Ok(res);
+        };
+        if same_origin(&target, res.url()) {
+            return Ok(res);
+        }
+        if debug_enabled() {
+            eprintln!(
+                "→ {method} {} (cross-origin redirect, no credentials)",
+                proxy::redact_url(&target)
+            );
+        }
+        plain
+            .request(method.clone(), target)
+            .send()
+            .await
+            .map_err(|e| anyhow::Error::new(e.without_url()).context("following redirect"))
     }
 
     /// Attempt a silent session refresh for a Fjord-Account host. Returns
@@ -733,20 +1036,52 @@ fn log_request(
     query: &[(String, String)],
     body: Option<&serde_json::Value>,
 ) {
+    for line in request_log_lines(method, url, query, body) {
+        eprintln!("{line}");
+    }
+}
+
+/// The lines `--debug` prints for an outgoing request. Pure so the redaction
+/// is testable: no header is ever printed (so neither the forge token nor the
+/// proxy credential can appear), and a `token` / `access_token` query value is
+/// replaced whether it sits in the URL or in the query pairs.
+fn request_log_lines(
+    method: &Method,
+    url: &Url,
+    query: &[(String, String)],
+    body: Option<&serde_json::Value>,
+) -> Vec<String> {
     let q = if query.is_empty() {
         String::new()
     } else {
-        let pairs: Vec<String> = query.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        let pairs: Vec<String> = query
+            .iter()
+            .map(|(k, v)| {
+                if proxy::is_secret_query_key(k) {
+                    format!("{k}=[redacted]")
+                } else {
+                    format!("{k}={v}")
+                }
+            })
+            .collect();
         format!("?{}", pairs.join("&"))
     };
-    eprintln!("→ {method} {url}{q}");
-    if let Some(b) = body {
-        if is_sensitive_path(url.path()) {
-            eprintln!("  body: [redacted: sensitive endpoint]");
-        } else if let Ok(text) = serde_json::to_string(b) {
-            eprintln!("  body: {}", truncate_preview(&text));
-        }
+    let mut lines = vec![format!("→ {method} {}{q}", proxy::redact_url(url))];
+    if let Some(line) = body.and_then(|b| debug_body_preview(url.path(), b)) {
+        lines.push(format!("  body: {line}"));
     }
+    lines
+}
+
+/// What `--debug` may print for a request body: a truncated preview, or a
+/// fixed marker when the endpoint carries a credential or an Actions value.
+fn debug_body_preview(path: &str, body: &serde_json::Value) -> Option<String> {
+    if is_sensitive_path(path) {
+        return Some("[redacted: sensitive endpoint]".to_string());
+    }
+    serde_json::to_string(body)
+        .ok()
+        .map(|text| truncate_preview(&text))
 }
 
 /// Cap a debug body preview at 200 characters, appending an ellipsis when
@@ -809,7 +1144,7 @@ pub(crate) async fn ensure_success(res: Response) -> Result<Response> {
     let message = parse_error_message(&text).unwrap_or_else(|| text.clone());
     let err = ApiError {
         status,
-        url: url.to_string(),
+        url: proxy::redact_url(&url),
         message,
         body: text,
     };
@@ -921,6 +1256,28 @@ mod trust_tests {
 
     fn client(base: &str) -> Client {
         Client::for_base_url(Url::parse(base).unwrap(), "tok".into()).unwrap()
+    }
+
+    #[test]
+    fn debug_body_preview_never_carries_a_secret_or_variable_value() {
+        let secret = serde_json::json!({ "data": "hunter2-secret-value" });
+        for path in [
+            "/api/v1/repos/o/r/actions/secrets/DEPLOY_KEY",
+            "/api/v1/orgs/team/actions/secrets/DEPLOY_KEY",
+            "/api/v1/repos/o/r/actions/variables/REGION",
+            "/api/v1/orgs/team/actions/variables/REGION",
+        ] {
+            let line = debug_body_preview(path, &secret).expect("a marker line");
+            assert_eq!(line, "[redacted: sensitive endpoint]", "{path}");
+            assert!(!line.contains("hunter2"), "{path}");
+        }
+        // An ordinary endpoint still shows its body.
+        let line = debug_body_preview(
+            "/api/v1/repos/o/r/issues",
+            &serde_json::json!({ "title": "t" }),
+        )
+        .unwrap();
+        assert!(line.contains("\"title\""));
     }
 
     #[test]

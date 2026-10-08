@@ -1,4 +1,11 @@
-//! Workflow run logs through the Forgejo API with Loki fallback.
+//! Workflow run logs through the token-authenticated Actions API, with a Loki
+//! fallback.
+//!
+//! Which servers have the job and job-log routes is decided by the gate table
+//! in `client::capability`, keyed on (flavor, version). A server known not to
+//! have them is never asked: fj reads from an explicitly configured Loki, or
+//! reports the limitation with the run's web URL. Job logs are read in bounded
+//! byte ranges and continued until the server says the log is complete.
 
 use std::error::Error;
 use std::fmt;
@@ -7,15 +14,26 @@ use std::pin::Pin;
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Duration, Utc};
+use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, CONTENT_RANGE, RANGE};
 use reqwest::{Method, StatusCode};
 use serde::Deserialize;
 use serde_json::Value;
 use url::Url;
 
-use crate::client::Client;
+use crate::api::workflow_run::{
+    actions_limitation, is_actions_unavailable, run_web_url, WorkflowRun,
+};
+use crate::client::capability::unsupported_reason;
+use crate::client::{Capability, Client, ServerInfo, Support};
 
 const DEFAULT_LOKI_URL: &str = "http://100.105.235.123:3100";
 const LOKI_LIMIT: &str = "5000";
+
+/// Bytes asked for per job-log request.
+pub(crate) const LOG_CHUNK_BYTES: u64 = 1024 * 1024;
+/// Ceiling on one job's log held in memory. A longer log is cut here with a
+/// visible note instead of growing without bound.
+pub(crate) const LOG_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RunLogs {
@@ -25,26 +43,31 @@ pub struct RunLogs {
 
 impl RunLogs {
     pub fn status(&self) -> Option<&str> {
-        if self.jobs.iter().any(|j| j.status == "failure") {
-            return Some("failure");
-        }
-        if self.jobs.iter().any(|j| j.status == "cancelled") {
-            return Some("cancelled");
-        }
-        if self.jobs.iter().any(|j| j.status == "timed_out") {
-            return Some("timed_out");
-        }
-        if self
-            .jobs
-            .iter()
-            .all(|j| matches!(j.status.as_str(), "success" | "skipped"))
-        {
-            return Some("success");
-        }
-        self.jobs
-            .iter()
-            .find_map(|j| (!j.status.is_empty()).then_some(j.status.as_str()))
+        aggregate_job_status(self.jobs.iter().map(|j| j.status.as_str()))
     }
+}
+
+/// A job status that will not change again.
+pub fn is_terminal_job_status(status: &str) -> bool {
+    matches!(
+        status,
+        "success" | "failure" | "cancelled" | "skipped" | "timed_out"
+    )
+}
+
+/// One status for a set of jobs: the worst outcome wins, all green is
+/// `success`, otherwise the first status reported.
+pub fn aggregate_job_status<'a>(statuses: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+    let statuses: Vec<&str> = statuses.into_iter().collect();
+    for worst in ["failure", "cancelled", "timed_out"] {
+        if statuses.contains(&worst) {
+            return Some(worst);
+        }
+    }
+    if statuses.iter().all(|s| matches!(*s, "success" | "skipped")) {
+        return Some("success");
+    }
+    statuses.into_iter().find(|s| !s.is_empty())
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -179,7 +202,7 @@ pub struct WorkflowRunJob {
 }
 
 impl WorkflowRunJob {
-    fn display_name(&self, index: usize) -> String {
+    pub fn display_name(&self, index: usize) -> String {
         if self.name.is_empty() {
             format!("job {index}")
         } else {
@@ -206,35 +229,27 @@ impl LogSource for ForgejoApiLogSource {
                     "Forgejo native workflow logs endpoint is unavailable".into(),
                 )
             })?;
-            let path = format!(
-                "{}/actions/jobs/{}/logs",
-                crate::api::repo_path(req.owner, req.name),
-                api_job.id
-            );
-            let query = req
+            let attempt = req
                 .attempt
-                .or_else(|| (api_job.attempt > 0).then_some(api_job.attempt))
-                .map(|attempt| vec![("attempt".to_string(), attempt.to_string())])
-                .unwrap_or_default();
-            let res = req.client.request(Method::GET, &path, &query, None).await?;
-            if res.status() == StatusCode::NOT_FOUND {
+                .or_else(|| (api_job.attempt > 0).then_some(api_job.attempt));
+            let Some(log) = read_job_log(
+                req.client,
+                req.owner,
+                req.name,
+                api_job.id,
+                attempt,
+                0,
+                LOG_CHUNK_BYTES,
+                LOG_MAX_BYTES,
+            )
+            .await?
+            else {
                 return Err(LogSourceError::Unavailable(
                     "Forgejo native workflow logs endpoint is unavailable".into(),
                 ));
-            }
-            if !res.status().is_success() {
-                let status = res.status();
-                let body = res.text().await.unwrap_or_default();
-                return Err(LogSourceError::Other(anyhow!(
-                    "Forgejo workflow log fetch failed ({status}): {}",
-                    body.trim()
-                )));
-            }
-            let text = res
-                .text()
-                .await
-                .context("reading Forgejo workflow log response")?;
-            let lines = text
+            };
+            let text = String::from_utf8_lossy(&log.bytes);
+            let mut lines: Vec<LogLine> = text
                 .lines()
                 .map(|message| LogLine {
                     timestamp: None,
@@ -242,21 +257,169 @@ impl LogSource for ForgejoApiLogSource {
                     message: message.to_string(),
                 })
                 .collect();
+            if log.truncated {
+                lines.push(LogLine {
+                    timestamp: None,
+                    stream: None,
+                    message: format!(
+                        "[fj] log truncated after {} MiB; open the run in the web UI for the rest",
+                        LOG_MAX_BYTES / (1024 * 1024)
+                    ),
+                });
+            }
             Ok(JobLogs {
                 job: req.job,
                 task_id: api_job
                     .task_id
                     .or_else(|| req.task.and_then(|task| task.id_u64().ok())),
                 job_id: Some(api_job.id),
-                name: req
-                    .api_job
-                    .map(|job| job.display_name(req.job))
-                    .unwrap_or_else(|| format!("job {}", req.job)),
+                name: api_job.display_name(req.job),
                 status: api_job.status.clone(),
                 lines,
             })
         })
     }
+}
+
+/// Bytes of one job's log, read from `start`.
+#[derive(Debug, Default)]
+pub(crate) struct JobLogBytes {
+    pub bytes: Vec<u8>,
+    /// The read stopped at the `max` ceiling with more log left on the server.
+    pub truncated: bool,
+}
+
+/// Parse `Content-Range: bytes <start>-<end>/<total|*>`.
+pub(crate) fn parse_content_range(value: &str) -> Option<(u64, u64, Option<u64>)> {
+    let rest = value.trim().strip_prefix("bytes")?.trim_start();
+    let (range, total) = rest.split_once('/')?;
+    let (start, end) = range.trim().split_once('-')?;
+    let start: u64 = start.trim().parse().ok()?;
+    let end: u64 = end.trim().parse().ok()?;
+    if end < start {
+        return None;
+    }
+    Some((start, end, total.trim().parse().ok()))
+}
+
+/// Read one job's log from the token-authenticated API route, in `chunk`-sized
+/// byte ranges starting at `start`, following each `206 Partial Content` with
+/// the next range until the server reports the end (`Content-Range` total, a
+/// short chunk, or `416`). At most `max` bytes are kept.
+///
+/// `Ok(None)` means the route answered 404 for the first range: either the
+/// server has no such route or the job has no recorded log. A server that
+/// ignores `Range` answers `200` with the whole log, which is taken as is.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn read_job_log(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    job_id: u64,
+    attempt: Option<u32>,
+    start: u64,
+    chunk: u64,
+    max: u64,
+) -> Result<Option<JobLogBytes>> {
+    let path = format!(
+        "{}/actions/jobs/{job_id}/logs",
+        crate::api::repo_path(owner, name)
+    );
+    let query = attempt
+        .map(|attempt| vec![("attempt".to_string(), attempt.to_string())])
+        .unwrap_or_default();
+    let chunk = chunk.max(1);
+    let mut out = JobLogBytes::default();
+    let mut offset = start;
+    loop {
+        if out.bytes.len() as u64 >= max {
+            out.truncated = true;
+            break;
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT, HeaderValue::from_static("text/plain"));
+        headers.insert(
+            RANGE,
+            HeaderValue::from_str(&format!("bytes={offset}-{}", offset + chunk - 1))
+                .context("building Range header")?,
+        );
+        let res = client
+            .request_with_headers(Method::GET, &path, &query, None, &headers)
+            .await?;
+        let status = res.status();
+        if status == StatusCode::NOT_FOUND {
+            if offset == start {
+                return Ok(None);
+            }
+            break;
+        }
+        if status == StatusCode::RANGE_NOT_SATISFIABLE {
+            // Nothing at or after `offset`: the log ends here (for now).
+            break;
+        }
+        if status == StatusCode::PARTIAL_CONTENT {
+            let range = res
+                .headers()
+                .get(CONTENT_RANGE)
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_content_range);
+            let body = res
+                .bytes()
+                .await
+                .context("reading Forgejo workflow log response")?;
+            if let Some((got, _, _)) = range {
+                if got != offset {
+                    return Err(anyhow!(
+                        "workflow log server answered byte {got} when asked for byte {offset}"
+                    ));
+                }
+            }
+            if body.is_empty() {
+                break;
+            }
+            offset += body.len() as u64;
+            out.bytes.extend_from_slice(&body);
+            let done = match range {
+                Some((_, _, Some(total))) => offset >= total,
+                _ => (body.len() as u64) < chunk,
+            };
+            if done {
+                break;
+            }
+            continue;
+        }
+        if status.is_success() {
+            // `Range` was ignored: this is the whole log from byte 0.
+            crate::client::check_body_size(&res)?;
+            let body = res
+                .bytes()
+                .await
+                .context("reading Forgejo workflow log response")?;
+            let skip = usize::try_from(start).unwrap_or(usize::MAX).min(body.len());
+            out.bytes = body[skip..].to_vec();
+            break;
+        }
+        let body = res.text().await.unwrap_or_default();
+        return Err(anyhow!(
+            "Forgejo workflow log fetch failed ({status}): {}",
+            body.trim()
+        ));
+    }
+    Ok(Some(out))
+}
+
+/// Append `new` to `pending` and take every complete line out of it, leaving
+/// a trailing partial line for the next chunk. Used by `fj run watch`.
+pub fn split_complete_lines(pending: &mut Vec<u8>, new: &[u8]) -> Vec<String> {
+    pending.extend_from_slice(new);
+    let Some(last) = pending.iter().rposition(|b| *b == b'\n') else {
+        return Vec::new();
+    };
+    let complete: Vec<u8> = pending.drain(..=last).collect();
+    String::from_utf8_lossy(&complete)
+        .lines()
+        .map(str::to_string)
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -270,6 +433,16 @@ impl LokiLogSource {
             .or_else(|_| std::env::var("FJ_LOKI_URL"))
             .unwrap_or_else(|_| DEFAULT_LOKI_URL.to_string());
         Self::new(&raw)
+    }
+
+    /// The Loki the user pointed fj at, if any. Unlike `from_env` there is no
+    /// built-in default: a server without the log API is only read through
+    /// Loki when someone configured one on purpose.
+    pub fn configured() -> Result<Option<Self>> {
+        match std::env::var("FJ_RUN_LOG_LOKI_URL").or_else(|_| std::env::var("FJ_LOKI_URL")) {
+            Ok(raw) if !raw.trim().is_empty() => Self::new(raw.trim()).map(Some),
+            _ => Ok(None),
+        }
     }
 
     pub fn new(base_url: &str) -> Result<Self> {
@@ -344,6 +517,60 @@ impl LogSource for LokiLogSource {
     }
 }
 
+/// Where the Loki fallback comes from.
+enum LokiChoice {
+    /// `FJ_RUN_LOG_LOKI_URL` / `FJ_LOKI_URL`.
+    Env,
+    #[cfg(test)]
+    Base(String),
+    #[cfg(test)]
+    Disabled,
+}
+
+impl LokiChoice {
+    /// Loki for a job whose log the API reports missing. Keeps the historical
+    /// built-in default.
+    fn for_missing_job_log(&self) -> Result<Option<LokiLogSource>> {
+        match self {
+            LokiChoice::Env => LokiLogSource::from_env().map(Some),
+            #[cfg(test)]
+            LokiChoice::Base(base) => LokiLogSource::new(base).map(Some),
+            #[cfg(test)]
+            LokiChoice::Disabled => Ok(None),
+        }
+    }
+
+    /// Loki for a server with no log API at all: only one the user configured.
+    fn for_older_server(&self) -> Result<Option<LokiLogSource>> {
+        match self {
+            LokiChoice::Env => LokiLogSource::configured(),
+            #[cfg(test)]
+            LokiChoice::Base(base) => LokiLogSource::new(base).map(Some),
+            #[cfg(test)]
+            LokiChoice::Disabled => Ok(None),
+        }
+    }
+}
+
+struct NoLoki;
+
+impl LogSource for NoLoki {
+    fn available(&self) -> bool {
+        false
+    }
+
+    fn fetch<'a>(
+        &'a self,
+        _req: LogRequest<'a>,
+    ) -> Pin<Box<dyn Future<Output = LogSourceResult<JobLogs>> + Send + 'a>> {
+        Box::pin(async move {
+            Err(LogSourceError::Unavailable(
+                "no Loki log source is configured".into(),
+            ))
+        })
+    }
+}
+
 pub async fn fetch_run_logs(
     client: &Client,
     owner: &str,
@@ -353,15 +580,7 @@ pub async fn fetch_run_logs(
     attempt: Option<u32>,
     failed_only: bool,
 ) -> Result<RunLogs> {
-    let run_id = resolve_run_api_id(client, owner, name, run).await?;
-    let api_jobs = list_run_jobs_api(client, owner, name, run, run_id).await?;
-    let tasks = RemoteTasks {
-        client,
-        owner,
-        name,
-        run,
-    };
-    fetch_run_logs_with_sources(
+    fetch_run_logs_inner(
         client,
         owner,
         name,
@@ -369,10 +588,7 @@ pub async fn fetch_run_logs(
         job,
         attempt,
         failed_only,
-        &ForgejoApiLogSource,
-        &LokiLogSource::from_env()?,
-        &tasks,
-        &api_jobs,
+        LokiChoice::Env,
     )
     .await
 }
@@ -389,15 +605,7 @@ pub(crate) async fn fetch_run_logs_with_loki_base(
     failed_only: bool,
     loki_base: &str,
 ) -> Result<RunLogs> {
-    let run_id = resolve_run_api_id(client, owner, name, run).await?;
-    let api_jobs = list_run_jobs_api(client, owner, name, run, run_id).await?;
-    let tasks = RemoteTasks {
-        client,
-        owner,
-        name,
-        run,
-    };
-    fetch_run_logs_with_sources(
+    fetch_run_logs_inner(
         client,
         owner,
         name,
@@ -405,20 +613,147 @@ pub(crate) async fn fetch_run_logs_with_loki_base(
         job,
         attempt,
         failed_only,
-        &ForgejoApiLogSource,
-        &LokiLogSource::new(loki_base)?,
-        &tasks,
-        &api_jobs,
+        LokiChoice::Base(loki_base.to_string()),
     )
     .await
 }
 
-async fn resolve_run_api_id(
+/// `fetch_run_logs` with no Loki at all, so a test never depends on the
+/// developer's environment.
+#[cfg(test)]
+pub(crate) async fn fetch_run_logs_without_loki(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    run: u64,
+) -> Result<RunLogs> {
+    fetch_run_logs_inner(
+        client,
+        owner,
+        name,
+        run,
+        None,
+        None,
+        false,
+        LokiChoice::Disabled,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn fetch_run_logs_inner(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    run: u64,
+    job: Option<usize>,
+    attempt: Option<u32>,
+    failed_only: bool,
+    loki: LokiChoice,
+) -> Result<RunLogs> {
+    let tasks = RemoteTasks {
+        client,
+        owner,
+        name,
+        run,
+    };
+    let api_jobs = match run_jobs_for_logs(client, owner, name, run).await {
+        Ok(jobs) => jobs,
+        Err(err) if is_actions_unavailable(&err) => {
+            // No token-authenticated log route here. A separately authorized
+            // source is the only other way in; without one, say so and hand
+            // over the run URL.
+            let Some(source) = loki.for_older_server()? else {
+                return Err(err);
+            };
+            return fetch_run_logs_from_tasks(
+                client,
+                owner,
+                name,
+                run,
+                job,
+                attempt,
+                failed_only,
+                &source,
+                &tasks,
+            )
+            .await;
+        }
+        Err(err) => return Err(err),
+    };
+    match loki.for_missing_job_log()? {
+        Some(source) => {
+            fetch_run_logs_with_sources(
+                client,
+                owner,
+                name,
+                run,
+                job,
+                attempt,
+                failed_only,
+                &ForgejoApiLogSource,
+                &source,
+                &tasks,
+                &api_jobs,
+            )
+            .await
+        }
+        None => {
+            fetch_run_logs_with_sources(
+                client,
+                owner,
+                name,
+                run,
+                job,
+                attempt,
+                failed_only,
+                &ForgejoApiLogSource,
+                &NoLoki,
+                &tasks,
+                &api_jobs,
+            )
+            .await
+        }
+    }
+}
+
+/// The gate for reading a run's logs over the API: both the jobs route and the
+/// job-log route must be on offer. `Err` is the limitation, with the run URL.
+pub fn log_api_gate(info: &ServerInfo, run_url: &str) -> Result<()> {
+    for (cap, what) in [
+        (Capability::RunJobs, "list a run's jobs"),
+        (Capability::JobLogs, "read job logs"),
+    ] {
+        if info.supports(cap) == Support::Unsupported {
+            return Err(actions_limitation(
+                &unsupported_reason(info, cap, what),
+                run_url,
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn run_jobs_for_logs(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    run: u64,
+) -> Result<Vec<WorkflowRunJob>> {
+    let info = client.server_info().await;
+    log_api_gate(&info, &run_web_url(client, owner, name, run))?;
+    let run_id = resolve_run_api_id(client, owner, name, run).await?;
+    list_run_jobs_api(client, owner, name, run, run_id).await
+}
+
+/// Find a run by its per-repo run number. The job, log, artifact and action
+/// routes all want the INTERNAL run id, which only the run list reveals.
+pub(crate) async fn find_run(
     client: &Client,
     owner: &str,
     name: &str,
     run_number: u64,
-) -> Result<u64> {
+) -> Result<WorkflowRun> {
     let runs = crate::api::workflow_run::list_runs_filtered(
         client,
         owner,
@@ -428,10 +763,57 @@ async fn resolve_run_api_id(
         &crate::api::workflow_run::RunListFilters::default(),
     )
     .await?;
-    runs.iter()
+    runs.into_iter()
         .find(|run| run.run_number == run_number)
-        .map(|run| run.id)
         .ok_or_else(|| anyhow!("workflow run #{run_number} was not found; check `fj run list`"))
+}
+
+pub(crate) async fn resolve_run_api_id(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    run_number: u64,
+) -> Result<u64> {
+    Ok(find_run(client, owner, name, run_number).await?.id)
+}
+
+/// Decode a run's job list. Forgejo answers a bare array and folds the outcome
+/// into `status`; Gitea wraps the array in `{"jobs": [...]}`, names the attempt
+/// `run_attempt`, and reports `status: completed` beside a `conclusion`. Both
+/// are normalized to the Forgejo shape so every caller reads one `status`.
+pub fn parse_run_jobs(value: Value) -> Result<Vec<WorkflowRunJob>> {
+    let items = match value {
+        Value::Array(items) => items,
+        Value::Object(mut map) => match map.remove("jobs") {
+            Some(Value::Array(items)) => items,
+            _ => return Err(anyhow!("unexpected workflow run jobs response shape")),
+        },
+        _ => return Err(anyhow!("unexpected workflow run jobs response shape")),
+    };
+    items
+        .into_iter()
+        .map(|mut item| {
+            if let Some(obj) = item.as_object_mut() {
+                let conclusion = obj
+                    .get("conclusion")
+                    .and_then(Value::as_str)
+                    .filter(|c| !c.is_empty())
+                    .map(str::to_string);
+                let status = obj.get("status").and_then(Value::as_str).unwrap_or("");
+                if let Some(conclusion) = conclusion {
+                    if status.is_empty() || status == "completed" {
+                        obj.insert("status".into(), Value::String(conclusion));
+                    }
+                }
+                if !obj.contains_key("attempt") {
+                    if let Some(attempt) = obj.get("run_attempt").cloned() {
+                        obj.insert("attempt".into(), attempt);
+                    }
+                }
+            }
+            serde_json::from_value(item).context("decoding workflow run job")
+        })
+        .collect()
 }
 
 pub async fn list_run_jobs_api(
@@ -441,6 +823,14 @@ pub async fn list_run_jobs_api(
     run_number: u64,
     run_id: u64,
 ) -> Result<Vec<WorkflowRunJob>> {
+    let info = client.server_info().await;
+    let run_url = run_web_url(client, owner, name, run_number);
+    if info.supports(Capability::RunJobs) == Support::Unsupported {
+        return Err(actions_limitation(
+            &unsupported_reason(&info, Capability::RunJobs, "list a run's jobs"),
+            &run_url,
+        ));
+    }
     let path = format!(
         "{}/actions/runs/{run_id}/jobs",
         crate::api::repo_path(owner, name)
@@ -448,19 +838,22 @@ pub async fn list_run_jobs_api(
     let res = client.request(Method::GET, &path, &[], None).await?;
     let status = res.status();
     if status.is_success() {
-        return res.json().await.context("decoding workflow run jobs JSON");
+        return parse_run_jobs(
+            res.json()
+                .await
+                .context("decoding workflow run jobs JSON")?,
+        );
     }
     let body = res.text().await.unwrap_or_default();
     if status == StatusCode::NOT_FOUND {
-        let version = forgejo_version(client)
-            .await
-            .unwrap_or_else(|_| "unknown".into());
-        return Err(anyhow!(
-            "cannot read logs for run #{run_number}: this Forgejo server reports version `{version}` \
-             and does not expose the token-authenticated Actions job log API. Upgrade the \
-             server to Forgejo stable with `/api/v1/repos/.../actions/runs/{{run_id}}/jobs` and \
-             `/api/v1/repos/.../actions/jobs/{{job_id}}/logs` support, or open the run in the \
-             Forgejo web UI. See rasterstate/fj#103."
+        return Err(actions_limitation(
+            &format!(
+                "cannot read the jobs of run #{run_number} with an API token: this server ({}) \
+                 does not serve `/api/v1/repos/{{owner}}/{{repo}}/actions/runs/{{run_id}}/jobs` \
+                 (HTTP 404). See rasterstate/fj#103",
+                info.describe()
+            ),
+            &run_url,
         ));
     }
     Err(anyhow!(
@@ -468,19 +861,6 @@ pub async fn list_run_jobs_api(
         status.as_u16(),
         response_suffix(&body)
     ))
-}
-
-async fn forgejo_version(client: &Client) -> Result<String> {
-    #[derive(Deserialize)]
-    struct Version {
-        version: String,
-    }
-
-    let version: Version = client
-        .json(Method::GET, "/api/v1/version", &[], None::<&()>)
-        .await
-        .context("probing Forgejo version")?;
-    Ok(version.version)
 }
 
 fn response_suffix(body: &str) -> String {
@@ -546,10 +926,18 @@ pub async fn list_run_tasks(
             Option::<&serde_json::Value>::None,
         )
         .await?;
-    parse_workflow_tasks(value)
+    parse_workflow_tasks_for_run(value, Some(run))
 }
 
+#[cfg(test)]
 pub fn parse_workflow_tasks(value: Value) -> Result<Vec<WorkflowTask>> {
+    parse_workflow_tasks_for_run(value, None)
+}
+
+/// Like `parse_workflow_tasks`, keeping only the tasks of `run` when the
+/// entries carry a `run_number`. The task list ignores its `run` filter on
+/// Forgejo 16 and answers with every task in the repository.
+pub fn parse_workflow_tasks_for_run(value: Value, run: Option<u64>) -> Result<Vec<WorkflowTask>> {
     let values = if let Some(array) = value.as_array() {
         array.clone()
     } else if let Some(array) = value.get("tasks").and_then(Value::as_array) {
@@ -568,6 +956,12 @@ pub fn parse_workflow_tasks(value: Value) -> Result<Vec<WorkflowTask>> {
 
     values
         .into_iter()
+        .filter(
+            |value| match (run, value.get("run_number").and_then(Value::as_u64)) {
+                (Some(run), Some(number)) => number == run,
+                _ => true,
+            },
+        )
         .map(|value| serde_json::from_value(value).context("decoding workflow task"))
         .collect()
 }
@@ -678,7 +1072,51 @@ fn selected_jobs(
         .collect())
 }
 
-#[allow(dead_code)]
+/// Read a run's logs from Loki alone, addressing jobs by the run's task list.
+/// This is the path for a server with no job API, so there are no API jobs to
+/// lean on.
+#[allow(clippy::too_many_arguments)]
+async fn fetch_run_logs_from_tasks(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    run: u64,
+    job: Option<usize>,
+    attempt: Option<u32>,
+    failed_only: bool,
+    loki: &impl LogSource,
+    tasks: &dyn TaskSource,
+) -> Result<RunLogs> {
+    let tasks = tasks.load().await;
+    if tasks.is_empty() {
+        return Err(anyhow!(
+            "Loki fallback found no workflow task metadata for run #{run}"
+        ));
+    }
+    let selected = selected_tasks(&tasks, job, failed_only)?;
+    let mut jobs = Vec::with_capacity(selected.len());
+    for (index, task) in selected {
+        let req = LogRequest {
+            client,
+            owner,
+            name,
+            job: index,
+            attempt,
+            task: Some(task),
+            api_job: None,
+        };
+        match loki.fetch(req).await {
+            Ok(job) => jobs.push(job),
+            Err(LogSourceError::Unavailable(msg)) => return Err(anyhow!(msg)),
+            Err(LogSourceError::Other(err)) => return Err(err),
+        }
+    }
+    Ok(RunLogs {
+        source: "loki".into(),
+        jobs,
+    })
+}
+
 fn selected_tasks(
     tasks: &[WorkflowTask],
     job: Option<usize>,
@@ -777,6 +1215,108 @@ fn clean_loki_line(line: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_range_parses_window_and_total() {
+        assert_eq!(parse_content_range("bytes 0-9/25"), Some((0, 9, Some(25))));
+        assert_eq!(parse_content_range("bytes 10-19/*"), Some((10, 19, None)));
+        assert_eq!(parse_content_range(" bytes  4-4/5 "), Some((4, 4, Some(5))));
+        assert_eq!(parse_content_range("bytes 9-0/25"), None);
+        assert_eq!(parse_content_range("items 0-9/25"), None);
+        assert_eq!(parse_content_range("bytes */25"), None);
+    }
+
+    #[test]
+    fn complete_lines_hold_back_a_partial_tail() {
+        let mut pending = Vec::new();
+        assert_eq!(split_complete_lines(&mut pending, b"one\ntw"), vec!["one"]);
+        assert_eq!(pending, b"tw");
+        assert!(split_complete_lines(&mut pending, b"o").is_empty());
+        assert_eq!(
+            split_complete_lines(&mut pending, b"\nthree\n"),
+            vec!["two", "three"]
+        );
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn run_jobs_parse_forgejo_array_and_gitea_envelope() {
+        let forgejo = serde_json::json!([
+            { "id": 7, "attempt": 2, "name": "build", "status": "failure", "task_id": 91 }
+        ]);
+        let jobs = parse_run_jobs(forgejo).unwrap();
+        assert_eq!(
+            (jobs[0].id, jobs[0].attempt, jobs[0].task_id),
+            (7, 2, Some(91))
+        );
+        assert_eq!(jobs[0].status, "failure");
+
+        let gitea = serde_json::json!({ "total_count": 2, "jobs": [
+            { "id": 3, "run_attempt": 4, "name": "test", "status": "completed",
+              "conclusion": "success" },
+            { "id": 4, "name": "lint", "status": "in_progress", "conclusion": "" }
+        ]});
+        let jobs = parse_run_jobs(gitea).unwrap();
+        assert_eq!((jobs[0].id, jobs[0].attempt), (3, 4));
+        assert_eq!(jobs[0].status, "success");
+        assert_eq!(jobs[1].status, "in_progress");
+
+        assert!(parse_run_jobs(serde_json::json!({ "nope": [] })).is_err());
+    }
+
+    #[test]
+    fn aggregate_status_prefers_the_worst_outcome() {
+        assert_eq!(
+            aggregate_job_status(["success", "failure"]),
+            Some("failure")
+        );
+        assert_eq!(
+            aggregate_job_status(["success", "skipped"]),
+            Some("success")
+        );
+        assert_eq!(
+            aggregate_job_status(["success", "running"]),
+            Some("success")
+        );
+        assert_eq!(aggregate_job_status(["", "running"]), Some("running"));
+        assert!(is_terminal_job_status("cancelled"));
+        assert!(!is_terminal_job_status("running"));
+        assert!(!is_terminal_job_status("completed"));
+    }
+
+    #[test]
+    fn log_gate_withholds_on_old_servers_and_never_crosses_axes() {
+        use crate::client::Flavor;
+
+        let url = "https://h/o/r/actions/runs/5";
+        assert!(log_api_gate(&ServerInfo::new(Flavor::Forgejo, "16.0.4"), url).is_ok());
+        assert!(log_api_gate(&ServerInfo::new(Flavor::Gitea, "1.27.3"), url).is_ok());
+        assert!(log_api_gate(&ServerInfo::unidentified(), url).is_ok());
+
+        let err = log_api_gate(&ServerInfo::new(Flavor::Forgejo, "15.0.2"), url).unwrap_err();
+        assert!(is_actions_unavailable(&err));
+        let msg = err.to_string();
+        assert!(msg.contains("Forgejo 15.0.2"), "{msg}");
+        assert!(msg.contains(url), "{msg}");
+
+        // Gitea 1.24 has job logs but not the jobs list that finds them.
+        let err = log_api_gate(&ServerInfo::new(Flavor::Gitea, "1.24.0"), url).unwrap_err();
+        assert!(err.to_string().contains("Gitea added the route in 1.25"));
+    }
+
+    #[test]
+    fn tasks_are_narrowed_to_the_run_when_the_server_names_it() {
+        let value = serde_json::json!({ "workflow_runs": [
+            { "id": 1, "name": "a", "run_number": 7 },
+            { "id": 2, "name": "b", "run_number": 8 },
+            { "id": 3, "name": "c" }
+        ]});
+        let all = parse_workflow_tasks(value.clone()).unwrap();
+        assert_eq!(all.len(), 3);
+        let run = parse_workflow_tasks_for_run(value, Some(7)).unwrap();
+        let ids: Vec<&str> = run.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["1", "3"]);
+    }
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,

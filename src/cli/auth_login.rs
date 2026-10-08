@@ -6,7 +6,7 @@ use dialoguer::{Password, Select};
 use crate::api;
 use crate::auth as token_store;
 use crate::cli::auth::LoginArgs;
-use crate::cli::auth_probe::{build_probe_client, probe_version, warn_on_old_forgejo};
+use crate::cli::auth_probe::{build_probe_client, probe_server, record_server, server_label};
 use crate::cli::instances::{self, CommonsLookup, Listing};
 use crate::config::hosts::{AuthKind, FjordAccount, Host, Hosts};
 use crate::output;
@@ -108,53 +108,67 @@ async fn login_pat(args: LoginArgs) -> Result<()> {
     let git_protocol = args.git_protocol.clone();
 
     // Verify before persisting: never store a token we can't actually use.
-    let provisional = Host {
-        user: None,
-        git_protocol: git_protocol.clone(),
-        web_url: web_url.clone(),
-        api_base_path: None,
-        auth_kind: AuthKind::Pat,
-        fjord_account: None,
-    };
-    let probe_client = build_probe_client(&hostname, &provisional, &token)?;
+    let mut hosts = Hosts::load()?;
+    let mut host = pat_host_entry(
+        hosts.hosts.get(&hostname),
+        None,
+        git_protocol,
+        web_url.clone(),
+    );
+    // A reverse proxy configured with `fj auth proxy` before this login has
+    // to be answered for the verification request to reach the forge at all.
+    let allow_generic_env = hosts.current.as_deref().is_none_or(|c| c == hostname);
+    let proxy = crate::client::proxy_credential_for_host(&hostname, &host, allow_generic_env)?;
+    let probe_client = build_probe_client(&hostname, &host, &token, proxy)?;
     let me = api::user::current(&probe_client)
         .await
         .context("verifying token against /api/v1/user")?;
 
-    // One-shot version probe. Surfaces obvious version mismatches before
-    // they manifest as cryptic 404s on later commands. Failure here is
-    // non-fatal: some Forgejo-compatible servers may not expose /version
-    // identically.
-    let version_string = probe_version(&probe_client).await.unwrap_or_default();
-    warn_on_old_forgejo(&version_string);
+    // One-shot flavor and version probe. Surfaces an old Forgejo before it
+    // manifests as cryptic 404s on later commands, and records which forge
+    // this is so later commands gate optional routes without re-deriving it.
+    // Never fatal: a server that answers neither version route is recorded as
+    // unidentified.
+    let server = probe_server(&probe_client).await;
 
     // Persist host + token.
-    let mut hosts = Hosts::load()?;
-    let host = Host {
-        user: Some(me.login.clone()),
-        git_protocol,
-        web_url,
-        api_base_path: None,
-        auth_kind: AuthKind::Pat,
-        fjord_account: None,
-    };
+    host.user = Some(me.login.clone());
+    record_server(&mut host, &server);
     hosts.upsert(&hostname, host);
     hosts.save()?;
     let storage = token_store::store_token(&hostname, &token)?;
     print_file_store_notice(&storage);
 
     println!(
-        "{} Logged in to {} as {}{}",
+        "{} Logged in to {} as {} ({})",
         output::bold("✓"),
         output::bold(&hostname),
         output::bold(&me.login),
-        if version_string.is_empty() {
-            String::new()
-        } else {
-            format!(" ({})", output::dim(&version_string))
-        }
+        output::dim(&server_label(&server))
     );
     Ok(())
+}
+
+/// The hosts.toml entry a PAT login writes. Carries over an existing PAT
+/// entry's reverse-proxy config, because logging in again (a rotated token)
+/// must not silently drop the proxy setup. An entry of another auth kind is
+/// replaced outright.
+fn pat_host_entry(
+    existing: Option<&Host>,
+    user: Option<String>,
+    git_protocol: String,
+    web_url: Option<String>,
+) -> Host {
+    Host {
+        user,
+        git_protocol,
+        web_url,
+        auth_kind: AuthKind::Pat,
+        proxy: existing
+            .filter(|h| h.auth_kind == AuthKind::Pat)
+            .and_then(|h| h.proxy.clone()),
+        ..Default::default()
+    }
 }
 
 /// Fjord Account sign-in. The deployment's `GET /api/auth/status` decides the
@@ -792,6 +806,7 @@ fn persist_oidc_session(
             "oidc",
             hosts.hosts.get(&platform_url),
         )),
+        ..Default::default()
     };
     hosts.upsert(&platform_url, host_entry);
     hosts.save()?;
@@ -886,6 +901,7 @@ async fn login_fjord_credentials(args: LoginArgs, platform_url: String) -> Resul
             "credentials",
             hosts.hosts.get(&platform_url),
         )),
+        ..Default::default()
     };
     hosts.upsert(&platform_url, host_entry);
     hosts.save()?;
@@ -1043,7 +1059,7 @@ fn prompt_hostname() -> Result<String> {
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
-fn normalize_pat_host(raw: &str) -> Result<(String, Option<String>)> {
+pub(crate) fn normalize_pat_host(raw: &str) -> Result<(String, Option<String>)> {
     let trimmed = raw.trim().trim_end_matches('/');
     if trimmed.is_empty() {
         return Err(anyhow!("hostname is required"));
@@ -1128,7 +1144,39 @@ mod tests {
                 default_instance_public_url: instance.map(|_| "https://rasterhub.com".to_string()),
                 auth_flow: Some("oidc".into()),
             }),
+            ..Default::default()
         }
+    }
+
+    #[test]
+    fn pat_login_keeps_an_existing_proxy_config() {
+        use crate::config::hosts::ProxyConfig;
+        let existing = Host {
+            proxy: Some(ProxyConfig {
+                username: "gate".into(),
+                pat_transport: Default::default(),
+            }),
+            flavor: Some("gitea".into()),
+            ..Default::default()
+        };
+        let entry = pat_host_entry(Some(&existing), Some("alice".into()), "ssh".into(), None);
+        assert_eq!(entry.proxy, existing.proxy);
+        assert_eq!(entry.git_protocol, "ssh");
+        // The flavor is re-probed on every login, never carried over.
+        assert_eq!(entry.flavor, None);
+    }
+
+    #[test]
+    fn pat_login_does_not_inherit_from_a_fjord_entry() {
+        let entry = pat_host_entry(
+            Some(&signed_in_host(Some("819eadfe"))),
+            None,
+            "https".into(),
+            None,
+        );
+        assert_eq!(entry.auth_kind, AuthKind::Pat);
+        assert!(entry.fjord_account.is_none());
+        assert!(entry.proxy.is_none());
     }
 
     #[test]

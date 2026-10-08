@@ -105,7 +105,8 @@ per-repository number shown by `fj run list`; `fj` resolves that number through:
 - `GET /api/v1/repos/{owner}/{repo}/actions/runs/{internal_run_id}/jobs`
   to map the selected job index to a job id.
 - `GET /api/v1/repos/{owner}/{repo}/actions/jobs/{job_id}/logs`
-  to fetch the plaintext job log.
+  to fetch the plaintext job log, in bounded byte ranges (`Range: bytes=a-b`,
+  1 MiB per request, following `206` continuations up to a 64 MiB ceiling).
 
 Verified on rasterhub 2026-08-14 with a PAT:
 
@@ -115,52 +116,65 @@ GET /api/v1/repos/rasterstate/fleet/actions/runs/18434/jobs -> HTTP 200; job_ind
 GET /api/v1/repos/rasterstate/fleet/actions/jobs/43624/logs -> HTTP 200
 ```
 
-If the native job-log API is unavailable, `fj` can fall back to the fleet Loki
-log source when task metadata is present. Otherwise it returns an explicit
-server-version error instead of pretending a cookie-gated web route is an API.
+Whether a route is offered is decided by `client::capability`, keyed on the
+forge flavor and version (see `docs/compatibility.md`). On a server that is
+known not to have the log routes, or that answers 404 for them, `fj` reads from
+a separately authorized Loki source when one is configured
+(`FJ_RUN_LOG_LOKI_URL` / `FJ_LOKI_URL`), and otherwise reports the limitation
+with the run URL. It never sends the token to a cookie-gated web route.
 
-`fj run view N` without `--log`, `fj run watch`, `fj run rerun`, and
-`fj run cancel` still use Forgejo's human-facing web routes:
+One path still uses a built-in Loki address: when a server that has the log
+routes reports a single job's log as missing, `fj` queries
+`DEFAULT_LOKI_URL` in `src/api/workflow_logs.rs` if neither variable is set.
 
-- `fj run view N` calls `fetch_run_summary`, which POSTs the ViewPost route
-  with an empty `logCursors` body to get run-level state without any log lines.
-- `fj run watch` polls incremental per-step JSON:
+`fj run view N`, `fj run watch`, and `fj run download` prefer the API as well:
+
+- `fj run view N` reads the run and its jobs from the API. The API carries no
+  pusher and no per-job duration, so those columns are empty on that path.
+- `fj run watch` polls the job list and tails each job log from its last byte
+  offset with a ranged read, until every job is terminal.
+- `fj run cancel` posts `actions/runs/{id}/cancel` (Forgejo 16+).
+- `fj run rerun` posts the Gitea 1.26+ rerun routes. Forgejo has no rerun
+  route, so there it reports the limitation and the run URL.
+
+Where the server has no API route, the read commands fall back to Forgejo's
+human-facing web routes **without credentials** (`api::workflow::web_client`
+strips the token):
+
+- the run overview POSTs the ViewPost route with an empty `logCursors` body to
+  get run-level state without any log lines;
+- the live tail polls incremental per-step JSON:
   `POST /{owner}/{repo}/actions/runs/{run}/jobs/{job}/attempt/{attempt}`
   with body `{"logCursors":[{"step":S,"cursor":C,"expanded":true}]}`.
-  An empty `{}` body returns run/job/step state with no lines, which is
-  how we cheaply learn the step count before requesting every step.
+
+That fallback works for publicly readable runs only. A private run on such a
+server gets the limitation message and the run URL.
 
 How it still respects the layering rules:
 
-- No parallel HTTP path. API log reads and web-route calls both go through
+- No parallel HTTP path. API reads and web-route calls both go through
   `Client::request`. Web-route calls use absolute same-origin URLs built from
   `Client::base()`, so they still share client plumbing.
 - `is_trusted_url` keeps sending credentials only when an absolute URL points
-  back to the same trusted host.
+  back to the same trusted host, and web-route calls carry none at all.
 
 Three parameter quirks worth knowing (all documented at the call site):
 
 - `run` is the **per-repo run number** (the `#` column of `fj run list`),
-  not the internal run id.
-- `job` is the zero-based job position. Forgejo clamps some web-route job
-  indices to the first job rather than 404ing, so `cli::workflow::validate_job`
-  rejects them against the returned job count where web routes are used.
+  not the internal run id. The API routes take the internal id, which `fj`
+  resolves from the run list.
+- `job` is the zero-based job position in the job list.
 - `attempt` is 1-based. API log reads use the job's latest attempt unless the
   user pins `--attempt`.
 
 Limitations, surfaced to the user rather than hidden:
 
-- The job-log API is Forgejo-version dependent. If
-  `/actions/runs/{id}/jobs` returns 404, `fj` names the server version and says
-  the token-authenticated log API is unavailable.
-- A Fjord-Account gateway only proxies `/api/v1`, so it won't forward web
-  routes. API-backed `fj run logs` may work through a gateway that exposes the
-  Forgejo Actions API, but `watch`, plain `view`, `rerun`, and `cancel` still
-  refuse early through `cli::workflow::guard_web_routes`.
-- `fj run rerun` / `cancel` use the web layer (there is no `/api/v1`
-  rerun/cancel), and Forgejo rejects a PAT-authenticated POST to those
-  state-changing actions with a handler 404. `post_run_action` translates
-  that into a message pointing at the run URL to act on in the browser.
+- The Actions API is flavor and version dependent. A withheld or missing route
+  produces a message that names the server, the limitation, and the run URL.
+- A Fjord Account gateway only proxies `/api/v1`, so the credential-free web
+  fallback is refused there.
+- A 403 on rerun or cancel is reported as a permission denial, distinct from a
+  missing route.
 
 ## Pager
 

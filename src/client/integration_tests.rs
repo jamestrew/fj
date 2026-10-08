@@ -10,11 +10,24 @@ use url::Url;
 use wiremock::matchers::{body_json, header, method, path, query_param, query_param_is_missing};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use super::Client;
+use super::{Capability, Client, Flavor, PatTransport, ProxyCredential, ServerInfo, Support};
 
 async fn client_for(server: &MockServer) -> Client {
     let base = Url::parse(&format!("{}/api/v1/", server.uri())).expect("base url");
     Client::for_base_url(base, "test-token".into()).expect("client")
+}
+
+/// A client whose server flavor and version are already known, so a test does
+/// not have to mock the version routes to reach a particular gate.
+async fn pinned_client(server: &MockServer, flavor: Flavor, version: &str) -> Client {
+    client_for(server)
+        .await
+        .with_server_info(ServerInfo::new(flavor, version))
+}
+
+/// Matches a request that carries no `Authorization` header at all.
+fn no_authorization(req: &wiremock::Request) -> bool {
+    !req.headers.contains_key("authorization")
 }
 
 #[tokio::test]
@@ -432,9 +445,18 @@ async fn workflow_org_secrets_and_variables_use_org_actions_paths() {
     Mock::given(method("GET"))
         .and(path("/api/v1/orgs/team/actions/variables"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-            {"name": "IMAGE", "created_at": "2026-06-01T00:00:00Z"}
+            {"name": "IMAGE", "data": "registry.example/app", "owner_id": 4, "repo_id": 0}
         ])))
         .expect(1)
+        .mount(&server)
+        .await;
+    // `set` looks the variable up (it exists, so PUT), then re-reads it.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/orgs/team/actions/variables/IMAGE"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!(
+            {"name": "IMAGE", "data": "registry.example/app", "owner_id": 4, "repo_id": 0}
+        )))
+        .expect(2)
         .mount(&server)
         .await;
     Mock::given(method("PUT"))
@@ -467,9 +489,15 @@ async fn workflow_org_secrets_and_variables_use_org_actions_paths() {
         .await
         .expect("org variables list");
     assert_eq!(variables[0].name, "IMAGE");
-    crate::api::workflow::set_org_variable(&c, "team", "IMAGE", "registry.example/app")
-        .await
-        .expect("org variable set");
+    let outcome =
+        crate::api::workflow::set_org_variable(&c, "team", "IMAGE", "registry.example/app")
+            .await
+            .expect("org variable set");
+    assert_eq!(outcome.write, crate::api::workflow::VariableWrite::Updated);
+    assert_eq!(
+        outcome.variable.scope(),
+        crate::api::workflow::VariableScope::Owner
+    );
     crate::api::workflow::delete_org_variable(&c, "team", "IMAGE")
         .await
         .expect("org variable delete");
@@ -1656,7 +1684,7 @@ async fn run_logs_resolves_run_number_beyond_first_page() {
 }
 
 #[tokio::test]
-async fn run_logs_jobs_api_404_names_forgejo_version() {
+async fn run_logs_jobs_api_404_reports_the_limitation_with_the_run_url() {
     let server = MockServer::start().await;
 
     Mock::given(method("GET"))
@@ -1675,81 +1703,22 @@ async fn run_logs_jobs_api_404_names_forgejo_version() {
         .expect(1)
         .mount(&server)
         .await;
-    Mock::given(method("GET"))
-        .and(path("/api/v1/version"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "version": "15.0.6+gitea-1.22.0"
-        })))
-        .expect(1)
-        .mount(&server)
-        .await;
 
+    // The server cannot be identified, so the gate does not withhold the
+    // route; the 404 it answers is then the evidence.
     let c = client_for(&server).await;
-    let err = crate::api::workflow::fetch_run_logs(&c, "o", "r", 12, None, None, false)
+    let err = crate::api::workflow::fetch_run_logs_without_loki(&c, "o", "r", 12)
         .await
-        .expect_err("LTS should get a capability error");
+        .expect_err("a server without the jobs route should get the limitation");
+    assert!(crate::api::workflow::is_actions_unavailable(&err));
     let msg = err.to_string();
     assert!(msg.contains("run #12"), "got: {msg}");
-    assert!(msg.contains("15.0.6+gitea-1.22.0"), "got: {msg}");
-    assert!(msg.contains("does not expose"), "got: {msg}");
+    assert!(msg.contains("HTTP 404"), "got: {msg}");
     assert!(msg.contains("rasterstate/fj#103"), "got: {msg}");
-}
-
-#[tokio::test]
-async fn run_logs_fetch_job_logs_two_phase() {
-    let server = MockServer::start().await;
-    // Phase 1: empty `logCursors` → state only, two steps, no lines.
-    Mock::given(method("POST"))
-        .and(path("/o/r/actions/runs/12/jobs/0/attempt/1"))
-        .and(body_json(json!({ "logCursors": [] })))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "logs": { "stepsLog": [] },
-            "state": {
-                "run": { "done": true, "status": "failure", "jobs": [{"name":"build","status":"failure","duration":"1m"}] },
-                "currentJob": {
-                    "title": "build",
-                    "steps": [
-                        {"summary":"checkout","status":"success","duration":"1s"},
-                        {"summary":"compile","status":"failure","duration":"9s"}
-                    ],
-                    "allAttempts": [{"number":1,"status":"failure"}]
-                }
-            }
-        })))
-        .expect(1)
-        .mount(&server)
-        .await;
-    // Phase 2: cursors for steps 0..2 → lines per step.
-    Mock::given(method("POST"))
-        .and(path("/o/r/actions/runs/12/jobs/0/attempt/1"))
-        .and(body_json(json!({ "logCursors": [
-            {"step":0,"cursor":0,"expanded":true},
-            {"step":1,"cursor":0,"expanded":true}
-        ]})))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "logs": { "stepsLog": [
-                {"step":0,"cursor":2,"lines":[{"index":1,"message":"cloned","timestamp":1.0}]},
-                {"step":1,"cursor":3,"lines":[{"index":1,"message":"error[E0382]","timestamp":2.0}]}
-            ]},
-            "state": {
-                "run": { "done": true, "status": "failure", "jobs": [] },
-                "currentJob": { "title": "build", "steps": [
-                    {"summary":"checkout","status":"success","duration":"1s"},
-                    {"summary":"compile","status":"failure","duration":"9s"}
-                ], "allAttempts": [] }
-            }
-        })))
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    let c = client_for(&server).await;
-    let view = crate::api::workflow::fetch_job_logs(&c, "o", "r", 12, 0, 1)
-        .await
-        .expect("logs");
-    assert_eq!(view.logs.steps_log.len(), 2);
-    assert_eq!(view.logs.steps_log[1].lines[0].message, "error[E0382]");
-    assert_eq!(view.state.current_job.steps[1].status, "failure");
+    assert!(
+        msg.contains(&format!("{}/o/r/actions/runs/12", server.uri())),
+        "got: {msg}"
+    );
 }
 
 #[tokio::test]
@@ -1871,6 +1840,7 @@ async fn run_summary_reads_run_level_state() {
     Mock::given(method("POST"))
         .and(path("/o/r/actions/runs/56/jobs/0/attempt/1"))
         .and(body_json(json!({ "logCursors": [] })))
+        .and(no_authorization)
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "logs": { "stepsLog": [] },
             "state": {
@@ -1899,7 +1869,6 @@ async fn run_summary_reads_run_level_state() {
     let run = &view.state.run;
     assert_eq!(run.title, "Fix the thing");
     assert_eq!(run.status, "success");
-    assert_eq!(run.link, "/o/r/actions/runs/56");
     assert_eq!(run.commit.short_sha, "abc1234567");
     assert_eq!(run.commit.branch.name, "main");
     assert_eq!(run.commit.pusher.display_name, "stephen");
@@ -1907,59 +1876,160 @@ async fn run_summary_reads_run_level_state() {
     assert_eq!(run.jobs[0].status, "success");
 }
 
-// ── Rerun web actions (run-level and per-job) ────────────────────────────────
-// `rerun`/`cancel`/`rerun_job` POST the human-facing web routes (no `/api/v1`
-// prefix). These pin the exact paths so a per-job rerun targets
-// `/jobs/{job}/rerun` and the whole-run rerun stays at `/rerun`.
+// ── Rerun and cancel (token API, gated per flavor and version) ───────────────
+// Gitea 1.26 has rerun routes; Forgejo has none. Forgejo 16 has a cancel route;
+// Gitea 1.27.3 has none. A withheld action makes no request at all.
 
-#[tokio::test]
-async fn rerun_posts_run_level_web_route() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/o/r/actions/runs/56/rerun"))
-        .respond_with(ResponseTemplate::new(200))
-        .expect(1)
-        .mount(&server)
+async fn mount_run_900(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/runs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "workflow_runs": [{ "id": 900, "run_number": 56, "status": "failure" }]
+        })))
+        .mount(server)
         .await;
-    let c = client_for(&server).await;
-    crate::api::workflow::rerun(&c, "o", "r", 56)
-        .await
-        .expect("rerun should POST the run-level route");
+}
+
+async fn refuse_everything(server: &MockServer) {
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(server)
+        .await;
 }
 
 #[tokio::test]
-async fn rerun_job_posts_per_job_web_route() {
+async fn rerun_uses_the_gitea_run_route() {
+    use crate::api::workflow::{rerun, RerunOutcome, RerunTarget};
     let server = MockServer::start().await;
-    // Job index 0 is a real job, not a "rerun all" sentinel: it must still hit
-    // the /jobs/0/rerun route, not the run-level /rerun.
+    mount_run_900(&server).await;
     Mock::given(method("POST"))
-        .and(path("/o/r/actions/runs/56/jobs/0/rerun"))
-        .respond_with(ResponseTemplate::new(200))
+        .and(path("/api/v1/repos/o/r/actions/runs/900/rerun"))
+        .and(header("authorization", "token test-token"))
+        .respond_with(ResponseTemplate::new(201))
         .expect(1)
         .mount(&server)
         .await;
-    let c = client_for(&server).await;
-    crate::api::workflow::rerun_job(&c, "o", "r", 56, 0)
+    let c = pinned_client(&server, Flavor::Gitea, "1.26.0").await;
+    let out = rerun(&c, "o", "r", 56, RerunTarget::Run)
         .await
-        .expect("rerun_job should POST the per-job route");
+        .expect("rerun");
+    assert_eq!(out, RerunOutcome::Started);
 }
 
 #[tokio::test]
-async fn rerun_token_404_points_at_web_ui() {
+async fn rerun_failed_uses_the_gitea_route_and_reads_no_failed_jobs() {
+    use crate::api::workflow::{rerun, RerunOutcome, RerunTarget};
     let server = MockServer::start().await;
+    mount_run_900(&server).await;
     Mock::given(method("POST"))
-        .and(path("/o/r/actions/runs/56/jobs/2/rerun"))
-        .respond_with(ResponseTemplate::new(404).set_body_string("Not found."))
+        .and(path("/api/v1/repos/o/r/actions/runs/900/rerun-failed-jobs"))
+        .respond_with(
+            ResponseTemplate::new(400)
+                .set_body_json(json!({ "message": "no failed jobs to re-run" })),
+        )
         .expect(1)
         .mount(&server)
         .await;
-    let c = client_for(&server).await;
-    let err = crate::api::workflow::rerun_job(&c, "o", "r", 56, 2)
+    let c = pinned_client(&server, Flavor::Gitea, "1.27.3").await;
+    let out = rerun(&c, "o", "r", 56, RerunTarget::Failed)
         .await
-        .expect_err("a 404 should surface an actionable message");
-    let msg = err.to_string();
-    assert!(msg.contains("won't rerun run #56"), "got: {msg}");
-    assert!(msg.contains("actions/runs/56"), "got: {msg}");
+        .expect("a run with nothing failed is not an error");
+    assert_eq!(out, RerunOutcome::NothingFailed);
+}
+
+#[tokio::test]
+async fn rerun_job_maps_the_index_to_the_gitea_job_id() {
+    use crate::api::workflow::{rerun, RerunOutcome, RerunTarget};
+    let server = MockServer::start().await;
+    mount_run_900(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/runs/900/jobs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "total_count": 2,
+            "jobs": [
+                { "id": 11, "name": "build", "status": "completed", "conclusion": "success" },
+                { "id": 12, "name": "test", "status": "completed", "conclusion": "failure" }
+            ]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/actions/runs/900/jobs/12/rerun"))
+        .respond_with(ResponseTemplate::new(201))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = pinned_client(&server, Flavor::Gitea, "1.26.2").await;
+    let out = rerun(&c, "o", "r", 56, RerunTarget::Job(1))
+        .await
+        .expect("rerun job");
+    assert_eq!(out, RerunOutcome::Started);
+
+    let err = rerun(&c, "o", "r", 56, RerunTarget::Job(5))
+        .await
+        .expect_err("an index past the last job is rejected before any POST");
+    assert!(err.to_string().contains("out of range"), "got: {err}");
+}
+
+#[tokio::test]
+async fn rerun_is_withheld_where_the_route_does_not_exist() {
+    use crate::api::workflow::{is_actions_unavailable, rerun, RerunTarget};
+    let server = MockServer::start().await;
+    refuse_everything(&server).await;
+    // Forgejo has no rerun route at any version, and a Forgejo version number
+    // is never read as a Gitea one: 16 is not "at least Gitea 1.26".
+    for (flavor, version) in [(Flavor::Forgejo, "16.0.4"), (Flavor::Gitea, "1.25.4")] {
+        let c = pinned_client(&server, flavor, version).await;
+        let err = rerun(&c, "o", "r", 56, RerunTarget::Run)
+            .await
+            .expect_err("rerun should be withheld");
+        assert!(is_actions_unavailable(&err), "{version}: {err}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!("{}/o/r/actions/runs/56", server.uri())),
+            "got: {msg}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cancel_uses_the_forgejo_16_route_and_names_a_permission_denial() {
+    use crate::api::workflow::{cancel, is_actions_unavailable};
+    let server = MockServer::start().await;
+    mount_run_900(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/actions/runs/900/cancel"))
+        .and(header("authorization", "token test-token"))
+        .respond_with(ResponseTemplate::new(204))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = pinned_client(&server, Flavor::Forgejo, "16.0.4").await;
+    cancel(&c, "o", "r", 56).await.expect("cancel");
+
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/actions/runs/900/cancel"))
+        .respond_with(ResponseTemplate::new(403).set_body_string("forbidden"))
+        .mount(&server)
+        .await;
+    let err = cancel(&c, "o", "r", 56).await.expect_err("403");
+    assert!(!is_actions_unavailable(&err));
+    assert!(err.to_string().contains("permission denied"), "got: {err}");
+}
+
+#[tokio::test]
+async fn cancel_is_withheld_on_gitea_and_older_forgejo() {
+    use crate::api::workflow::{cancel, is_actions_unavailable};
+    let server = MockServer::start().await;
+    refuse_everything(&server).await;
+    for (flavor, version) in [(Flavor::Gitea, "1.27.3"), (Flavor::Forgejo, "15.0.2")] {
+        let c = pinned_client(&server, flavor, version).await;
+        let err = cancel(&c, "o", "r", 56).await.expect_err("withheld");
+        assert!(is_actions_unavailable(&err), "{version}: {err}");
+        assert!(err.to_string().contains("/o/r/actions/runs/56"), "{err}");
+    }
 }
 
 // ── Parity batch: issue delete, pr update-branch, release delete-asset, workflow dispatch ──
@@ -2280,9 +2350,10 @@ async fn repo_collaborator_list_decodes_permissions() {
         .await;
     let c = client_for(&server).await;
 
-    let collaborators = crate::api::repo::list_collaborators(&c, "o", "r")
+    let collaborators = crate::api::repo::list_collaborators_page(&c, "o", "r", None)
         .await
-        .expect("collaborators");
+        .expect("collaborators")
+        .items;
 
     assert_eq!(collaborators.len(), 2);
     assert_eq!(collaborators[0].user.login, "alice");
@@ -2465,7 +2536,7 @@ async fn list_artifacts_parses_web_envelope() {
         .expect(1)
         .mount(&server)
         .await;
-    let c = client_for(&server).await;
+    let c = pinned_client(&server, Flavor::Forgejo, "15.0.2").await;
     let arts = crate::api::workflow::list_artifacts(&c, "o", "r", 5)
         .await
         .expect("list");
@@ -2480,12 +2551,16 @@ async fn download_artifact_returns_bytes() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/o/r/actions/runs/5/artifacts/binary"))
+        .and(no_authorization)
         .respond_with(ResponseTemplate::new(200).set_body_bytes(b"PK\x03\x04zip".to_vec()))
         .expect(1)
         .mount(&server)
         .await;
-    let c = client_for(&server).await;
-    let bytes = crate::api::workflow::download_artifact(&c, "o", "r", 5, "binary")
+    let c = pinned_client(&server, Flavor::Forgejo, "15.0.2").await;
+    // An entry listed from the web route has no API id.
+    let artifact: crate::api::workflow::Artifact =
+        serde_json::from_value(json!({ "name": "binary" })).unwrap();
+    let bytes = crate::api::workflow::download_artifact(&c, "o", "r", 5, &artifact)
         .await
         .expect("download");
     assert_eq!(&bytes[..2], b"PK");
@@ -2590,8 +2665,8 @@ async fn list_variables_parses_live_bare_array() {
         )))
         .and(header("authorization", "token test-token"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-            { "name": "REGION", "created_at": "2026-01-01T00:00:00Z" },
-            { "name": "STAGE", "created_at": "2026-01-02T00:00:00Z" }
+            { "name": "REGION", "data": "us-west-2", "owner_id": 3, "repo_id": 9 },
+            { "name": "STAGE", "data": "prod", "owner_id": 3, "repo_id": 9 }
         ])))
         .mount(&server)
         .await;
@@ -2601,27 +2676,131 @@ async fn list_variables_parses_live_bare_array() {
         .unwrap();
     assert_eq!(vars.len(), 2);
     assert_eq!(vars[0].name, "REGION");
+    assert_eq!(vars[0].data, "us-west-2");
     assert_eq!(vars[1].name, "STAGE");
 }
 
 #[tokio::test]
-async fn set_variable_puts_value_body() {
+async fn set_variable_updates_an_existing_variable_with_put() {
     let server = MockServer::start().await;
-    let owner = "o";
-    let name = "r";
-    Mock::given(method("PUT"))
-        .and(path(format!(
-            "/api/v1/repos/{owner}/{name}/actions/variables/REGION"
+    let item = "/api/v1/repos/o/r/actions/variables/REGION";
+    Mock::given(method("GET"))
+        .and(path(item))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!(
+            { "name": "REGION", "data": "us-west-2", "owner_id": 3, "repo_id": 9 }
         )))
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(item))
         .and(body_json(json!({ "value": "us-west-2" })))
         .and(header("authorization", "token test-token"))
         .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(item))
+        .respond_with(ResponseTemplate::new(409))
+        .expect(0)
         .mount(&server)
         .await;
     let client = client_for(&server).await;
-    crate::api::workflow::set_variable(&client, owner, name, "REGION", "us-west-2")
+    let outcome = crate::api::workflow::set_variable(&client, "o", "r", "REGION", "us-west-2")
         .await
         .unwrap();
+    assert_eq!(outcome.write, crate::api::workflow::VariableWrite::Updated);
+}
+
+#[tokio::test]
+async fn set_variable_creates_a_missing_variable_with_post_and_confirms_it() {
+    let server = MockServer::start().await;
+    // The user typed a lower-case name; the server stores it upper-cased.
+    let item = "/api/v1/repos/o/r/actions/variables/region";
+    Mock::given(method("GET"))
+        .and(path(item))
+        .respond_with(ResponseTemplate::new(404))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(item))
+        .and(body_json(json!({ "value": "us-west-2" })))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(item))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(item))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!(
+            { "name": "REGION", "data": "us-west-2", "owner_id": 3, "repo_id": 9 }
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = client_for(&server).await;
+    let outcome = crate::api::workflow::set_variable(&client, "o", "r", "region", "us-west-2")
+        .await
+        .unwrap();
+    assert_eq!(outcome.write, crate::api::workflow::VariableWrite::Created);
+    // Name and scope are the server's, not the request's.
+    assert_eq!(outcome.variable.name, "REGION");
+    assert_eq!(
+        outcome.variable.scope(),
+        crate::api::workflow::VariableScope::Repository
+    );
+}
+
+#[tokio::test]
+async fn variable_errors_tell_a_denied_token_from_disabled_actions() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/off/actions/variables"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/denied/actions/variables"))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/repos/o/r/actions/variables/GONE"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    let client = client_for(&server).await;
+
+    let off = crate::api::workflow::list_variables(&client, "o", "off")
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{off:#}").contains("Actions variables are unavailable for o/off"),
+        "{off:#}"
+    );
+
+    let denied = crate::api::workflow::list_variables(&client, "o", "denied")
+        .await
+        .unwrap_err();
+    let denied = format!("{denied:#}");
+    assert!(denied.contains("forbidden"), "{denied}");
+    assert!(!denied.contains("unavailable"), "{denied}");
+
+    let gone = crate::api::workflow::delete_variable(&client, "o", "r", "GONE")
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{gone:#}").contains("variable 'GONE' not found"),
+        "{gone:#}"
+    );
 }
 
 #[tokio::test]
@@ -2650,7 +2829,7 @@ async fn list_artifacts_parses_envelope() {
     let name = "r";
     Mock::given(method("GET"))
         .and(path(format!("/{owner}/{name}/actions/runs/56/artifacts")))
-        .and(header("authorization", "token test-token"))
+        .and(no_authorization)
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "artifacts": [
                 { "name": "build", "size": 1024, "status": "completed" },
@@ -2659,7 +2838,7 @@ async fn list_artifacts_parses_envelope() {
         })))
         .mount(&server)
         .await;
-    let client = client_for(&server).await;
+    let client = pinned_client(&server, Flavor::Forgejo, "15.0.2").await;
     let artifacts = crate::api::workflow::list_artifacts(&client, owner, name, 56)
         .await
         .unwrap();
@@ -3544,7 +3723,7 @@ async fn run_merge_diagnose(server: &MockServer, number: u64, style: &str) -> Op
     let pr = crate::api::pull::get(&c, "o", "r", number)
         .await
         .expect("get pull");
-    crate::cli::pr_merge_check::diagnose_merge_failure(&c, "o", "r", &pr, style, None).await
+    crate::cli::pr_merge_check::diagnose_merge_failure(&c, "o", "r", &pr, style, None, None).await
 }
 
 #[tokio::test]
@@ -4528,6 +4707,7 @@ async fn label_create_posts_color_and_skips_none_description() {
         name: "bug",
         color: "ee0000",
         description: None,
+        exclusive: None,
     };
     let l = crate::api::label::create(&c, "o", "r", &body)
         .await
@@ -5174,6 +5354,7 @@ async fn issue_create_skips_none_fields() {
         body: None,
         assignees: None,
         labels: None,
+        milestone: None,
     };
     let i = crate::api::issue::create(&c, "o", "r", &body)
         .await
@@ -5202,6 +5383,7 @@ async fn issue_create_posts_resolved_label_ids_and_assignees() {
         body: None,
         assignees: Some(vec!["alice".to_string(), "bob".to_string()]),
         labels: Some(vec![10, 11]),
+        milestone: None,
     };
     let i = crate::api::issue::create(&c, "o", "r", &body)
         .await
@@ -5566,7 +5748,7 @@ async fn workflow_list_artifacts_unwraps_envelope() {
         .expect(1)
         .mount(&server)
         .await;
-    let c = client_for(&server).await;
+    let c = pinned_client(&server, Flavor::Forgejo, "15.0.2").await;
     let arts = crate::api::workflow::list_artifacts(&c, "o", "r", 5)
         .await
         .expect("artifacts");
@@ -5583,11 +5765,14 @@ async fn workflow_list_artifacts_maps_404() {
         .expect(1)
         .mount(&server)
         .await;
-    let c = client_for(&server).await;
+    let c = pinned_client(&server, Flavor::Forgejo, "15.0.2").await;
     let err = crate::api::workflow::list_artifacts(&c, "o", "r", 9)
         .await
         .expect_err("should 404");
-    assert!(err.to_string().contains("not found"));
+    assert!(crate::api::workflow::is_actions_unavailable(&err));
+    let msg = err.to_string();
+    assert!(msg.contains("cannot read artifacts for run #9"), "{msg}");
+    assert!(msg.contains("/o/r/actions/runs/9"), "{msg}");
 }
 
 #[tokio::test]
@@ -6094,8 +6279,8 @@ async fn variable_list_json_shape_and_projection() {
     Mock::given(method("GET"))
         .and(path("/api/v1/repos/o/r/actions/variables"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-            { "name": "REGION", "created_at": "2026-01-01T00:00:00Z" },
-            { "name": "TIER", "created_at": "2026-01-02T00:00:00Z" }
+            { "name": "REGION", "data": "us-west-2", "owner_id": 3, "repo_id": 9 },
+            { "name": "TIER", "data": "gold", "owner_id": 3, "repo_id": 9 }
         ])))
         .expect(1)
         .mount(&server)
@@ -6106,8 +6291,11 @@ async fn variable_list_json_shape_and_projection() {
         .expect("variables");
     let v = serde_json::to_value(&vars).expect("serialize");
     assert_eq!(v[0]["name"], "REGION");
-    assert!(v[0]["created_at"].is_string());
-    assert!(v[0].get("data").is_none());
+    // A variable is readable configuration: the value and the server's
+    // scope ids are part of the JSON. No timestamp is invented.
+    assert_eq!(v[0]["data"], "us-west-2");
+    assert_eq!(v[0]["repo_id"], 9);
+    assert!(v[0].get("created_at").is_none());
     let projected = project_fields(&v, "name");
     assert_eq!(projected, json!([{ "name": "REGION" }, { "name": "TIER" }]));
 }
@@ -7256,4 +7444,2808 @@ async fn user_avatar_update_posts_base64_and_delete_removes_it() {
     let c = client_for(&server).await;
     update_avatar(&c, "iVBORw0KGgo=").await.unwrap();
     delete_avatar(&c).await.unwrap();
+}
+
+// ---- issues: sort, milestone on create, reactions, dependencies, time ----
+
+#[tokio::test]
+async fn issue_list_sends_sort_only_when_asked() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/issues"))
+        .and(query_param("sort", "oldest"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            issue_json(1, "first", "open"),
+            issue_json(9, "later", "open")
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/issues"))
+        .and(query_param_is_missing("sort"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!([issue_json(9, "later", "open")])),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let sorted = crate::api::issue::list(
+        &c,
+        "o",
+        "r",
+        crate::api::issue::ListOptions {
+            sort: Some("oldest"),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("sorted list");
+    // The order is the forge's: nothing re-sorts it on the way through.
+    let numbers: Vec<u64> = sorted.items.iter().map(|i| i.number).collect();
+    assert_eq!(numbers, [1, 9]);
+
+    let default = crate::api::issue::list(&c, "o", "r", Default::default())
+        .await
+        .expect("default list");
+    assert_eq!(default.items.len(), 1);
+}
+
+#[tokio::test]
+async fn issue_create_sends_milestone_in_the_create_request() {
+    use crate::api::issue::CreateIssue;
+    let server = MockServer::start().await;
+    let mut created = issue_json(4, "new", "open");
+    created["milestone"] = json!({ "id": 2, "title": "v2" });
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/issues"))
+        .and(body_json(json!({ "title": "new", "milestone": 2 })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(created))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let body = CreateIssue {
+        title: "new",
+        body: None,
+        assignees: None,
+        labels: None,
+        milestone: Some(2),
+    };
+    let i = crate::api::issue::create(&c, "o", "r", &body)
+        .await
+        .expect("create");
+    let confirmed = i.milestone.expect("the forge reports the milestone");
+    assert_eq!((confirmed.id, confirmed.title.as_str()), (2, "v2"));
+}
+
+#[tokio::test]
+async fn milestone_resolve_matches_a_title_then_an_id() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/milestones"))
+        .and(query_param("state", "all"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            milestone_json(1, "v1", "open"),
+            milestone_json(2, "v2", "closed")
+        ])))
+        .mount(&server)
+        .await;
+    // An id that is not on the listed page is looked up directly.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/milestones/77"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(milestone_json(77, "old", "closed")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let by_title = crate::api::milestone::resolve(&c, "o", "r", "v2")
+        .await
+        .expect("by title");
+    assert_eq!(by_title.id, 2);
+    let by_id = crate::api::milestone::resolve(&c, "o", "r", "1")
+        .await
+        .expect("by id");
+    assert_eq!(by_id.title, "v1");
+    let direct = crate::api::milestone::resolve(&c, "o", "r", "77")
+        .await
+        .expect("by id off the page");
+    assert_eq!(direct.title, "old");
+    let err = crate::api::milestone::resolve(&c, "o", "r", "nope")
+        .await
+        .expect_err("unknown title");
+    assert!(
+        err.to_string().contains("no milestone named 'nope'"),
+        "{err}"
+    );
+}
+
+fn reaction_json(content: &str, login: &str) -> serde_json::Value {
+    json!({
+        "content": content,
+        "user": { "id": 1, "login": login },
+        "created_at": "2026-01-01T00:00:00Z"
+    })
+}
+
+#[tokio::test]
+async fn reactions_list_and_add_on_an_issue_and_on_a_comment() {
+    use crate::api::issue_reaction::{self, Target};
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/issues/3/reactions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            reaction_json("+1", "alice"),
+            reaction_json("rocket", "bob")
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/issues/comments/55/reactions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!([reaction_json("eyes", "bob")])),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/issues/3/reactions"))
+        .and(body_json(json!({ "content": "heart" })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(reaction_json("heart", "alice")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/issues/comments/55/reactions"))
+        .and(body_json(json!({ "content": "-1" })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(reaction_json("-1", "alice")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let on_issue = issue_reaction::list(&c, "o", "r", Target::Issue(3))
+        .await
+        .expect("issue reactions");
+    assert_eq!(on_issue.len(), 2);
+    assert_eq!(on_issue[1].user.as_ref().unwrap().login, "bob");
+    let on_comment = issue_reaction::list(&c, "o", "r", Target::Comment(55))
+        .await
+        .expect("comment reactions");
+    assert_eq!(on_comment[0].content, "eyes");
+    let added = issue_reaction::add(&c, "o", "r", Target::Issue(3), "heart")
+        .await
+        .expect("add on issue");
+    assert_eq!(added.content, "heart");
+    let added = issue_reaction::add(&c, "o", "r", Target::Comment(55), "-1")
+        .await
+        .expect("add on comment");
+    assert_eq!(added.content, "-1");
+}
+
+#[tokio::test]
+async fn reaction_delete_carries_a_body_naming_the_reaction() {
+    use crate::api::issue_reaction::{self, Target};
+    let server = MockServer::start().await;
+    // Only a DELETE whose body names the reaction matches; a bodiless DELETE
+    // would fall through to wiremock's 404 and fail the calls below.
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/repos/o/r/issues/3/reactions"))
+        .and(body_json(json!({ "content": "+1" })))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/repos/o/r/issues/comments/55/reactions"))
+        .and(body_json(json!({ "content": "rocket" })))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    issue_reaction::remove(&c, "o", "r", Target::Issue(3), "+1")
+        .await
+        .expect("remove on issue");
+    issue_reaction::remove(&c, "o", "r", Target::Comment(55), "rocket")
+        .await
+        .expect("remove on comment");
+}
+
+#[tokio::test]
+async fn reaction_forbidden_surfaces_the_status() {
+    use crate::api::issue_reaction::{self, Target};
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/issues/3/reactions"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({ "message": "locked" })))
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let err = issue_reaction::add(&c, "o", "r", Target::Issue(3), "heart")
+        .await
+        .expect_err("forbidden");
+    assert_eq!(
+        crate::api::issue_tracker::status_of(&err),
+        Some(StatusCode::FORBIDDEN)
+    );
+}
+
+#[tokio::test]
+async fn dependencies_list_each_direction_from_its_own_endpoint() {
+    use crate::api::issue_dependency::{self, Direction};
+    let server = MockServer::start().await;
+    let mut cross = issue_json(8, "upstream fix", "closed");
+    cross["repository"] = json!({ "owner": "other", "name": "lib", "full_name": "other/lib" });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/issues/3/dependencies"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!([issue_json(1, "groundwork", "open"), cross])),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/issues/3/blocks"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!([issue_json(5, "release", "open")])),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let depends_on = issue_dependency::list(&c, "o", "r", 3, Direction::DependsOn, None)
+        .await
+        .expect("depends on");
+    assert_eq!(
+        depends_on.iter().map(|d| d.number).collect::<Vec<_>>(),
+        [1, 8]
+    );
+    let repo = depends_on[1].repository.as_ref().expect("repository");
+    assert_eq!((repo.owner.as_str(), repo.name.as_str()), ("other", "lib"));
+    let blocks = issue_dependency::list(&c, "o", "r", 3, Direction::Blocks, None)
+        .await
+        .expect("blocks");
+    assert_eq!(blocks.iter().map(|d| d.number).collect::<Vec<_>>(), [5]);
+}
+
+#[tokio::test]
+async fn dependency_add_and_remove_keep_the_direction_and_name_the_other_item() {
+    use crate::api::issue_dependency::{self, Direction, IssueMeta};
+    let server = MockServer::start().await;
+    let other = json!({ "owner": "o", "repo": "r", "index": 7 });
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/issues/3/dependencies"))
+        .and(body_json(other.clone()))
+        .respond_with(ResponseTemplate::new(201).set_body_json(issue_json(3, "a bug", "open")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/issues/3/blocks"))
+        .and(body_json(other.clone()))
+        .respond_with(ResponseTemplate::new(201).set_body_json(issue_json(3, "a bug", "open")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // The DELETE carries the same body; without it nothing names the link.
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/repos/o/r/issues/3/dependencies"))
+        .and(body_json(other.clone()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issue_json(3, "a bug", "open")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/repos/o/r/issues/3/blocks"))
+        .and(body_json(other))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issue_json(3, "a bug", "open")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let meta = IssueMeta {
+        owner: "o".into(),
+        repo: "r".into(),
+        index: 7,
+    };
+    for direction in [Direction::DependsOn, Direction::Blocks] {
+        issue_dependency::add(&c, "o", "r", 3, direction, &meta)
+            .await
+            .expect("add");
+        issue_dependency::remove(&c, "o", "r", 3, direction, &meta)
+            .await
+            .expect("remove");
+    }
+}
+
+#[tokio::test]
+async fn issue_tracker_reads_repo_switches_and_probes_a_work_item() {
+    use crate::api::issue_tracker;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 1, "name": "r", "archived": true,
+            "permissions": { "admin": false, "push": false, "pull": true },
+            "internal_tracker": {
+                "enable_time_tracker": true,
+                "allow_only_contributors_to_track_time": true,
+                "enable_issue_dependencies": false
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/issues/3"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issue_json(3, "a bug", "open")))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/issues/404"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({ "message": "not found" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/issues/403"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({ "message": "no" })))
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let tracker = issue_tracker::get(&c, "o", "r").await.expect("repo facts");
+    assert!(tracker.archived);
+    assert_eq!(tracker.dependencies_enabled(), Some(false));
+    assert_eq!(tracker.time_tracking_enabled(), Some(true));
+    assert!(tracker.time_limited_to_contributors());
+    assert!(issue_tracker::work_item_exists(&c, "o", "r", 3)
+        .await
+        .expect("exists"));
+    assert!(!issue_tracker::work_item_exists(&c, "o", "r", 404)
+        .await
+        .expect("missing"));
+    // Anything but a 404 is not an answer to "does it exist".
+    assert!(issue_tracker::work_item_exists(&c, "o", "r", 403)
+        .await
+        .is_err());
+}
+
+fn tracked_time_json(id: u64, user: &str, seconds: u64) -> serde_json::Value {
+    json!({
+        "id": id, "time": seconds, "user_name": user, "user_id": 1,
+        "created": "2026-01-01T00:00:00Z",
+        "issue": issue_json(3, "a bug", "open")
+    })
+}
+
+#[tokio::test]
+async fn tracked_time_list_add_and_delete() {
+    use crate::api::issue_time;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/issues/3/times"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            tracked_time_json(1, "alice", 3600),
+            tracked_time_json(2, "bob", 1800)
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/issues/3/times"))
+        .and(body_json(json!({ "time": 5400 })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(tracked_time_json(3, "alice", 5400)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/repos/o/r/issues/3/times/2"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let entries = issue_time::list(&c, "o", "r", 3).await.expect("list");
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[1].user_name, "bob");
+    assert_eq!(entries.iter().map(|e| e.time).sum::<u64>(), 5400);
+    let added = issue_time::add(&c, "o", "r", 3, 5400).await.expect("add");
+    assert_eq!((added.id, added.time), (3, 5400));
+    issue_time::delete(&c, "o", "r", 3, 2)
+        .await
+        .expect("delete");
+}
+
+#[tokio::test]
+async fn tracked_time_failures_keep_their_status() {
+    use crate::api::issue_time;
+    use crate::api::issue_tracker::status_of;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/issues/3/times"))
+        .respond_with(
+            ResponseTemplate::new(400)
+                .set_body_json(json!({ "message": "time tracking disabled" })),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/repos/o/r/issues/3/times/2"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({ "message": "forbidden" })))
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let err = issue_time::add(&c, "o", "r", 3, 60)
+        .await
+        .expect_err("disabled");
+    assert_eq!(status_of(&err), Some(StatusCode::BAD_REQUEST));
+    let err = issue_time::delete(&c, "o", "r", 3, 2)
+        .await
+        .expect_err("denied");
+    assert_eq!(status_of(&err), Some(StatusCode::FORBIDDEN));
+}
+
+// --- Organizations, teams, collaborators, transfers, single topics ---
+
+#[tokio::test]
+async fn org_create_posts_fields_and_decodes_the_org() {
+    use crate::api::org::CreateOrg;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/orgs"))
+        .and(body_json(json!({
+            "username": "acme",
+            "full_name": "Acme Inc",
+            "visibility": "private"
+        })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "id": 7, "username": "acme", "full_name": "Acme Inc",
+            "description": "", "visibility": "private", "avatar_url": ""
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let body = CreateOrg {
+        username: "acme",
+        full_name: Some("Acme Inc"),
+        visibility: Some("private"),
+        ..Default::default()
+    };
+    let org = crate::api::org::create(&c, &body).await.expect("create");
+    assert_eq!(org.username, "acme");
+    assert_eq!(org.visibility, "private");
+}
+
+#[tokio::test]
+async fn org_create_tells_permission_denial_from_name_conflict() {
+    use crate::api::org::CreateOrg;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/orgs"))
+        .and(body_json(json!({ "username": "denied" })))
+        .respond_with(
+            ResponseTemplate::new(403)
+                .set_body_json(json!({ "message": "organization creation is disabled" })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/orgs"))
+        .and(body_json(json!({ "username": "taken" })))
+        .respond_with(
+            ResponseTemplate::new(422)
+                .set_body_json(json!({ "message": "user already exists [name: taken]" })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+
+    let denied = CreateOrg {
+        username: "denied",
+        ..Default::default()
+    };
+    let err = crate::api::org::create(&c, &denied).await.expect_err("403");
+    let msg = format!("{err:#}");
+    assert!(msg.starts_with("permission denied"), "{msg}");
+    assert!(!msg.contains("name conflict"), "{msg}");
+
+    let taken = CreateOrg {
+        username: "taken",
+        ..Default::default()
+    };
+    let err = crate::api::org::create(&c, &taken).await.expect_err("422");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.starts_with("name conflict: 'taken' is already taken"),
+        "{msg}"
+    );
+    assert!(!msg.contains("permission denied"), "{msg}");
+}
+
+#[tokio::test]
+async fn org_team_create_posts_units_and_decodes_the_team() {
+    use crate::api::org::{resolve_team_units, CreateTeam, TeamPermission};
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/orgs/acme/teams"))
+        .and(body_json(json!({
+            "name": "docs",
+            "permission": "write",
+            "includes_all_repositories": false,
+            "can_create_org_repo": false,
+            "units": ["repo.code", "repo.wiki"]
+        })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "id": 12, "name": "docs", "description": "", "permission": "write",
+            "includes_all_repositories": false, "can_create_org_repo": false,
+            "units": ["repo.code", "repo.wiki"],
+            "units_map": { "repo.code": "write", "repo.wiki": "write" }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let (units, units_map) = resolve_team_units(
+        TeamPermission::Write,
+        &["repo.code".to_string(), "repo.wiki".to_string()],
+        &[],
+    )
+    .unwrap();
+    let body = CreateTeam {
+        name: "docs".into(),
+        description: None,
+        permission: TeamPermission::Write.as_api_value(),
+        includes_all_repositories: false,
+        can_create_org_repo: false,
+        units,
+        units_map,
+    };
+    let team = crate::api::org::create_team(&c, "acme", &body)
+        .await
+        .expect("create team");
+    assert_eq!(team.id, 12);
+    assert_eq!(team.permission, "write");
+    assert_eq!(
+        team.units_map.get("repo.wiki").map(String::as_str),
+        Some("write")
+    );
+}
+
+#[tokio::test]
+async fn org_find_team_matches_name_then_id() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/orgs/acme/teams"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "id": 1, "name": "Owners", "permission": "owner", "units": null, "units_map": null },
+            { "id": 12, "name": "docs", "permission": "write" }
+        ])))
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let by_name = crate::api::org::find_team(&c, "acme", "DOCS")
+        .await
+        .expect("by name");
+    assert_eq!(by_name.id, 12);
+    let by_id = crate::api::org::find_team(&c, "acme", "1")
+        .await
+        .expect("by id");
+    assert_eq!(by_id.name, "Owners");
+    let err = crate::api::org::find_team(&c, "acme", "ghosts")
+        .await
+        .expect_err("missing");
+    assert!(
+        err.to_string().contains("no team 'ghosts' in org acme"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn org_team_members_list_add_remove_and_membership() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/teams/12/members"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "id": 1, "login": "alice" },
+            { "id": 2, "login": "bob" }
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v1/teams/12/members/carol"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/teams/12/members/bob"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/teams/12/members/carol"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "id": 3, "login": "carol" })),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/teams/12/members/bob"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+
+    let members = crate::api::org::list_team_members(&c, 12, 30)
+        .await
+        .expect("members");
+    let logins: Vec<&str> = members.items.iter().map(|u| u.login.as_str()).collect();
+    assert_eq!(logins, vec!["alice", "bob"]);
+
+    crate::api::org::add_team_member(&c, 12, "carol")
+        .await
+        .expect("add");
+    crate::api::org::remove_team_member(&c, 12, "bob")
+        .await
+        .expect("remove");
+    assert!(crate::api::org::is_team_member(&c, 12, "carol")
+        .await
+        .expect("carol"));
+    assert!(!crate::api::org::is_team_member(&c, 12, "bob")
+        .await
+        .expect("bob"));
+}
+
+#[tokio::test]
+async fn org_team_member_change_surfaces_permission_denial() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v1/teams/12/members/carol"))
+        .respond_with(
+            ResponseTemplate::new(403)
+                .set_body_json(json!({ "message": "Must be an organization owner" })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let err = crate::api::org::add_team_member(&c, 12, "carol")
+        .await
+        .expect_err("403");
+    let err = crate::api::org::with_forbidden_context(err, "permission denied: test".into());
+    let msg = format!("{err:#}");
+    assert!(msg.starts_with("permission denied: test"), "{msg}");
+    assert!(msg.contains("Must be an organization owner"), "{msg}");
+}
+
+#[tokio::test]
+async fn org_team_repos_list_add_remove_and_assignment() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/teams/12/repos"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "id": 1, "full_name": "acme/web", "private": true }
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v1/teams/12/repos/acme/api"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/teams/12/repos/acme/web"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/teams/12/repos/acme/api"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "id": 2, "full_name": "acme/api" })),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/teams/12/repos/acme/web"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+
+    let repos = crate::api::org::list_team_repos(&c, 12, 30)
+        .await
+        .expect("repos");
+    assert_eq!(repos.items.len(), 1);
+    assert_eq!(repos.items[0].full_name, "acme/web");
+    assert!(repos.items[0].private);
+
+    crate::api::org::add_team_repo(&c, 12, "acme", "api")
+        .await
+        .expect("add");
+    crate::api::org::remove_team_repo(&c, 12, "acme", "web")
+        .await
+        .expect("remove");
+    assert!(crate::api::org::team_has_repo(&c, 12, "acme", "api")
+        .await
+        .expect("api"));
+    assert!(!crate::api::org::team_has_repo(&c, 12, "acme", "web")
+        .await
+        .expect("web"));
+}
+
+#[tokio::test]
+async fn org_user_permissions_decodes_flags() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/users/alice/orgs/acme/permissions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "is_owner": false, "is_admin": false, "can_write": true,
+            "can_read": true, "can_create_repository": true
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let p = crate::api::org::user_permissions(&c, "alice", "acme")
+        .await
+        .expect("permissions");
+    assert!(!p.is_owner);
+    assert!(p.can_create_repository);
+}
+
+#[tokio::test]
+async fn repo_collaborator_list_resolves_permission_per_row() {
+    // fj#276: the list sends `permissions: null`; the real level comes from
+    // one `.../permission` lookup per collaborator.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/collaborators"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "id": 1, "login": "alice", "permissions": null },
+            { "id": 2, "login": "bob", "permissions": null },
+            { "id": 3, "login": "carol", "permissions": null }
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/collaborators/alice/permission"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "permission": "admin", "role_name": "admin",
+            "user": { "id": 1, "login": "alice" }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/collaborators/bob/permission"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "permission": "read", "role_name": "read",
+            "user": { "id": 2, "login": "bob" }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/collaborators/carol/permission"))
+        .respond_with(
+            ResponseTemplate::new(403)
+                .set_body_json(json!({ "message": "Only admins can query all permissions" })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+
+    let mut rows = crate::api::repo::list_collaborators_page(&c, "o", "r", Some(30))
+        .await
+        .expect("list")
+        .items;
+    // Before the lookups nothing is known, and nothing claims "none".
+    assert!(rows.iter().all(|r| r.permission_level() == "unknown"));
+
+    let undisclosed = crate::api::repo::resolve_collaborator_permissions(&c, "o", "r", &mut rows)
+        .await
+        .expect("resolve");
+    assert_eq!(undisclosed, 1);
+    let levels: Vec<&str> = rows.iter().map(|r| r.permission_level()).collect();
+    assert_eq!(levels, vec!["admin", "read", "unknown"]);
+}
+
+#[tokio::test]
+async fn repo_collaborator_permission_lookup_failure_is_an_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/collaborators/alice/permission"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({ "message": "gone" })))
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let mut rows: Vec<crate::api::repo::Collaborator> =
+        serde_json::from_value(json!([{ "id": 1, "login": "alice" }])).unwrap();
+    assert!(
+        crate::api::repo::resolve_collaborator_permissions(&c, "o", "r", &mut rows)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn repo_collaborator_membership_and_confirmed_permission() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/collaborators/alice"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/collaborators/ghost"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/collaborators/alice/permission"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "permission": "write", "role_name": "write",
+            "user": { "id": 1, "login": "alice" }
+        })))
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    assert!(crate::api::repo::is_collaborator(&c, "o", "r", "alice")
+        .await
+        .expect("alice"));
+    assert!(!crate::api::repo::is_collaborator(&c, "o", "r", "ghost")
+        .await
+        .expect("ghost"));
+    let access = crate::api::repo::collaborator_permission(&c, "o", "r", "alice")
+        .await
+        .expect("permission");
+    assert_eq!(access.permission, "write");
+    assert_eq!(access.user.expect("user").login, "alice");
+}
+
+#[tokio::test]
+async fn repo_collaborator_remove_forbidden_names_the_access_needed() {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/repos/o/r/collaborators/alice"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({ "message": "nope" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let err = crate::api::repo::remove_collaborator(&c, "o", "r", "alice")
+        .await
+        .expect_err("403");
+    let msg = err.to_string();
+    assert!(msg.starts_with("permission denied"), "{msg}");
+    assert!(msg.contains("admin access"), "{msg}");
+}
+
+#[tokio::test]
+async fn repo_transfer_request_reports_pending_from_the_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/bob/web/transfer"))
+        .and(body_json(json!({ "new_owner": "acme", "team_ids": [3] })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "name": "web", "full_name": "bob/web",
+            "owner": { "id": 1, "login": "bob" },
+            "repo_transfer": {
+                "doer": { "id": 1, "login": "bob" },
+                "recipient": { "id": 9, "login": "acme" },
+                "teams": [{ "id": 3, "name": "docs" }]
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let after = crate::api::repo::request_transfer(&c, "bob", "web", "acme", &[3])
+        .await
+        .expect("transfer");
+    assert_eq!(after.owner.login, "bob");
+    let pending = after.repo_transfer.expect("pending");
+    assert_eq!(pending.recipient.expect("recipient").login, "acme");
+    assert_eq!(pending.teams[0].name, "docs");
+}
+
+#[tokio::test]
+async fn repo_transfer_request_reports_moved_from_the_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/bob/web/transfer"))
+        .and(body_json(json!({ "new_owner": "acme" })))
+        .respond_with(ResponseTemplate::new(202).set_body_json(json!({
+            "name": "web", "full_name": "acme/web",
+            "owner": { "id": 9, "login": "acme" },
+            "repo_transfer": null
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let after = crate::api::repo::request_transfer(&c, "bob", "web", "acme", &[])
+        .await
+        .expect("transfer");
+    assert_eq!(after.full_name, "acme/web");
+    assert!(after.repo_transfer.is_none());
+}
+
+#[tokio::test]
+async fn repo_transfer_request_forbidden_is_a_typed_denial() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/bob/web/transfer"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({ "message": "forbidden" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let err = crate::api::repo::request_transfer(&c, "bob", "web", "acme", &[])
+        .await
+        .expect_err("403");
+    let api = err
+        .downcast_ref::<crate::client::ApiError>()
+        .expect("typed error");
+    assert_eq!(api.status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn repo_transfer_accept_and_reject_decode_the_repository() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/bob/web/transfer/accept"))
+        .respond_with(ResponseTemplate::new(202).set_body_json(json!({
+            "name": "web", "full_name": "acme/web",
+            "owner": { "id": 9, "login": "acme" }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/bob/lib/transfer/reject"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "name": "lib", "full_name": "bob/lib",
+            "owner": { "id": 1, "login": "bob" },
+            "repo_transfer": null
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let accepted = crate::api::repo::accept_transfer(&c, "bob", "web")
+        .await
+        .expect("accept");
+    assert_eq!(accepted.owner.login, "acme");
+    let rejected = crate::api::repo::reject_transfer(&c, "bob", "lib")
+        .await
+        .expect("reject");
+    assert_eq!(rejected.owner.login, "bob");
+    assert!(rejected.repo_transfer.is_none());
+}
+
+#[tokio::test]
+async fn repo_transfer_state_reads_the_pending_transfer() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/bob/web"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "name": "web", "full_name": "bob/web",
+            "owner": { "id": 1, "login": "bob" },
+            "repo_transfer": {
+                "doer": { "id": 1, "login": "bob" },
+                "recipient": { "id": 2, "login": "carol" },
+                "teams": null
+            }
+        })))
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let repo = crate::api::repo::transfer_state(&c, "bob", "web")
+        .await
+        .expect("state");
+    let t = repo.repo_transfer.expect("pending");
+    assert_eq!(t.doer.expect("doer").login, "bob");
+    assert_eq!(t.recipient.expect("recipient").login, "carol");
+}
+
+#[tokio::test]
+async fn repo_pending_transfers_keeps_only_marked_repositories() {
+    let server = MockServer::start().await;
+    let listing = json!([
+        { "name": "web", "full_name": "bob/web", "owner": { "id": 1, "login": "bob" },
+          "repo_transfer": {
+              "doer": { "id": 1, "login": "bob" },
+              "recipient": { "id": 2, "login": "carol" },
+              "teams": []
+          } },
+        { "name": "lib", "full_name": "bob/lib", "owner": { "id": 1, "login": "bob" },
+          "repo_transfer": null },
+        { "name": "api", "full_name": "bob/api", "owner": { "id": 1, "login": "bob" } }
+    ]);
+    Mock::given(method("GET"))
+        .and(path("/api/v1/user/repos"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(listing.clone()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/users/bob/repos"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(listing))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let mine = crate::api::repo::list_pending_transfers(&c, None)
+        .await
+        .expect("mine");
+    assert_eq!(mine.len(), 1);
+    assert_eq!(mine[0].full_name, "bob/web");
+    let theirs = crate::api::repo::list_pending_transfers(&c, Some("bob"))
+        .await
+        .expect("theirs");
+    assert_eq!(theirs.len(), 1);
+}
+
+#[tokio::test]
+async fn repo_lookup_owner_tells_org_from_user_from_nobody() {
+    use crate::api::repo::OwnerKind;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/orgs/Acme"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 9, "name": "acme", "username": "acme", "full_name": "Acme Inc"
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/orgs/carol"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/users/carol"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 2, "login": "carol", "full_name": "Carol Example"
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/orgs/ghost"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/users/ghost"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+
+    let org = crate::api::repo::lookup_owner(&c, "Acme")
+        .await
+        .expect("org")
+        .expect("found");
+    assert_eq!(org.kind, OwnerKind::Organization);
+    // The forge's spelling wins over what was typed.
+    assert_eq!(org.login, "acme");
+    assert_eq!(org.full_name, "Acme Inc");
+
+    let user = crate::api::repo::lookup_owner(&c, "carol")
+        .await
+        .expect("user")
+        .expect("found");
+    assert_eq!(user.kind, OwnerKind::User);
+    assert_eq!(user.login, "carol");
+
+    assert!(crate::api::repo::lookup_owner(&c, "ghost")
+        .await
+        .expect("ghost")
+        .is_none());
+}
+
+#[tokio::test]
+async fn repo_topic_add_and_remove_hit_the_single_topic_route() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v1/repos/o/r/topics/rust"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/repos/o/r/topics/cli"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    crate::api::repo::add_topic(&c, "o", "r", "rust")
+        .await
+        .expect("add");
+    crate::api::repo::remove_topic(&c, "o", "r", "cli")
+        .await
+        .expect("remove");
+}
+
+#[tokio::test]
+async fn repo_topic_change_surfaces_the_forge_message() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v1/repos/o/r/topics/bad"))
+        .respond_with(ResponseTemplate::new(422).set_body_json(json!({
+            "message": "Topic name is invalid", "invalidTopics": ["bad"]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v1/repos/o/r/topics"))
+        .respond_with(
+            ResponseTemplate::new(403).set_body_json(json!({ "message": "write access needed" })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let err = crate::api::repo::add_topic(&c, "o", "r", "bad")
+        .await
+        .expect_err("422");
+    assert!(
+        format!("{err:#}").contains("Topic name is invalid"),
+        "{err:#}"
+    );
+    let err = crate::api::repo::set_topics(&c, "o", "r", &["x".into()])
+        .await
+        .expect_err("403");
+    assert!(
+        format!("{err:#}").contains("write access needed"),
+        "{err:#}"
+    );
+}
+
+// ---- pull request line comments and merge preflight reads ----
+
+fn review_json(id: u64, state: &str, comments_count: u64) -> serde_json::Value {
+    json!({
+        "id": id, "state": state, "body": "",
+        "user": { "id": id, "login": format!("u{id}") },
+        "submitted_at": "2026-05-30T00:00:00Z",
+        "html_url": format!("https://x/o/r/pulls/12#review-{id}"),
+        "official": true, "dismissed": false, "stale": false,
+        "comments_count": comments_count
+    })
+}
+
+#[tokio::test]
+async fn pull_review_batches_line_comments_with_the_verdict_in_one_request() {
+    use crate::api::pull::{DiffSide, LineComment, ReviewEvent};
+    let server = MockServer::start().await;
+    // One POST carries the verdict, the body and both comments. An old-side
+    // anchor sets only `old_position`, a new-side one only `new_position`,
+    // both as file line numbers; no range field is sent.
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/pulls/12/reviews"))
+        .and(body_json(json!({
+            "event": "REQUEST_CHANGES",
+            "body": "see inline",
+            "comments": [
+                { "path": "src/a:b.rs", "body": "why removed?", "old_position": 11, "new_position": 0 },
+                { "path": "src/c.rs", "body": "rename this", "old_position": 0, "new_position": 42 }
+            ]
+        })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(review_json(9, "REQUEST_CHANGES", 2)),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let comments = [
+        LineComment {
+            path: "src/a:b.rs".into(),
+            side: DiffSide::Old,
+            line: 11,
+            body: "why removed?".into(),
+        },
+        LineComment {
+            path: "src/c.rs".into(),
+            side: DiffSide::New,
+            line: 42,
+            body: "rename this".into(),
+        },
+    ];
+    let review = crate::api::pull::submit_review_with_comments(
+        &c,
+        "o",
+        "r",
+        12,
+        ReviewEvent::RequestChanges,
+        Some("see inline"),
+        &comments,
+    )
+    .await
+    .expect("review");
+    assert_eq!(review.state, "REQUEST_CHANGES");
+    assert_eq!(review.comments_count, 2);
+}
+
+#[tokio::test]
+async fn pull_review_posts_a_single_line_comment_without_a_verdict() {
+    use crate::api::pull::{DiffSide, LineComment, ReviewEvent};
+    let server = MockServer::start().await;
+    // A lone comment is a COMMENT review with no body: no verdict travels.
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/pulls/12/reviews"))
+        .and(body_json(json!({
+            "event": "COMMENT",
+            "comments": [
+                { "path": "README.md", "body": "typo", "old_position": 0, "new_position": 3 }
+            ]
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(review_json(10, "COMMENT", 1)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let review = crate::api::pull::submit_review_with_comments(
+        &c,
+        "o",
+        "r",
+        12,
+        ReviewEvent::Comment,
+        None,
+        &[LineComment {
+            path: "README.md".into(),
+            side: DiffSide::New,
+            line: 3,
+            body: "typo".into(),
+        }],
+    )
+    .await
+    .expect("review");
+    assert_eq!(review.state, "COMMENT");
+    assert_eq!(review.comments_count, 1);
+}
+
+#[tokio::test]
+async fn pull_review_with_line_comments_is_not_retried_and_surfaces_422() {
+    use crate::api::pull::{DiffSide, LineComment, ReviewEvent};
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/pulls/12/reviews"))
+        .respond_with(
+            ResponseTemplate::new(422).set_body_json(json!({ "message": "invalid position" })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let err = crate::api::pull::submit_review_with_comments(
+        &c,
+        "o",
+        "r",
+        12,
+        ReviewEvent::Comment,
+        None,
+        &[LineComment {
+            path: "a".into(),
+            side: DiffSide::New,
+            line: 1,
+            body: "x".into(),
+        }],
+    )
+    .await
+    .expect_err("422");
+    let api = err.downcast_ref::<super::ApiError>().expect("api error");
+    assert_eq!(api.status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn pull_list_reviews_all_walks_pages_until_an_empty_one() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/pulls/12/reviews"))
+        .and(query_param("page", "1"))
+        .and(query_param("limit", "50"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            review_json(1, "APPROVED", 0),
+            review_json(2, "COMMENT", 0)
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // A short first page is not trusted as the end: page 2 is still read.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/pulls/12/reviews"))
+        .and(query_param("page", "2"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!([review_json(3, "APPROVED", 0)])),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/pulls/12/reviews"))
+        .and(query_param("page", "3"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let scan = crate::api::pull::list_reviews_all(&c, "o", "r", 12)
+        .await
+        .expect("scan");
+    assert!(scan.complete);
+    assert_eq!(scan.reviews.len(), 3);
+    assert!(scan.reviews[0].official);
+}
+
+#[tokio::test]
+async fn pull_list_reviews_all_is_incomplete_when_the_server_ignores_paging() {
+    let server = MockServer::start().await;
+    // Every page answers with the same review: the walk must stop and must
+    // not claim it saw everything.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/pulls/12/reviews"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!([review_json(1, "APPROVED", 0)])),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let scan = crate::api::pull::list_reviews_all(&c, "o", "r", 12)
+        .await
+        .expect("scan");
+    assert!(!scan.complete);
+    assert_eq!(scan.reviews.len(), 1);
+}
+
+#[tokio::test]
+async fn pull_list_reviews_all_propagates_a_permission_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/pulls/12/reviews"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({ "message": "no" })))
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let err = crate::api::pull::list_reviews_all(&c, "o", "r", 12)
+        .await
+        .expect_err("403");
+    let api = err.downcast_ref::<super::ApiError>().expect("api error");
+    assert_eq!(api.status, StatusCode::FORBIDDEN);
+}
+
+fn status_page(contexts: &[(&str, &str)]) -> serde_json::Value {
+    json!({
+        "state": "pending",
+        "sha": "abc",
+        "total_count": contexts.len(),
+        "statuses": contexts.iter().map(|(c, s)| json!({
+            "status": s, "context": c, "description": "", "target_url": ""
+        })).collect::<Vec<_>>()
+    })
+}
+
+#[tokio::test]
+async fn pull_combined_status_all_folds_every_page_of_statuses() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/commits/abc/status"))
+        .and(query_param("page", "1"))
+        .and(query_param("limit", "50"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(status_page(&[("a", "success"), ("b", "pending")])),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/commits/abc/status"))
+        .and(query_param("page", "2"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(status_page(&[("required-ci", "success")])),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    // Forgejo answers a page past the end with an empty object.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/commits/abc/status"))
+        .and(query_param("page", "3"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let scan = crate::api::pull::combined_status_all(&c, "o", "r", "abc")
+        .await
+        .expect("scan");
+    assert!(scan.complete);
+    assert_eq!(scan.combined.state, "pending");
+    assert_eq!(scan.combined.total_count, 3);
+    let contexts: Vec<&str> = scan
+        .combined
+        .statuses
+        .iter()
+        .map(|s| s.context.as_str())
+        .collect();
+    assert_eq!(contexts, ["a", "b", "required-ci"]);
+}
+
+#[tokio::test]
+async fn pull_combined_status_all_with_no_ci_is_a_complete_empty_scan() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/commits/abc/status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let scan = crate::api::pull::combined_status_all(&c, "o", "r", "abc")
+        .await
+        .expect("scan");
+    assert!(scan.complete);
+    assert!(scan.combined.statuses.is_empty());
+}
+
+#[tokio::test]
+async fn pull_combined_status_all_is_incomplete_when_paging_is_ignored() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/commits/abc/status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(status_page(&[("a", "success")])))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let scan = crate::api::pull::combined_status_all(&c, "o", "r", "abc")
+        .await
+        .expect("scan");
+    assert!(!scan.complete);
+    assert_eq!(scan.combined.statuses.len(), 1);
+}
+
+#[tokio::test]
+async fn protect_effective_reads_the_rule_a_non_admin_can_see() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/branches/release%2F1.0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "name": "release/1.0",
+            "protected": true,
+            "effective_branch_protection_name": "release/*",
+            "required_approvals": 2,
+            "enable_status_check": true,
+            "status_check_contexts": ["CI / *"],
+            "user_can_merge": false,
+            "user_can_push": false
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let p = crate::api::protect::effective(&c, "o", "r", "release/1.0")
+        .await
+        .expect("effective");
+    assert_eq!(p.protected, Some(true));
+    assert_eq!(
+        p.effective_branch_protection_name.as_deref(),
+        Some("release/*")
+    );
+    assert_eq!(p.required_approvals, Some(2));
+    assert_eq!(p.enable_status_check, Some(true));
+    assert_eq!(p.status_check_contexts, Some(vec!["CI / *".to_string()]));
+    assert_eq!(p.user_can_merge, Some(false));
+}
+
+#[tokio::test]
+async fn protect_effective_keeps_omitted_and_null_fields_unknown() {
+    let server = MockServer::start().await;
+    // A server that reports the branch but none of the rule, and a null list.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/branches/main"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "name": "main",
+            "status_check_contexts": null
+        })))
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let p = crate::api::protect::effective(&c, "o", "r", "main")
+        .await
+        .expect("effective");
+    assert_eq!(p.protected, None);
+    assert_eq!(p.required_approvals, None);
+    assert_eq!(p.status_check_contexts, None);
+    assert_eq!(p.user_can_merge, None);
+}
+
+#[tokio::test]
+async fn protect_effective_tells_missing_from_forbidden() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/branches/gone"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({ "message": "nf" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/branches/secret"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({ "message": "no" })))
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let err = crate::api::protect::effective(&c, "o", "r", "gone")
+        .await
+        .expect_err("404");
+    assert!(
+        format!("{err:#}").contains("branch 'gone' not found"),
+        "{err:#}"
+    );
+    let err = crate::api::protect::effective(&c, "o", "r", "secret")
+        .await
+        .expect_err("403");
+    let api = err
+        .chain()
+        .find_map(|c| c.downcast_ref::<super::ApiError>())
+        .expect("api error");
+    assert_eq!(api.status, StatusCode::FORBIDDEN);
+}
+
+/// A non-admin's view: the branch endpoint answers, the admin-only rule
+/// endpoint does not. Returns the preflight and the post-refusal diagnosis.
+async fn run_preflight(
+    server: &MockServer,
+    number: u64,
+) -> (crate::cli::pr_preflight::Preflight, Option<String>) {
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/branch_protections/main"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({ "message": "no" })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(server)
+        .await;
+    let c = client_for(server).await;
+    let pr = crate::api::pull::get(&c, "o", "r", number)
+        .await
+        .expect("get pull");
+    let preflight = crate::cli::pr_preflight::gather(&c, "o", "r", &pr, None).await;
+    let reason = crate::cli::pr_merge_check::diagnose_merge_failure(
+        &c,
+        "o",
+        "r",
+        &pr,
+        "merge",
+        None,
+        Some(&preflight),
+    )
+    .await;
+    (preflight, reason)
+}
+
+async fn mount_pull_and_rule(server: &MockServer, rule: serde_json::Value) {
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/pulls/7"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(merge_diag_pull_json(7, true, false, "open")),
+        )
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/branches/main"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(rule))
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn merge_preflight_blocks_on_a_required_check_found_on_a_later_page() {
+    use crate::cli::pr_preflight::{CheckOutcome, Gate};
+    let server = MockServer::start().await;
+    mount_pull_and_rule(
+        &server,
+        json!({
+            "name": "main", "protected": true,
+            "effective_branch_protection_name": "main",
+            "required_approvals": 0, "enable_status_check": true,
+            "status_check_contexts": ["ci", "never-reports"],
+            "user_can_merge": true, "user_can_push": true
+        }),
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/commits/abc1234/status"))
+        .and(query_param("page", "1"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(status_page(&[("optional", "failure")])),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/commits/abc1234/status"))
+        .and(query_param("page", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(status_page(&[("ci", "success")])))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/commits/abc1234/status"))
+        .and(query_param("page", "3"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+    let (p, reason) = run_preflight(&server, 7).await;
+    // `ci` was on page 2 and is green; the optional failure does not block;
+    // the required check that never reported does.
+    assert_eq!(p.is_required("optional"), Some(false));
+    assert_eq!(p.required_checks[0].outcome, CheckOutcome::Success);
+    assert_eq!(p.required_checks[1].outcome, CheckOutcome::Missing);
+    assert!(matches!(p.checks, Gate::Blocked(_)));
+    assert_eq!(p.approvals, Gate::NotRequired);
+    let pre = p.pre_merge_blocker(false).expect("blocked before merging");
+    assert!(pre.contains("\"never-reports\" has not reported"), "{pre}");
+    // The same explanation is available after a refusal, without admin rights.
+    assert!(reason.expect("diagnosed").contains("never-reports"));
+}
+
+#[tokio::test]
+async fn merge_preflight_leaves_unreadable_evidence_unknown() {
+    use crate::cli::pr_preflight::Gate;
+    let server = MockServer::start().await;
+    mount_pull_and_rule(
+        &server,
+        json!({
+            "name": "main", "protected": true,
+            "effective_branch_protection_name": "main",
+            "required_approvals": 1, "enable_status_check": true,
+            "status_check_contexts": ["ci"],
+            "user_can_merge": true, "user_can_push": true
+        }),
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/commits/abc1234/status"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({ "message": "no" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/pulls/7/reviews"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({ "message": "no" })))
+        .mount(&server)
+        .await;
+    let (p, reason) = run_preflight(&server, 7).await;
+    assert!(matches!(&p.checks, Gate::Unknown(w) if w.contains("permission denied")));
+    assert!(matches!(&p.approvals, Gate::Unknown(w) if w.contains("permission denied")));
+    // Unknown is neither a pass nor a block: the server gets to decide.
+    assert!(p.pre_merge_blocker(false).is_none());
+    assert_eq!(p.to_json()["verdict"], "unknown");
+    assert!(reason.is_none());
+    assert!(p.refusal_note().expect("note").contains("could not check"));
+}
+
+#[tokio::test]
+async fn merge_preflight_with_an_unreadable_rule_is_unknown_and_reads_nothing_else() {
+    use crate::cli::pr_preflight::Protection;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/pulls/7"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(merge_diag_pull_json(7, true, false, "open")),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/branches/main"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({ "message": "no" })))
+        .mount(&server)
+        .await;
+    // No status or review mocks: reading them would 404 and is not attempted.
+    let (p, reason) = run_preflight(&server, 7).await;
+    assert!(matches!(&p.protection, Protection::Unknown(w) if w.contains("permission denied")));
+    assert_eq!(p.is_required("ci"), None);
+    assert!(p.pre_merge_blocker(false).is_none());
+    assert!(reason.is_none());
+}
+
+#[tokio::test]
+async fn merge_preflight_counts_only_official_approvals() {
+    use crate::cli::pr_preflight::Gate;
+    let server = MockServer::start().await;
+    mount_pull_and_rule(
+        &server,
+        json!({
+            "name": "main", "protected": true,
+            "effective_branch_protection_name": "main",
+            "required_approvals": 2, "enable_status_check": false,
+            "status_check_contexts": [],
+            "user_can_merge": true, "user_can_push": true
+        }),
+    )
+    .await;
+    let mut unofficial = review_json(2, "APPROVED", 0);
+    unofficial["official"] = json!(false);
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/pulls/7/reviews"))
+        .and(query_param("page", "1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!([review_json(1, "APPROVED", 0), unofficial])),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/pulls/7/reviews"))
+        .and(query_param("page", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&server)
+        .await;
+    let (p, reason) = run_preflight(&server, 7).await;
+    assert_eq!(p.checks, Gate::NotRequired);
+    assert_eq!(
+        p.approvals,
+        Gate::Blocked("PR #7 needs 2 approving review(s) but has 1.".into())
+    );
+    assert_eq!(
+        reason.as_deref(),
+        Some("PR #7 needs 2 approving review(s) but has 1.")
+    );
+}
+
+// ---- repo commits: signature verification, refs ----
+
+#[tokio::test]
+async fn commit_list_starts_at_ref_and_keeps_verification_on() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/commits"))
+        .and(query_param("sha", "abc123"))
+        .and(query_param("stat", "false"))
+        .and(query_param("files", "false"))
+        .and(query_param("limit", "3"))
+        // Never opt out: the server default (true) is what carries the verdict.
+        .and(query_param_is_missing("verification"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {
+                "sha": "1111111111111111111111111111111111111111",
+                "commit": {
+                    "message": "signed work",
+                    "author": { "name": "Ada", "email": "ada@example.com", "date": "2026-01-01T00:00:00Z" },
+                    "verification": {
+                        "verified": true,
+                        "reason": "ada / ABCDEF",
+                        "signature": "-----BEGIN PGP SIGNATURE-----",
+                        "signer": { "name": "Ada", "email": "ada@example.com", "username": "ada" }
+                    }
+                }
+            },
+            {
+                "sha": "2222222222222222222222222222222222222222",
+                "commit": {
+                    "message": "plain work",
+                    "verification": { "verified": false, "reason": "gpg.error.not_signed_commit", "signature": "", "signer": null }
+                }
+            },
+            {
+                "sha": "3333333333333333333333333333333333333333",
+                "commit": { "message": "old forge" }
+            }
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let commits = crate::api::commit::list(
+        &c,
+        "o",
+        "r",
+        &crate::api::commit::ListOptions {
+            start: Some("abc123"),
+            path: None,
+            limit: 3,
+        },
+    )
+    .await
+    .expect("commit list");
+    assert_eq!(commits.len(), 3);
+    let v = commits[0].commit.verification.as_ref().expect("reported");
+    assert!(v.verified);
+    assert_eq!(v.signer.as_ref().unwrap().username, "ada");
+    assert!(!commits[1].commit.verification.as_ref().unwrap().verified);
+    // No `verification` object decodes to None, not to "unsigned".
+    assert!(commits[2].commit.verification.is_none());
+}
+
+#[tokio::test]
+async fn commit_get_reads_one_commit_and_names_a_missing_one() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/git/commits/v1.0.0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "sha": "1111111111111111111111111111111111111111",
+            "html_url": "https://forge.example/o/r/commit/1111111",
+            "commit": { "message": "release", "verification": { "verified": false, "reason": "gpg.error.no_gpg_keys_found", "signature": "sig" } },
+            "parents": [{ "sha": "0000000000000000000000000000000000000000" }],
+            "stats": { "total": 3, "additions": 2, "deletions": 1 },
+            "files": [{ "filename": "a.txt", "status": "modified" }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/git/commits/nope"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let commit = crate::api::commit::get(&c, "o", "r", "v1.0.0")
+        .await
+        .expect("commit");
+    assert_eq!(commit.stats.as_ref().unwrap().additions, 2);
+    assert_eq!(commit.files.as_ref().unwrap()[0].filename, "a.txt");
+    let v = commit.commit.verification.unwrap();
+    assert!(!v.verified);
+    assert_eq!(v.signature.as_deref(), Some("sig"));
+
+    let err = crate::api::commit::get(&c, "o", "r", "nope")
+        .await
+        .expect_err("404");
+    assert!(
+        format!("{err:#}").contains("commit 'nope' not found"),
+        "{err:#}"
+    );
+}
+
+// ---- contents at a ref (tag browsing) ----
+
+#[tokio::test]
+async fn contents_reads_file_and_directory_at_a_tag_ref() {
+    use crate::api::contents::Contents;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/contents/docs/a%20b.md"))
+        .and(query_param("ref", "v1.0.0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "name": "a b.md", "path": "docs/a b.md", "type": "file", "size": 5,
+            "sha": "abc", "encoding": "base64", "content": "aGVs\nbG8=",
+            "last_commit_sha": "1111111"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/contents"))
+        .and(query_param("ref", "v1.0.0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "name": "docs", "path": "docs", "type": "dir", "size": 0, "sha": "d1" },
+            { "name": "README.md", "path": "README.md", "type": "file", "size": 12, "sha": "f1" }
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/contents/gone.txt"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+
+    let file = crate::api::contents::get(&c, "o", "r", "docs/a b.md", Some("v1.0.0"))
+        .await
+        .expect("file");
+    let Contents::Entry(entry) = file else {
+        panic!("expected a single entry");
+    };
+    assert_eq!(
+        crate::api::contents::file_bytes(&entry).unwrap().as_deref(),
+        Some(b"hello".as_slice())
+    );
+
+    let dir = crate::api::contents::get(&c, "o", "r", "", Some("v1.0.0"))
+        .await
+        .expect("dir");
+    let Contents::Dir(entries) = dir else {
+        panic!("expected a directory listing");
+    };
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].kind, "dir");
+
+    let err = crate::api::contents::get(&c, "o", "r", "gone.txt", Some("v1.0.0"))
+        .await
+        .expect_err("404");
+    assert!(
+        format!("{err:#}").contains("path 'gone.txt' not found at 'v1.0.0'"),
+        "{err:#}"
+    );
+}
+
+// ---- organization labels and exclusive groups ----
+
+#[tokio::test]
+async fn org_label_crud_uses_org_label_endpoints() {
+    use crate::api::label::{CreateLabel, EditLabel};
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/orgs/team/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "id": 7, "name": "priority/high", "color": "ee0000", "exclusive": true, "is_archived": false }
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/orgs/team/labels"))
+        .and(body_json(
+            json!({ "name": "priority/low", "color": "00ee00", "exclusive": true }),
+        ))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "id": 8, "name": "priority/low", "color": "00ee00", "exclusive": true
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/orgs/team/labels/8"))
+        .and(body_json(json!({ "exclusive": false })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 8, "name": "priority/low", "color": "00ee00", "exclusive": false
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/orgs/team/labels/8"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // The repo label collection is never consulted for an org operation.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/team/r/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+
+    let labels = crate::api::label::list_org(&c, "team").await.expect("list");
+    assert_eq!(labels[0].exclusive_scope(), Some("priority"));
+    let created = crate::api::label::create_org(
+        &c,
+        "team",
+        &CreateLabel {
+            name: "priority/low",
+            color: "00ee00",
+            description: None,
+            exclusive: Some(true),
+        },
+    )
+    .await
+    .expect("create");
+    assert!(created.exclusive);
+    let edited = crate::api::label::edit_org(
+        &c,
+        "team",
+        created.id,
+        &EditLabel {
+            exclusive: Some(false),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("edit");
+    assert!(!edited.exclusive);
+    crate::api::label::delete_org(&c, "team", created.id)
+        .await
+        .expect("delete");
+}
+
+#[tokio::test]
+async fn org_label_calls_name_a_missing_org_and_keep_403_distinct() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/orgs/ghost/labels"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/orgs/team/labels/8"))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let missing = crate::api::label::list_org(&c, "ghost")
+        .await
+        .expect_err("404");
+    assert!(
+        format!("{missing:#}").contains("organization 'ghost' or its label was not found"),
+        "{missing:#}"
+    );
+    let denied = crate::api::label::delete_org(&c, "team", 8)
+        .await
+        .expect_err("403");
+    let denied = format!("{denied:#}");
+    assert!(denied.contains("forbidden"), "{denied}");
+    assert!(!denied.contains("was not found"), "{denied}");
+}
+
+#[tokio::test]
+async fn label_names_resolve_to_org_labels_only_when_the_repo_has_none() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/team/r/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "id": 1, "name": "bug", "color": "ee0000" },
+            { "id": 2, "name": "shared", "color": "ee0000" }
+        ])))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/orgs/team/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "id": 50, "name": "priority/high", "color": "ee0000", "exclusive": true },
+            { "id": 51, "name": "shared", "color": "00ee00" }
+        ])))
+        // One fetch covers every unmatched name; none when all are repo labels.
+        .expect(1)
+        .mount(&server)
+        .await;
+    // A user-owned repo: the org endpoint 404s, which means "no org labels".
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/alice/r/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/orgs/alice/labels"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+
+    let repo_only = vec!["bug".to_string()];
+    let ids = crate::api::label::resolve_names_to_ids(&c, "team", "r", &repo_only)
+        .await
+        .expect("repo label");
+    assert_eq!(ids, vec![1]);
+
+    let mixed = vec![
+        "priority/high".to_string(),
+        "shared".to_string(),
+        "bug".to_string(),
+    ];
+    let labels = crate::api::label::resolve_names(&c, "team", "r", &mixed)
+        .await
+        .expect("mixed");
+    // The repo's own `shared` shadows the org's.
+    assert_eq!(
+        labels.iter().map(|l| l.id).collect::<Vec<_>>(),
+        vec![50, 2, 1]
+    );
+    assert_eq!(labels[0].exclusive_scope(), Some("priority"));
+
+    let err = crate::api::label::resolve_names(&c, "alice", "r", &repo_only)
+        .await
+        .expect_err("unknown on a user repo");
+    assert!(err.to_string().contains("no label named 'bug'"));
+}
+
+#[tokio::test]
+async fn assigning_an_exclusive_label_reports_the_forge_confirmed_replacement() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/issues/3/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "id": 1, "name": "bug", "color": "ee0000" },
+            { "id": 10, "name": "priority/low", "color": "00ee00", "exclusive": true }
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // Only the requested id is sent: fj does not remove the sibling itself.
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/issues/3/labels"))
+        .and(body_json(json!({ "labels": [11] })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "id": 1, "name": "bug", "color": "ee0000" },
+            { "id": 11, "name": "priority/high", "color": "ee0000", "exclusive": true }
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/repos/o/r/issues/3/labels/10"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let requested: Vec<crate::api::label::Label> = serde_json::from_value(json!([
+        { "id": 11, "name": "priority/high", "color": "ee0000", "exclusive": true }
+    ]))
+    .unwrap();
+    let assignment = crate::api::label::assign(&c, "o", "r", 3, requested)
+        .await
+        .expect("assign");
+    assert_eq!(assignment.before.as_ref().map(Vec::len), Some(2));
+    assert_eq!(
+        assignment
+            .after
+            .iter()
+            .map(|l| l.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["bug", "priority/high"]
+    );
+}
+
+#[tokio::test]
+async fn assigning_ordinary_labels_skips_the_before_read() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/issues/3/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/issues/3/labels"))
+        .and(body_json(json!({ "labels": [1] })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "id": 1, "name": "bug", "color": "ee0000" }
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let requested: Vec<crate::api::label::Label> =
+        serde_json::from_value(json!([{ "id": 1, "name": "bug", "color": "ee0000" }])).unwrap();
+    let assignment = crate::api::label::assign(&c, "o", "r", 3, requested)
+        .await
+        .expect("assign");
+    assert!(assignment.before.is_none());
+    assert_eq!(assignment.after.len(), 1);
+}
+
+// ── Forge flavor from route evidence ─────────────────────────────────────────
+
+#[tokio::test]
+async fn server_info_identifies_forgejo_from_its_own_route_once() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/forgejo/v1/version"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "version": "16.0.4+gitea-1.22.0" })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/version"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "version": "x" })))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let info = c.server_info().await;
+    assert_eq!(info.flavor, Flavor::Forgejo);
+    assert_eq!(info.raw, "16.0.4+gitea-1.22.0");
+    assert_eq!(info.supports(Capability::JobLogs), Support::Supported);
+    // Cached for the process: the second ask makes no request.
+    assert_eq!(c.server_info().await.flavor, Flavor::Forgejo);
+}
+
+#[tokio::test]
+async fn server_info_identifies_gitea_and_never_applies_the_forgejo_floor() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/forgejo/v1/version"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/version"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "version": "1.27.3" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let info = c.server_info().await;
+    assert_eq!(info.flavor, Flavor::Gitea);
+    assert_eq!(info.raw, "1.27.3");
+    assert!(crate::client::capability::floor_warning(&info).is_none());
+    assert_eq!(info.supports(Capability::RunRerun), Support::Supported);
+    assert_eq!(info.supports(Capability::RunCancel), Support::Unsupported);
+}
+
+#[tokio::test]
+async fn server_info_keeps_an_unidentifiable_host_distinct() {
+    // Neither version route answers.
+    let silent = MockServer::start().await;
+    let info = client_for(&silent).await.server_info().await;
+    assert_eq!(info.flavor, Flavor::Unidentified);
+    assert_eq!(info.supports(Capability::RunJobs), Support::Unknown);
+    assert!(crate::client::capability::floor_warning(&info).is_none());
+
+    // The Forgejo route is blocked rather than absent: a 403 is not evidence
+    // of Gitea, even though the shared route answers with a 1.x version.
+    let blocked = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/forgejo/v1/version"))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&blocked)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/version"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "version": "1.20.0" })))
+        .mount(&blocked)
+        .await;
+    let info = client_for(&blocked).await.server_info().await;
+    assert_eq!(info.flavor, Flavor::Unidentified);
+    assert_eq!(info.raw, "1.20.0");
+    assert!(crate::client::capability::floor_warning(&info).is_none());
+}
+
+// ── Token-authenticated job logs: bounded byte ranges ────────────────────────
+
+async fn mount_log_range(server: &MockServer, range: &str, content_range: &str, body: &str) {
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/jobs/7/logs"))
+        .and(header("range", range))
+        .and(header("authorization", "token test-token"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("Content-Range", content_range)
+                .set_body_string(body),
+        )
+        .expect(1)
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn job_log_follows_byte_range_continuations_to_the_end() {
+    let server = MockServer::start().await;
+    mount_log_range(&server, "bytes=0-9", "bytes 0-9/25", "0123456789").await;
+    mount_log_range(&server, "bytes=10-19", "bytes 10-19/25", "abcdefghij").await;
+    mount_log_range(&server, "bytes=20-29", "bytes 20-24/25", "KLMNO").await;
+    let c = client_for(&server).await;
+    let log = crate::api::workflow::read_job_log(&c, "o", "r", 7, None, 0, 10, 1000)
+        .await
+        .expect("read")
+        .expect("the route exists");
+    assert_eq!(log.bytes, b"0123456789abcdefghijKLMNO");
+    assert!(!log.truncated);
+}
+
+#[tokio::test]
+async fn job_log_read_is_bounded_and_resumable() {
+    let server = MockServer::start().await;
+    mount_log_range(&server, "bytes=0-9", "bytes 0-9/*", "0123456789").await;
+    mount_log_range(&server, "bytes=10-19", "bytes 10-19/*", "abcdefghij").await;
+    let c = client_for(&server).await;
+    // A 15-byte ceiling stops after the second chunk and says so.
+    let log = crate::api::workflow::read_job_log(&c, "o", "r", 7, None, 0, 10, 15)
+        .await
+        .expect("read")
+        .expect("the route exists");
+    assert_eq!(log.bytes.len(), 20);
+    assert!(log.truncated);
+
+    // A later read picks up at an offset, with the attempt in the query.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/jobs/7/logs"))
+        .and(header("range", "bytes=20-29"))
+        .and(query_param("attempt", "2"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("Content-Range", "bytes 20-22/23")
+                .set_body_string("xyz"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let log = crate::api::workflow::read_job_log(&c, "o", "r", 7, Some(2), 20, 10, 1000)
+        .await
+        .expect("read")
+        .expect("the route exists");
+    assert_eq!(log.bytes, b"xyz");
+    assert!(!log.truncated);
+}
+
+#[tokio::test]
+async fn job_log_handles_ignored_range_past_the_end_and_missing_route() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/jobs/1/logs"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("whole log\n"))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/jobs/2/logs"))
+        .respond_with(ResponseTemplate::new(416))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/jobs/3/logs"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    // A server that ignores Range answers 200 with everything; a resumed read
+    // keeps only what it has not seen.
+    let log = crate::api::workflow::read_job_log(&c, "o", "r", 1, None, 6, 10, 1000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(log.bytes, b"log\n");
+    // Nothing new yet.
+    let log = crate::api::workflow::read_job_log(&c, "o", "r", 2, None, 40, 10, 1000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(log.bytes.is_empty());
+    // No such route, or no log recorded.
+    assert!(
+        crate::api::workflow::read_job_log(&c, "o", "r", 3, None, 0, 10, 1000)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn run_logs_on_forgejo_16_read_a_bounded_range_with_the_token() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/runs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "workflow_runs": [{ "id": 1200, "run_number": 12, "status": "success" }]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/runs/1200/jobs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "id": 7, "name": "build", "status": "success", "attempt": 1 }
+        ])))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/jobs/7/logs"))
+        .and(header("range", "bytes=0-1048575"))
+        .and(header("authorization", "token test-token"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("Content-Range", "bytes 0-7/8")
+                .set_body_string("one\ntwo\n"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = pinned_client(&server, Flavor::Forgejo, "16.0.4").await;
+    let logs = crate::api::workflow::fetch_run_logs_without_loki(&c, "o", "r", 12)
+        .await
+        .expect("logs");
+    assert_eq!(logs.source, "forgejo-api");
+    let lines: Vec<&str> = logs.jobs[0]
+        .lines
+        .iter()
+        .map(|l| l.message.as_str())
+        .collect();
+    assert_eq!(lines, vec!["one", "two"]);
+}
+
+#[tokio::test]
+async fn run_logs_on_an_older_server_report_the_limitation_without_a_request() {
+    let server = MockServer::start().await;
+    refuse_everything(&server).await;
+    let c = pinned_client(&server, Flavor::Forgejo, "15.0.2").await;
+    let err = crate::api::workflow::fetch_run_logs_without_loki(&c, "o", "r", 12)
+        .await
+        .expect_err("15.x has no token log route");
+    assert!(crate::api::workflow::is_actions_unavailable(&err));
+    let msg = err.to_string();
+    assert!(msg.contains("Forgejo 15.0.2"), "got: {msg}");
+    assert!(
+        msg.contains(&format!("{}/o/r/actions/runs/12", server.uri())),
+        "got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn run_logs_on_an_older_server_use_a_configured_loki() {
+    let server = MockServer::start().await;
+    let loki = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/tasks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"tasks": [
+            {
+                "id": 123,
+                "name": "build",
+                "status": "failure",
+                "started_at": "2026-07-03T00:00:00Z",
+                "stopped_at": "2026-07-03T00:05:00Z"
+            }
+        ]})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // The job and log routes are known absent, so they are never asked.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/runs"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/loki/api/v1/query_range"))
+        .and(no_authorization)
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "status": "success",
+            "data": {
+                "resultType": "streams",
+                "result": [{
+                    "stream": { "container": "/FORGEJO-ACTIONS-TASK-123-WORKFLOW-abcd" },
+                    "values": [["1793577000000000000", "from loki\n"]]
+                }]
+            }
+        })))
+        .expect(1)
+        .mount(&loki)
+        .await;
+    let c = pinned_client(&server, Flavor::Forgejo, "15.0.2").await;
+    let logs = crate::api::workflow::fetch_run_logs_with_loki_base(
+        &c,
+        "o",
+        "r",
+        56,
+        None,
+        None,
+        false,
+        &loki.uri(),
+    )
+    .await
+    .expect("logs");
+    assert_eq!(logs.source, "loki");
+    assert_eq!(logs.jobs[0].task_id, Some(123));
+    assert_eq!(logs.jobs[0].lines[0].message, "from loki");
+}
+
+// ── Web routes never see the forge token ─────────────────────────────────────
+
+#[tokio::test]
+async fn web_run_page_is_requested_without_the_token() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/o/r/actions/runs/7/jobs/0/attempt/1"))
+        .and(wiremock::matchers::header_exists("authorization"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/o/r/actions/runs/7/jobs/0/attempt/1"))
+        .and(no_authorization)
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "state": {
+                "run": { "title": "t", "status": "success", "done": true,
+                         "jobs": [{ "name": "check", "status": "success", "duration": "2s" }] },
+                "currentJob": {}
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // A server with no jobs API: the overview falls back to the web route.
+    let c = pinned_client(&server, Flavor::Forgejo, "15.0.2").await;
+    let overview = crate::api::workflow::fetch_run_overview(&c, "o", "r", 7)
+        .await
+        .expect("overview");
+    assert_eq!(overview.title, "t");
+    assert_eq!(overview.jobs[0].duration, "2s");
+    assert_eq!(overview.url, format!("{}/o/r/actions/runs/7", server.uri()));
+}
+
+#[tokio::test]
+async fn run_overview_prefers_the_api_and_never_touches_the_web_route() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/runs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "workflow_runs": [{
+                "id": 1200, "run_number": 12, "name": "CI", "status": "failure",
+                "head_branch": "main", "head_sha": "0123456789abcdef"
+            }]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/runs/1200/jobs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "id": 7, "name": "build", "status": "failure", "attempt": 1 }
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let c = pinned_client(&server, Flavor::Forgejo, "16.0.4").await;
+    let overview = crate::api::workflow::fetch_run_overview(&c, "o", "r", 12)
+        .await
+        .expect("overview");
+    assert_eq!(overview.title, "CI");
+    assert_eq!(overview.status, "failure");
+    assert_eq!(overview.branch, "main");
+    assert_eq!(overview.jobs[0].name, "build");
+}
+
+#[tokio::test]
+async fn artifacts_use_the_api_routes_where_the_server_has_them() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/runs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "workflow_runs": [{ "id": 1200, "run_number": 12, "status": "success" }]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/runs/1200/artifacts"))
+        .and(header("authorization", "token test-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "id": 4, "name": "dist", "size_in_bytes": 10, "expired": false }
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/artifacts/4/zip"))
+        .and(header("authorization", "token test-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"PK\x03\x04".to_vec()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = pinned_client(&server, Flavor::Forgejo, "16.0.4").await;
+    let arts = crate::api::workflow::list_artifacts(&c, "o", "r", 12)
+        .await
+        .expect("list");
+    assert_eq!((arts[0].id, arts[0].size), (4, 10));
+    assert_eq!(arts[0].status, "completed");
+    let bytes = crate::api::workflow::download_artifact(&c, "o", "r", 12, &arts[0])
+        .await
+        .expect("download");
+    assert_eq!(&bytes[..2], b"PK");
+}
+
+// ── Reverse proxy with its own HTTP Basic credential ─────────────────────────
+
+const PROXY_PASSWORD: &str = "hunter2-proxy";
+
+fn proxy_credential(pat_transport: PatTransport) -> ProxyCredential {
+    ProxyCredential {
+        username: "ops".into(),
+        password: PROXY_PASSWORD.into(),
+        pat_transport,
+    }
+}
+
+fn proxy_basic() -> String {
+    use base64::Engine;
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("ops:{PROXY_PASSWORD}"))
+    )
+}
+
+async fn proxied_client(server: &MockServer, pat_transport: PatTransport) -> Client {
+    client_for(server)
+        .await
+        .with_proxy(proxy_credential(pat_transport))
+        .expect("loopback is a safe transport")
+}
+
+async fn mount_basic_challenge(server: &MockServer, expected: u64) {
+    Mock::given(method("GET"))
+        .and(path("/api/v1/user"))
+        .respond_with(
+            ResponseTemplate::new(401).insert_header("WWW-Authenticate", r#"Basic realm="gate""#),
+        )
+        .expect(expected)
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn proxy_basic_challenge_then_success_carries_both_credentials() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/user"))
+        .and(header("authorization", proxy_basic().as_str()))
+        .and(header("x-forge-authorization", "token test-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "login": "alice" })))
+        .with_priority(1)
+        .expect(2)
+        .mount(&server)
+        .await;
+    // Exactly one challenge: the first request goes out without the proxy
+    // credential, and the second request of the process sends it up front.
+    mount_basic_challenge(&server, 1).await;
+
+    let c = proxied_client(&server, PatTransport::Header).await;
+    for _ in 0..2 {
+        let me: serde_json::Value = c
+            .json(Method::GET, "/api/v1/user", &[], None::<&()>)
+            .await
+            .expect("both credentials accepted");
+        assert_eq!(me["login"], "alice");
+    }
+}
+
+#[tokio::test]
+async fn proxy_407_challenge_leaves_authorization_to_the_forge() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/user"))
+        .and(header("proxy-authorization", proxy_basic().as_str()))
+        .and(header("authorization", "token test-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "login": "alice" })))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/user"))
+        .respond_with(
+            ResponseTemplate::new(407).insert_header("Proxy-Authenticate", r#"Basic realm="gate""#),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = proxied_client(&server, PatTransport::Header).await;
+    let me: serde_json::Value = c
+        .json(Method::GET, "/api/v1/user", &[], None::<&()>)
+        .await
+        .expect("ok");
+    assert_eq!(me["login"], "alice");
+}
+
+#[tokio::test]
+async fn proxy_query_transport_moves_the_token_into_the_query() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/user"))
+        .and(header("authorization", proxy_basic().as_str()))
+        .and(query_param("token", "test-token"))
+        .and(|req: &wiremock::Request| !req.headers.contains_key("x-forge-authorization"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "login": "alice" })))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    mount_basic_challenge(&server, 1).await;
+    let c = proxied_client(&server, PatTransport::Query).await;
+    let me: serde_json::Value = c
+        .json(Method::GET, "/api/v1/user", &[], None::<&()>)
+        .await
+        .expect("ok");
+    assert_eq!(me["login"], "alice");
+}
+
+#[tokio::test]
+async fn proxy_wrong_credential_names_the_proxy_and_leaks_nothing() {
+    let server = MockServer::start().await;
+    // The proxy challenges again after the credential was sent.
+    mount_basic_challenge(&server, 2).await;
+    let c = proxied_client(&server, PatTransport::Header).await;
+    let err = c
+        .request(Method::GET, "/api/v1/user", &[], None)
+        .await
+        .expect_err("a rejected proxy credential is an error, not a 401 response");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("rejected the proxy credential"), "got: {msg}");
+    assert!(
+        msg.contains("Your forge token was not the problem"),
+        "got: {msg}"
+    );
+    assert!(msg.contains("fj auth proxy"), "got: {msg}");
+    assert!(!msg.contains(PROXY_PASSWORD), "got: {msg}");
+    assert!(!msg.contains("test-token"), "got: {msg}");
+}
+
+#[tokio::test]
+async fn proxy_challenge_without_a_configured_credential_says_what_to_set() {
+    let server = MockServer::start().await;
+    mount_basic_challenge(&server, 1).await;
+    let c = client_for(&server).await;
+    let err = c
+        .request(Method::GET, "/api/v1/user", &[], None)
+        .await
+        .expect_err("the challenge is a distinct error");
+    let msg = err.to_string();
+    assert!(msg.contains("reverse proxy"), "got: {msg}");
+    assert!(msg.contains("not your forge token"), "got: {msg}");
+    assert!(msg.contains("fj auth proxy --host"), "got: {msg}");
+    assert!(msg.contains("FJ_PROXY_PASSWORD"), "got: {msg}");
+}
+
+#[tokio::test]
+async fn forge_401_behind_an_accepting_proxy_is_not_blamed_on_the_proxy() {
+    let server = MockServer::start().await;
+    // The proxy lets the request through; the forge then rejects the token.
+    // A forge 401 carries no Basic challenge.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/user"))
+        .and(header("authorization", proxy_basic().as_str()))
+        .respond_with(ResponseTemplate::new(401).set_body_json(json!({ "message": "bad token" })))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    mount_basic_challenge(&server, 1).await;
+    let c = proxied_client(&server, PatTransport::Header).await;
+    let err = c
+        .request(Method::GET, "/api/v1/user", &[], None)
+        .await
+        .expect_err("forge rejection");
+    let msg = err.to_string();
+    assert!(msg.contains("accepted the proxy credential"), "got: {msg}");
+    assert!(msg.contains("X-Forge-Authorization"), "got: {msg}");
+    assert!(!msg.contains("rejected the proxy credential"), "got: {msg}");
+
+    // Without a proxy in the picture, a plain forge 401 is still just a 401.
+    let plain = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/user"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&plain)
+        .await;
+    let res = client_for(&plain)
+        .await
+        .request(Method::GET, "/api/v1/user", &[], None)
+        .await
+        .expect("a forge 401 is a response");
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[test]
+fn debug_output_never_contains_either_secret() {
+    // `--debug` prints these lines for a request. No header is printed, and a
+    // token riding in the query (the opt-in transport) is redacted in both the
+    // URL and the query pairs.
+    let url = Url::parse("https://ops:hunter2-proxy@git.example/api/v1/user?token=test-token&a=b")
+        .unwrap();
+    let query = vec![
+        ("token".to_string(), "test-token".to_string()),
+        ("access_token".to_string(), "test-token".to_string()),
+        ("page".to_string(), "2".to_string()),
+    ];
+    let text = super::request_log_lines(&Method::GET, &url, &query, None).join("\n");
+    assert!(!text.contains("test-token"), "{text}");
+    assert!(!text.contains(PROXY_PASSWORD), "{text}");
+    assert!(text.contains("page=2"), "{text}");
+    assert!(text.contains("a=b"), "{text}");
+
+    let debugged = format!("{:?}", proxy_credential(PatTransport::Query));
+    assert!(!debugged.contains(PROXY_PASSWORD), "{debugged}");
 }

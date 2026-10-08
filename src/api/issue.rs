@@ -33,9 +33,20 @@ pub struct Issue {
     pub comments: u64,
     #[serde(default)]
     pub is_locked: bool,
+    /// The milestone the issue is assigned to, when it has one.
+    #[serde(default)]
+    pub milestone: Option<IssueMilestone>,
     /// Present only when the issue is actually a pull request.
     #[serde(default)]
     pub pull_request: Option<serde_json::Value>,
+}
+
+/// The milestone as embedded in an issue: just enough to name it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IssueMilestone {
+    pub id: u64,
+    #[serde(default)]
+    pub title: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,6 +56,32 @@ pub struct Label {
     pub color: String,
     #[serde(default)]
     pub description: String,
+    /// Member of an exclusive group: an issue keeps at most one label per
+    /// group (see [`Label::exclusive_scope`]).
+    #[serde(default)]
+    pub exclusive: bool,
+    #[serde(default)]
+    pub is_archived: bool,
+}
+
+impl Label {
+    /// The exclusive group this label belongs to, by Forgejo's rule: the
+    /// label must be flagged `exclusive`, and the group is everything before
+    /// the last `/` in its name (`team/priority/high` is in `team/priority`).
+    /// A name with no `/`, or with it first or last, has no group even when
+    /// flagged.
+    pub fn exclusive_scope(&self) -> Option<&str> {
+        if !self.exclusive {
+            return None;
+        }
+        name_scope(&self.name)
+    }
+}
+
+/// The `scope` part of a `scope/name` label name, if it has one.
+pub fn name_scope(name: &str) -> Option<&str> {
+    let idx = name.rfind('/')?;
+    (idx > 0 && idx < name.len() - 1).then(|| &name[..idx])
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +112,9 @@ pub struct ListOptions<'a> {
     pub milestone: Option<&'a str>,
     pub mentioned: Option<&'a str>,
     pub query: Option<&'a str>,
+    /// Wire value for the `sort` query parameter; `None` keeps the forge's
+    /// default order.
+    pub sort: Option<&'a str>,
 }
 
 impl Default for ListOptions<'_> {
@@ -89,6 +129,7 @@ impl Default for ListOptions<'_> {
             milestone: None,
             mentioned: None,
             query: None,
+            sort: None,
         }
     }
 }
@@ -119,6 +160,9 @@ pub async fn list(
     if let Some(q) = opts.query {
         query.push(("q".into(), q.into()));
     }
+    if let Some(sort) = opts.sort {
+        query.push(("sort".into(), sort.into()));
+    }
     if opts.paginate || opts.limit > 50 {
         if opts.paginate {
             query.push(("page".into(), opts.page.max(1).to_string()));
@@ -147,6 +191,9 @@ pub struct CreateIssue<'a> {
     pub assignees: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub labels: Option<Vec<u64>>,
+    /// Milestone id, set in the same request that creates the issue.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub milestone: Option<u64>,
 }
 
 pub async fn create(
@@ -365,11 +412,7 @@ pub async fn upload_asset(
         .file_name(asset_name.to_string())
         .mime_str("application/octet-stream")?;
     let form = reqwest::multipart::Form::new().part("attachment", part);
-    let mut headers = reqwest::header::HeaderMap::new();
-    let auth = client
-        .auth_header_value()?
-        .ok_or_else(|| anyhow::anyhow!("issue asset upload requires an authenticated host"))?;
-    headers.insert(reqwest::header::AUTHORIZATION, auth);
+    let headers = client.upload_auth_headers("issue asset upload")?;
     let res = client
         .http()
         .post(url)

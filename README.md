@@ -78,6 +78,8 @@ fj repo view                             # auto-detects the repo from your git r
 fj pr list --state all -L 10             # latest 10 PRs
 fj pr list --base main --no-draft        # branch/draft filters
 fj issue list --milestone v1 --mentioned alice
+fj issue list --sort oldest              # any order Forgejo's issue list honors
+fj issue reaction toggle +1 12           # also: dependency, time (issue or PR number)
 fj issue create --template bug            # seed body from repo templates
 fj pr create --template                   # choose a PR template interactively
 fj api /version                          # raw API escape hatch
@@ -136,11 +138,11 @@ A Fjord Account session under OIDC keeps a refresh token, so it renews silently
 
 ### Web session for cookie-gated Actions routes
 
-`fj run logs` and `fj run view --log` read job logs through Forgejo's
-token-authenticated Actions API on supported Forgejo builds. The remaining
-human-facing Actions routes, including `fj run watch` and `fj run rerun`, are
-cookie-gated on rasterhub (fj#103). To use those browser-backed routes on a
-private repo, import the `i_like_gitea` cookie from a signed-in browser:
+`fj run logs`, `fj run view`, and `fj run watch` read through the
+token-authenticated Actions API where the server has it (Forgejo 16+, Gitea
+1.25+; see `docs/compatibility.md`). fj never sends your token to a
+cookie-gated web route. You can store the `i_like_gitea` cookie from a
+signed-in browser, but no command sends it yet (fj#103):
 
 ```sh
 fj auth session --with-cookie                # paste the cookie on stdin (kept out of history)
@@ -149,7 +151,13 @@ fj auth session --clear                      # forget the stored web session
 
 The cookie is stored under a keychain slot separate from your API token, is
 never echoed, and honours the `FJ_SESSION` env override. `fj auth status` shows
-a "Web session" line per host so you can see whether these routes are enabled.
+a "Web session" line per host so you can see whether one is stored.
+
+### Forge behind a reverse proxy with HTTP Basic auth
+
+`fj auth proxy --host <host> --username <user>` stores a proxy credential that
+is separate from the forge token. See `docs/troubleshooting.md` for the
+transport tradeoff and the one proxy config line the default needs.
 
 ## Everyday workflows
 
@@ -159,6 +167,10 @@ a "Web session" line per host so you can see whether these routes are enabled.
 fj pr checkout 42                        # fetch and check out the PR branch
 fj pr diff 42 | less                     # or `fj pr files 42` for a file summary
 fj pr review 42 --event approve --body "LGTM"
+fj pr review 42 --line-comment src/main.rs 88 "off by one"   # one line comment, no verdict
+fj pr review 42 --event request-changes --body "see inline" \
+  --line-comment src/main.rs 88 "off by one" \
+  --line-comment src/old.rs old:12 "why was this removed?"  # all sent as one review
 fj pr request-review 42 alice bob        # tag specific reviewers
 ```
 

@@ -174,7 +174,7 @@ fj run logs 56 --failed      # logs for jobs that did not finish green
 fj run logs 56 --job 1       # one job by zero-based job index
 fj run view 56 --log         # compatibility path for full logs
 fj run view 56 --log-failed  # compatibility path for failed-job logs
-fj run watch 56              # stream the web UI log live until the job ends
+fj run watch 56              # tail the job logs live until the run ends
 ```
 
 By default `--log` spans all of a run's jobs, and `--log-failed` shows
@@ -188,12 +188,20 @@ Two things to know, because they look like bugs but aren't:
 - `fj run logs` maps the `#` run number to an internal run id with
   `/api/v1/repos/.../actions/runs`, maps the job index through
   `/actions/runs/{id}/jobs`, then reads `/actions/jobs/{job_id}/logs`.
-  A personal access token is sufficient on supported Forgejo builds.
+  A personal access token is sufficient on Forgejo 16+ and Gitea 1.25+.
+  Logs are read in bounded byte ranges, so a large log is never one request.
+- On an older server those routes do not exist. `fj` then reports the
+  limitation with the run URL to open in the web UI (or reads from Loki if
+  you set `FJ_RUN_LOG_LOKI_URL`). It never sends your token to a web route.
 - "logs are no longer available for this run" means Forgejo pruned them
   after its retention period. They're gone server-side; there's nothing
   `fj` can fetch.
 
-`fj run watch`, plain `fj run view`, `rerun`, and `cancel` still use web
+`fj run watch`, plain `fj run view`, and `fj run download` use the same API
+where the server has it. `fj run cancel` needs Forgejo 16+, and `fj run rerun`
+needs Gitea 1.26+ (Forgejo has no rerun route); elsewhere they print the run
+URL. See `docs/compatibility.md` for the full table.
+
 routes. Those are not available for hosts logged in through a Fjord Account
 gateway, which only proxies `/api/v1`; use a host with a personal access token
 for those commands.

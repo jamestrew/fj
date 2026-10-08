@@ -13,7 +13,7 @@ use crate::cli::pr_args::{MergeStyleArg, ReviewEventArg, StateFilter, UpdateStyl
 use crate::cli::pr_fill::{self, FillMode};
 use crate::cli::pr_status::StatusArgs;
 use crate::cli::{
-    list as list_output, pr_comment, pr_inspect, pr_merge_check, pr_review, pr_status,
+    list as list_output, pr_comment, pr_inspect, pr_merge_check, pr_preflight, pr_review, pr_status,
 };
 use crate::git;
 use crate::output;
@@ -254,13 +254,36 @@ pub struct ReviewArgs {
     pub r: RepoFlag,
     /// Pull request number
     pub number: u64,
-    /// Review action.
-    #[arg(value_enum, long, short = 'e')]
-    pub event: ReviewEventArg,
+    /// Review action. Optional only when line comments are given: they are
+    /// then posted on their own as a plain comment, with no verdict.
+    #[arg(
+        value_enum,
+        long,
+        short = 'e',
+        required_unless_present_any = ["line_comment", "line_comments_file"]
+    )]
+    pub event: Option<ReviewEventArg>,
     /// Review body. Use `-` for stdin. Omit to open `$EDITOR` (unless the
     /// event is `approve` and you have nothing to say).
     #[arg(short = 'b', long)]
     pub body: Option<String>,
+    /// Comment on one line of the diff (repeatable). All line comments are
+    /// sent with the verdict in a single review. LINE is `N` or `new:N` for
+    /// a line of the pull request's version of the file, `old:N` for a line
+    /// of the base version (a removed line). One line only, no ranges.
+    #[arg(
+        long = "line-comment",
+        num_args = 3,
+        value_names = ["PATH", "LINE", "BODY"],
+        action = clap::ArgAction::Append,
+        allow_hyphen_values = true
+    )]
+    pub line_comment: Vec<String>,
+    /// Read line comments from a JSON file (`-` for stdin): an array of
+    /// `{"path": "...", "line": N, "side": "new"|"old", "body": "..."}`.
+    /// `side` defaults to `new`. Adds to any `--line-comment`.
+    #[arg(long = "line-comments-file", value_name = "FILE")]
+    pub line_comments_file: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -605,13 +628,10 @@ async fn create(args: CreateArgs, host: Option<&str>) -> Result<()> {
         )?,
     };
     let label_names = clean_csv_values(args.label);
-    let label_ids = if label_names.is_empty() {
-        None
+    let requested_labels = if label_names.is_empty() {
+        Vec::new()
     } else {
-        Some(
-            api::label::resolve_names_to_ids(&ctx.client, &ctx.owner, &ctx.name, &label_names)
-                .await?,
-        )
+        api::label::resolve_names(&ctx.client, &ctx.owner, &ctx.name, &label_names).await?
     };
     let assignees = clean_csv_values(args.assignee);
     let pr = api::pull::create(
@@ -628,8 +648,15 @@ async fn create(args: CreateArgs, host: Option<&str>) -> Result<()> {
     )
     .await?;
     println!("✓ Created PR #{}: {}", pr.number, pr.title);
-    if let Some(label_ids) = label_ids {
-        api::label::add_to_issue(&ctx.client, &ctx.owner, &ctx.name, pr.number, label_ids).await?;
+    if !requested_labels.is_empty() {
+        crate::cli::label_assign::add_resolved(
+            &ctx.client,
+            &ctx.owner,
+            &ctx.name,
+            pr.number,
+            requested_labels,
+        )
+        .await?;
     }
     if !assignees.is_empty() {
         api::issue::add_assignees(&ctx.client, &ctx.owner, &ctx.name, pr.number, assignees).await?;
@@ -738,11 +765,14 @@ async fn edit(args: EditArgs, host: Option<&str>) -> Result<()> {
         updated_pr = Some(pr);
     }
     if !add_labels.is_empty() {
-        let label_ids =
-            api::label::resolve_names_to_ids(&ctx.client, &ctx.owner, &ctx.name, &add_labels)
-                .await?;
-        api::label::add_to_issue(&ctx.client, &ctx.owner, &ctx.name, args.number, label_ids)
-            .await?;
+        crate::cli::label_assign::add_names(
+            &ctx.client,
+            &ctx.owner,
+            &ctx.name,
+            args.number,
+            &add_labels,
+        )
+        .await?;
     }
     if !remove_labels.is_empty() {
         let label_ids =
@@ -949,6 +979,22 @@ async fn merge(args: MergeArgs, host: Option<&str>) -> Result<()> {
         Some(style) => style.into(),
         None => repo_default_merge_style(&ctx).await?,
     };
+    // Read what the base branch's rule requires before asking the server to
+    // merge, so a blocker that is already certain is explained up front. A PR
+    // that cannot be read, or is not open, goes straight to the server, which
+    // answers with its own error. Unknown evidence never blocks here.
+    let preflight = match api::pull::get(&ctx.client, &ctx.owner, &ctx.name, args.number).await {
+        Ok(pr) if !pr.merged && pr.state == "open" => {
+            Some(pr_preflight::gather(&ctx.client, &ctx.owner, &ctx.name, &pr, None).await)
+        }
+        _ => None,
+    };
+    if let Some(blocker) = preflight
+        .as_ref()
+        .and_then(|p| p.pre_merge_blocker(args.auto))
+    {
+        return Err(anyhow!("{blocker}"));
+    }
     let res = api::pull::merge(
         &ctx.client,
         &ctx.owner,
@@ -999,6 +1045,7 @@ async fn merge(args: MergeArgs, host: Option<&str>) -> Result<()> {
                     &pr,
                     style.as_str(),
                     Some(&e.to_string()),
+                    preflight.as_ref(),
                 )
                 .await
                 {
@@ -1014,9 +1061,24 @@ async fn merge(args: MergeArgs, host: Option<&str>) -> Result<()> {
                     return Err(anyhow!("{reason}"));
                 }
             }
-            Err(e)
+            // Nothing specific: keep the server's own words, and say which
+            // evidence was left unread so the gap is not read as a pass.
+            match preflight.as_ref().and_then(|p| p.refusal_note()) {
+                Some(note) if is_refusal(&e) => {
+                    let message = format!("{e}\n  note: {note}");
+                    Err(e.context(message))
+                }
+                _ => Err(e),
+            }
         }
     }
+}
+
+/// True when the server answered and said no (a 4xx), as opposed to a network
+/// failure or a server error, where a note about branch rules would mislead.
+fn is_refusal(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<crate::client::ApiError>()
+        .is_some_and(|api| api.status.is_client_error())
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]

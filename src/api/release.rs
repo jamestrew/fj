@@ -161,14 +161,10 @@ pub async fn upload_asset(
         .file_name(asset_name.to_string())
         .mime_str("application/octet-stream")?;
     let form = reqwest::multipart::Form::new().part("attachment", part);
-    let mut headers = reqwest::header::HeaderMap::new();
-    // Pull the Authorization header straight from the client so it picks
-    // up the right scheme (PAT vs Fjord bearer) without this call site
-    // needing to know which one is active.
-    let auth = client
-        .auth_header_value()?
-        .ok_or_else(|| anyhow::anyhow!("release asset upload requires an authenticated host"))?;
-    headers.insert(reqwest::header::AUTHORIZATION, auth);
+    // Pull the auth headers straight from the client so it picks the right
+    // scheme (PAT vs Fjord bearer) and, behind a reverse proxy, the header
+    // the proxy asked for, without this call site knowing which is active.
+    let headers = client.upload_auth_headers("release asset upload")?;
     let res = client
         .http()
         .post(url)

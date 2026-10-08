@@ -456,10 +456,110 @@ pub fn delete_session_cookie(host: &str) -> Result<()> {
     delete_token(&session_keychain_key(host))
 }
 
+/// Prefix for the reverse-proxy password slot. Disjoint from the bare-host PAT
+/// key, so a proxy password can never be loaded as a forge token or the other
+/// way round. The `@` is what guarantees it: a host key is a DNS name with an
+/// optional port and path and can never contain one, whereas a `proxy:` prefix
+/// would collide with a host that is literally named `proxy` (`proxy:8080`).
+const PROXY_PREFIX: &str = "proxy-basic@";
+
+/// Compose the token-store key for a host's reverse-proxy password.
+pub fn proxy_keychain_key(host: &str) -> String {
+    format!("{PROXY_PREFIX}{host}")
+}
+
+/// Store the reverse-proxy password for `host` (keychain, or the same 0600
+/// file fallback the PAT uses). Replaces any existing entry.
+pub fn store_proxy_password(host: &str, password: &str) -> Result<TokenStoreLocation> {
+    store_token(&proxy_keychain_key(host), password)
+}
+
+/// Load the persisted reverse-proxy password for `host`.
+pub fn load_proxy_password(host: &str) -> Result<Option<String>> {
+    load_persisted_token(&proxy_keychain_key(host))
+}
+
+/// Delete the stored reverse-proxy password for `host`.
+pub fn delete_proxy_password(host: &str) -> Result<()> {
+    delete_token(&proxy_keychain_key(host))
+}
+
+pub fn host_env_proxy_password_var(host: &str) -> String {
+    format!("FJ_PROXY_PASSWORD_{}", host_env_suffix(host))
+}
+
+pub fn host_env_proxy_user_var(host: &str) -> String {
+    format!("FJ_PROXY_USER_{}", host_env_suffix(host))
+}
+
+fn non_empty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Resolve one half of the proxy credential from the environment. The
+/// host-scoped variable always applies; the generic one only when the caller
+/// has established it is safe for the selected host (same rule as `FJ_TOKEN`).
+fn env_proxy_value(host_var: &str, generic_var: &str, allow_generic_env: bool) -> Option<String> {
+    non_empty_env(host_var).or_else(|| {
+        allow_generic_env
+            .then(|| non_empty_env(generic_var))
+            .flatten()
+    })
+}
+
+/// Proxy password from `FJ_PROXY_PASSWORD_<HOST>` or, when allowed,
+/// `FJ_PROXY_PASSWORD`.
+pub fn env_proxy_password(host: &str, allow_generic_env: bool) -> Option<String> {
+    env_proxy_value(
+        &host_env_proxy_password_var(host),
+        "FJ_PROXY_PASSWORD",
+        allow_generic_env,
+    )
+}
+
+/// Proxy username from `FJ_PROXY_USER_<HOST>` or, when allowed, `FJ_PROXY_USER`.
+pub fn env_proxy_user(host: &str, allow_generic_env: bool) -> Option<String> {
+    env_proxy_value(
+        &host_env_proxy_user_var(host),
+        "FJ_PROXY_USER",
+        allow_generic_env,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fmt;
+
+    #[test]
+    fn proxy_password_key_can_never_be_a_host_key() {
+        // A PAT lives under the bare host key. Even a host literally named
+        // `proxy` cannot collide with another host's proxy slot.
+        for host in ["rasterhub.com", "proxy:8080", "localhost:3000", "8080"] {
+            let key = proxy_keychain_key(host);
+            assert_ne!(key, host);
+            assert!(key.contains('@'), "{key}");
+            assert_ne!(key, session_keychain_key(host));
+            assert_ne!(key, fjord_keychain_key(host));
+        }
+        assert_ne!(proxy_keychain_key("8080"), "proxy:8080");
+    }
+
+    #[test]
+    fn proxy_env_vars_are_distinct_from_the_token_vars() {
+        let host = "rasterhub.com";
+        let token = host_env_token_var(host);
+        let password = host_env_proxy_password_var(host);
+        let user = host_env_proxy_user_var(host);
+        assert!(token.starts_with("FJ_TOKEN_H"));
+        assert!(password.starts_with("FJ_PROXY_PASSWORD_H"));
+        assert!(user.starts_with("FJ_PROXY_USER_H"));
+        assert_ne!(token, password);
+        assert_ne!(password, user);
+    }
 
     /// Regression for the truncate-then-write window: rewriting the token store
     /// must REPLACE the file, not empty it and refill it.

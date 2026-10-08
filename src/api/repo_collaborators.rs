@@ -4,7 +4,7 @@ use anyhow::{anyhow, Result};
 use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 
-use crate::client::Client;
+use crate::client::{ApiError, Client, Page};
 
 use super::user::User;
 
@@ -12,8 +12,18 @@ use super::user::User;
 pub struct Collaborator {
     #[serde(flatten)]
     pub user: User,
+    /// The flags the list endpoint sends. Forgejo returns plain user objects
+    /// there with `permissions: null`, so this is usually `None` and is never
+    /// read as "no access".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<RepoPermissions>,
+    /// Access confirmed by `GET .../collaborators/{user}/permission`
+    /// (`read`, `write`, `admin` or `owner`). `None` until looked up, or when
+    /// the forge would not disclose it.
     #[serde(default)]
-    pub permissions: RepoPermissions,
+    pub permission: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -27,17 +37,32 @@ pub struct RepoPermissions {
 }
 
 impl Collaborator {
-    pub fn permission_level(&self) -> &'static str {
-        if self.permissions.admin {
-            "admin"
-        } else if self.permissions.push {
-            "write"
-        } else if self.permissions.pull {
-            "read"
-        } else {
-            "none"
+    /// The collaborator's access: the confirmed permission when it was looked
+    /// up, else the list endpoint's flags when it sent any, else `unknown`.
+    /// Absent data is never reported as `none`.
+    pub fn permission_level(&self) -> &str {
+        if let Some(permission) = self.permission.as_deref().filter(|p| !p.is_empty()) {
+            return permission;
+        }
+        match &self.permissions {
+            Some(p) if p.admin => "admin",
+            Some(p) if p.push => "write",
+            Some(p) if p.pull => "read",
+            Some(_) => "none",
+            None => "unknown",
         }
     }
+}
+
+/// `RepoCollaboratorPermission`: one user's confirmed access to a repository.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollaboratorAccess {
+    #[serde(default)]
+    pub permission: String,
+    #[serde(default)]
+    pub role_name: String,
+    #[serde(default)]
+    pub user: Option<User>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -62,13 +87,69 @@ struct CollaboratorBody<'a> {
     permission: &'a str,
 }
 
-pub async fn list_collaborators(
+/// Collaborators, following pagination up to `limit` rows (all when `None`).
+pub async fn list_collaborators_page(
     client: &Client,
     owner: &str,
     name: &str,
-) -> Result<Vec<Collaborator>> {
+    limit: Option<u32>,
+) -> Result<Page<Collaborator>> {
     let path = format!("{}/collaborators", crate::api::repo_path(owner, name));
+    client
+        .get_all_page(&path, &[], limit.map(|l| l as usize))
+        .await
+}
+
+/// The access the forge confirms for `user` on this repository.
+pub async fn collaborator_permission(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    user: &str,
+) -> Result<CollaboratorAccess> {
+    let path = format!("{}/permission", collaborator_path(owner, name, user));
     client.json(Method::GET, &path, &[], None::<&()>).await
+}
+
+/// Fill in each collaborator's confirmed permission. The list endpoint cannot
+/// answer that, so it takes one lookup per row. A forge that will not disclose
+/// another user's permission to this account answers 403: that row is left
+/// unresolved (shown as `unknown`) and counted in the return value. Any other
+/// failure is an error.
+pub async fn resolve_collaborator_permissions(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    collaborators: &mut [Collaborator],
+) -> Result<usize> {
+    let mut undisclosed = 0;
+    for c in collaborators.iter_mut() {
+        match collaborator_permission(client, owner, name, &c.user.login).await {
+            Ok(access) => {
+                c.permission = Some(access.permission).filter(|p| !p.is_empty());
+                c.role_name = Some(access.role_name).filter(|r| !r.is_empty());
+            }
+            Err(err)
+                if err
+                    .downcast_ref::<ApiError>()
+                    .is_some_and(|e| e.status == StatusCode::FORBIDDEN) =>
+            {
+                undisclosed += 1;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(undisclosed)
+}
+
+/// 204 means `user` is a collaborator, 404 means not.
+pub async fn is_collaborator(client: &Client, owner: &str, name: &str, user: &str) -> Result<bool> {
+    let path = collaborator_path(owner, name, user);
+    let res = client.request(Method::GET, &path, &[], None).await?;
+    match res.status() {
+        StatusCode::NOT_FOUND => Ok(false),
+        _ => crate::client::ensure_success(res).await.map(|_| true),
+    }
 }
 
 pub async fn add_collaborator(
@@ -82,10 +163,7 @@ pub async fn add_collaborator(
     let body = CollaboratorBody {
         permission: permission.as_api_value(),
     };
-    let res = client
-        .request(Method::PUT, &path, &[], Some(&serde_json::to_value(body)?))
-        .await?;
-    res.error_for_status()?;
+    client.send(Method::PUT, &path, &[], Some(&body)).await?;
     Ok(())
 }
 
@@ -107,6 +185,9 @@ pub async fn remove_collaborator(
         StatusCode::UNPROCESSABLE_ENTITY if message.to_lowercase().contains("collaborator") => {
             Err(anyhow!("'{user}' is not a collaborator on {owner}/{name}"))
         }
+        StatusCode::FORBIDDEN => Err(anyhow!(
+            "permission denied: removing a collaborator from {owner}/{name} needs admin access to it: {message}"
+        )),
         _ => Err(anyhow!(
             "could not remove collaborator '{user}': HTTP {status}: {message}"
         )),
@@ -133,4 +214,44 @@ async fn api_error_message(res: reqwest::Response) -> String {
         })
         .filter(|s| !s.is_empty())
         .unwrap_or(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn collaborator(v: serde_json::Value) -> Collaborator {
+        serde_json::from_value(v).expect("collaborator")
+    }
+
+    #[test]
+    fn null_permissions_are_unknown_not_none() {
+        // fj#276: Forgejo's list sends `permissions: null`. That used to
+        // default to all-false and print "none" for every collaborator.
+        let c = collaborator(serde_json::json!({ "id": 1, "login": "alice", "permissions": null }));
+        assert!(c.permissions.is_none());
+        assert_eq!(c.permission_level(), "unknown");
+        let c = collaborator(serde_json::json!({ "id": 1, "login": "alice" }));
+        assert_eq!(c.permission_level(), "unknown");
+    }
+
+    #[test]
+    fn confirmed_permission_wins_over_list_flags() {
+        let mut c = collaborator(serde_json::json!({
+            "id": 1, "login": "alice",
+            "permissions": { "admin": false, "push": false, "pull": true }
+        }));
+        assert_eq!(c.permission_level(), "read");
+        c.permission = Some("admin".into());
+        assert_eq!(c.permission_level(), "admin");
+    }
+
+    #[test]
+    fn explicit_all_false_flags_still_read_as_none() {
+        let c = collaborator(serde_json::json!({
+            "id": 1, "login": "alice",
+            "permissions": { "admin": false, "push": false, "pull": false }
+        }));
+        assert_eq!(c.permission_level(), "none");
+    }
 }

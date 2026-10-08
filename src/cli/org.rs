@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::{Args, Subcommand};
 
 use crate::api;
+use crate::cli::org_team;
 use crate::client::Client;
 use crate::output;
 
@@ -19,6 +20,37 @@ pub enum OrgSub {
     View(ViewArgs),
     /// List teams in an org.
     Teams(TeamsArgs),
+    /// Create an organization on the selected host.
+    Create(CreateArgs),
+    /// Create a team and manage its members and repositories.
+    Team(org_team::TeamCmd),
+}
+
+#[derive(Debug, Args)]
+pub struct CreateArgs {
+    /// Organization name (letters, digits, '-', '_' and '.')
+    pub name: String,
+    /// Display name
+    #[arg(long)]
+    pub full_name: Option<String>,
+    /// Description
+    #[arg(long)]
+    pub description: Option<String>,
+    /// Contact email
+    #[arg(long)]
+    pub email: Option<String>,
+    /// Location
+    #[arg(long)]
+    pub location: Option<String>,
+    /// Website URL
+    #[arg(long)]
+    pub website: Option<String>,
+    /// Who can see the organization. The forge default is public.
+    #[arg(long, value_enum)]
+    pub visibility: Option<api::org::OrgVisibility>,
+    /// Emit JSON instead of the profile view
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -52,7 +84,33 @@ pub async fn run(cmd: OrgCmd, host: Option<&str>) -> Result<()> {
         OrgSub::List(args) => list(&client, args).await,
         OrgSub::View(args) => view(&client, args).await,
         OrgSub::Teams(args) => teams(&client, args).await,
+        OrgSub::Create(args) => create(&client, args).await,
+        OrgSub::Team(cmd) => org_team::run(&client, cmd).await,
     }
+}
+
+/// Validates the fields locally, creates the org, then prints the profile the
+/// server confirmed (the same view as `fj org view`).
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn create(client: &Client, args: CreateArgs) -> Result<()> {
+    api::org::validate_org_name(&args.name)?;
+    api::org::validate_org_fields(args.email.as_deref(), args.website.as_deref())?;
+    let body = api::org::CreateOrg {
+        username: &args.name,
+        full_name: args.full_name.as_deref(),
+        description: args.description.as_deref(),
+        email: args.email.as_deref(),
+        location: args.location.as_deref(),
+        website: args.website.as_deref(),
+        visibility: args.visibility.map(|v| v.as_api_value()),
+    };
+    let o = api::org::create(client, &body).await?;
+    if args.json {
+        return output::print_json(&serde_json::to_value(&o)?);
+    }
+    println!("✓ Created organization {} on {}", o.username, client.host());
+    print_org(&o);
+    Ok(())
 }
 
 async fn list(client: &Client, args: ListArgs) -> Result<()> {
@@ -86,6 +144,11 @@ async fn view(client: &Client, args: ViewArgs) -> Result<()> {
     if args.json {
         return output::print_json(&serde_json::to_value(&o)?);
     }
+    print_org(&o);
+    Ok(())
+}
+
+fn print_org(o: &api::org::Organization) {
     println!("{}", output::bold(&o.username));
     if !o.full_name.is_empty() {
         println!("{}", o.full_name);
@@ -96,7 +159,6 @@ async fn view(client: &Client, args: ViewArgs) -> Result<()> {
     }
     println!();
     println!("Visibility: {}", o.visibility);
-    Ok(())
 }
 
 async fn teams(client: &Client, args: TeamsArgs) -> Result<()> {

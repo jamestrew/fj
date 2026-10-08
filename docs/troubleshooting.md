@@ -36,6 +36,67 @@ fj auth refresh --token NEW      # replace the stored token
 fj auth login --host <host>      # full re-login (overwrites)
 ```
 
+## The forge sits behind a reverse proxy that asks for HTTP Basic auth
+
+Symptom: `error: ... is behind a reverse proxy that requires its own HTTP Basic
+credential`, or `... rejected the proxy credential`. Neither is about your
+forge token. Give fj the proxy credential, which it keeps apart from the token:
+
+```sh
+fj auth proxy --host git.example.com --username ops    # prompts for the password
+fj auth proxy --host git.example.com --username ops --with-password < secret
+fj auth proxy --host git.example.com --clear
+```
+
+You can run this before `fj auth login`, which itself has to get through the
+proxy. The username goes in `hosts.toml`. The password goes where the token
+goes (OS keychain, or the 0600 `tokens.toml` fallback) under its own key, so it
+cannot be confused with the token. In CI set `FJ_PROXY_USER` and
+`FJ_PROXY_PASSWORD` (or the host-scoped `FJ_PROXY_USER_<HOST>` /
+`FJ_PROXY_PASSWORD_<HOST>`, same suffix as `FJ_TOKEN_<HOST>`).
+
+fj sends the proxy credential only after the proxy asks for it, only to the
+configured host, and only over HTTPS or to a loopback address. Neither secret
+appears in `--debug` output or in error text.
+
+**The tradeoff you have to pick.** A proxy that answers `407` reads
+`Proxy-Authorization`, and nothing conflicts. A proxy that answers `401` with
+`WWW-Authenticate: Basic` (nginx `auth_basic`, Caddy `basic_auth`, Traefik
+`basicAuth`) reads `Authorization`, which is also where the forge expects its
+token. One request carries one `Authorization` header, so the token has to
+travel another way. Choose with `--pat-transport`:
+
+- `header` (default). The token travels in `X-Forge-Authorization`. It stays
+  out of URLs and access logs. The cost: the proxy needs one line to hand it
+  to the forge.
+
+  ```nginx
+  proxy_set_header Authorization $http_x_forge_authorization;
+  ```
+
+  ```caddy
+  reverse_proxy forge:3000 {
+      header_up Authorization {http.request.header.X-Forge-Authorization}
+  }
+  ```
+
+- `query`. The token travels in the URL as `?token=`. It works with an
+  unmodified proxy. The cost: the token is written to the proxy's and the
+  forge's access logs, and it works only while the forge accepts query tokens
+  (`DISABLE_QUERY_AUTH_TOKEN`, which newer servers turn on). Asset uploads are
+  refused in this mode.
+
+If you see `... accepted the proxy credential, but the forge then rejected the
+request`, the proxy let you in and the forge did not get a valid token: with
+`header` transport, check that the proxy forwards `X-Forge-Authorization` as
+`Authorization`; otherwise check the token itself.
+
+**Git over HTTPS is out of scope.** `git` and the `fj auth setup-git`
+credential helper hit the same header conflict, and git cannot send a second
+header per host without putting a secret in its config. Use SSH for git on a
+proxied host (`fj auth login --git-protocol ssh`). Hosts signed in through a
+Fjord Account are not supported behind such a proxy either.
+
 ## I want to see the raw HTTP requests fj is making
 
 ```sh

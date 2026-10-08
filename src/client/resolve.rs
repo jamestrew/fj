@@ -6,6 +6,7 @@
 use anyhow::{anyhow, Context, Result};
 use url::Url;
 
+use super::proxy::ProxyCredential;
 use crate::auth;
 use crate::config::hosts::{api_base_path, AuthKind, Host, Hosts};
 
@@ -13,6 +14,43 @@ pub struct ResolvedHost {
     pub name: String,
     pub host: Host,
     pub token: Option<String>,
+    /// Credential for a reverse proxy in front of the host, when one is
+    /// configured. Separate from `token` by construction.
+    pub proxy: Option<ProxyCredential>,
+}
+
+/// Assemble the proxy credential for `name` from the environment and the
+/// stored config. Each half resolves independently: the environment wins, then
+/// hosts.toml (username) and the token store (password). `None` unless both
+/// halves are present, so a half-configured credential is never sent.
+pub fn proxy_credential_for_host(
+    name: &str,
+    host: &Host,
+    allow_generic_env: bool,
+) -> Result<Option<ProxyCredential>> {
+    if host.auth_kind != AuthKind::Pat {
+        return Ok(None);
+    }
+    let username = auth::env_proxy_user(name, allow_generic_env)
+        .or_else(|| host.proxy.as_ref().map(|p| p.username.clone()))
+        .filter(|u| !u.is_empty());
+    let Some(username) = username else {
+        return Ok(None);
+    };
+    let password = match auth::env_proxy_password(name, allow_generic_env) {
+        Some(p) => Some(p),
+        None if host.proxy.is_some() => auth::load_proxy_password(name)?,
+        None => None,
+    };
+    Ok(password.map(|password| ProxyCredential {
+        username,
+        password,
+        pat_transport: host
+            .proxy
+            .as_ref()
+            .map(|p| p.pat_transport)
+            .unwrap_or_default(),
+    }))
 }
 
 /// Look up the host config and token for the host the user is targeting.
@@ -51,10 +89,12 @@ pub fn resolve(host_flag: Option<&str>) -> Result<ResolvedHost> {
             })?)
         }
     };
+    let proxy = proxy_credential_for_host(&name, &host_cfg, allow_generic_env)?;
     Ok(ResolvedHost {
         name,
         host: host_cfg,
         token,
+        proxy,
     })
 }
 

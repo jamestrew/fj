@@ -33,6 +33,32 @@ pub struct Host {
     /// `auth_kind == FjordAccount`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fjord_account: Option<FjordAccount>,
+    /// Which forge this host is (`forgejo`, `gitea` or `unidentified`), as
+    /// established from route evidence at login or refresh. Absent on entries
+    /// written before the field existed; commands that need it probe lazily.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flavor: Option<String>,
+    /// The version string the server reported when `flavor` was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_version: Option<String>,
+    /// Credential for a reverse proxy in front of the forge. Only the
+    /// username and the transport choice live here: the proxy password is a
+    /// secret in the token store under its own key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<ProxyConfig>,
+}
+
+/// Non-secret half of a host's reverse-proxy credential.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProxyConfig {
+    /// HTTP Basic username the proxy expects.
+    pub username: String,
+    /// How the forge token travels when the proxy takes `Authorization`.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::client::PatTransport::is_default"
+    )]
+    pub pat_transport: crate::client::PatTransport,
 }
 
 /// How a host authenticates fj's requests.
@@ -295,7 +321,49 @@ mod tests {
             api_base_path: None,
             auth_kind: AuthKind::Pat,
             fjord_account: None,
+            ..Default::default()
         }
+    }
+
+    #[test]
+    fn entries_written_before_flavor_and_proxy_still_load() {
+        let old = r#"current = "a.example"
+
+[hosts."a.example"]
+user = "alice"
+git_protocol = "https"
+"#;
+        let parsed: Hosts = toml::from_str(old).unwrap();
+        let h = &parsed.hosts["a.example"];
+        assert_eq!(h.flavor, None);
+        assert_eq!(h.server_version, None);
+        assert!(h.proxy.is_none());
+        // And nothing new is written for a host that never set them.
+        let text = toml::to_string_pretty(&parsed).unwrap();
+        assert!(!text.contains("flavor"), "{text}");
+        assert!(!text.contains("proxy"), "{text}");
+    }
+
+    #[test]
+    fn proxy_config_round_trips_without_a_password_field() {
+        let mut hosts = Hosts::default();
+        let mut h = host("alice");
+        h.flavor = Some("gitea".into());
+        h.server_version = Some("1.27.3".into());
+        h.proxy = Some(ProxyConfig {
+            username: "gate".into(),
+            pat_transport: crate::client::PatTransport::Query,
+        });
+        hosts.upsert("a.example", h);
+        let text = toml::to_string_pretty(&hosts).unwrap();
+        assert!(text.contains("username = \"gate\""), "{text}");
+        assert!(text.contains("pat_transport = \"query\""), "{text}");
+        assert!(!text.contains("password"), "{text}");
+        let back: Hosts = toml::from_str(&text).unwrap();
+        let got = &back.hosts["a.example"];
+        assert_eq!(got.flavor.as_deref(), Some("gitea"));
+        assert_eq!(got.server_version.as_deref(), Some("1.27.3"));
+        assert_eq!(got.proxy, hosts.hosts["a.example"].proxy);
     }
 
     #[test]

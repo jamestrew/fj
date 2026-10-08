@@ -190,10 +190,202 @@ pub(crate) fn read_value(value: Option<&str>, from_file: Option<&str>) -> Result
     ))
 }
 
+/// The line `fj variable set` prints. Everything in it is server truth: the
+/// name is the one the server stored (Forgejo upper-cases variable names),
+/// and the scope is the one its `repo_id` / `owner_id` record. `target` is
+/// the requested `owner/name` or org, used only to name that scope, and
+/// `org_requested` says which of the two it is. If the server recorded a
+/// different scope than the one asked for, the line says so instead of
+/// repeating the request back.
+pub(crate) fn variable_set_message(
+    outcome: &api::workflow::VariableOutcome,
+    org_requested: bool,
+    target: &str,
+) -> String {
+    use api::workflow::{VariableScope, VariableWrite};
+    let verb = match outcome.write {
+        VariableWrite::Created => "Created",
+        VariableWrite::Updated => "Updated",
+    };
+    let scope = match (outcome.variable.scope(), org_requested) {
+        (VariableScope::Repository, false) => {
+            format!("repository scope: {target} only")
+        }
+        (VariableScope::Owner, true) => {
+            format!("organization scope: every repository in {target}")
+        }
+        (VariableScope::Repository, true) => format!(
+            "repository scope, although organization {target} was requested; check `fj variable list --org {target}`"
+        ),
+        (VariableScope::Owner, false) => format!(
+            "owner scope (shared across the owner's repositories), although repository {target} was requested"
+        ),
+        (VariableScope::Unreported, true) => {
+            format!("scope not reported by the server; requested organization {target}")
+        }
+        (VariableScope::Unreported, false) => {
+            format!("scope not reported by the server; requested repository {target}")
+        }
+    };
+    format!(
+        "✓ {verb} variable {} ({scope}). Stored readable, not as a secret.",
+        outcome.variable.name
+    )
+}
+
+/// Table rows for `fj variable list`: name, value preview, server scope.
+pub(crate) fn variable_rows(vars: &[api::workflow::ActionVariable]) -> Vec<Vec<String>> {
+    use api::workflow::VariableScope;
+    vars.iter()
+        .map(|v| {
+            vec![
+                v.name.clone(),
+                value_preview(&v.data),
+                match v.scope() {
+                    VariableScope::Repository => "repository".to_string(),
+                    VariableScope::Owner => "owner".to_string(),
+                    VariableScope::Unreported => String::new(),
+                },
+            ]
+        })
+        .collect()
+}
+
+/// One table cell for a variable value: the first line, capped at 60 chars,
+/// with an ellipsis when anything was dropped. `--json` carries the whole
+/// value.
+fn value_preview(value: &str) -> String {
+    const MAX: usize = 60;
+    let first = value.lines().next().unwrap_or_default();
+    let mut out: String = first.chars().take(MAX).collect();
+    if first.chars().count() > MAX || value.lines().count() > 1 {
+        out.push('…');
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+
+    fn variable(
+        name: &str,
+        data: &str,
+        owner_id: i64,
+        repo_id: i64,
+    ) -> api::workflow::ActionVariable {
+        api::workflow::ActionVariable {
+            name: name.into(),
+            data: data.into(),
+            owner_id,
+            repo_id,
+            created_at: None,
+        }
+    }
+
+    #[test]
+    fn variable_set_message_shows_server_name_and_repository_scope() {
+        // The user typed `region`; the server stored REGION on the repo.
+        let msg = variable_set_message(
+            &api::workflow::VariableOutcome {
+                write: api::workflow::VariableWrite::Created,
+                variable: variable("REGION", "us-west-2", 3, 9),
+            },
+            false,
+            "o/r",
+        );
+        assert_eq!(
+            msg,
+            "✓ Created variable REGION (repository scope: o/r only). Stored readable, not as a secret."
+        );
+    }
+
+    #[test]
+    fn variable_set_message_shows_organization_scope_on_update() {
+        let msg = variable_set_message(
+            &api::workflow::VariableOutcome {
+                write: api::workflow::VariableWrite::Updated,
+                variable: variable("IMAGE", "x", 4, 0),
+            },
+            true,
+            "team",
+        );
+        assert!(msg.starts_with(
+            "✓ Updated variable IMAGE (organization scope: every repository in team)"
+        ));
+    }
+
+    #[test]
+    fn variable_set_message_never_echoes_a_scope_the_server_did_not_confirm() {
+        let unreported = variable_set_message(
+            &api::workflow::VariableOutcome {
+                write: api::workflow::VariableWrite::Created,
+                variable: variable("X", "1", 0, 0),
+            },
+            false,
+            "o/r",
+        );
+        assert!(unreported.contains("scope not reported by the server"));
+        assert!(!unreported.contains("repository scope: o/r"));
+
+        let mismatch = variable_set_message(
+            &api::workflow::VariableOutcome {
+                write: api::workflow::VariableWrite::Created,
+                variable: variable("X", "1", 4, 0),
+            },
+            false,
+            "o/r",
+        );
+        assert!(mismatch.contains("owner scope"));
+        assert!(mismatch.contains("although repository o/r was requested"));
+    }
+
+    #[test]
+    fn variable_set_message_does_not_print_the_value() {
+        let msg = variable_set_message(
+            &api::workflow::VariableOutcome {
+                write: api::workflow::VariableWrite::Created,
+                variable: variable("X", "the-value", 0, 9),
+            },
+            false,
+            "o/r",
+        );
+        assert!(!msg.contains("the-value"));
+    }
+
+    #[test]
+    fn variable_rows_show_value_and_scope() {
+        let rows = variable_rows(&[
+            variable("REGION", "us-west-2", 3, 9),
+            variable("IMAGE", "a\nb", 4, 0),
+            variable("OLD", "", 0, 0),
+        ]);
+        assert_eq!(rows[0], vec!["REGION", "us-west-2", "repository"]);
+        assert_eq!(rows[1], vec!["IMAGE", "a…", "owner"]);
+        assert_eq!(rows[2], vec!["OLD", "", ""]);
+    }
+
+    #[test]
+    fn value_preview_caps_long_values_by_char() {
+        let long = "é".repeat(80);
+        let got = value_preview(&long);
+        assert_eq!(got.chars().count(), 61);
+        assert!(got.ends_with('…'));
+        assert_eq!(value_preview("short"), "short");
+    }
+
+    #[test]
+    fn variable_help_separates_variables_from_secrets() {
+        use clap::CommandFactory;
+        let mut cmd = crate::cli::Cli::command();
+        let var = cmd.find_subcommand_mut("variable").expect("variable");
+        let set = var.find_subcommand_mut("set").expect("set");
+        let help = set.render_long_help().to_string();
+        assert!(help.contains("Variable name"));
+        assert!(!help.contains("Secret name"));
+        assert!(help.contains("fj secret set"));
+    }
 
     #[test]
     fn read_value_passes_inline_value_through_verbatim() {

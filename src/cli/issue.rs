@@ -7,6 +7,9 @@ use crate::api::template::TemplateKind;
 use crate::cli::context::{repo_web_url, resolve_repo, RepoFlag};
 use crate::cli::create_template;
 use crate::cli::issue_comment::{self, CommentArgs, DeleteCommentArgs, EditCommentArgs};
+use crate::cli::issue_dependency::{self, DependencyCmd};
+use crate::cli::issue_reaction::{self, ReactionCmd};
+use crate::cli::issue_time::{self, TimeCmd};
 use crate::cli::list as list_output;
 use crate::client::{ApiError, Page};
 use crate::output;
@@ -52,6 +55,49 @@ pub enum IssueSub {
     DeleteComment(DeleteCommentArgs),
     /// Create a branch tied to the issue.
     Develop(DevelopArgs),
+    /// React to an issue, a pull request, or a comment, and see the tally.
+    Reaction(ReactionCmd),
+    /// Show and change what an issue or pull request depends on and blocks.
+    Dependency(DependencyCmd),
+    /// Show, log, and delete tracked time on an issue or pull request.
+    Time(TimeCmd),
+}
+
+/// Orders the forge's issue list endpoint honors. The names are the forge's
+/// own `sort` values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum SortArg {
+    /// Most recently updated first
+    Recentupdate,
+    /// Least recently updated first
+    Leastupdate,
+    /// Newest first
+    Latest,
+    /// Oldest first
+    Oldest,
+    /// Most commented first
+    Mostcomment,
+    /// Least commented first
+    Leastcomment,
+    /// Nearest due date first
+    Nearduedate,
+    /// Farthest due date first
+    Farduedate,
+}
+
+impl SortArg {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SortArg::Recentupdate => "recentupdate",
+            SortArg::Leastupdate => "leastupdate",
+            SortArg::Latest => "latest",
+            SortArg::Oldest => "oldest",
+            SortArg::Mostcomment => "mostcomment",
+            SortArg::Leastcomment => "leastcomment",
+            SortArg::Nearduedate => "nearduedate",
+            SortArg::Farduedate => "farduedate",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -102,6 +148,9 @@ pub struct ListArgs {
     /// Search text to filter by
     #[arg(short = 'S', long = "search")]
     pub query: Option<String>,
+    /// Order the list (omit for the forge's default order)
+    #[arg(long, value_enum, value_name = "ORDER")]
+    pub sort: Option<SortArg>,
     /// Emit JSON instead of a table
     #[arg(long)]
     pub json: bool,
@@ -159,6 +208,9 @@ pub struct CreateArgs {
         value_delimiter = ','
     )]
     pub assignee: Vec<String>,
+    /// Milestone title or id to file the issue under.
+    #[arg(short = 'm', long, value_name = "TITLE|ID")]
+    pub milestone: Option<String>,
     /// Open the new issue in your browser after creating.
     #[arg(long)]
     pub web: bool,
@@ -284,6 +336,9 @@ pub async fn run(cmd: IssueCmd, host: Option<&str>) -> Result<()> {
         IssueSub::EditComment(args) => issue_comment::edit_comment(args, host).await,
         IssueSub::DeleteComment(args) => issue_comment::delete_comment(args, host).await,
         IssueSub::Develop(args) => develop(args, host).await,
+        IssueSub::Reaction(cmd) => issue_reaction::run(cmd, host).await,
+        IssueSub::Dependency(cmd) => issue_dependency::run(cmd, host).await,
+        IssueSub::Time(cmd) => issue_time::run(cmd, host).await,
     }
 }
 
@@ -325,6 +380,7 @@ async fn list(args: ListArgs, host: Option<&str>) -> Result<()> {
         milestone: args.milestone.as_deref(),
         mentioned: args.mentioned.as_deref(),
         query: args.query.as_deref(),
+        sort: args.sort.map(SortArg::as_str),
     };
     let page = match api::issue::list(&ctx.client, &ctx.owner, &ctx.name, opts).await {
         Ok(page) => page,
@@ -452,29 +508,61 @@ async fn create(args: CreateArgs, host: Option<&str>) -> Result<()> {
         Some(("ISSUE_BODY.md", template_body.as_deref().unwrap_or(""))),
     )?;
     let label_names = clean_csv_values(args.label);
-    let labels = if label_names.is_empty() {
-        None
+    let requested_labels = if label_names.is_empty() {
+        Vec::new()
     } else {
-        Some(
-            api::label::resolve_names_to_ids(&ctx.client, &ctx.owner, &ctx.name, &label_names)
-                .await?,
-        )
+        api::label::resolve_names(&ctx.client, &ctx.owner, &ctx.name, &label_names).await?
     };
+    let labels =
+        (!requested_labels.is_empty()).then(|| requested_labels.iter().map(|l| l.id).collect());
     let assignees = clean_csv_values(args.assignee);
     let assignees = (!assignees.is_empty()).then_some(assignees);
+    // Resolved before the create so a bad name never leaves an issue behind,
+    // and sent in the same request so there is no second step to fail.
+    let milestone = match args.milestone.as_deref().map(str::trim) {
+        Some("") => return Err(anyhow!("--milestone needs a title or an id")),
+        Some(wanted) => {
+            Some(api::milestone::resolve(&ctx.client, &ctx.owner, &ctx.name, wanted).await?)
+        }
+        None => None,
+    };
     let payload = CreateIssue {
         title: &title,
         body: body.as_deref(),
         assignees,
         labels,
+        milestone: milestone.as_ref().map(|m| m.id),
     };
     let issue = api::issue::create(&ctx.client, &ctx.owner, &ctx.name, &payload).await?;
     println!("✓ Created issue #{}: {}", issue.number, issue.title);
+    for line in crate::cli::label_assign::explain_created(&requested_labels, &issue.labels) {
+        println!("{line}");
+    }
     println!("{}", issue.html_url);
+    if let Some(wanted) = &milestone {
+        println!(
+            "{}",
+            milestone_line(
+                issue.milestone.as_ref().map(|m| m.title.as_str()),
+                &wanted.title
+            )
+        );
+    }
     if args.web {
         web::open(&issue.html_url)?;
     }
     Ok(())
+}
+
+/// What to say about the milestone after a create: the one the forge
+/// reports, or a warning when it reports none for the one we sent.
+fn milestone_line(confirmed: Option<&str>, wanted: &str) -> String {
+    match confirmed {
+        Some(title) => format!("Milestone: {title}"),
+        None => format!(
+            "warning: the forge did not report milestone '{wanted}' on the new issue; check it with `fj issue view`"
+        ),
+    }
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -521,11 +609,14 @@ async fn edit(args: EditArgs, host: Option<&str>) -> Result<()> {
     }
 
     if !add_labels.is_empty() {
-        let label_ids =
-            api::label::resolve_names_to_ids(&ctx.client, &ctx.owner, &ctx.name, &add_labels)
-                .await?;
-        api::label::add_to_issue(&ctx.client, &ctx.owner, &ctx.name, args.number, label_ids)
-            .await?;
+        crate::cli::label_assign::add_names(
+            &ctx.client,
+            &ctx.owner,
+            &ctx.name,
+            args.number,
+            &add_labels,
+        )
+        .await?;
     }
     if !remove_labels.is_empty() {
         let label_ids =
@@ -733,6 +824,66 @@ mod tests {
             }
             other => panic!("expected issue list, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn list_parses_every_sort_order_to_its_wire_value() {
+        use crate::cli::{Cli, Command};
+        use clap::Parser;
+        for name in [
+            "recentupdate",
+            "leastupdate",
+            "latest",
+            "oldest",
+            "mostcomment",
+            "leastcomment",
+            "nearduedate",
+            "farduedate",
+        ] {
+            let cli =
+                Cli::try_parse_from(["fj", "issue", "list", "--sort", name]).expect("should parse");
+            match cli.command {
+                Command::Issue(IssueCmd {
+                    command: IssueSub::List(a),
+                }) => assert_eq!(a.sort.map(SortArg::as_str), Some(name)),
+                other => panic!("expected issue list, got {other:?}"),
+            }
+        }
+        // `relevance` only means something to a search, and an unknown order
+        // would silently fall back to the default on the forge.
+        for bad in ["relevance", "priority", "newest"] {
+            assert!(Cli::try_parse_from(["fj", "issue", "list", "--sort", bad]).is_err());
+        }
+        let cli = Cli::try_parse_from(["fj", "issue", "list"]).expect("should parse");
+        match cli.command {
+            Command::Issue(IssueCmd {
+                command: IssueSub::List(a),
+            }) => assert!(a.sort.is_none()),
+            other => panic!("expected issue list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_parses_milestone() {
+        use crate::cli::{Cli, Command};
+        use clap::Parser;
+        for flag in ["--milestone", "-m"] {
+            let cli = Cli::try_parse_from(["fj", "issue", "create", "-t", "x", flag, "v1.0"])
+                .expect("should parse");
+            match cli.command {
+                Command::Issue(IssueCmd {
+                    command: IssueSub::Create(a),
+                }) => assert_eq!(a.milestone.as_deref(), Some("v1.0")),
+                other => panic!("expected issue create, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn milestone_line_reports_what_the_forge_confirmed() {
+        assert_eq!(milestone_line(Some("v1.0"), "v1.0"), "Milestone: v1.0");
+        let warning = milestone_line(None, "v1.0");
+        assert!(warning.starts_with("warning:") && warning.contains("'v1.0'"));
     }
 
     #[test]

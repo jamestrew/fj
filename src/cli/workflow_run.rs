@@ -316,14 +316,10 @@ async fn view(args: ViewArgs, host: Option<&str>) -> Result<()> {
         return ensure_exit_status(logs.status().unwrap_or(""), args.exit_status);
     }
 
-    // Non-log `view` still reads Forgejo web routes. The API/Loki log path
-    // above intentionally stays available for Fjord Account gateway hosts.
-    guard_web_routes(&ctx.client)?;
-
-    let view =
-        api::workflow::fetch_run_summary(&ctx.client, &ctx.owner, &ctx.name, args.run_id).await?;
-    let run = &view.state.run;
-    let url = absolutize(&ctx.client, &run.link);
+    // The summary comes from `/api/v1` where the server lists a run's jobs,
+    // and from the web route (asked without the token) where it does not.
+    let run =
+        api::workflow::fetch_run_overview(&ctx.client, &ctx.owner, &ctx.name, args.run_id).await?;
 
     if args.json {
         let jobs: Vec<serde_json::Value> = run
@@ -337,10 +333,10 @@ async fn view(args: ViewArgs, host: Option<&str>) -> Result<()> {
             "run_number": args.run_id,
             "title": run.title,
             "status": run.status,
-            "branch": run.commit.branch.name,
-            "sha": run.commit.short_sha,
-            "pushed_by": run.commit.pusher.display_name,
-            "url": url,
+            "branch": run.branch,
+            "sha": run.sha,
+            "pushed_by": run.pushed_by,
+            "url": run.url,
             "jobs": jobs,
         });
         output::print_json(&value)?;
@@ -349,12 +345,12 @@ async fn view(args: ViewArgs, host: Option<&str>) -> Result<()> {
 
     println!("Run #{}: {}", args.run_id, run.title);
     println!("Status:   {}", output::action_status(&run.status));
-    println!("Branch:   {}", run.commit.branch.name);
-    println!("SHA:      {}", run.commit.short_sha);
-    if !run.commit.pusher.display_name.is_empty() {
-        println!("Pushed:   {}", run.commit.pusher.display_name);
+    println!("Branch:   {}", run.branch);
+    println!("SHA:      {}", run.sha);
+    if !run.pushed_by.is_empty() {
+        println!("Pushed:   {}", run.pushed_by);
     }
-    println!("URL:      {url}");
+    println!("URL:      {}", run.url);
     if !run.jobs.is_empty() {
         println!();
         let rows: Vec<Vec<String>> = run
@@ -450,6 +446,115 @@ struct WatchOptions {
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn watch_resolved(ctx: &RepoContext, args: WatchOptions) -> Result<()> {
+    // Tail the job log over `/api/v1` where the server has the routes. A
+    // server that turns out not to have them answers the first call with the
+    // typed limitation, and only then does the web route get a turn.
+    let info = ctx.client.server_info().await;
+    let run_url = api::workflow::run_web_url(&ctx.client, &ctx.owner, &ctx.name, args.run_id);
+    if api::workflow::log_api_gate(&info, &run_url).is_ok() {
+        match watch_api(ctx, args).await {
+            Err(err) if api::workflow::is_actions_unavailable(&err) => {}
+            other => return other,
+        }
+    }
+    watch_web(ctx, args).await
+}
+
+/// The final status once the watched job and every other job in the run have
+/// stopped; `None` while anything can still change.
+fn watch_final_status(jobs: &[api::workflow::WorkflowRunJob], job: usize) -> Option<String> {
+    let watched = jobs.get(job)?;
+    if !api::workflow::is_terminal_job_status(&watched.status)
+        || !jobs
+            .iter()
+            .all(|j| api::workflow::is_terminal_job_status(&j.status))
+    {
+        return None;
+    }
+    Some(
+        api::workflow::aggregate_job_status(jobs.iter().map(|j| j.status.as_str()))
+            .unwrap_or("")
+            .to_string(),
+    )
+}
+
+fn job_out_of_range(job: usize, n: usize) -> anyhow::Error {
+    anyhow!(
+        "job index {job} is out of range: this run has {n} job(s) (0..{})",
+        n.saturating_sub(1)
+    )
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn watch_api(ctx: &RepoContext, args: WatchOptions) -> Result<()> {
+    let (client, owner, name) = (&ctx.client, ctx.owner.as_str(), ctx.name.as_str());
+    let run = api::workflow::find_run(client, owner, name, args.run_id).await?;
+    let mut stdout = std::io::stdout();
+    let mut pending: Vec<u8> = Vec::new();
+    let mut offset = 0u64;
+    let mut watching: Option<(u64, Option<u32>)> = None;
+
+    loop {
+        let jobs =
+            api::workflow::list_run_jobs_api(client, owner, name, args.run_id, run.id).await?;
+        if !jobs.is_empty() && args.job >= jobs.len() {
+            return Err(job_out_of_range(args.job, jobs.len()));
+        }
+        if let Some(job) = jobs.get(args.job) {
+            let attempt = args
+                .attempt
+                .or_else(|| (job.attempt > 0).then_some(job.attempt));
+            // A rerun starts a new attempt with a new log: start over.
+            if watching != Some((job.id, attempt)) {
+                watching = Some((job.id, attempt));
+                offset = 0;
+                pending.clear();
+            }
+            // Each poll reads a bounded range from where the last one stopped.
+            if let Some(log) = api::workflow::read_job_log(
+                client,
+                owner,
+                name,
+                job.id,
+                attempt,
+                offset,
+                api::workflow::LOG_CHUNK_BYTES,
+                api::workflow::LOG_MAX_BYTES,
+            )
+            .await?
+            {
+                offset += log.bytes.len() as u64;
+                for line in api::workflow::split_complete_lines(&mut pending, &log.bytes) {
+                    let _ = writeln!(stdout, "{line}");
+                }
+                let _ = stdout.flush();
+            }
+        }
+
+        // The statuses were read before the log, so a finished job's log has
+        // been read to its end by now.
+        if let Some(status) = watch_final_status(&jobs, args.job) {
+            if !pending.is_empty() {
+                let _ = writeln!(stdout, "{}", String::from_utf8_lossy(&pending));
+            }
+            if offset == 0 {
+                println!("{}", output::dim("(no log was recorded for this job)"));
+            }
+            println!(
+                "\n{} {}",
+                output::bold("run finished:"),
+                output::action_status(&status),
+            );
+            return ensure_exit_status(&status, args.exit_status);
+        }
+        tokio::time::sleep(Duration::from_secs(args.interval.max(1))).await;
+    }
+}
+
+/// The fallback for a server with no job API: poll the run page's web route,
+/// without the token. Only a publicly readable run answers.
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn watch_web(ctx: &RepoContext, args: WatchOptions) -> Result<()> {
     guard_web_routes(&ctx.client)?;
     let (owner, name) = (ctx.owner.as_str(), ctx.name.as_str());
     let attempt = match args.attempt {
@@ -681,52 +786,25 @@ fn run_status_succeeded(status: &str) -> bool {
     matches!(status, "success" | "skipped")
 }
 
-/// Which job indices `view --log` should fetch when `--job` is omitted.
-/// `--log` spans every job; `--log-failed` keeps only the jobs that did not
-/// finish green (anything but `success` / `skipped`), so a failure isn't
-/// hidden behind an earlier passing job.
-#[cfg(test)]
-fn jobs_to_log(statuses: &[String], failed_only: bool) -> Vec<usize> {
-    if !failed_only {
-        return (0..statuses.len()).collect();
-    }
-    failed_job_indices(statuses)
-}
-
-/// Indices of jobs that did not finish green (anything but `success` /
-/// `skipped`). Shared by `view --log-failed` and `rerun --failed` so both treat
-/// "failed" identically.
-fn failed_job_indices(statuses: &[String]) -> Vec<usize> {
-    statuses
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| !matches!(s.as_str(), "success" | "skipped"))
-        .map(|(i, _)| i)
-        .collect()
-}
-
 /// Forgejo clamps an out-of-range job index to the first job rather than
 /// 404ing, which would silently show the wrong logs. Reject it instead.
 fn validate_job(view: &api::workflow::RunView, job: usize) -> Result<()> {
     let n = view.state.run.jobs.len();
     if n > 0 && job >= n {
-        return Err(anyhow!(
-            "job index {job} is out of range: this run has {n} job(s) (0..{})",
-            n - 1
-        ));
+        return Err(job_out_of_range(job, n));
     }
     Ok(())
 }
 
-/// Most of `fj run` (view/watch/rerun/cancel) reads or POSTs Forgejo web
-/// routes, which a Fjord-Account gateway does not proxy. Refuse early with an
-/// actionable message rather than emitting a confusing 404 from the gateway.
-pub(crate) fn guard_web_routes(client: &crate::client::Client) -> Result<()> {
+/// The web fallback of `fj run watch` polls a Forgejo web route, which a
+/// Fjord-Account gateway does not proxy. Refuse early with an actionable
+/// message rather than emitting a confusing 404 from the gateway.
+fn guard_web_routes(client: &crate::client::Client) -> Result<()> {
     if matches!(client.auth_scheme(), AuthScheme::FjordBearer) {
         return Err(anyhow!(
-            "`fj run` isn't supported over a Fjord Account gateway yet: it uses \
-             Forgejo's web routes, which the gateway doesn't forward. Use a host \
-             configured with a personal access token instead."
+            "`fj run watch` on a server without the Actions job API isn't supported over \
+             a Fjord Account gateway: it needs Forgejo's web routes, which the gateway \
+             doesn't forward. Use a host configured with a personal access token instead."
         ));
     }
     Ok(())
@@ -745,65 +823,46 @@ fn absolutize(client: &crate::client::Client, link: &str) -> String {
     }
 }
 
+/// Which rerun the flags ask for. `--job` and `--failed` conflict in clap.
+fn rerun_target(job: Option<usize>, failed: bool) -> api::workflow::RerunTarget {
+    match (job, failed) {
+        (Some(job), _) => api::workflow::RerunTarget::Job(job),
+        (None, true) => api::workflow::RerunTarget::Failed,
+        (None, false) => api::workflow::RerunTarget::Run,
+    }
+}
+
+fn rerun_message(target: api::workflow::RerunTarget, run: u64) -> String {
+    match target {
+        api::workflow::RerunTarget::Run => format!("✓ Re-ran workflow run #{run}"),
+        api::workflow::RerunTarget::Failed => {
+            format!("✓ Re-ran the failed jobs of workflow run #{run}")
+        }
+        api::workflow::RerunTarget::Job(job) => {
+            format!("✓ Re-ran job {job} of workflow run #{run}")
+        }
+    }
+}
+
+// Rerun and cancel are `/api/v1` calls, gated on (flavor, version) inside
+// `api::workflow`. A server without the route gets the limitation and the run
+// URL; no web route is POSTed.
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn rerun(args: RerunArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
-    guard_web_routes(&ctx.client)?;
-    let (owner, name) = (ctx.owner.as_str(), ctx.name.as_str());
-
-    // `--job N` and `--failed` both target individual jobs through Forgejo's
-    // per-job rerun route; only the bare command reruns the whole run.
-    if let Some(job) = args.job {
-        // Validate the index against the run so a typo'd `--job` fails with a
-        // clear message instead of Forgejo's bare 404.
-        let summary =
-            api::workflow::fetch_run_summary(&ctx.client, owner, name, args.run_id).await?;
-        validate_job(&summary, job)?;
-        api::workflow::rerun_job(&ctx.client, owner, name, args.run_id, job).await?;
-        println!("✓ Re-ran job {job} of workflow run #{}", args.run_id);
-        return Ok(());
-    }
-
-    if args.failed {
-        let summary =
-            api::workflow::fetch_run_summary(&ctx.client, owner, name, args.run_id).await?;
-        let statuses: Vec<String> = summary
-            .state
-            .run
-            .jobs
-            .iter()
-            .map(|j| j.status.clone())
-            .collect();
-        let failed = failed_job_indices(&statuses);
-        if failed.is_empty() {
-            let note = if statuses.is_empty() {
-                "This run has no jobs."
-            } else {
-                "No failed jobs to rerun."
-            };
-            println!("{}", output::dim(note));
-            return Ok(());
+    let target = rerun_target(args.job, args.failed);
+    match api::workflow::rerun(&ctx.client, &ctx.owner, &ctx.name, args.run_id, target).await? {
+        api::workflow::RerunOutcome::Started => println!("{}", rerun_message(target, args.run_id)),
+        api::workflow::RerunOutcome::NothingFailed => {
+            println!("{}", output::dim("No failed jobs to rerun."))
         }
-        for &job in &failed {
-            api::workflow::rerun_job(&ctx.client, owner, name, args.run_id, job).await?;
-        }
-        println!(
-            "✓ Re-ran {} failed job(s) of workflow run #{}",
-            failed.len(),
-            args.run_id
-        );
-        return Ok(());
     }
-
-    api::workflow::rerun(&ctx.client, owner, name, args.run_id).await?;
-    println!("✓ Re-ran workflow run #{}", args.run_id);
     Ok(())
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn cancel(args: IdArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
-    guard_web_routes(&ctx.client)?;
     api::workflow::cancel(&ctx.client, &ctx.owner, &ctx.name, args.run_id).await?;
     println!("✓ Cancelled workflow run #{}", args.run_id);
     Ok(())
@@ -840,10 +899,6 @@ mod tests {
         assert!(validate_job(&view, 5).is_ok());
     }
 
-    fn statuses(ss: &[&str]) -> Vec<String> {
-        ss.iter().map(|s| s.to_string()).collect()
-    }
-
     #[test]
     fn ensure_exit_status_ignores_failed_runs_without_flag() {
         assert!(ensure_exit_status("failure", false).is_ok());
@@ -862,22 +917,45 @@ mod tests {
     }
 
     #[test]
-    fn failed_job_indices_keeps_only_non_green_jobs() {
-        let ss = statuses(&["success", "failure", "skipped", "cancelled"]);
-        assert_eq!(failed_job_indices(&ss), vec![1, 3]);
+    fn rerun_target_follows_the_flags() {
+        use api::workflow::RerunTarget;
+        assert_eq!(rerun_target(None, false), RerunTarget::Run);
+        assert_eq!(rerun_target(None, true), RerunTarget::Failed);
+        assert_eq!(rerun_target(Some(2), false), RerunTarget::Job(2));
+        assert!(rerun_message(RerunTarget::Job(2), 7).contains("job 2 of workflow run #7"));
+        assert!(rerun_message(RerunTarget::Failed, 7).contains("failed jobs"));
+        assert!(rerun_message(RerunTarget::Run, 7).ends_with("run #7"));
+    }
+
+    fn api_jobs(ss: &[&str]) -> Vec<api::workflow::WorkflowRunJob> {
+        ss.iter()
+            .map(|s| api::workflow::WorkflowRunJob {
+                status: s.to_string(),
+                ..Default::default()
+            })
+            .collect()
     }
 
     #[test]
-    fn failed_job_indices_empty_when_all_green() {
-        let ss = statuses(&["success", "skipped"]);
-        assert!(failed_job_indices(&ss).is_empty());
-    }
-
-    #[test]
-    fn jobs_to_log_without_failed_only_spans_every_job() {
-        let ss = statuses(&["success", "failure", "success"]);
-        assert_eq!(jobs_to_log(&ss, false), vec![0, 1, 2]);
-        assert_eq!(jobs_to_log(&ss, true), vec![1]);
+    fn watch_waits_for_every_job_then_reports_the_worst_status() {
+        assert_eq!(
+            watch_final_status(&api_jobs(&["success", "running"]), 0),
+            None
+        );
+        assert_eq!(
+            watch_final_status(&api_jobs(&["running", "success"]), 0),
+            None
+        );
+        assert_eq!(watch_final_status(&api_jobs(&[]), 0), None);
+        assert_eq!(
+            watch_final_status(&api_jobs(&["success", "failure"]), 0).as_deref(),
+            Some("failure")
+        );
+        assert_eq!(
+            watch_final_status(&api_jobs(&["success", "skipped"]), 1).as_deref(),
+            Some("success")
+        );
+        assert!(job_out_of_range(3, 2).to_string().contains("(0..1)"));
     }
 
     #[test]
@@ -1131,27 +1209,6 @@ mod tests {
             panic!("expected run watch command");
         };
         assert!(args.exit_status);
-    }
-
-    #[test]
-    fn jobs_to_log_full_spans_every_job() {
-        let s = statuses(&["success", "failure", "skipped"]);
-        assert_eq!(jobs_to_log(&s, false), vec![0, 1, 2]);
-        assert_eq!(jobs_to_log(&statuses(&[]), false), Vec::<usize>::new());
-    }
-
-    #[test]
-    fn jobs_to_log_failed_keeps_only_non_green_jobs() {
-        // job 0 passed, job 1 failed, job 2 skipped -> only job 1
-        let s = statuses(&["success", "failure", "skipped"]);
-        assert_eq!(jobs_to_log(&s, true), vec![1]);
-        // cancelled / error count as failed too
-        assert_eq!(
-            jobs_to_log(&statuses(&["cancelled", "error"]), true),
-            vec![0, 1]
-        );
-        // all green -> empty (caller prints "No failed jobs")
-        assert!(jobs_to_log(&statuses(&["success", "skipped"]), true).is_empty());
     }
 
     fn test_client() -> crate::client::Client {

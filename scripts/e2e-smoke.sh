@@ -38,6 +38,15 @@ run "$FJ" repo view "$TEST_REPO" --json
 echo "== issue =="
 run "$FJ" issue list -R "$TEST_REPO" --state all
 run "$FJ" issue list -R "$TEST_REPO" --json
+run "$FJ" issue list -R "$TEST_REPO" --state all --sort oldest
+# These read one work item, so they need an existing issue or pull request
+# number; the dependency and time lists also need those features enabled on
+# the repo. Opt in with FJ_E2E_ISSUE=<number>.
+if [[ -n "${FJ_E2E_ISSUE:-}" ]]; then
+  run "$FJ" issue reaction list "$FJ_E2E_ISSUE" -R "$TEST_REPO"
+  run "$FJ" issue dependency list "$FJ_E2E_ISSUE" -R "$TEST_REPO"
+  run "$FJ" issue time list "$FJ_E2E_ISSUE" -R "$TEST_REPO"
+fi
 
 echo "== pr =="
 run "$FJ" pr list -R "$TEST_REPO" --state all
@@ -54,9 +63,22 @@ run "$FJ" milestone list -R "$TEST_REPO"
 echo "== branches / topics =="
 run "$FJ" repo branches "$TEST_REPO"
 run "$FJ" repo topics "$TEST_REPO"
+run "$FJ" repo transfer view -R "$TEST_REPO"
+
+
+echo "== commits / contents =="
+run "$FJ" repo commit list -R "$TEST_REPO" -L 5
+run "$FJ" repo contents -R "$TEST_REPO"
+if [[ "$ADMIN" = "1" ]]; then
+  echo "== variables (admin) =="
+  run "$FJ" variable list -R "$TEST_REPO"
+fi
 if [[ "$ADMIN" = "1" ]]; then
   echo "== protect (admin) =="
   run "$FJ" protect list -R "$TEST_REPO"
+  # Reads the account's orgs and repositories, so it needs a token with the
+  # user and organization read scopes.
+  run "$FJ" repo transfer list
 fi
 
 echo "== notifications (local mute list) =="

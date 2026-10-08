@@ -42,12 +42,82 @@ pub async fn combined_status(
     name: &str,
     sha: &str,
 ) -> Result<CombinedStatus> {
+    combined_status_page(client, owner, name, sha, &[]).await
+}
+
+/// Page cap for the complete scans a merge gate is judged on.
+pub(crate) const SCAN_MAX_PAGES: u32 = 10;
+
+pub(crate) fn page_query(page: u32) -> Vec<(String, String)> {
+    vec![
+        ("page".to_string(), page.to_string()),
+        ("limit".to_string(), "50".to_string()),
+    ]
+}
+
+/// The statuses on a commit gathered by [`combined_status_all`]. `complete`
+/// is false when the page cap was reached first, in which case a context that
+/// was not seen may still exist on a later page.
+#[derive(Debug, Clone)]
+pub struct StatusScan {
+    pub combined: CombinedStatus,
+    pub complete: bool,
+}
+
+/// The combined status with every page of `statuses` folded in. The endpoint
+/// pages its statuses and reports no reliable total, so the walk ends only on
+/// an empty page; a short page proves nothing when the server caps the page
+/// size below what was asked for.
+pub async fn combined_status_all(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    sha: &str,
+) -> Result<StatusScan> {
+    let mut combined = empty_combined_status(sha);
+    let mut complete = false;
+    for page in 1..=SCAN_MAX_PAGES {
+        let mut batch = combined_status_page(client, owner, name, sha, &page_query(page)).await?;
+        if page == 1 {
+            combined.state = std::mem::take(&mut batch.state);
+        }
+        if batch.statuses.is_empty() {
+            complete = true;
+            break;
+        }
+        let before = combined.statuses.len();
+        for s in batch.statuses {
+            if !combined
+                .statuses
+                .iter()
+                .any(|seen| seen.context == s.context)
+            {
+                combined.statuses.push(s);
+            }
+        }
+        // A page that repeats what was already seen means the server ignored
+        // `page`; stop rather than loop, and do not claim completeness.
+        if combined.statuses.len() == before {
+            break;
+        }
+    }
+    combined.total_count = combined.statuses.len() as u64;
+    Ok(StatusScan { combined, complete })
+}
+
+async fn combined_status_page(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    sha: &str,
+    query: &[(String, String)],
+) -> Result<CombinedStatus> {
     let path = format!(
         "{}/commits/{}/status",
         crate::api::repo_path(owner, name),
         crate::api::path_segment(sha)
     );
-    let value: serde_json::Value = client.json(Method::GET, &path, &[], None::<&()>).await?;
+    let value: serde_json::Value = client.json(Method::GET, &path, query, None::<&()>).await?;
     if value.is_null() {
         return Ok(empty_combined_status(sha));
     }

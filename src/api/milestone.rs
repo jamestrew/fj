@@ -109,3 +109,81 @@ pub async fn assign(
     res.error_for_status()?;
     Ok(())
 }
+
+/// Pick the milestone a user named, by title first and by id second (the same
+/// order the forge uses for the `milestones` list filter). `Ok(None)` means
+/// nothing in `milestones` matched. A title shared by several milestones is an
+/// error naming their ids, since guessing would file the issue in the wrong one.
+pub fn pick<'a>(milestones: &'a [Milestone], wanted: &str) -> Result<Option<&'a Milestone>> {
+    let wanted = wanted.trim();
+    let by_title: Vec<&Milestone> = milestones.iter().filter(|m| m.title == wanted).collect();
+    match by_title.as_slice() {
+        [one] => return Ok(Some(one)),
+        [] => {}
+        many => {
+            let ids = many
+                .iter()
+                .map(|m| m.id.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!("several milestones are titled '{wanted}' (ids {ids}); pass the id");
+        }
+    }
+    Ok(wanted
+        .parse::<u64>()
+        .ok()
+        .and_then(|id| milestones.iter().find(|m| m.id == id)))
+}
+
+/// Resolve a milestone title or id to the milestone the forge holds. An id
+/// that is not on the first list page is still looked up directly.
+pub async fn resolve(client: &Client, owner: &str, name: &str, wanted: &str) -> Result<Milestone> {
+    let milestones = list(client, owner, name, "all").await?;
+    if let Some(found) = pick(&milestones, wanted)? {
+        return Ok(found.clone());
+    }
+    if let Ok(id) = wanted.trim().parse::<u64>() {
+        return get(client, owner, name, id).await;
+    }
+    Err(anyhow::anyhow!(
+        "no milestone named '{}' in {owner}/{name} (see `fj milestone list`)",
+        wanted.trim()
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn milestone(id: u64, title: &str) -> Milestone {
+        Milestone {
+            id,
+            title: title.to_string(),
+            description: String::new(),
+            state: "open".to_string(),
+            open_issues: 0,
+            closed_issues: 0,
+            due_on: None,
+            created_at: None,
+            closed_at: None,
+        }
+    }
+
+    #[test]
+    fn pick_prefers_title_then_falls_back_to_id() {
+        let all = [milestone(7, "v1"), milestone(8, "7"), milestone(9, "v2")];
+        assert_eq!(pick(&all, "v1").unwrap().unwrap().id, 7);
+        // A milestone literally titled "7" wins over the milestone with id 7.
+        assert_eq!(pick(&all, "7").unwrap().unwrap().id, 8);
+        assert_eq!(pick(&all, " 9 ").unwrap().unwrap().id, 9);
+        assert!(pick(&all, "nope").unwrap().is_none());
+        assert!(pick(&all, "42").unwrap().is_none());
+    }
+
+    #[test]
+    fn pick_refuses_an_ambiguous_title() {
+        let all = [milestone(1, "v1"), milestone(2, "v1")];
+        let err = pick(&all, "v1").unwrap_err().to_string();
+        assert!(err.contains("ids 1, 2"), "{err}");
+    }
+}

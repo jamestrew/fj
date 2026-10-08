@@ -13,10 +13,11 @@
 
 use crate::api;
 use crate::api::pull::Pull;
+use crate::cli::pr_preflight::{Preflight, Protection};
 
 /// Strip a leading `refs/heads/` so a PR base ref matches the bare branch name
 /// the branch-protection endpoint expects.
-fn bare_branch(r: &str) -> &str {
+pub(crate) fn bare_branch(r: &str) -> &str {
     r.strip_prefix("refs/heads/").unwrap_or(r)
 }
 
@@ -46,6 +47,9 @@ pub struct MergeFacts {
     /// `context` is the reported check's own name, or the required pattern
     /// with `state` `missing` when no reported check matched it.
     pub failing_checks: Vec<(String, String)>,
+    /// What the base branch's rule is known to refuse this merge for, already
+    /// worded, from the preflight any reader of the repo can run.
+    pub rule_blocker: Option<String>,
     /// Branch protection blocks merging an out-of-date branch.
     pub block_on_outdated: bool,
     /// Raw merge rejection from Forgejo, when available.
@@ -88,6 +92,9 @@ pub fn diagnose(f: &MergeFacts) -> Option<String> {
             "PR #{} has merge conflicts with {}; rebase or resolve the conflicts, then retry.",
             f.number, f.base
         ));
+    }
+    if let Some(blocker) = &f.rule_blocker {
+        return Some(blocker.clone());
     }
     if let Some((ctx, state)) = f.failing_checks.first() {
         if state == "missing" && is_glob_pattern(ctx) {
@@ -177,6 +184,7 @@ pub async fn diagnose_merge_failure(
     pull: &Pull,
     style: &str,
     merge_error: Option<&str>,
+    preflight: Option<&Preflight>,
 ) -> Option<String> {
     let base = bare_branch(&pull.base.ref_).to_string();
 
@@ -204,24 +212,40 @@ pub async fn diagnose_merge_failure(
             .collect();
     }
 
-    // Branch protection (404 when the base is unprotected; permission errors
-    // for non-admins). Either way, fall through to whatever else we learned.
-    if let Ok(prot) = api::protect::get(client, owner, name, &base).await {
-        facts.required_approvals = prot.required_approvals;
+    // What the rule requires, as far as a reader of the repo can see it. This
+    // is the part that works without admin rights.
+    facts.rule_blocker = preflight.and_then(|p| p.blocker()).map(str::to_string);
+    let rule_read = preflight.is_some_and(|p| !matches!(p.protection, Protection::Unknown(_)));
+    let unprotected = preflight.is_some_and(|p| p.protection == Protection::Unprotected);
+
+    // The full rule (admin-only; 404 when the base is unprotected). It is the
+    // only source for the outdated-branch setting, and the fallback for checks
+    // and approvals when the branch endpoint told us nothing. The rule is
+    // keyed by its own name, which is a glob and not always the branch name.
+    let rule_name = preflight.and_then(|p| p.rule_name()).unwrap_or(&base);
+    if unprotected {
+        // Nothing to read: there is no rule.
+    } else if let Ok(prot) = api::protect::get(client, owner, name, rule_name).await {
         facts.block_on_outdated = prot.block_on_outdated_branch;
 
-        if prot.required_approvals > 0 {
-            facts.approvals = count_approvals(client, owner, name, pull.number).await;
-        }
-        if prot.enable_status_check && !prot.status_check_contexts.is_empty() {
-            facts.failing_checks = failing_required(
-                client,
-                owner,
-                name,
-                &pull.head.sha,
-                &prot.status_check_contexts,
-            )
-            .await;
+        if !rule_read {
+            if prot.required_approvals > 0 {
+                // An unreadable review list is not zero approvals.
+                if let Some(n) = count_approvals(client, owner, name, pull.number).await {
+                    facts.required_approvals = prot.required_approvals;
+                    facts.approvals = n;
+                }
+            }
+            if prot.enable_status_check && !prot.status_check_contexts.is_empty() {
+                facts.failing_checks = failing_required(
+                    client,
+                    owner,
+                    name,
+                    &pull.head.sha,
+                    &prot.status_check_contexts,
+                )
+                .await;
+            }
         }
     }
 
@@ -235,11 +259,10 @@ async fn count_approvals(
     owner: &str,
     name: &str,
     number: u64,
-) -> i64 {
-    let reviews = match api::pull::list_reviews(client, owner, name, number).await {
-        Ok(r) => r,
-        Err(_) => return 0,
-    };
+) -> Option<i64> {
+    let reviews = api::pull::list_reviews(client, owner, name, number)
+        .await
+        .ok()?;
     // Reviews arrive oldest-first; last write per user wins.
     let mut latest: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for r in reviews {
@@ -249,7 +272,7 @@ async fn count_approvals(
             latest.insert(r.user.login, state);
         }
     }
-    latest.values().filter(|s| *s == "APPROVED").count() as i64
+    Some(latest.values().filter(|s| *s == "APPROVED").count() as i64)
 }
 
 /// Required status checks that are not green on `sha`, as `(context, state)`.
@@ -306,7 +329,7 @@ pub fn required_check_failures(
 }
 
 /// True when a required context uses glob syntax rather than naming a check.
-fn is_glob_pattern(p: &str) -> bool {
+pub(crate) fn is_glob_pattern(p: &str) -> bool {
     p.contains(['*', '?', '[', '{'])
 }
 
@@ -314,10 +337,10 @@ fn is_glob_pattern(p: &str) -> bool {
 /// contexts (compiled without separators): `*` and `**` match any run of
 /// characters, `?` one character, `[abc]` / `[a-z]` / `[!abc]` a class,
 /// `{a,b}` alternatives, and `\` escapes the next character.
-#[derive(Debug)]
-struct Glob(Vec<Tok>);
+#[derive(Debug, Clone)]
+pub(crate) struct Glob(Vec<Tok>);
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Tok {
     Lit(char),
     Any,
@@ -331,7 +354,7 @@ enum Tok {
 
 impl Glob {
     /// `None` when the pattern is malformed (an unclosed `[` or `{`).
-    fn compile(pattern: &str) -> Option<Glob> {
+    pub(crate) fn compile(pattern: &str) -> Option<Glob> {
         let chars: Vec<char> = pattern.chars().collect();
         let (glob, rest) = Self::parse(&chars, false)?;
         rest.is_empty().then_some(glob)
@@ -401,7 +424,7 @@ impl Glob {
         Some((Glob(toks), s))
     }
 
-    fn matches(&self, text: &str) -> bool {
+    pub(crate) fn matches(&self, text: &str) -> bool {
         let chars: Vec<char> = text.chars().collect();
         Self::match_from(&self.0, &chars)
     }
