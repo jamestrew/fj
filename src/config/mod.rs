@@ -1,4 +1,5 @@
 pub mod hosts;
+pub mod muted;
 
 use std::path::PathBuf;
 

@@ -58,6 +58,9 @@ if [[ "$ADMIN" = "1" ]]; then
   run "$FJ" protect list -R "$TEST_REPO"
 fi
 
+echo "== notifications (local mute list) =="
+run "$FJ" status muted
+
 echo "== actions =="
 run "$FJ" workflow list -R "$TEST_REPO"
 run "$FJ" run list -R "$TEST_REPO" -L 5

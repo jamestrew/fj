@@ -6462,3 +6462,374 @@ async fn persistently_401_refreshes_at_most_once() {
         "refresh is attempted at most once, never in a loop"
     );
 }
+
+// ---- notifications: per-thread read, unsubscribe, filtered paging ----
+
+fn notification_thread(id: u64, unread: bool, kind: &str, repo: &str) -> serde_json::Value {
+    json!({
+        "id": id, "unread": unread, "pinned": false,
+        "updated_at": "2026-01-01T00:00:00Z",
+        "url": format!("https://x/api/v1/notifications/threads/{id}"),
+        "subject": {
+            "title": "a thing", "type": kind, "state": "open",
+            "html_url": format!("https://x/{repo}/issues/5"),
+            "url": format!("https://x/api/v1/repos/{repo}/issues/5")
+        },
+        "repository": { "full_name": repo }
+    })
+}
+
+#[tokio::test]
+async fn notification_mark_thread_read_accepts_205_with_empty_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/notifications/threads/7"))
+        .respond_with(ResponseTemplate::new(205))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    crate::api::notification::mark_thread_read(&c, 7)
+        .await
+        .expect("205 with no body is success");
+}
+
+#[tokio::test]
+async fn notification_mark_thread_read_surfaces_not_found() {
+    let server = MockServer::start().await;
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/notifications/threads/7"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({ "message": "gone" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let err = crate::api::notification::mark_thread_read(&c, 7)
+        .await
+        .expect_err("404 is an error");
+    assert!(format!("{err:#}").contains("404"), "{err:#}");
+}
+
+#[tokio::test]
+async fn notification_get_thread_decodes() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/notifications/threads/7"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(notification_thread(7, false, "Pull", "o/r")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let t = crate::api::notification::get_thread(&c, 7)
+        .await
+        .expect("thread");
+    assert_eq!(t.id, 7);
+    assert!(!t.unread);
+    assert_eq!(t.subject.html_url, "https://x/o/r/issues/5");
+}
+
+#[tokio::test]
+async fn notification_list_filtered_drops_muted_threads_on_every_page() {
+    let server = MockServer::start().await;
+    // limit 2 => per-page 2. Page 1 is all muted, page 2 is half muted, page
+    // 3 is short, which ends the walk.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/notifications"))
+        .and(query_param("limit", "2"))
+        .and(query_param_is_missing("page"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            notification_thread(1, true, "Issue", "Loud/Repo"),
+            notification_thread(2, true, "Issue", "loud/repo"),
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/notifications"))
+        .and(query_param("limit", "2"))
+        .and(query_param("page", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            notification_thread(3, true, "Issue", "o/r"),
+            notification_thread(4, true, "Issue", "LOUD/REPO"),
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/notifications"))
+        .and(query_param("limit", "2"))
+        .and(query_param("page", "3"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+            "id": 5, "unread": true, "pinned": false,
+            "updated_at": "2026-01-01T00:00:00Z",
+            "url": "https://x/api/v1/notifications/threads/5",
+            "subject": { "title": "no repo", "type": "Issue", "state": "open" },
+            "repository": null
+        }])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let inbox = crate::api::notification::list_filtered(&c, false, 2, |n| {
+        n.repository
+            .as_ref()
+            .is_none_or(|r| !r.full_name.eq_ignore_ascii_case("loud/repo"))
+    })
+    .await
+    .expect("list");
+    let ids: Vec<u64> = inbox.items.iter().map(|n| n.id).collect();
+    assert_eq!(ids, [3, 5], "server order kept, repo-less thread passes");
+    assert_eq!(inbox.hidden, 3);
+    assert!(!inbox.truncated);
+}
+
+#[tokio::test]
+async fn notification_list_filtered_stops_once_the_limit_is_met() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/notifications"))
+        .and(query_param("limit", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            notification_thread(1, true, "Issue", "o/r"),
+            notification_thread(2, true, "Issue", "o/r"),
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let inbox = crate::api::notification::list_filtered(&c, false, 2, |_| true)
+        .await
+        .expect("list");
+    assert_eq!(inbox.items.len(), 2);
+    assert_eq!(inbox.hidden, 0);
+}
+
+#[tokio::test]
+async fn notification_unsubscribe_deletes_for_current_user_then_marks_read() {
+    let server = MockServer::start().await;
+    // First read sees the unread thread; the reconciling read after the
+    // PATCH sees it read.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/notifications/threads/7"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(notification_thread(7, true, "Issue", "o/r")),
+        )
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/notifications/threads/7"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(notification_thread(7, false, "Issue", "o/r")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/user"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "id": 1, "login": "alice" })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/repos/o/r/issues/5/subscriptions/alice"))
+        .respond_with(ResponseTemplate::new(201))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/notifications/threads/7"))
+        .respond_with(ResponseTemplate::new(205))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let report = crate::api::notification::unsubscribe_thread(&c, 7)
+        .await
+        .expect("unsubscribe");
+    assert_eq!(
+        report.outcome,
+        crate::api::notification::Unsubscribed::Removed
+    );
+    assert_eq!(report.user, "alice");
+    assert_eq!(report.target.index, 5);
+    assert!(!report.thread.unread, "report carries the server's state");
+}
+
+#[tokio::test]
+async fn notification_unsubscribe_skips_mark_read_for_a_read_thread() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/notifications/threads/7"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(notification_thread(7, false, "Pull", "o/r")),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/user"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "id": 1, "login": "alice" })),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/repos/o/r/issues/5/subscriptions/alice"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .respond_with(ResponseTemplate::new(205))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let report = crate::api::notification::unsubscribe_thread(&c, 7)
+        .await
+        .expect("unsubscribe");
+    assert_eq!(
+        report.outcome,
+        crate::api::notification::Unsubscribed::AlreadyUnsubscribed
+    );
+}
+
+#[tokio::test]
+async fn notification_unsubscribe_refuses_repository_threads_without_deleting() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/notifications/threads/7"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(notification_thread(
+                7,
+                true,
+                "Repository",
+                "o/r",
+            )),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .respond_with(ResponseTemplate::new(201))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .respond_with(ResponseTemplate::new(205))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let err = crate::api::notification::unsubscribe_thread(&c, 7)
+        .await
+        .expect_err("repository thread is not subscribable");
+    assert!(
+        format!("{err:#}").contains("only issue and pull request"),
+        "{err:#}"
+    );
+}
+
+#[tokio::test]
+async fn notification_unsubscribe_refuses_when_current_user_is_unknown() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/notifications/threads/7"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(notification_thread(7, true, "Issue", "o/r")),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/user"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({ "message": "scope" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .respond_with(ResponseTemplate::new(201))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .respond_with(ResponseTemplate::new(205))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let err = crate::api::notification::unsubscribe_thread(&c, 7)
+        .await
+        .expect_err("no current user, no delete");
+    assert!(
+        format!("{err:#}").contains("could not resolve the current user"),
+        "{err:#}"
+    );
+}
+
+#[tokio::test]
+async fn notification_unsubscribe_reconciles_after_a_failed_delete() {
+    let server = MockServer::start().await;
+    // Read once before the delete and once after it fails.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/notifications/threads/7"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(notification_thread(7, true, "Issue", "o/r")),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/user"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "id": 1, "login": "alice" })),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/repos/o/r/issues/5/subscriptions/alice"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({ "message": "no issue" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .respond_with(ResponseTemplate::new(205))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let err = crate::api::notification::unsubscribe_thread(&c, 7)
+        .await
+        .expect_err("delete failed");
+    let text = format!("{err:#}");
+    assert!(text.contains("still unread on the server"), "{text}");
+    assert!(text.contains("404"), "{text}");
+}
+
+#[tokio::test]
+async fn notification_delete_subscription_explains_a_304() {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/repos/o/r/issues/5/subscriptions/bob"))
+        .respond_with(ResponseTemplate::new(304))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let target = crate::api::notification::SubscriptionTarget {
+        owner: "o".into(),
+        repo: "r".into(),
+        index: 5,
+    };
+    let err = crate::api::notification::delete_subscription(&c, &target, "bob")
+        .await
+        .expect_err("304 is a refusal");
+    assert!(
+        format!("{err:#}").contains("their own subscription"),
+        "{err:#}"
+    );
+}

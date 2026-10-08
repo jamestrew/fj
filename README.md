@@ -167,6 +167,10 @@ fj pr request-review 42 alice bob        # tag specific reviewers
 fj pr status                             # cross-repo dashboard of PRs you care about
 fj status                                # notifications inbox
 fj status --mark-read                    # clear it
+fj status read 42                        # mark one thread read (id from the ID column)
+fj status unsubscribe 42                 # leave that issue/PR thread and mark it read
+fj status mute owner/noisy-repo          # hide a repo locally (server unread count unchanged)
+fj status muted                          # list local mutes; `fj status unmute` reverses one
 ```
 
 **Cut a release:**

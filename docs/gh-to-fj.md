@@ -147,7 +147,7 @@ called out.
 | `gh`                              | `fj`                              | Notes                                           |
 | --------------------------------- | --------------------------------- | ----------------------------------------------- |
 | `gh browse`                       | `fj browse`                       | `fj browse src/main.rs` deep-links.             |
-| `gh status`                       | `fj status`                       | Notifications inbox.                            |
+| `gh status`                       | `fj status`                       | Notifications inbox. Also `fj status read ID`, `unsubscribe ID`, and a local per-account repo mute (`mute` / `unmute` / `muted`). |
 | `gh ssh-key list`                 | `fj ssh-key list`                 |                                                 |
 | `gh gpg-key list`                 | `fj gpg-key list`                 |                                                 |
 | `gh alias list`                   | `fj alias list`                   |                                                 |
