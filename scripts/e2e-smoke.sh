@@ -24,6 +24,7 @@ fi
 echo "== auth =="
 run "$FJ" auth status
 run "$FJ" auth list
+run "$FJ" auth group list
 
 echo "== api =="
 run "$FJ" api /version
@@ -68,5 +69,18 @@ run "$FJ" run list -R "$TEST_REPO" -L 5
 echo "== search =="
 run "$FJ" search repos "$TEST_REPO" -L 3
 run "$FJ" search issues "is:issue" -L 3
+
+echo "== profile =="
+run "$FJ" profile view
+run "$FJ" profile email list
+
+# Instance administration needs an instance-admin token, so it is opt-in
+# separately from the repo-admin checks above.
+if [[ "${FJ_E2E_INSTANCE_ADMIN:-0}" = "1" ]]; then
+  echo "== admin (instance admin) =="
+  run "$FJ" admin settings
+  run "$FJ" admin cron list -L 5
+  run "$FJ" admin unadopted list -L 5
+fi
 
 echo "✓ e2e smoke passed against $TEST_REPO"

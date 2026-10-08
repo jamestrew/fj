@@ -1,3 +1,4 @@
+pub mod admin;
 pub mod hook;
 pub mod issue;
 pub mod label;

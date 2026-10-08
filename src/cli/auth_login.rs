@@ -7,6 +7,7 @@ use crate::api;
 use crate::auth as token_store;
 use crate::cli::auth::LoginArgs;
 use crate::cli::auth_probe::{build_probe_client, probe_version, warn_on_old_forgejo};
+use crate::cli::instances::{self, CommonsLookup, Listing};
 use crate::config::hosts::{AuthKind, FjordAccount, Host, Hosts};
 use crate::output;
 
@@ -222,7 +223,10 @@ async fn login_fjord_oidc(args: LoginArgs, platform_url: String) -> Result<()> {
             let tokens =
                 oidc::exchange_code(&platform_url, &client, &code, &redirect_uri, &pkce.verifier)
                     .await?;
-            persist_oidc_session(&args, platform_url, tokens)
+            let bearer = tokens.access_token.clone();
+            persist_oidc_session(&args, platform_url.clone(), tokens)?;
+            finish_fjord_login(&platform_url, &bearer).await;
+            Ok(())
         }
         OidcCapture::Loopback => {
             let client = oidc::client_id();
@@ -231,7 +235,10 @@ async fn login_fjord_oidc(args: LoginArgs, platform_url: String) -> Result<()> {
             let tokens =
                 oidc::exchange_code(&platform_url, &client, &code, &redirect_uri, &pkce.verifier)
                     .await?;
-            persist_oidc_session(&args, platform_url, tokens)
+            let bearer = tokens.access_token.clone();
+            persist_oidc_session(&args, platform_url.clone(), tokens)?;
+            finish_fjord_login(&platform_url, &bearer).await;
+            Ok(())
         }
     }
 }
@@ -316,7 +323,10 @@ async fn login_device_flow(args: &LoginArgs, platform_url: String, auto: bool) -
         deadline,
     )
     .await?;
-    persist_oidc_session(args, platform_url, tokens)
+    let bearer = tokens.access_token.clone();
+    persist_oidc_session(args, platform_url.clone(), tokens)?;
+    finish_fjord_login(&platform_url, &bearer).await;
+    Ok(())
 }
 
 /// Print the branded device-flow instructions: the verification URL, the code
@@ -410,6 +420,240 @@ fn fjord_account_for(platform_url: &str, auth_flow: &str, previous: Option<&Host
         default_instance_slug: kept.and_then(|a| a.default_instance_slug.clone()),
         default_instance_public_url: kept.and_then(|a| a.default_instance_public_url.clone()),
         auth_flow: Some(auth_flow.to_string()),
+    }
+}
+
+/// What re-validating the remembered instance against the platform concluded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SelectionCheck {
+    /// No instance was remembered: a first sign-in, or one never picked.
+    NothingRemembered,
+    /// Still on the account and ready. The user lands straight back on it.
+    Restored { id: String, name: String },
+    /// Gone, or present but not ready. The selection has been cleared.
+    Stale {
+        id: String,
+        name: Option<String>,
+        /// The state the platform reports, when the instance is still there.
+        not_ready_state: Option<String>,
+    },
+    /// The remembered instance is the Commons and the Commons lookup did not
+    /// answer, so nothing can be concluded. The selection is left alone.
+    Unverified { id: String },
+}
+
+/// Re-validate the instance this host's own record remembers against a fresh
+/// listing, and bring the record in line with the answer.
+///
+/// Present and ready: the cached name, slug, and URL are refreshed from the
+/// platform and the selection stands. Missing or not ready: all four instance
+/// fields are cleared, so the session is persisted with no instance and the
+/// next command asks for one instead of routing to a forge that is not there.
+///
+/// One carve-out. The Commons lookup is best-effort, so when it did not answer
+/// and the remembered instance is the Commons, its absence from the listing
+/// proves nothing. Clearing it would make a Commons outage cost the user their
+/// selection, which is exactly the coupling the best-effort rule forbids.
+fn revalidate_selection(account: &mut FjordAccount, listing: &Listing) -> SelectionCheck {
+    let Some(id) = account.default_instance_id.clone() else {
+        return SelectionCheck::NothingRemembered;
+    };
+    let found = listing.selectable().into_iter().find(|i| i.id == id);
+    if let Some(instance) = found.as_ref().filter(|i| i.is_ready()) {
+        account.default_instance_display_name = Some(instance.display_name.clone());
+        account.default_instance_slug = Some(instance.slug.clone());
+        account.default_instance_public_url = instance.public_url.clone();
+        return SelectionCheck::Restored {
+            id,
+            name: instance.display_name.clone(),
+        };
+    }
+    let remembered_commons = account.default_instance_slug.as_deref() == Some("commons");
+    if found.is_none()
+        && remembered_commons
+        && matches!(listing.commons, CommonsLookup::Unavailable)
+    {
+        return SelectionCheck::Unverified { id };
+    }
+    let name = account.default_instance_display_name.take();
+    account.default_instance_id = None;
+    account.default_instance_slug = None;
+    account.default_instance_public_url = None;
+    SelectionCheck::Stale {
+        id,
+        name,
+        not_ready_state: found.and_then(|i| i.state),
+    }
+}
+
+const PICK_INSTANCE_HINT: &str =
+    "Next: `fj instances list` to see your Forgejo instances, then `fj instances use <id>`.";
+
+/// The lines sign-in prints about the instance selection. For a stale
+/// selection this is fj's picker: the instances that can be selected right
+/// now, and the command that selects one. It never prompts, so a sign-in
+/// driven without a TTY cannot hang on it.
+fn selection_report(check: &SelectionCheck, listing: Option<&Listing>) -> Vec<String> {
+    match check {
+        SelectionCheck::NothingRemembered => vec![PICK_INSTANCE_HINT.to_string()],
+        SelectionCheck::Restored { id, name } => {
+            vec![format!("Using instance {name} ({id}), as before.")]
+        }
+        SelectionCheck::Unverified { id } => vec![format!(
+            "Kept instance {id} selected, but could not confirm it just now. \
+             `fj instances list` shows what is available."
+        )],
+        SelectionCheck::Stale {
+            id,
+            name,
+            not_ready_state,
+        } => {
+            let label = match name.as_deref().filter(|n| !n.is_empty()) {
+                Some(name) => format!("{name} ({id})"),
+                None => id.clone(),
+            };
+            let why = match not_ready_state {
+                Some(state) => format!("is not ready (state: {state})"),
+                None => "is no longer on this account".to_string(),
+            };
+            let mut lines = vec![format!(
+                "The previously selected instance {label} {why}, so no instance is selected now."
+            )];
+            let ready: Vec<_> = listing
+                .map(|l| l.selectable())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|i| i.is_ready())
+                .collect();
+            if ready.is_empty() {
+                lines.push(
+                    "No instance is ready to select yet. Check `fj instances list`.".to_string(),
+                );
+            } else {
+                lines.push("Pick one with `fj instances use <id>`:".to_string());
+                lines.extend(
+                    ready
+                        .iter()
+                        .map(|i| format!("  {}  {}", i.id, i.display_name)),
+                );
+            }
+            lines
+        }
+    }
+}
+
+/// Longest the post-sign-in instance check may take. The sign-in itself is
+/// already stored by then; this only bounds how long the command lingers.
+const REVALIDATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// After a sign-in has been persisted, land the user back on the instance
+/// this host remembered, if the platform still has it and it is ready.
+///
+/// Runs after the tokens and host entry are saved, never before: a slow or
+/// failing platform call here must not be able to lose a completed sign-in.
+/// If the listing cannot be fetched at all the remembered selection is kept,
+/// unverified, and the user is told so. That is what fj did before this check
+/// existed, and it is the safe side of not knowing.
+///
+/// The remembered instance is read from the record keyed by this platform URL
+/// and nothing else. No other configured host is consulted.
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn restore_instance_after_login(platform_url: &str, bearer: &str) -> Result<()> {
+    let remembered = Hosts::load()?
+        .hosts
+        .get(platform_url)
+        .and_then(|host| host.fjord_account.as_ref())
+        .and_then(|account| account.default_instance_id.clone());
+    let Some(remembered) = remembered else {
+        print_selection_report(&SelectionCheck::NothingRemembered, None);
+        return Ok(());
+    };
+
+    let fetched = tokio::time::timeout(
+        REVALIDATE_TIMEOUT,
+        instances::fetch_listing_once(platform_url, bearer),
+    )
+    .await;
+    let listing = match fetched {
+        Ok(Ok(listing)) => listing,
+        Ok(Err(e)) => {
+            eprintln!(
+                "  {}",
+                output::dim(&format!(
+                    "note: could not check that instance {remembered} is still available ({e}); \
+                     keeping it selected. `fj instances list` shows what is available."
+                ))
+            );
+            return Ok(());
+        }
+        Err(_) => {
+            eprintln!(
+                "  {}",
+                output::dim(&format!(
+                    "note: the platform took too long to list instances, so instance \
+                     {remembered} was not re-checked; keeping it selected."
+                ))
+            );
+            return Ok(());
+        }
+    };
+
+    // Reloaded rather than reused: the fetch above can take seconds, and this
+    // write must not undo a change another fj process made meanwhile.
+    let mut hosts = Hosts::load()?;
+    let Some(account) = hosts
+        .hosts
+        .get_mut(platform_url)
+        .and_then(|host| host.fjord_account.as_mut())
+    else {
+        return Ok(());
+    };
+    let before = (
+        account.default_instance_id.clone(),
+        account.default_instance_display_name.clone(),
+        account.default_instance_slug.clone(),
+        account.default_instance_public_url.clone(),
+    );
+    let check = revalidate_selection(account, &listing);
+    let after = (
+        account.default_instance_id.clone(),
+        account.default_instance_display_name.clone(),
+        account.default_instance_slug.clone(),
+        account.default_instance_public_url.clone(),
+    );
+    if before != after {
+        hosts.save()?;
+    }
+    print_selection_report(&check, Some(&listing));
+    Ok(())
+}
+
+/// The instance step of a Fjord Account sign-in. By the time this runs the
+/// sign-in is stored, so nothing here may turn it into a failed command: an
+/// error is reported as a note and the login still succeeds.
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn finish_fjord_login(platform_url: &str, bearer: &str) {
+    if let Err(e) = restore_instance_after_login(platform_url, bearer).await {
+        eprintln!(
+            "  {}",
+            output::dim(&format!(
+                "note: signed in, but could not check the selected instance ({e}). \
+                 `fj instances list` shows what is available."
+            ))
+        );
+    }
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn print_selection_report(check: &SelectionCheck, listing: Option<&Listing>) {
+    let lines = selection_report(check, listing);
+    let stale = matches!(check, SelectionCheck::Stale { .. });
+    for (index, line) in lines.iter().enumerate() {
+        if stale && index == 0 {
+            println!("{} {line}", output::bold("!"));
+        } else {
+            println!("  {}", output::dim(line));
+        }
     }
 }
 
@@ -563,10 +807,6 @@ fn persist_oidc_session(
             None => String::new(),
         }
     );
-    println!(
-        "  {}",
-        output::dim("Next: `fj instances list` to see your Forgejo instances, then `fj instances use <id>`.")
-    );
     Ok(())
 }
 
@@ -658,10 +898,7 @@ async fn login_fjord_credentials(args: LoginArgs, platform_url: String) -> Resul
         output::bold(&platform_url),
         output::bold(&user_email),
     );
-    println!(
-        "  {}",
-        output::dim("Next: `fj instances list` to see your Forgejo instances, then `fj instances use <id>`.")
-    );
+    finish_fjord_login(&platform_url, &access_token).await;
     Ok(())
 }
 
@@ -1005,5 +1242,268 @@ mod tests {
             choose_oidc_capture(false, false, false),
             OidcCapture::Loopback
         );
+    }
+
+    use crate::fjord::{CommonsInfo, CommonsMembership, ForgeInstance};
+
+    fn forge(id: &str, name: &str, state: Option<&str>) -> ForgeInstance {
+        ForgeInstance {
+            id: id.into(),
+            display_name: name.into(),
+            slug: name.to_lowercase(),
+            region: None,
+            plan: None,
+            state: state.map(str::to_string),
+            public_url: Some(format!("https://{id}.example")),
+            created_at: None,
+        }
+    }
+
+    fn listing(instances: Vec<ForgeInstance>, commons: CommonsLookup) -> Listing {
+        Listing { instances, commons }
+    }
+
+    fn remembered(id: &str) -> FjordAccount {
+        signed_in_host(Some(id)).fjord_account.unwrap()
+    }
+
+    fn joined_commons(gateway_forge_id: Option<&str>) -> CommonsInfo {
+        CommonsInfo {
+            url: "https://commons.example".into(),
+            name: "The Commons".into(),
+            member_count: None,
+            gateway_forge_id: gateway_forge_id.map(str::to_string),
+            membership: CommonsMembership {
+                joined: true,
+                namespace: None,
+                org_slug: None,
+            },
+        }
+    }
+
+    fn assert_cleared(account: &FjordAccount) {
+        assert_eq!(account.default_instance_id, None);
+        assert_eq!(account.default_instance_display_name, None);
+        assert_eq!(account.default_instance_slug, None);
+        assert_eq!(account.default_instance_public_url, None);
+        // Clearing the selection is not signing out: the account stays.
+        assert_eq!(account.platform_url, "https://fjord.sh");
+        assert_eq!(account.auth_flow.as_deref(), Some("oidc"));
+    }
+
+    #[test]
+    fn revalidation_restores_an_instance_that_is_still_ready() {
+        let mut account = remembered("inst_a");
+        let fresh = listing(
+            vec![
+                forge("inst_b", "Other", Some("ready")),
+                forge("inst_a", "Renamed", Some("ready")),
+            ],
+            CommonsLookup::Absent,
+        );
+        let check = revalidate_selection(&mut account, &fresh);
+        assert_eq!(
+            check,
+            SelectionCheck::Restored {
+                id: "inst_a".into(),
+                name: "Renamed".into()
+            }
+        );
+        assert_eq!(account.default_instance_id.as_deref(), Some("inst_a"));
+        // The cached fields follow the platform, not the stale local copy.
+        assert_eq!(
+            account.default_instance_display_name.as_deref(),
+            Some("Renamed")
+        );
+        assert_eq!(account.default_instance_slug.as_deref(), Some("renamed"));
+        assert_eq!(
+            account.default_instance_public_url.as_deref(),
+            Some("https://inst_a.example")
+        );
+        assert_eq!(
+            selection_report(&check, Some(&fresh)),
+            vec!["Using instance Renamed (inst_a), as before.".to_string()]
+        );
+    }
+
+    #[test]
+    fn revalidation_treats_a_missing_state_as_ready() {
+        let mut account = remembered("inst_a");
+        let fresh = listing(vec![forge("inst_a", "A", None)], CommonsLookup::Absent);
+        assert!(matches!(
+            revalidate_selection(&mut account, &fresh),
+            SelectionCheck::Restored { .. }
+        ));
+    }
+
+    #[test]
+    fn revalidation_clears_an_instance_that_is_gone() {
+        let mut account = remembered("inst_gone");
+        let fresh = listing(
+            vec![
+                forge("inst_b", "Other", Some("ready")),
+                forge("inst_c", "Building", Some("provisioning")),
+            ],
+            CommonsLookup::Absent,
+        );
+        let check = revalidate_selection(&mut account, &fresh);
+        assert_eq!(
+            check,
+            SelectionCheck::Stale {
+                id: "inst_gone".into(),
+                name: Some("rasterhub.com".into()),
+                not_ready_state: None,
+            }
+        );
+        assert_cleared(&account);
+        // The picker offers only what can actually be selected.
+        assert_eq!(
+            selection_report(&check, Some(&fresh)),
+            vec![
+                "The previously selected instance rasterhub.com (inst_gone) is no longer on \
+                 this account, so no instance is selected now."
+                    .to_string(),
+                "Pick one with `fj instances use <id>`:".to_string(),
+                "  inst_b  Other".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn revalidation_clears_an_instance_that_is_present_but_not_ready() {
+        let mut account = remembered("inst_a");
+        let fresh = listing(
+            vec![forge("inst_a", "A", Some("suspended"))],
+            CommonsLookup::Absent,
+        );
+        let check = revalidate_selection(&mut account, &fresh);
+        assert_eq!(
+            check,
+            SelectionCheck::Stale {
+                id: "inst_a".into(),
+                name: Some("rasterhub.com".into()),
+                not_ready_state: Some("suspended".into()),
+            }
+        );
+        assert_cleared(&account);
+        let lines = selection_report(&check, Some(&fresh));
+        assert!(lines[0].contains("is not ready (state: suspended)"));
+        assert_eq!(
+            lines[1],
+            "No instance is ready to select yet. Check `fj instances list`."
+        );
+    }
+
+    #[test]
+    fn revalidation_with_nothing_remembered_changes_nothing() {
+        let mut account = signed_in_host(None).fjord_account.unwrap();
+        let fresh = listing(
+            vec![forge("inst_a", "A", Some("ready"))],
+            CommonsLookup::Absent,
+        );
+        let check = revalidate_selection(&mut account, &fresh);
+        assert_eq!(check, SelectionCheck::NothingRemembered);
+        // Nothing is auto-selected on the user's behalf.
+        assert_eq!(account.default_instance_id, None);
+        assert_eq!(
+            selection_report(&check, Some(&fresh)),
+            vec![PICK_INSTANCE_HINT.to_string()]
+        );
+    }
+
+    #[test]
+    fn revalidation_restores_a_remembered_routable_commons() {
+        let mut account = remembered("gw_commons");
+        account.default_instance_slug = Some("commons".into());
+        let fresh = listing(
+            vec![],
+            CommonsLookup::Found(joined_commons(Some("gw_commons"))),
+        );
+        assert_eq!(
+            revalidate_selection(&mut account, &fresh),
+            SelectionCheck::Restored {
+                id: "gw_commons".into(),
+                name: "The Commons".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_commons_outage_does_not_cost_the_remembered_commons_selection() {
+        let mut account = remembered("gw_commons");
+        account.default_instance_slug = Some("commons".into());
+        let fresh = listing(
+            vec![forge("inst_a", "A", Some("ready"))],
+            CommonsLookup::Unavailable,
+        );
+        let check = revalidate_selection(&mut account, &fresh);
+        assert_eq!(
+            check,
+            SelectionCheck::Unverified {
+                id: "gw_commons".into()
+            }
+        );
+        assert_eq!(account.default_instance_id.as_deref(), Some("gw_commons"));
+        assert_eq!(account.default_instance_slug.as_deref(), Some("commons"));
+    }
+
+    #[test]
+    fn a_commons_outage_does_not_shield_an_ordinary_missing_instance() {
+        let mut account = remembered("inst_gone");
+        let fresh = listing(vec![], CommonsLookup::Unavailable);
+        assert!(matches!(
+            revalidate_selection(&mut account, &fresh),
+            SelectionCheck::Stale { .. }
+        ));
+        assert_cleared(&account);
+    }
+
+    #[test]
+    fn a_remembered_commons_that_stopped_being_routable_is_cleared() {
+        // The lookup answered, and the Commons is now browser-only (or left):
+        // that is a real answer, so the selection goes.
+        for commons in [
+            CommonsLookup::Found(joined_commons(None)),
+            CommonsLookup::Absent,
+        ] {
+            let mut account = remembered("gw_commons");
+            account.default_instance_slug = Some("commons".into());
+            let fresh = listing(vec![], commons);
+            assert!(matches!(
+                revalidate_selection(&mut account, &fresh),
+                SelectionCheck::Stale { .. }
+            ));
+            assert_cleared(&account);
+        }
+    }
+
+    #[test]
+    fn stale_report_without_a_cached_name_falls_back_to_the_id() {
+        let check = SelectionCheck::Stale {
+            id: "inst_x".into(),
+            name: None,
+            not_ready_state: None,
+        };
+        let lines = selection_report(&check, None);
+        assert!(lines[0].starts_with("The previously selected instance inst_x is no longer"));
+    }
+
+    #[test]
+    fn revalidation_reads_only_the_account_it_is_given() {
+        // Two Fjord hosts, each remembering its own instance. Re-validating
+        // one against its listing must not read or write the other.
+        let mut ours = remembered("inst_ours");
+        let theirs = remembered("inst_theirs");
+        let fresh = listing(
+            vec![forge("inst_theirs", "Theirs", Some("ready"))],
+            CommonsLookup::Absent,
+        );
+        // `inst_theirs` being on the listing is no reason to adopt it.
+        assert!(matches!(
+            revalidate_selection(&mut ours, &fresh),
+            SelectionCheck::Stale { .. }
+        ));
+        assert_cleared(&ours);
+        assert_eq!(theirs.default_instance_id.as_deref(), Some("inst_theirs"));
     }
 }

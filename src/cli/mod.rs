@@ -1,3 +1,4 @@
+pub mod admin;
 pub mod agent;
 mod agent_provider;
 mod agent_redact;
@@ -5,6 +6,7 @@ mod agent_review;
 pub mod alias;
 pub mod api;
 pub mod auth;
+mod auth_group;
 mod auth_login;
 mod auth_probe;
 mod auth_setup_git;
@@ -33,6 +35,7 @@ mod pr_inspect;
 pub(crate) mod pr_merge_check;
 mod pr_review;
 mod pr_status;
+pub mod profile;
 pub mod protect;
 pub mod release;
 pub mod repo;
@@ -161,6 +164,10 @@ pub enum Command {
     SshKey(key::SshKeyCmd),
     /// Manage GPG keys on your account.
     GpgKey(key::GpgKeyCmd),
+    /// Manage your account profile, email addresses, and avatar.
+    Profile(profile::ProfileCmd),
+    /// Administer the forge instance (needs an instance administrator).
+    Admin(admin::AdminCmd),
     /// User-defined command aliases.
     Alias(alias::AliasCmd),
     /// Manage local fj configuration (editor, pager, browser, etc.).
@@ -257,6 +264,8 @@ async fn dispatch(command: Command, host: Option<&str>) -> Result<()> {
         Command::Org(cmd) => org::run(cmd, host).await,
         Command::SshKey(cmd) => key::run_ssh(cmd, host).await,
         Command::GpgKey(cmd) => key::run_gpg(cmd, host).await,
+        Command::Profile(cmd) => profile::run(cmd, host).await,
+        Command::Admin(cmd) => admin::run(cmd, host).await,
         Command::Alias(cmd) => alias::run(cmd).await,
         Command::Config(cmd) => config::run(cmd).await,
         Command::Protect(cmd) => protect::run(cmd, host).await,

@@ -184,6 +184,8 @@ pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
     "org",
     "ssh-key",
     "gpg-key",
+    "profile",
+    "admin",
     "alias",
     "config",
     "extension",

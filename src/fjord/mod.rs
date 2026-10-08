@@ -247,6 +247,17 @@ pub struct ForgeInstance {
     pub created_at: Option<String>,
 }
 
+impl ForgeInstance {
+    /// Whether the instance can be routed to right now. A missing state counts
+    /// as ready (older deployments do not report one); any other value, such
+    /// as `provisioning`, does not. Same rule as the phone apps' `isReady`.
+    pub fn is_ready(&self) -> bool {
+        self.state
+            .as_deref()
+            .is_none_or(|state| state.eq_ignore_ascii_case("ready"))
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct ForgeInstancesResponse {
     instances: Vec<ForgeInstance>,
@@ -320,6 +331,9 @@ pub async fn list_instances(platform_url: &str, bearer: &str) -> Result<Vec<Forg
 pub struct CommonsInfo {
     pub url: String,
     pub name: String,
+    /// Member count, when the platform reports one.
+    #[serde(rename = "memberCount", default)]
+    pub member_count: Option<u64>,
     #[serde(rename = "gatewayForgeId", default)]
     pub gateway_forge_id: Option<String>,
     #[serde(default)]
@@ -330,6 +344,12 @@ pub struct CommonsInfo {
 pub struct CommonsMembership {
     #[serde(default)]
     pub joined: bool,
+    /// The account's namespace on the Commons, once it has one.
+    #[serde(default)]
+    pub namespace: Option<String>,
+    /// The Commons organization the membership is held through.
+    #[serde(rename = "orgSlug", default)]
+    pub org_slug: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -370,6 +390,34 @@ impl CommonsInfo {
             public_url: Some(public_url),
             created_at: None,
         })
+    }
+
+    /// The name to show for the Commons, never blank.
+    pub fn display_name(&self) -> &str {
+        match self.name.trim() {
+            "" => "Fjord Commons",
+            name => name,
+        }
+    }
+
+    /// The URL to hand a joined account to in the browser when the Commons is
+    /// not gateway-routable, or `None` when no hand-off applies: not joined
+    /// (an un-joined Commons is never presented), already switchable (it is
+    /// an instance, not a hand-off), or a url that is not a plain web origin.
+    ///
+    /// The scheme check is not decoration. This string comes from the
+    /// platform and ends up as an argument to the OS opener, which will
+    /// happily launch `file:` or a custom scheme handler.
+    pub fn browser_handoff_url(&self) -> Option<&str> {
+        if !self.membership.joined || self.to_switchable_instance().is_some() {
+            return None;
+        }
+        let url = self.url.trim();
+        let parsed = Url::parse(url).ok()?;
+        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+            return None;
+        }
+        Some(url)
     }
 }
 
@@ -485,5 +533,131 @@ mod tests {
             joined.as_str(),
             "https://p.example/api/v1/forge-gateway/inst/api/v1/user"
         );
+    }
+
+    fn commons(value: serde_json::Value) -> CommonsInfo {
+        serde_json::from_value(value).expect("commons descriptor decodes")
+    }
+
+    #[test]
+    fn commons_descriptor_decodes_every_field() {
+        let c = commons(serde_json::json!({
+            "url": "https://commons.example",
+            "name": "The Commons",
+            "memberCount": 42,
+            "gatewayForgeId": "box_1",
+            "membership": { "joined": true, "namespace": "stephen", "orgSlug": "commons" },
+        }));
+        assert_eq!(c.url, "https://commons.example");
+        assert_eq!(c.name, "The Commons");
+        assert_eq!(c.member_count, Some(42));
+        assert_eq!(c.gateway_forge_id.as_deref(), Some("box_1"));
+        assert!(c.membership.joined);
+        assert_eq!(c.membership.namespace.as_deref(), Some("stephen"));
+        assert_eq!(c.membership.org_slug.as_deref(), Some("commons"));
+    }
+
+    #[test]
+    fn commons_descriptor_tolerates_absent_and_null_optionals() {
+        let absent = commons(serde_json::json!({
+            "url": "https://commons.example",
+            "name": "The Commons",
+            "membership": { "joined": false },
+        }));
+        assert_eq!(absent.member_count, None);
+        assert_eq!(absent.gateway_forge_id, None);
+        assert_eq!(absent.membership.namespace, None);
+        assert_eq!(absent.membership.org_slug, None);
+
+        let nulls = commons(serde_json::json!({
+            "url": "https://commons.example",
+            "name": "The Commons",
+            "memberCount": null,
+            "gatewayForgeId": null,
+            "membership": { "joined": true, "namespace": null, "orgSlug": null },
+        }));
+        assert_eq!(nulls.member_count, None);
+        assert_eq!(nulls.membership.namespace, None);
+        assert!(nulls.membership.joined);
+
+        // A descriptor with no membership object at all is not a joined one:
+        // membership is never inferred from the descriptor being present.
+        let bare = commons(serde_json::json!({ "url": "https://c.example", "name": "C" }));
+        assert!(!bare.membership.joined);
+        assert!(bare.to_switchable_instance().is_none());
+        assert!(bare.browser_handoff_url().is_none());
+    }
+
+    #[test]
+    fn joined_routable_commons_is_an_instance_not_a_handoff() {
+        let c = commons(serde_json::json!({
+            "url": "https://commons.example",
+            "name": "The Commons",
+            "gatewayForgeId": "box_1",
+            "membership": { "joined": true },
+        }));
+        let instance = c.to_switchable_instance().expect("switchable");
+        assert_eq!(instance.id, "box_1");
+        assert_eq!(instance.state.as_deref(), Some("ready"));
+        assert!(c.browser_handoff_url().is_none());
+    }
+
+    #[test]
+    fn joined_commons_without_a_gateway_id_is_a_browser_handoff() {
+        for gateway in [serde_json::Value::Null, serde_json::json!("  ")] {
+            let c = commons(serde_json::json!({
+                "url": "https://commons.example",
+                "name": "The Commons",
+                "gatewayForgeId": gateway,
+                "membership": { "joined": true },
+            }));
+            assert!(c.to_switchable_instance().is_none());
+            assert_eq!(c.browser_handoff_url(), Some("https://commons.example"));
+        }
+    }
+
+    #[test]
+    fn unjoined_commons_is_neither_an_instance_nor_a_handoff() {
+        let c = commons(serde_json::json!({
+            "url": "https://commons.example",
+            "name": "The Commons",
+            "gatewayForgeId": "box_1",
+            "membership": { "joined": false },
+        }));
+        assert!(c.to_switchable_instance().is_none());
+        assert!(c.browser_handoff_url().is_none());
+    }
+
+    #[test]
+    fn handoff_refuses_a_url_that_is_not_a_web_origin() {
+        for url in ["file:///etc/passwd", "javascript:alert(1)", "", "not a url"] {
+            let c = commons(serde_json::json!({
+                "url": url,
+                "name": "The Commons",
+                "membership": { "joined": true },
+            }));
+            assert!(c.browser_handoff_url().is_none(), "{url}");
+        }
+    }
+
+    #[test]
+    fn instance_readiness_treats_a_missing_state_as_ready() {
+        let with = |state: serde_json::Value| -> ForgeInstance {
+            serde_json::from_value(serde_json::json!({
+                "id": "i", "displayName": "I", "slug": "i", "state": state,
+            }))
+            .unwrap()
+        };
+        assert!(with(serde_json::Value::Null).is_ready());
+        assert!(with(serde_json::json!("ready")).is_ready());
+        assert!(with(serde_json::json!("READY")).is_ready());
+        assert!(!with(serde_json::json!("provisioning")).is_ready());
+        assert!(!with(serde_json::json!("suspended")).is_ready());
+    }
+
+    #[test]
+    fn commons_display_name_falls_back_when_blank() {
+        let c = commons(serde_json::json!({ "url": "https://c.example", "name": " " }));
+        assert_eq!(c.display_name(), "Fjord Commons");
     }
 }

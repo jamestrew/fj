@@ -4,7 +4,7 @@ use clap::{Args, Subcommand};
 use crate::api;
 use crate::auth as token_store;
 use crate::cli::auth_probe::build_probe_client;
-use crate::cli::{auth_login, auth_setup_git};
+use crate::cli::{auth_group, auth_login, auth_setup_git};
 use crate::config::hosts::Hosts;
 use crate::output;
 
@@ -35,6 +35,8 @@ pub enum AuthSub {
     Session(SessionArgs),
     /// Install a git credential helper that uses fj's stored token.
     SetupGit(SetupGitArgs),
+    /// Organize hosts into named groups (a label only; auth is unaffected).
+    Group(auth_group::GroupCmd),
 }
 
 #[derive(Debug, Args)]
@@ -178,6 +180,7 @@ pub async fn run(cmd: AuthCmd, global_host: Option<&str>) -> Result<()> {
             };
             auth_setup_git::setup_git(args)
         }
+        AuthSub::Group(cmd) => auth_group::run(cmd, global_host),
     }
 }
 
@@ -498,6 +501,9 @@ async fn status(args: StatusArgs, global_host: Option<&str>) -> Result<()> {
             }
         }
         println!("  Git protocol: {}", host.git_protocol);
+        if let Some(line) = auth_group::status_line(&hosts, &name) {
+            println!("{line}");
+        }
     }
     Ok(())
 }
@@ -543,29 +549,8 @@ fn list() -> Result<()> {
         println!("(no hosts configured)");
         return Ok(());
     }
-    let rows: Vec<Vec<String>> = hosts
-        .hosts
-        .iter()
-        .map(|(name, h)| {
-            let current = if hosts.current.as_deref() == Some(name) {
-                "*"
-            } else {
-                ""
-            };
-            let scheme = match h.auth_kind {
-                crate::config::hosts::AuthKind::Pat => "pat",
-                crate::config::hosts::AuthKind::FjordAccount => "fjord-account",
-            };
-            vec![
-                current.into(),
-                name.clone(),
-                h.user.clone().unwrap_or_default(),
-                scheme.into(),
-                h.git_protocol.clone(),
-            ]
-        })
-        .collect();
-    let table = output::render_table(&["", "HOST", "USER", "AUTH", "PROTOCOL"], &rows);
+    let (headers, rows) = auth_group::host_table(&hosts);
+    let table = output::render_table(&headers, &rows);
     print!("{table}");
     Ok(())
 }

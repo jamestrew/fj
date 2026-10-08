@@ -91,6 +91,36 @@ pub struct Hosts {
     /// Map of hostname -> host config.
     #[serde(default)]
     pub hosts: BTreeMap<String, Host>,
+    /// User-named groups: group name -> the hosts assigned to it. A purely
+    /// organizational label; nothing about auth or host resolution reads it.
+    /// A host appears under at most one group (the mutators below keep that
+    /// true). Absent from the file until the first group is created, so a
+    /// config that never used groups is written exactly as before.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub groups: BTreeMap<String, Vec<String>>,
+}
+
+/// Longest group name accepted. Generous for a label, small enough that it
+/// cannot wreck the `fj auth list` table.
+const MAX_GROUP_NAME_LEN: usize = 64;
+
+/// Normalize and validate a user-supplied group name: surrounding whitespace
+/// is dropped, and the result must be non-empty, of sane length, and free of
+/// control characters (it is printed in tables and written as a TOML key).
+pub fn normalize_group_name(raw: &str) -> Result<String> {
+    let name = raw.trim();
+    if name.is_empty() {
+        return Err(anyhow!("group name is required"));
+    }
+    if name.chars().count() > MAX_GROUP_NAME_LEN {
+        return Err(anyhow!(
+            "group name is too long (at most {MAX_GROUP_NAME_LEN} characters)"
+        ));
+    }
+    if name.chars().any(char::is_control) {
+        return Err(anyhow!("group name must not contain control characters"));
+    }
+    Ok(name.to_string())
 }
 
 impl Hosts {
@@ -152,7 +182,91 @@ impl Hosts {
         if self.current.as_deref() == Some(hostname) {
             self.current = self.hosts.keys().next().cloned();
         }
+        // A removed host leaves no assignment behind for a later host of the
+        // same name to inherit. The group itself stays.
+        self.unassign_group(hostname);
         removed
+    }
+
+    /// The group `hostname` is assigned to, if any.
+    pub fn group_of(&self, hostname: &str) -> Option<&str> {
+        self.groups
+            .iter()
+            .find(|(_, members)| members.iter().any(|m| m == hostname))
+            .map(|(name, _)| name.as_str())
+    }
+
+    /// Create an empty group. Errors if one of that name already exists.
+    pub fn create_group(&mut self, name: &str) -> Result<String> {
+        let name = normalize_group_name(name)?;
+        if self.groups.contains_key(&name) {
+            return Err(anyhow!("group '{name}' already exists"));
+        }
+        self.groups.insert(name.clone(), Vec::new());
+        Ok(name)
+    }
+
+    /// Rename a group, keeping its assignments. Returns the new name.
+    pub fn rename_group(&mut self, old: &str, new: &str) -> Result<String> {
+        let old = old.trim();
+        let new = normalize_group_name(new)?;
+        if !self.groups.contains_key(old) {
+            return Err(anyhow!("no group named '{old}'"));
+        }
+        if old == new {
+            return Ok(new);
+        }
+        if self.groups.contains_key(&new) {
+            return Err(anyhow!("group '{new}' already exists"));
+        }
+        let members = self.groups.remove(old).unwrap_or_default();
+        self.groups.insert(new.clone(), members);
+        Ok(new)
+    }
+
+    /// Delete a group and clear its assignments. The hosts themselves are
+    /// untouched. Returns the hosts that were in it, now ungrouped.
+    pub fn delete_group(&mut self, name: &str) -> Result<Vec<String>> {
+        let name = name.trim();
+        self.groups
+            .remove(name)
+            .ok_or_else(|| anyhow!("no group named '{name}'"))
+    }
+
+    /// Assign a configured host to an existing group, replacing any prior
+    /// assignment so the host belongs to exactly one. Returns the group the
+    /// host was in before, when that was a different one.
+    pub fn assign_group(&mut self, hostname: &str, group: &str) -> Result<Option<String>> {
+        let group = group.trim();
+        if !self.hosts.contains_key(hostname) {
+            return Err(anyhow!("host '{hostname}' is not configured"));
+        }
+        if !self.groups.contains_key(group) {
+            return Err(anyhow!(
+                "no group named '{group}'. Create it with `fj auth group create`."
+            ));
+        }
+        let previous = self.unassign_group(hostname).filter(|p| p != group);
+        if let Some(members) = self.groups.get_mut(group) {
+            members.push(hostname.to_string());
+            members.sort();
+        }
+        Ok(previous)
+    }
+
+    /// Remove `hostname` from whatever group holds it. Returns that group.
+    /// Clears every occurrence, so a hand-edited file listing a host under
+    /// two groups is repaired rather than half-fixed.
+    pub fn unassign_group(&mut self, hostname: &str) -> Option<String> {
+        let mut previous = None;
+        for (name, members) in self.groups.iter_mut() {
+            let before = members.len();
+            members.retain(|m| m != hostname);
+            if members.len() != before && previous.is_none() {
+                previous = Some(name.clone());
+            }
+        }
+        previous
     }
 
     pub fn set_current(&mut self, hostname: &str) -> Result<()> {
@@ -253,6 +367,170 @@ mod tests {
     fn set_current_rejects_unknown() {
         let mut h = Hosts::default();
         assert!(h.set_current("nope").is_err());
+    }
+
+    fn two_hosts() -> Hosts {
+        let mut h = Hosts::default();
+        h.upsert("a.example", host("alice"));
+        h.upsert("b.example", host("bob"));
+        h
+    }
+
+    #[test]
+    fn group_create_assign_and_lookup() {
+        let mut h = two_hosts();
+        assert_eq!(h.create_group("  work ").unwrap(), "work");
+        assert_eq!(h.assign_group("a.example", "work").unwrap(), None);
+        assert_eq!(h.group_of("a.example"), Some("work"));
+        assert_eq!(h.group_of("b.example"), None);
+    }
+
+    #[test]
+    fn assigning_replaces_the_prior_assignment() {
+        let mut h = two_hosts();
+        h.create_group("work").unwrap();
+        h.create_group("personal").unwrap();
+        h.assign_group("a.example", "work").unwrap();
+
+        let previous = h.assign_group("a.example", "personal").unwrap();
+
+        assert_eq!(previous.as_deref(), Some("work"));
+        assert_eq!(h.group_of("a.example"), Some("personal"));
+        assert!(h.groups["work"].is_empty());
+        // Re-assigning to the same group is a no-op, not a duplicate entry.
+        assert_eq!(h.assign_group("a.example", "personal").unwrap(), None);
+        assert_eq!(h.groups["personal"], vec!["a.example".to_string()]);
+    }
+
+    #[test]
+    fn assign_rejects_an_unknown_host_or_group() {
+        let mut h = two_hosts();
+        h.create_group("work").unwrap();
+        assert!(h.assign_group("nope.example", "work").is_err());
+        assert!(h.assign_group("a.example", "nope").is_err());
+        assert_eq!(h.group_of("a.example"), None);
+    }
+
+    #[test]
+    fn create_rejects_duplicates_and_bad_names() {
+        let mut h = Hosts::default();
+        h.create_group("work").unwrap();
+        assert!(h.create_group("work").is_err());
+        assert!(h.create_group("   ").is_err());
+        assert!(h.create_group("a\nb").is_err());
+        assert!(h.create_group(&"x".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn rename_keeps_assignments() {
+        let mut h = two_hosts();
+        h.create_group("work").unwrap();
+        h.create_group("other").unwrap();
+        h.assign_group("a.example", "work").unwrap();
+
+        assert_eq!(h.rename_group("work", "clients").unwrap(), "clients");
+
+        assert_eq!(h.group_of("a.example"), Some("clients"));
+        assert!(!h.groups.contains_key("work"));
+        assert!(h.rename_group("work", "x").is_err());
+        assert!(h.rename_group("clients", "other").is_err());
+        assert_eq!(h.rename_group("clients", "clients").unwrap(), "clients");
+    }
+
+    #[test]
+    fn deleting_a_group_clears_assignments_and_leaves_hosts_alone() {
+        let mut h = two_hosts();
+        h.create_group("work").unwrap();
+        h.assign_group("a.example", "work").unwrap();
+        h.assign_group("b.example", "work").unwrap();
+        h.set_current("b.example").unwrap();
+
+        let freed = h.delete_group("work").unwrap();
+
+        assert_eq!(
+            freed,
+            vec!["a.example".to_string(), "b.example".to_string()]
+        );
+        assert_eq!(h.group_of("a.example"), None);
+        assert_eq!(h.group_of("b.example"), None);
+        assert_eq!(h.hosts.len(), 2);
+        assert_eq!(h.hosts["a.example"].user.as_deref(), Some("alice"));
+        assert_eq!(h.current.as_deref(), Some("b.example"));
+        assert!(h.delete_group("work").is_err());
+    }
+
+    #[test]
+    fn grouping_does_not_affect_host_resolution() {
+        let mut h = two_hosts();
+        h.create_group("work").unwrap();
+        h.assign_group("b.example", "work").unwrap();
+        assert_eq!(h.resolve_host(None).unwrap(), "a.example");
+        assert_eq!(h.resolve_host(Some("b.example")).unwrap(), "b.example");
+    }
+
+    #[test]
+    fn removing_a_host_drops_its_assignment_but_keeps_the_group() {
+        let mut h = two_hosts();
+        h.create_group("work").unwrap();
+        h.assign_group("a.example", "work").unwrap();
+        h.remove("a.example");
+        assert!(h.groups.contains_key("work"));
+        assert!(h.groups["work"].is_empty());
+    }
+
+    #[test]
+    fn re_login_upsert_keeps_the_group_assignment() {
+        let mut h = two_hosts();
+        h.create_group("work").unwrap();
+        h.assign_group("a.example", "work").unwrap();
+        h.upsert("a.example", host("alice2"));
+        assert_eq!(h.group_of("a.example"), Some("work"));
+    }
+
+    #[test]
+    fn unassign_repairs_a_host_listed_under_two_groups() {
+        let mut h: Hosts = toml::from_str(
+            r#"
+            [hosts."a.example"]
+            user = "alice"
+            [groups]
+            one = ["a.example"]
+            two = ["a.example"]
+            "#,
+        )
+        .unwrap();
+        assert!(h.unassign_group("a.example").is_some());
+        assert_eq!(h.group_of("a.example"), None);
+    }
+
+    #[test]
+    fn a_config_without_groups_loads_and_writes_no_groups_key() {
+        let old = r#"
+            current = "a.example"
+            [hosts."a.example"]
+            user = "alice"
+            git_protocol = "https"
+        "#;
+        let h: Hosts = toml::from_str(old).expect("pre-groups config still loads");
+        assert!(h.groups.is_empty());
+        let written = toml::to_string_pretty(&h).unwrap();
+        assert!(!written.contains("groups"), "{written}");
+    }
+
+    #[test]
+    fn groups_survive_a_save_and_load_round_trip() {
+        let mut h = two_hosts();
+        h.create_group("client work").unwrap();
+        h.create_group("empty").unwrap();
+        h.assign_group("b.example", "client work").unwrap();
+
+        let written = toml::to_string_pretty(&h).unwrap();
+        let back: Hosts = toml::from_str(&written).unwrap();
+
+        assert_eq!(back.group_of("b.example"), Some("client work"));
+        assert!(back.groups["empty"].is_empty());
+        assert_eq!(back.current.as_deref(), Some("a.example"));
+        assert_eq!(back.hosts.len(), 2);
     }
 
     #[test]

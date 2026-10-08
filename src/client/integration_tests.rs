@@ -6833,3 +6833,427 @@ async fn notification_delete_subscription_explains_a_304() {
         "{err:#}"
     );
 }
+
+// --- fj admin: settings, cron, user creation, unadopted repositories ---
+
+#[tokio::test]
+async fn admin_settings_section_reports_server_values_or_unavailable() {
+    use crate::api::admin::{settings_section, Section};
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/settings/repository"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"lfs_disabled": true})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/settings/ui"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/settings/api"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({"message": "nope"})))
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+
+    // Only what the server sent: no client default for the other keys.
+    assert_eq!(
+        settings_section(&c, "/api/v1/settings/repository")
+            .await
+            .unwrap(),
+        Section::Available(json!({"lfs_disabled": true}))
+    );
+    assert_eq!(
+        settings_section(&c, "/api/v1/settings/ui").await.unwrap(),
+        Section::Unavailable(404)
+    );
+    // A denial is an error, never "unavailable".
+    let err = settings_section(&c, "/api/v1/settings/api")
+        .await
+        .expect_err("403 is not a missing endpoint");
+    let api = err
+        .chain()
+        .find_map(|c| c.downcast_ref::<super::ApiError>())
+        .expect("typed error");
+    assert_eq!(api.status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn admin_cron_list_decodes_tasks_and_flags_a_missing_endpoint() {
+    use crate::api::admin::cron_list;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/admin/cron"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {
+                "name": "update_mirrors", "schedule": "@every 10m",
+                "next": "2026-10-08T12:10:00Z", "prev": "2026-10-08T12:00:00Z",
+                "exec_times": 42
+            },
+            {"name": "sparse"}
+        ])))
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let tasks = cron_list(&c, 100).await.unwrap().expect("endpoint exists");
+    assert_eq!(tasks.len(), 2);
+    assert_eq!(tasks[0].name, "update_mirrors");
+    assert_eq!(tasks[0].exec_times, Some(42));
+    // Absent fields stay absent instead of becoming zero values.
+    assert_eq!(tasks[1].exec_times, None);
+    assert!(tasks[1].schedule.is_none() && tasks[1].next.is_none());
+
+    let missing = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/admin/cron"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&missing)
+        .await;
+    let c = client_for(&missing).await;
+    assert!(cron_list(&c, 100).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn admin_cron_list_forbidden_is_an_error_not_unavailable() {
+    use crate::api::admin::cron_list;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/admin/cron"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({"message": "admin only"})))
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let err = cron_list(&c, 100).await.expect_err("403 surfaces");
+    assert!(format!("{err:#}").contains("admin only"), "{err:#}");
+}
+
+fn new_user_body(password: Option<&str>) -> crate::api::admin::CreateUser<'_> {
+    crate::api::admin::CreateUser {
+        username: "alice",
+        email: "alice@example.com",
+        password,
+        must_change_password: password.map(|_| true),
+        send_notify: false,
+        full_name: None,
+        login_name: None,
+        source_id: None,
+        visibility: None,
+        restricted: None,
+    }
+}
+
+#[tokio::test]
+async fn admin_create_user_posts_once_and_returns_the_account_without_credentials() {
+    use crate::api::admin::create_user;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/admin/users"))
+        .and(body_json(json!({
+            "username": "alice", "email": "alice@example.com",
+            "password": "initial-pw-123", "must_change_password": true,
+            "send_notify": false
+        })))
+        // A misbehaving server echoing the secret must not get it printed.
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "id": 7, "login": "alice", "email": "alice@example.com",
+            "password": "initial-pw-123"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let created = create_user(&c, &new_user_body(Some("initial-pw-123")))
+        .await
+        .unwrap();
+    assert_eq!(
+        created,
+        json!({"id": 7, "login": "alice", "email": "alice@example.com"})
+    );
+}
+
+#[tokio::test]
+async fn admin_create_user_failure_never_carries_the_password() {
+    use crate::api::admin::create_user;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/admin/users"))
+        .respond_with(
+            ResponseTemplate::new(422).set_body_json(json!({"message": "user already exists"})),
+        )
+        // POST is never retried, so exactly one attempt.
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let err = create_user(&c, &new_user_body(Some("initial-pw-123")))
+        .await
+        .expect_err("422 surfaces");
+    let shown = format!("{err:#} {err:?}");
+    assert!(shown.contains("user already exists"), "{shown}");
+    assert!(!shown.contains("initial-pw-123"), "{shown}");
+}
+
+#[tokio::test]
+async fn admin_unadopted_list_sends_pattern_and_paging() {
+    use crate::api::admin::{unadopted_list, UnadoptedQuery};
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/admin/unadopted"))
+        .and(query_param("pattern", "al*"))
+        .and(query_param("page", "2"))
+        .and(query_param("limit", "10"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!(["alice/legacy"])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let repos = unadopted_list(
+        &c,
+        &UnadoptedQuery {
+            pattern: Some("al*"),
+            page: Some(2),
+            limit: Some(10),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(repos, vec!["alice/legacy"]);
+}
+
+#[tokio::test]
+async fn admin_unadopted_list_omits_an_unset_pattern() {
+    use crate::api::admin::{unadopted_list, UnadoptedQuery};
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/admin/unadopted"))
+        .and(query_param_is_missing("pattern"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let repos = unadopted_list(&c, &UnadoptedQuery::default())
+        .await
+        .unwrap();
+    assert!(repos.is_empty());
+}
+
+#[tokio::test]
+async fn admin_unadopted_adopt_and_delete_hit_their_endpoints() {
+    use crate::api::admin::{unadopted_adopt, unadopted_delete};
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/admin/unadopted/alice/legacy"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/admin/unadopted/alice/old"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    unadopted_adopt(&c, "alice", "legacy").await.unwrap();
+    unadopted_delete(&c, "alice", "old").await.unwrap();
+}
+
+#[tokio::test]
+async fn admin_unadopted_adopt_is_an_error_until_the_server_confirms() {
+    use crate::api::admin::unadopted_adopt;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/admin/unadopted/alice/ghost"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/admin/unadopted/alice/locked"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({"message": "admin only"})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    for (repo, status) in [
+        ("ghost", StatusCode::NOT_FOUND),
+        ("locked", StatusCode::FORBIDDEN),
+    ] {
+        let err = unadopted_adopt(&c, "alice", repo)
+            .await
+            .expect_err("not adopted");
+        let api = err
+            .chain()
+            .find_map(|c| c.downcast_ref::<super::ApiError>())
+            .expect("typed error");
+        assert_eq!(api.status, status);
+    }
+}
+
+// --- fj profile: settings, emails, avatar ---
+
+#[tokio::test]
+async fn user_settings_patch_sends_only_changed_fields() {
+    use crate::api::user::{edit_settings, settings, Settings};
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/user/settings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "full_name": "Alice", "description": "", "hide_email": true,
+            "theme": "forgejo-auto"
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/user/settings"))
+        .and(body_json(
+            json!({"location": "Oslo", "hide_activity": false}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "full_name": "Alice", "location": "Oslo", "hide_activity": false
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+
+    let current = settings(&c).await.unwrap();
+    assert_eq!(current.full_name.as_deref(), Some("Alice"));
+    assert_eq!(current.description.as_deref(), Some(""));
+    assert_eq!(current.hide_email, Some(true));
+    // Not sent by the server, so not known.
+    assert_eq!(current.hide_activity, None);
+
+    let body = Settings {
+        location: Some("Oslo".into()),
+        hide_activity: Some(false),
+        ..Settings::default()
+    };
+    let confirmed = edit_settings(&c, &body).await.unwrap();
+    assert_eq!(confirmed.location.as_deref(), Some("Oslo"));
+    assert_eq!(confirmed.hide_activity, Some(false));
+}
+
+#[tokio::test]
+async fn user_settings_policy_refusal_keeps_the_server_message() {
+    use crate::api::user::{edit_settings, Settings};
+    let server = MockServer::start().await;
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/user/settings"))
+        .respond_with(
+            ResponseTemplate::new(403)
+                .set_body_json(json!({"message": "changing full name is disabled"})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let err = edit_settings(
+        &c,
+        &Settings {
+            full_name: Some("X".into()),
+            ..Settings::default()
+        },
+    )
+    .await
+    .expect_err("refused");
+    let api = err
+        .chain()
+        .find_map(|c| c.downcast_ref::<super::ApiError>())
+        .expect("typed error");
+    assert_eq!(api.message, "changing full name is disabled");
+}
+
+#[tokio::test]
+async fn user_emails_list_add_and_delete() {
+    use crate::api::user::{add_emails, delete_emails, emails};
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/user/emails"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {"email": "a@example.com", "verified": true, "primary": true},
+            {"email": "b@example.com", "verified": false, "primary": false},
+            {"email": "c@example.com"}
+        ])))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/user/emails"))
+        .and(body_json(json!({"emails": ["new@example.com"]})))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!([
+            {"email": "new@example.com", "verified": false, "primary": false}
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/user/emails"))
+        .and(body_json(json!({"emails": ["b@example.com"]})))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+
+    let listed = emails(&c).await.unwrap();
+    assert_eq!(listed.len(), 3);
+    assert_eq!(
+        (listed[0].verified, listed[0].primary),
+        (Some(true), Some(true))
+    );
+    assert_eq!(listed[1].verified, Some(false));
+    // The server said nothing, so nothing is assumed.
+    assert_eq!((listed[2].verified, listed[2].primary), (None, None));
+
+    let added = add_emails(&c, &["new@example.com".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(added[0].verified, Some(false));
+
+    delete_emails(&c, &["b@example.com".to_string()])
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn user_email_add_rejection_keeps_the_server_message() {
+    use crate::api::user::add_emails;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/user/emails"))
+        .respond_with(ResponseTemplate::new(422).set_body_json(json!({
+            "message": "Email address a@blocked.test is not allowed by the domain allowlist"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let err = add_emails(&c, &["a@blocked.test".to_string()])
+        .await
+        .expect_err("rejected");
+    assert!(format!("{err:#}").contains("domain allowlist"), "{err:#}");
+}
+
+#[tokio::test]
+async fn user_avatar_update_posts_base64_and_delete_removes_it() {
+    use crate::api::user::{delete_avatar, update_avatar};
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/user/avatar"))
+        .and(body_json(json!({"image": "iVBORw0KGgo="})))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/user/avatar"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    update_avatar(&c, "iVBORw0KGgo=").await.unwrap();
+    delete_avatar(&c).await.unwrap();
+}

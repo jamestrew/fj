@@ -105,6 +105,7 @@ fj auth login --host rasterhub.com          # Forgejo PAT
 fj auth login --fjord                        # Fjord Account (opens your browser)
 fj instances                                 # list/pick an instance after --fjord
 fj auth status                               # per-host scheme, sign-in, and session
+fj auth group create work                    # label hosts; `fj auth group assign work`
 ```
 
 ### Signing in to a Fjord Account across devices
@@ -244,7 +245,7 @@ Run `fj --help` for the live list; every group has its own `--help`.
 | --------------- | -------------------------------------------------------------- |
 | Repos and code  | `repo`, `issue`, `pr`, `release`, `search`, `browse`            |
 | Actions         | `run`, `workflow`, `secret`, `variable`                         |
-| Account and host| `auth`, `instances`, `org`, `ssh-key`, `gpg-key`               |
+| Account and host| `auth`, `instances`, `org`, `ssh-key`, `gpg-key`, `profile`, `admin` |
 | Power and config| `api`, `alias`, `config`, `protect`, `hook`, `extension`, `completion`, `man` |
 | Preview         | `work`, `stack`, `agent`                                        |
 

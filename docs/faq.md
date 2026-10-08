@@ -26,6 +26,11 @@ fj auth switch other.example.com   # make it the default
 fj --host other.example.com repo list
 ```
 
+With several hosts, `fj auth group` files them under names of your own
+(`fj auth group create work`, then `fj auth group assign work --host
+other.example.com`). A group is only a label shown by `fj auth list` and
+`fj auth status`; it changes nothing about how a host authenticates.
+
 ## How do I sign in to a Fjord Account?
 
 ```sh
@@ -45,7 +50,13 @@ picks the flow automatically:
   recovery code if your account requires one).
 
 After signing in, `fj instances list` shows the Forgejo instances on your
-account and `fj instances use <id>` picks the default one. An expired
+account and `fj instances use <id>` picks the default one. A Fjord Commons
+you have joined is listed with them, marked as the shared community forge;
+when it cannot be reached through the gateway it shows as `browser only`
+and `fj instances use commons` opens it in your browser instead of selecting
+it. Signing in again keeps the instance you had picked if it is still on the
+account and ready; otherwise the selection is cleared and `fj` tells you to
+pick again. An expired
 session renews itself silently when a refresh token is present; you can also
 run `fj auth refresh` to renew it on demand. If a deployment exposes no
 CLI-drivable sign-in, sign in to your Forgejo directly with a token instead:

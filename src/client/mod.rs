@@ -767,9 +767,17 @@ fn truncate_preview(text: &str) -> String {
 /// debug log (`fj secret set`, `variable set`, token/key management, …).
 fn is_sensitive_path(path: &str) -> bool {
     let p = path.to_ascii_lowercase();
-    ["secret", "variable", "token", "password", "/keys"]
-        .iter()
-        .any(|needle| p.contains(needle))
+    // `/admin/users` carries a new account's initial password.
+    [
+        "secret",
+        "variable",
+        "token",
+        "password",
+        "/keys",
+        "/admin/users",
+    ]
+    .iter()
+    .any(|needle| p.contains(needle))
 }
 
 /// Upper bound on a single response body we'll buffer into memory. A
@@ -931,6 +939,13 @@ mod trust_tests {
         assert_eq!(truncate_preview("hello"), "hello");
         let exactly_200: String = "x".repeat(200);
         assert_eq!(truncate_preview(&exactly_200), exactly_200);
+    }
+
+    #[test]
+    fn user_creation_body_is_never_debug_logged() {
+        // `fj admin user create` posts the initial password here.
+        assert!(is_sensitive_path("/api/v1/admin/users"));
+        assert!(!is_sensitive_path("/api/v1/admin/cron"));
     }
 
     #[test]
