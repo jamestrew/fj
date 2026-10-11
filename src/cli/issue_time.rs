@@ -319,7 +319,7 @@ async fn list(args: ListArgs, host: Option<&str>) -> Result<()> {
         println!("(no tracked time)");
         return Ok(());
     }
-    print!("{}", entries_table(shown));
+    println!("{}", entries_table(shown));
     if shown.len() < entries.len() {
         println!(
             "{}",

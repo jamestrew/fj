@@ -6,6 +6,154 @@ All notable changes will be recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-10
+
+### Added
+
+- **Notifications can be handled one thread at a time.** `fj status read <ID>`
+  marks a single thread read and confirms it against the server.
+  `fj status unsubscribe <ID>` drops your subscription to the issue or pull
+  request behind a thread and marks it read; a thread with no work item behind
+  it is refused before anything is sent. `fj status mute|unmute|muted` keep a
+  per-account list of repositories to hide from the inbox (stored in
+  `muted_repos.toml` next to `hosts.toml`), with `--include-muted` to see them
+  anyway. Muted threads still count toward the server's unread count.
+- **`fj issue reaction`, `fj issue dependency` and `fj issue time`.** Reactions
+  (`list|add|remove|toggle`) work on an issue or pull request body or, with
+  `--comment`, on one comment. Dependencies (`list|add|remove`) show "Depends
+  on" and "Blocks" as two lists and keep the direction through `--blocks`; a
+  self reference, a duplicate and a cycle are refused before any mutation.
+  Tracked time (`list|add|delete`) logs and totals time, reading durations as
+  `1h30m`, `45m`, `90s` or `1:30`. All three accept a pull request number.
+- **`fj issue list --sort` and `fj issue create --milestone`.** `--sort` takes
+  Forgejo's own orders (`recentupdate`, `leastupdate`, `latest`, `oldest`,
+  `mostcomment`, `leastcomment`, `nearduedate`, `farduedate`). `--milestone`
+  takes a title or an id and errors on an ambiguous title. `fj issue view
+  --json` and the list JSON gain a `milestone` field.
+- **Inline review comments.** `fj pr review N --line-comment <PATH> <LINE>
+  <BODY>` is repeatable, and `--line-comments-file` takes the same as a JSON
+  array. `LINE` is `N` or `new:N` for the pull request's version of the file
+  and `old:N` for a removed line. Comments given with `--event` go out in that
+  review in one request; without `--event` they post as a plain comment review.
+  Each anchor is checked against the diff first, so a line that cannot be
+  commented on is refused locally with the commentable lines named.
+- **`fj pr merge` explains a blocked merge before it tries.** It reads the base
+  branch's effective protection, which needs read access only, and stops on a
+  certain blocker (a required check failing, pending or not reported, a missing
+  required approval, no merge permission) with the reason. Evidence it could
+  not read stays "unknown" and never blocks. `fj pr checks` shows the same
+  verdict, gains a `REQUIRED` column, and lists required checks that have not
+  reported; its `--json` gains `required`, `statuses_complete` and
+  `merge_preflight`.
+- **Organizations and teams.** `fj org create` creates an organization.
+  `fj org team create|members|add-member|remove-member|repos|add-repo|
+  remove-repo` manage a team; every change is followed by a read, and the
+  command errors if that read contradicts it.
+- **Repository transfers.** `fj repo transfer request` resolves the new owner
+  and refuses an unknown owner, the current owner and an already pending
+  transfer before it asks. `fj repo transfer list|view|accept|reject` review
+  incoming transfers. Forgejo has no incoming-transfer endpoint, so `list`
+  scans your repository listings and can miss a transfer addressed to one of
+  your organizations; `view -R` always works.
+- **`fj repo topics add|remove`** change single topics and print the list the
+  forge confirms.
+- **Commits and files at a ref.** `fj repo commit list|view` read history at
+  `--ref`, `--branch` or `--tag` and show each commit's signature state.
+  `fj repo contents [PATH]` reads a file or directory at a ref, with a tag
+  pinned to its commit. `fj browse --tag` opens the tag route.
+- **Organization labels and exclusive groups.** `fj label list|create|edit|
+  delete --org ORG` work on organization labels, with `--exclusive` and
+  `--no-exclusive` for `group/name` labels. Assigning labels on issue and pull
+  request create or edit falls back to the organization's labels for names the
+  repository does not have.
+- **`fj admin`.** `fj admin settings` and `fj admin cron list` are read-only
+  views of the instance. `fj admin user create` takes the password from stdin
+  or a prompt, never from a flag, and keeps it out of `--debug`.
+  `fj admin unadopted list|adopt|delete` handle unadopted repositories behind a
+  typed confirmation. A 403 reads as "requires an instance administrator" and
+  is never folded into "unavailable".
+- **`fj profile`.** `fj profile view|edit`, `fj profile email list|add|remove`
+  and `fj profile avatar set|delete`. An edit sends only the fields that were
+  passed and warns about any the response does not reflect.
+- **Account groups.** `fj auth group list|create|rename|delete|assign|unassign`
+  keep user-named groups of hosts in `hosts.toml`. Grouping never changes host
+  resolution. `fj auth status` and `fj auth list` show the group once one
+  exists.
+- **The Commons appears in `fj instances`.** A joined Commons is listed beside
+  the account's own forges: selectable when the gateway can route to it, and a
+  "browser only" row otherwise, which `fj instances use commons` hands off to
+  the browser. The lookup is best-effort, so a slow or failing Commons no
+  longer fails the listing.
+- **Forge flavor detection and capability gates.** fj identifies Forgejo or
+  Gitea before applying a version floor, stores the flavor and version at
+  login and refresh, and shows them in `fj auth status`. One table decides
+  which routes are offered. `fj run rerun` uses the Gitea 1.26+ routes and
+  `fj run cancel` the Forgejo 16 route; a withheld action sends nothing and
+  names the run URL.
+- **Basic-auth reverse proxies.** `fj auth proxy` stores a separate HTTP Basic
+  credential for a proxy in front of the forge. A 407 proxy takes it in
+  `Proxy-Authorization`. A 401 Basic proxy takes it in `Authorization`, and
+  the forge token moves to `X-Forge-Authorization`, which the proxy has to
+  forward. `--pat-transport query` works with an unmodified proxy at the cost
+  of the token appearing in access logs. Git over HTTPS behind such a proxy is
+  out of scope; use SSH.
+
+### Changed
+
+- **The `fj status` table has a leading `ID` column**, which shifts the columns
+  for anything parsing the table. `--limit` above 50 now pages instead of
+  silently clamping.
+- **`fj label create|edit --color` is now `--label-color`.** The old flag
+  shared an id with the global ANSI `--color` and both commands panicked at
+  parse time, so the old spelling never worked.
+- **`fj variable list` output changed.** The table is `NAME / VALUE / SCOPE`
+  and the JSON follows the forge's `ActionVariable` shape (`name`, `data`,
+  `owner_id`, `repo_id`).
+- **`fj instances list --json` gains `kind`, `routing` and a `commons`
+  descriptor.** A browser-only Commons entry has a null `id`.
+- **The token no longer reaches any web route.** Job logs are read through the
+  Actions API with ranged requests (1 MiB chunks, 64 MiB ceiling). `fj run
+  view`, `fj run watch` and artifact downloads use the API where the server
+  has it and fall back to an anonymous web request elsewhere, so on older
+  servers they work for publicly readable runs only.
+- **`fj run rerun` on Forgejo reports that the forge has no rerun route**
+  instead of attempting a web POST that could never succeed with a token.
+- **A Fjord Account re-login re-validates the remembered instance.** It is kept
+  when still present and ready; otherwise it is cleared and the ready
+  instances are printed with the `fj instances use <id>` hint.
+- **`fj pr review --event comment` with nothing to say, and `--event
+  request-changes` with no body, fail locally** instead of as a server 422.
+- **`fj repo topics --set` prints the list the forge confirms** and validates
+  topic names locally.
+
+### Fixed
+
+- **Concurrent commands no longer sign a Fjord Account out.** The refresh token
+  rotates on every exchange and a replay revokes the whole family, so two
+  commands refreshing at once (a prompt hook plus an interactive command is
+  enough) killed the session. Refreshes now take a per-platform file lock held
+  across the exchange and the persist, and the rotated refresh token is written
+  before the new bearer, so an interruption leaves the previous pair intact. A
+  spent grant now prints the recovery as the first line of the error.
+- **`fj auth login --fjord` keeps the selected instance.** Signing in again to
+  a platform you were already signed into cleared the default instance, so the
+  command after a successful recovery failed with "no default Fjord instance
+  selected".
+- **`fj pr merge` no longer blames a required check on a green pull request.**
+  Forgejo treats each required status context as a glob, so `*` means every
+  reported context. fj looked the pattern up by name, never found a check
+  called `*`, and reported it missing. Patterns are now matched the way
+  Forgejo matches them, and a failing check is reported under its real name.
+- **`fj repo collaborator list` reported every permission as none.** The list
+  endpoint sends no permissions, so each row is now resolved through the
+  per-collaborator endpoint; a row that cannot be read shows "unknown".
+- **`fj variable set` could not create a variable, and a non-empty `fj variable
+  list` failed to decode.** `set` now creates or replaces and confirms.
+  Variable values no longer reach `--debug` output.
+- **fj warned "older than Forgejo 7" on any Gitea 1.x host.** The version floor
+  now applies to Forgejo only.
+- **`fj issue time list` printed its total on the last row of the table.**
+
 ## [0.5.0] - 2026-09-13
 
 ### Added
