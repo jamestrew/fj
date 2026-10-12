@@ -28,6 +28,10 @@ set -euo pipefail
 
 REPO="${FJ_RELEASE_REPO:-rasterstate/fj}"
 ORG="${REPO%%/*}"
+# The release host. Without one fj falls back to its current host, which may not
+# be the forge the release runs on; every API read then fails and looks like a
+# missing runner. FJ_HOST, when set, still wins.
+export FJ_HOST="${FJ_HOST:-${FJ_RELEASE_HOST:-rasterhub.com}}"
 
 # Labels the release matrix targets (see .forgejo/workflows/release.yml).
 REQUIRED_LABELS=(macos-15 docker)
@@ -66,8 +70,12 @@ fi
 
 # ── 2. runners ───────────────────────────────────────────────────────────────
 echo "== runners (need an online runner for: ${REQUIRED_LABELS[*]}) =="
-runners=$(fj api "/api/v1/orgs/$ORG/actions/runners" 2>/dev/null || echo '[]')
-for lbl in "${REQUIRED_LABELS[@]}"; do
+if ! runners=$(fj api "/api/v1/orgs/$ORG/actions/runners" 2>/dev/null); then
+  bad "couldn't list runners for $ORG on $FJ_HOST (not signed in there, or no access to the org's runners)"
+  runners='[]'
+  REQUIRED_LABELS=()
+fi
+for lbl in ${REQUIRED_LABELS[@]+"${REQUIRED_LABELS[@]}"}; do
   n=$(printf '%s' "$runners" | jq -r --arg l "$lbl" \
         '[.[]? | select((.status // "") != "offline") | select((.labels // []) | index($l))] | length' 2>/dev/null || echo 0)
   if [ "${n:-0}" -gt 0 ]; then

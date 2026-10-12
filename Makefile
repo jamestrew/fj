@@ -16,6 +16,13 @@ BINDIR     := $(PREFIX)/bin
 MANDIR     ?= $(PREFIX)/share/man/man1
 # A stable code-signing identity (see `security find-identity -v -p codesigning`).
 SIGN_ID    ?= Developer ID Application: Raster & State LLC (62Y3FRM8PD)
+# codesign refuses a name that matches more than one certificate ("ambiguous"),
+# which happens once a renewed certificate sits beside the old one. Resolve the
+# name to the first valid match's SHA-1 and sign with that. Any certificate of
+# the same team satisfies the same keychain trust, so which one is picked does
+# not matter. Falls back to the name as given (a hash, or a name with no match).
+SIGN_HASH   = $(shell security find-identity -v -p codesigning 2>/dev/null | grep -F '"$(SIGN_ID)"' | awk 'NR==1 {print $$2}')
+SIGN_WITH   = $(if $(SIGN_HASH),$(SIGN_HASH),$(SIGN_ID))
 # Pin the signing identifier so every re-sign satisfies the same keychain trust.
 IDENTIFIER ?= fj-a88ab591fd97b299
 UNAME      := $(shell uname)
@@ -72,7 +79,7 @@ install: build
 	install -d "$(MANDIR)"
 	install -m 0644 target/man/*.1 "$(MANDIR)"
 ifeq ($(UNAME),Darwin)
-	codesign --force --sign "$(SIGN_ID)" --identifier "$(IDENTIFIER)" "$(BINDIR)/fj"
+	codesign --force --sign "$(SIGN_WITH)" --identifier "$(IDENTIFIER)" "$(BINDIR)/fj"
 	@echo "Installed and signed $(BINDIR)/fj"
 	@echo "Man pages installed to $(MANDIR) (run: man fj)"
 	@echo 'Run any fj command once and click "Always Allow" — it will stick across rebuilds.'
