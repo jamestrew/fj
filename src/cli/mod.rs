@@ -56,6 +56,7 @@ mod repo_mirror;
 mod repo_social;
 mod repo_topics;
 mod repo_transfer;
+pub mod runner;
 pub mod search;
 pub mod stack;
 mod stack_state;
@@ -165,6 +166,8 @@ pub enum Command {
     Secret(workflow::SecretCmd),
     /// Manage Actions variables.
     Variable(workflow::VariableCmd),
+    /// Actions runners: fetch a registration token.
+    Runner(runner::RunnerCmd),
     /// Cross-cutting search (repos, issues, prs, users).
     Search(search::SearchCmd),
     /// Open the current repo (or a path within it) in your browser.
@@ -271,6 +274,7 @@ async fn dispatch(command: Command, host: Option<&str>) -> Result<()> {
         Command::Workflow(cmd) => workflow::run_workflow(cmd, host).await,
         Command::Secret(cmd) => workflow_secret::run_secret(cmd, host).await,
         Command::Variable(cmd) => workflow_variable::run_variable(cmd, host).await,
+        Command::Runner(cmd) => runner::run(cmd, host).await,
         Command::Search(cmd) => search::run(cmd, host).await,
         Command::Browse(args) => browse::run(args, host).await,
         Command::Status(args) => status::run(args, host).await,

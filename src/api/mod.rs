@@ -23,6 +23,7 @@ mod repo_core;
 mod repo_keys;
 mod repo_social;
 mod repo_transfer;
+pub mod runner;
 pub mod search;
 pub(crate) mod serde_util;
 pub mod tag;

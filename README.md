@@ -256,7 +256,7 @@ Run `fj --help` for the live list; every group has its own `--help`.
 | Area            | Commands                                                        |
 | --------------- | -------------------------------------------------------------- |
 | Repos and code  | `repo`, `issue`, `pr`, `release`, `search`, `browse`            |
-| Actions         | `run`, `workflow`, `secret`, `variable`                         |
+| Actions         | `run`, `workflow`, `secret`, `variable`, `runner`               |
 | Account and host| `auth`, `instances`, `org`, `ssh-key`, `gpg-key`, `profile`, `admin` |
 | Power and config| `api`, `alias`, `config`, `protect`, `hook`, `extension`, `completion`, `man` |
 | Preview         | `work`, `stack`, `agent`                                        |

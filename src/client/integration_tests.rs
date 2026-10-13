@@ -10249,3 +10249,72 @@ fn debug_output_never_contains_either_secret() {
     let debugged = format!("{:?}", proxy_credential(PatTransport::Query));
     assert!(!debugged.contains(PROXY_PASSWORD), "{debugged}");
 }
+
+// ---- runner registration token ----
+
+#[tokio::test]
+async fn runner_registration_token_uses_the_route_for_each_scope() {
+    use crate::api::runner::{registration_token, Scope};
+    let server = MockServer::start().await;
+    for (route, token) in [
+        (
+            "/api/v1/repos/o/r/actions/runners/registration-token",
+            "repo-token",
+        ),
+        (
+            "/api/v1/orgs/team/actions/runners/registration-token",
+            "org-token",
+        ),
+        (
+            "/api/v1/user/actions/runners/registration-token",
+            "user-token",
+        ),
+        ("/api/v1/admin/runners/registration-token", "instance-token"),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(route))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "token": token })))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    let c = client_for(&server).await;
+    let repo = Scope::Repo {
+        owner: "o".into(),
+        name: "r".into(),
+    };
+    for (scope, want) in [
+        (repo, "repo-token"),
+        (Scope::Org("team".into()), "org-token"),
+        (Scope::User, "user-token"),
+        (Scope::Instance, "instance-token"),
+    ] {
+        let got = registration_token(&c, &scope).await.expect("token");
+        assert_eq!(got, want);
+    }
+}
+
+#[tokio::test]
+async fn runner_registration_token_reports_a_denial_and_an_empty_reply() {
+    use crate::api::runner::{registration_token, Scope};
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/admin/runners/registration-token"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({"message": "forbidden"})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/user/actions/runners/registration-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "token": "" })))
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let err = registration_token(&c, &Scope::Instance)
+        .await
+        .expect_err("403");
+    assert_eq!(crate::error_exit_code(&err), crate::EXIT_AUTH_FORBIDDEN);
+    let err = registration_token(&c, &Scope::User)
+        .await
+        .expect_err("empty");
+    assert!(err.to_string().contains("without a registration token"));
+}

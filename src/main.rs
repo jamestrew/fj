@@ -178,6 +178,7 @@ pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
     "workflow",
     "secret",
     "variable",
+    "runner",
     "search",
     "browse",
     "status",

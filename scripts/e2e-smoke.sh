@@ -72,6 +72,8 @@ run "$FJ" repo contents -R "$TEST_REPO"
 if [[ "$ADMIN" = "1" ]]; then
   echo "== variables (admin) =="
   run "$FJ" variable list -R "$TEST_REPO"
+  # `run` discards stdout, so the token never reaches the log.
+  run "$FJ" runner token -R "$TEST_REPO"
 fi
 if [[ "$ADMIN" = "1" ]]; then
   echo "== protect (admin) =="

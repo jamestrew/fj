@@ -6,6 +6,14 @@ All notable changes will be recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`fj runner token`.** Prints an Actions runner registration token and
+  nothing else, so provisioning can run
+  `forgejo-runner register --token "$(fj runner token --org ORG)"`. Scope is
+  the repository (`-R`, or the current clone) by default, or `--org`, `--user`
+  or `--instance` (instance administrators only).
+
 ## [0.6.0] - 2026-10-10
 
 ### Added
