@@ -59,12 +59,14 @@ docs/                  architecture, jq, gh-to-fj, faq, troubleshooting
   additionally drops the untested async command handlers inside the mixed
   command modules, via `#[cfg_attr(coverage_nightly, coverage(off))]` on
   every cli `async fn` (inert on stable). It's the intent-precise number
-  (~76% vs ~51% for plain `coverage`). When you add a cli `async fn`
-  handler, keep the attribute on it. CI currently enforces `COV_MIN=60`
-  while fj#249 is open, because the runner measures a wider surface than the
-  calibrated local floor. That floor is deliberately about a point under the
-  observed number: the surface drifts between runs on its own, so a floor set
-  at the observed value fails on drift instead of on a regression.
+  (~89% lines). When you add a cli `async fn` handler, keep the attribute
+  on it. CI enforces `COV_MIN=88`, about a point under the observed number,
+  and the runner and a local run measure the same surface. The target starts
+  with a full `cargo llvm-cov clean`, not `clean --workspace`: stale
+  instrumented objects in a restored `target/` are counted as a second,
+  unexecuted copy of the code and drag the number down (fj#249). Local runs
+  need cargo-llvm-cov 0.9 or newer; 0.8 misses the test binary under the
+  pinned nightly's build layout and reports about 2%.
 - `./scripts/install-hooks.sh` symlinks repo hooks into `.git/hooks`.
 - `FJ_SKIP_PRECOMMIT=1` bypasses the fast hook for genuine emergencies only.
 - `FJ_E2E=1` enables the live API smoke against `stephen/fj-cli-test`.

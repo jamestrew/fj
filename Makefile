@@ -127,17 +127,19 @@ coverage-html:
 	cargo llvm-cov --all --open --ignore-filename-regex '$(COV_IGNORE)'
 
 # Intent-precise coverage: handler regions excluded on top of COV_IGNORE.
-# COV_MIN is the minimum line coverage; 0 locally (pure report). CI currently
-# enforces 61 while fj#249 tracks why the runner measures a wider surface than
-# the local floor was calibrated against.
+# COV_MIN is the minimum line coverage; 0 locally (pure report), 88 in CI.
+# The clean is a full one on purpose. `clean --workspace` leaves behind
+# instrumented objects from an older cargo layout, and a restored CI cache
+# carried such a set: llvm-cov counted it as a second, unexecuted copy of
+# every file it knew, which read as a wider surface at lower coverage (fj#249).
 COV_MIN ?= 0
 COV_TOOLCHAIN ?= nightly-2026-08-07
 coverage-strict:
-	cargo +$(COV_TOOLCHAIN) llvm-cov clean --workspace
+	cargo +$(COV_TOOLCHAIN) llvm-cov clean
 	CARGO_ENCODED_RUSTFLAGS= RUSTFLAGS="--cfg coverage_nightly" cargo +$(COV_TOOLCHAIN) llvm-cov --all --summary-only \
 		--no-rustc-wrapper --fail-under-lines $(COV_MIN) --ignore-filename-regex '$(COV_IGNORE)'
 
 coverage-strict-html:
-	cargo +$(COV_TOOLCHAIN) llvm-cov clean --workspace
+	cargo +$(COV_TOOLCHAIN) llvm-cov clean
 	CARGO_ENCODED_RUSTFLAGS= RUSTFLAGS="--cfg coverage_nightly" cargo +$(COV_TOOLCHAIN) llvm-cov --all --open --no-rustc-wrapper \
 		--ignore-filename-regex '$(COV_IGNORE)'
