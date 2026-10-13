@@ -260,8 +260,11 @@ async fn token_list_contains_run(
     name: &str,
     run: u64,
 ) -> Result<bool> {
-    let runs = crate::api::workflow_run::list_runs(client, owner, name, 50).await?;
-    Ok(runs.iter().any(|r| r.run_number == run))
+    Ok(
+        crate::api::workflow_run::find_run_by_number(client, owner, name, run)
+            .await?
+            .is_some(),
+    )
 }
 
 /// `web` is the token-less client from `web_client`.

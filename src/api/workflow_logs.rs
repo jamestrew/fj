@@ -754,17 +754,8 @@ pub(crate) async fn find_run(
     name: &str,
     run_number: u64,
 ) -> Result<WorkflowRun> {
-    let runs = crate::api::workflow_run::list_runs_filtered(
-        client,
-        owner,
-        name,
-        50,
-        true,
-        &crate::api::workflow_run::RunListFilters::default(),
-    )
-    .await?;
-    runs.into_iter()
-        .find(|run| run.run_number == run_number)
+    crate::api::workflow_run::find_run_by_number(client, owner, name, run_number)
+        .await?
         .ok_or_else(|| anyhow!("workflow run #{run_number} was not found; check `fj run list`"))
 }
 

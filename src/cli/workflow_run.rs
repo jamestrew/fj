@@ -387,6 +387,13 @@ async fn log(args: LogArgs, host: Option<&str>) -> Result<()> {
     if args.json {
         return output::print_json(&serde_json::to_value(&logs)?);
     }
+    if logs.jobs.is_empty() && args.failed {
+        println!(
+            "{}",
+            output::dim(&format!("Run #{} has no failed jobs.", args.run_id))
+        );
+        return Ok(());
+    }
     print_run_logs(&logs);
     Ok(())
 }

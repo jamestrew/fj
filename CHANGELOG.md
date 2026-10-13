@@ -36,6 +36,13 @@ All notable changes will be recorded here. The format follows
   The exit status is still 3.
 - **The Homebrew formula test matches real output.** It looked for the short
   description in `fj --help`, which prints the long one. It now reads `fj -h`.
+- **Run commands find runs older than the newest 50.** `fj run view`, `--log`,
+  `--log-failed`, `rerun`, `cancel` and artifact downloads resolve a run number
+  through the run list, and that read never left the first page because Forgejo
+  sends no `Link` header there. An older run in a busy repository was reported
+  as not found. The lookup now asks the server for the run number directly, and
+  `fj run list --paginate` follows `total_count`, so it returns every page too.
+  `fj run view --log-failed` on a run with nothing failed says so (#248).
 
 ## [0.6.0] - 2026-10-10
 

@@ -1185,6 +1185,115 @@ async fn run_list_combines_filters_with_and() {
 }
 
 #[tokio::test]
+async fn run_lookup_asks_the_server_for_the_run_number() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/runs"))
+        .and(query_param("run_number", "7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "total_count": 1,
+            "workflow_runs": [{ "id": 70, "status": "failure", "index_in_repo": 7 }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let c = client_for(&server).await;
+    let id = crate::api::workflow::find_run(&c, "o", "r", 7)
+        .await
+        .unwrap()
+        .id;
+    assert_eq!(id, 70);
+}
+
+#[tokio::test]
+async fn run_lookup_walks_past_the_first_page_when_the_filter_is_ignored() {
+    // An older server ignores `run_number` and sends no Link header; only
+    // `total_count` says there is a second page.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/runs"))
+        .and(query_param("page", "1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "total_count": 3,
+            "workflow_runs": [
+                { "id": 90, "status": "success", "run_number": 9 },
+                { "id": 80, "status": "success", "run_number": 8 }
+            ]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/runs"))
+        .and(query_param("page", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "total_count": 3,
+            "workflow_runs": [{ "id": 70, "status": "failure", "run_number": 7 }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let c = client_for(&server).await;
+    let id = crate::api::workflow::find_run(&c, "o", "r", 7)
+        .await
+        .unwrap()
+        .id;
+    assert_eq!(id, 70);
+}
+
+#[tokio::test]
+async fn run_lookup_reports_a_run_the_server_does_not_have() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/runs"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "total_count": 0, "workflow_runs": [] })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let c = client_for(&server).await;
+    let err = crate::api::workflow::find_run(&c, "o", "r", 7)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "workflow run #7 was not found; check `fj run list`"
+    );
+}
+
+#[tokio::test]
+async fn run_list_paginate_stops_when_the_total_overstates_the_list() {
+    // A total the pages never reach must not spin: the repeat page ends it.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/runs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "total_count": 500,
+            "workflow_runs": [{ "id": 1, "status": "success", "run_number": 1 }]
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let c = client_for(&server).await;
+    let runs = crate::api::workflow::list_runs_filtered(
+        &c,
+        "o",
+        "r",
+        20,
+        true,
+        &crate::api::workflow::RunListFilters::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(runs.len(), 1);
+}
+
+#[tokio::test]
 async fn run_list_paginate_keeps_filters_across_pages() {
     let server = MockServer::start().await;
     let next_url = format!(
@@ -1640,7 +1749,8 @@ async fn run_logs_resolves_run_number_beyond_first_page() {
                     "workflow_runs": [{ "id": 1000, "index_in_repo": 100, "status": "success" }]
                 })),
         )
-        .expect(1)
+        // Once for the `run_number` probe this server ignores, once for the walk.
+        .expect(2)
         .mount(&server)
         .await;
     Mock::given(method("GET"))

@@ -136,7 +136,6 @@ struct RunList {
     #[serde(default)]
     workflow_runs: Vec<WorkflowRun>,
     #[serde(default)]
-    #[allow(dead_code)]
     total_count: u64,
 }
 
@@ -232,10 +231,11 @@ async fn fetch_all_run_pages(
 ) -> Result<Vec<WorkflowRun>> {
     const MAX_PAGES: u32 = 100;
 
-    let mut out = Vec::new();
+    let mut out: Vec<WorkflowRun> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     let mut current_path = path.to_string();
     let mut current_query = run_list_query(1, 50, filters);
-    for _ in 0..MAX_PAGES {
+    for page in 1..=MAX_PAGES {
         let res = client
             .request(Method::GET, &current_path, &current_query, None)
             .await?;
@@ -251,12 +251,19 @@ async fn fetch_all_run_pages(
 
         let headers = res.headers().clone();
         let list: RunList = res.json().await.context("decoding workflow runs JSON")?;
-        if list.workflow_runs.is_empty() {
+        let before = out.len();
+        out.extend(
+            list.workflow_runs
+                .into_iter()
+                .filter(|run| seen.insert(run.id)),
+        );
+        // A page that adds nothing new is the end, whatever the server says
+        // about a next page or a total.
+        if out.len() == before {
             break;
         }
-        out.extend(list.workflow_runs);
 
-        let Some(next) = headers
+        let next = headers
             .get(reqwest::header::LINK)
             .and_then(|link| link.to_str().ok())
             .map(crate::client::pagination::parse_link_header)
@@ -264,18 +271,59 @@ async fn fetch_all_run_pages(
                 links
                     .into_iter()
                     .find_map(|(url, rel)| (rel == "next").then_some(url))
-            })
-        else {
-            break;
-        };
-        let parsed = Url::parse(&next)?;
-        current_path = parsed.path().to_string();
-        current_query = parsed
-            .query_pairs()
-            .map(|(key, value)| (key.into_owned(), value.into_owned()))
-            .collect();
+            });
+        match next {
+            Some(next) => {
+                let parsed = Url::parse(&next)?;
+                current_path = parsed.path().to_string();
+                current_query = parsed
+                    .query_pairs()
+                    .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                    .collect();
+            }
+            // Forgejo sends no Link header on this route, only `total_count`,
+            // so the count is what says another page exists.
+            None if (out.len() as u64) < list.total_count => {
+                current_path = path.to_string();
+                current_query = run_list_query(page + 1, 50, filters);
+            }
+            None => break,
+        }
     }
     Ok(out)
+}
+
+/// Find one run by its per-repo run number. The server filters on
+/// `run_number`, so this is a single request however old the run is. A server
+/// that ignores the filter answers with its newest page instead; when the run
+/// is not on it, walk the rest of the list.
+pub(crate) async fn find_run_by_number(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    run_number: u64,
+) -> Result<Option<WorkflowRun>> {
+    let path = format!("{}/actions/runs", crate::api::repo_path(owner, name));
+    let mut q = run_list_query(1, 50, &RunListFilters::default());
+    q.push(("run_number".into(), run_number.to_string()));
+    let list: RunList = client.json(Method::GET, &path, &q, None::<&()>).await?;
+
+    let filter_ignored = list
+        .workflow_runs
+        .iter()
+        .any(|run| run.run_number != run_number);
+    if let Some(run) = list
+        .workflow_runs
+        .into_iter()
+        .find(|run| run.run_number == run_number)
+    {
+        return Ok(Some(run));
+    }
+    if !filter_ignored {
+        return Ok(None);
+    }
+    let runs = fetch_all_run_pages(client, &path, &RunListFilters::default()).await?;
+    Ok(runs.into_iter().find(|run| run.run_number == run_number))
 }
 
 fn run_list_query(page: u32, limit: u32, filters: &RunListFilters) -> Vec<(String, String)> {
