@@ -3584,7 +3584,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/v1/repos/o/r/pulls"))
             .and(body_json(serde_json::json!({
-                "title": "Add login", "head": "stephen/login-1", "base": "main", "draft": false
+                "title": "Add login", "head": "stephen/login-1", "base": "main"
             })))
             .respond_with(ResponseTemplate::new(201).set_body_json(pull_value(
                 12,
@@ -3659,7 +3659,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/v1/repos/o/r/pulls"))
             .and(body_json(serde_json::json!({
-                "title": "t", "head": "b", "base": "main", "draft": true
+                "title": "WIP: t", "head": "b", "base": "main"
             })))
             .respond_with(
                 ResponseTemplate::new(201).set_body_json(pull_value(3, "b", "open", true)),
@@ -3697,9 +3697,19 @@ mod tests {
             )
             .mount(&server)
             .await;
-        // ready = PATCH the pull with {draft:false}
+        // ready = drop the work-in-progress prefix from the title
+        let mut draft = pull_value(7, "b", "open", true);
+        draft["title"] = serde_json::json!("WIP: t");
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/o/r/pulls/7"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(draft))
+            .mount(&server)
+            .await;
         Mock::given(method("PATCH"))
             .and(path("/api/v1/repos/o/r/pulls/7"))
+            .and(wiremock::matchers::body_json(
+                serde_json::json!({ "title": "t" }),
+            ))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(pull_value(7, "b", "open", false)),
             )

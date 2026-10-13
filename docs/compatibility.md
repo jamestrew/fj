@@ -24,7 +24,6 @@ please open an [issue](../.forgejo/issue_template/bug.md) with
 These features rely on endpoints introduced in or after Gitea 1.20.
 `fj` will return an HTTP 404 with the endpoint path.
 
-- `fj pr ready` (`PATCH /repos/.../pulls/{n}` with `draft: false`).
 - `fj repo mirror-sync` (`POST /repos/.../mirror-sync`).
 - `fj milestone` group on instances that didn't expose
   `/repos/.../milestones/{id}` for editing.

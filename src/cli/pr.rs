@@ -919,8 +919,11 @@ fn append_attachments(body: &str, refs: &[String]) -> String {
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn ready(args: SimpleArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
-    api::pull::ready(&ctx.client, &ctx.owner, &ctx.name, args.number).await?;
-    println!("✓ PR #{} is ready for review", args.number);
+    if api::pull::ready(&ctx.client, &ctx.owner, &ctx.name, args.number).await? {
+        println!("✓ PR #{} is ready for review", args.number);
+    } else {
+        println!("PR #{} is already ready for review", args.number);
+    }
     Ok(())
 }
 

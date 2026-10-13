@@ -396,7 +396,15 @@ async fn list(args: ListArgs, host: Option<&str>) -> Result<()> {
             }
             Page::single(Vec::new())
         }
-        Err(err) => return Err(err),
+        Err(err) => {
+            return Err(api::issue_tracker::explain_not_found(
+                &ctx.client,
+                &ctx.owner,
+                &ctx.name,
+                err,
+            )
+            .await)
+        }
     };
     if args.json {
         return list_output::print_json(&page);
@@ -533,7 +541,18 @@ async fn create(args: CreateArgs, host: Option<&str>) -> Result<()> {
         labels,
         milestone: milestone.as_ref().map(|m| m.id),
     };
-    let issue = api::issue::create(&ctx.client, &ctx.owner, &ctx.name, &payload).await?;
+    let issue = match api::issue::create(&ctx.client, &ctx.owner, &ctx.name, &payload).await {
+        Ok(issue) => issue,
+        Err(err) => {
+            return Err(api::issue_tracker::explain_not_found(
+                &ctx.client,
+                &ctx.owner,
+                &ctx.name,
+                err,
+            )
+            .await)
+        }
+    };
     println!("✓ Created issue #{}: {}", issue.number, issue.title);
     for line in crate::cli::label_assign::explain_created(&requested_labels, &issue.labels) {
         println!("{line}");

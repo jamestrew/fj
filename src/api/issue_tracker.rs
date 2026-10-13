@@ -20,6 +20,12 @@ pub struct InternalTracker {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+pub struct ExternalTracker {
+    #[serde(default)]
+    pub external_tracker_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct Permissions {
     #[serde(default)]
     pub admin: bool,
@@ -37,6 +43,10 @@ pub struct RepoTracker {
     pub archived: bool,
     #[serde(default)]
     pub internal_tracker: Option<InternalTracker>,
+    #[serde(default)]
+    pub has_issues: Option<bool>,
+    #[serde(default)]
+    pub external_tracker: Option<ExternalTracker>,
     #[serde(default)]
     pub permissions: Option<Permissions>,
 }
@@ -76,6 +86,47 @@ pub fn status_of(err: &anyhow::Error) -> Option<StatusCode> {
     err.downcast_ref::<ApiError>().map(|e| e.status)
 }
 
+/// Why the forge has no issue tracker to query for this repo, if that is the
+/// case: issues switched off, or kept in an external tracker.
+fn no_tracker_reason(repo: &RepoTracker, owner: &str, name: &str) -> Option<String> {
+    if repo.has_issues == Some(false) {
+        return Some(format!("issues are disabled for {owner}/{name}"));
+    }
+    let external = repo.external_tracker.as_ref()?;
+    Some(
+        match external
+            .external_tracker_url
+            .as_deref()
+            .filter(|u| !u.is_empty())
+        {
+            Some(url) => format!("{owner}/{name} keeps its issues in an external tracker: {url}"),
+            None => format!("{owner}/{name} keeps its issues in an external tracker"),
+        },
+    )
+}
+
+/// Give a 404 from an issue endpoint its real cause. The forge answers "not
+/// found" for a repo whose issues are off or live elsewhere, which reads as if
+/// the repo itself were missing. Any other error, and a 404 on a repo with a
+/// working tracker, comes back unchanged.
+pub async fn explain_not_found(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    err: anyhow::Error,
+) -> anyhow::Error {
+    if status_of(&err) != Some(StatusCode::NOT_FOUND) {
+        return err;
+    }
+    match get(client, owner, name).await {
+        Ok(repo) => match no_tracker_reason(&repo, owner, name) {
+            Some(reason) => err.context(reason),
+            None => err,
+        },
+        Err(_) => err,
+    }
+}
+
 /// Whether issue or pull request `index` exists and is readable. Used to tell
 /// a missing work item apart from the other things a 404 can mean here.
 pub async fn work_item_exists(
@@ -98,6 +149,33 @@ pub async fn work_item_exists(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tracker(json: &str) -> RepoTracker {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn no_tracker_reason_names_disabled_and_external_trackers() {
+        let off = tracker(r#"{"has_issues":false}"#);
+        assert_eq!(
+            no_tracker_reason(&off, "o", "r").as_deref(),
+            Some("issues are disabled for o/r")
+        );
+        let external = tracker(
+            r#"{"has_issues":true,"external_tracker":{"external_tracker_url":"https://t.example/o/r"}}"#,
+        );
+        assert_eq!(
+            no_tracker_reason(&external, "o", "r").as_deref(),
+            Some("o/r keeps its issues in an external tracker: https://t.example/o/r")
+        );
+        let bare = tracker(r#"{"external_tracker":{}}"#);
+        assert_eq!(
+            no_tracker_reason(&bare, "o", "r").as_deref(),
+            Some("o/r keeps its issues in an external tracker")
+        );
+        let internal = tracker(r#"{"has_issues":true,"internal_tracker":{}}"#);
+        assert_eq!(no_tracker_reason(&internal, "o", "r"), None);
+    }
 
     #[test]
     fn missing_internal_tracker_is_unknown_not_disabled() {

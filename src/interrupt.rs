@@ -43,7 +43,14 @@ use std::time::Duration;
 const GRACE: Duration = Duration::from_millis(250);
 
 /// 128 + SIGINT, the shell convention for "terminated by Ctrl+C".
-const EXIT_INTERRUPTED: i32 = 130;
+pub const EXIT_INTERRUPTED: i32 = 130;
+
+/// The error `cli::run` returns when Ctrl+C wins the race against the command.
+/// Typed so `main` can exit with [`EXIT_INTERRUPTED`] on the graceful path
+/// too, the same status the backstop uses.
+#[derive(Debug, thiserror::Error)]
+#[error("interrupted")]
+pub struct Interrupted;
 
 /// Nesting depth of child processes that currently own the terminal.
 static FOREGROUND_CHILDREN: AtomicUsize = AtomicUsize::new(0);

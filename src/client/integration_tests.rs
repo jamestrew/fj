@@ -3184,7 +3184,7 @@ async fn pull_create_posts_title_head_base() {
         .and(path("/api/v1/repos/o/r/pulls"))
         .and(body_json(json!({
             "title": "Add feature", "head": "feature", "base": "main",
-            "body": "details", "draft": false
+            "body": "details"
         })))
         .respond_with(ResponseTemplate::new(201).set_body_json(json!({
             "id": 1, "number": 12, "title": "Add feature",
@@ -3223,7 +3223,7 @@ async fn pull_create_can_be_followed_by_label_and_assignee_calls() {
         .and(path("/api/v1/repos/o/r/pulls"))
         .and(body_json(json!({
             "title": "Add feature", "head": "feature", "base": "main",
-            "body": "details", "draft": false
+            "body": "details"
         })))
         .respond_with(ResponseTemplate::new(201).set_body_json(json!({
             "id": 1, "number": 12, "title": "Add feature",
@@ -5923,20 +5923,149 @@ async fn pull_label_and_assignee_mutations_use_backing_issue_endpoints() {
         .expect("remove assignee from pr");
 }
 
+fn draft_pull_json(number: u64, title: &str, draft: bool) -> serde_json::Value {
+    let mut v = pull_json(number, "open");
+    v["title"] = json!(title);
+    v["draft"] = json!(draft);
+    v
+}
+
 #[tokio::test]
-async fn pull_ready_patches_draft_false() {
+async fn pull_ready_strips_the_wip_prefix_from_the_title() {
     let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/pulls/12"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(draft_pull_json(
+            12,
+            "wip: Add thing",
+            true,
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
     Mock::given(method("PATCH"))
         .and(path("/api/v1/repos/o/r/pulls/12"))
-        .and(body_json(json!({ "draft": false })))
-        .respond_with(ResponseTemplate::new(200).set_body_json(pull_json(12, "open")))
+        .and(body_json(json!({ "title": "Add thing" })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(draft_pull_json(
+            12,
+            "Add thing",
+            false,
+        )))
         .expect(1)
         .mount(&server)
         .await;
     let c = client_for(&server).await;
-    crate::api::pull::ready(&c, "o", "r", 12)
+    assert!(crate::api::pull::ready(&c, "o", "r", 12)
         .await
-        .expect("ready");
+        .expect("ready"));
+}
+
+#[tokio::test]
+async fn pull_ready_leaves_a_ready_pull_alone() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/pulls/12"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(pull_json(12, "open")))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/repos/o/r/pulls/12"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(pull_json(12, "open")))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    assert!(!crate::api::pull::ready(&c, "o", "r", 12)
+        .await
+        .expect("ready"));
+}
+
+#[tokio::test]
+async fn pull_ready_refuses_a_prefix_it_does_not_know() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/pulls/12"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(draft_pull_json(
+            12,
+            "Draft: Add thing",
+            true,
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/repos/o/r/pulls/12"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(pull_json(12, "open")))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let err = crate::api::pull::ready(&c, "o", "r", 12)
+        .await
+        .expect_err("unknown prefix");
+    assert!(err.to_string().contains("fj pr edit 12 --title"), "{err}");
+}
+
+#[tokio::test]
+async fn pull_ready_fails_when_the_server_still_reports_a_draft() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/pulls/12"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(draft_pull_json(
+            12,
+            "[WIP] Add thing",
+            true,
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/repos/o/r/pulls/12"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(draft_pull_json(
+            12,
+            "Add thing",
+            true,
+        )))
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let err = crate::api::pull::ready(&c, "o", "r", 12)
+        .await
+        .expect_err("still a draft");
+    assert!(err.to_string().contains("still a draft"), "{err}");
+}
+
+#[tokio::test]
+async fn pull_create_draft_prefixes_the_title() {
+    use crate::api::pull::CreatePull;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/repos/o/r/pulls"))
+        .and(body_json(json!({
+            "title": "WIP: Add thing", "head": "feature", "base": "main"
+        })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(draft_pull_json(
+            12,
+            "WIP: Add thing",
+            true,
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let pr = crate::api::pull::create(
+        &c,
+        "o",
+        "r",
+        &CreatePull {
+            title: "Add thing",
+            head: "feature",
+            base: "main",
+            body: None,
+            draft: true,
+        },
+    )
+    .await
+    .expect("create draft");
+    assert!(pr.draft);
 }
 
 #[tokio::test]
@@ -7759,6 +7888,54 @@ async fn dependency_add_and_remove_keep_the_direction_and_name_the_other_item() 
             .await
             .expect("remove");
     }
+}
+
+#[tokio::test]
+async fn issue_list_404_names_an_external_tracker() {
+    use crate::api::issue_tracker;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/issues"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({"message": "not found"})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 1, "name": "r", "has_issues": true,
+            "external_tracker": { "external_tracker_url": "https://t.example/o/r" }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let err = crate::api::issue::list(&c, "o", "r", Default::default())
+        .await
+        .err()
+        .expect("404");
+    let err = issue_tracker::explain_not_found(&c, "o", "r", err).await;
+    assert_eq!(
+        err.to_string(),
+        "o/r keeps its issues in an external tracker: https://t.example/o/r"
+    );
+    assert_eq!(crate::error_exit_code(&err), crate::EXIT_NOT_FOUND);
+}
+
+#[tokio::test]
+async fn issue_list_404_on_a_missing_repo_is_left_alone() {
+    use crate::api::issue_tracker;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({"message": "not found"})))
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let err = crate::api::issue::list(&c, "o", "r", Default::default())
+        .await
+        .err()
+        .expect("404");
+    let err = issue_tracker::explain_not_found(&c, "o", "r", err).await;
+    assert_eq!(err.to_string(), "not found: o/r");
 }
 
 #[tokio::test]

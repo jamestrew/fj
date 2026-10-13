@@ -251,7 +251,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         biased;
         sig = tokio::signal::ctrl_c() => {
             sig.context("installing SIGINT handler")?;
-            Err(anyhow::anyhow!("interrupted"))
+            Err(crate::interrupt::Interrupted.into())
         }
         res = cmd_future => res,
     }

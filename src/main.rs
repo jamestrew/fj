@@ -93,6 +93,12 @@ const EXIT_AUTH_FORBIDDEN: u8 = 4;
 const EXIT_RATE_LIMIT_TRANSIENT: u8 = 5;
 
 fn error_exit_code(err: &anyhow::Error) -> u8 {
+    if err
+        .chain()
+        .any(|cause| cause.is::<interrupt::Interrupted>())
+    {
+        return interrupt::EXIT_INTERRUPTED as u8;
+    }
     let api = err
         .chain()
         .find_map(|cause| cause.downcast_ref::<client::ApiError>());
@@ -205,6 +211,13 @@ pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
 mod tests {
     use super::*;
     use clap::error::ErrorKind;
+
+    #[test]
+    fn an_interrupt_exits_130_even_under_added_context() {
+        let err = anyhow::Error::from(interrupt::Interrupted).context("listing issues");
+        assert_eq!(error_exit_code(&err), 130);
+        assert_eq!(error_exit_code(&anyhow::anyhow!("interrupted")), 1);
+    }
 
     #[test]
     fn parse_error_exit_codes_match_cli_conventions() {

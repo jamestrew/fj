@@ -437,7 +437,7 @@ jobs:
 
             test do
               assert_match "fj #{version}", shell_output("#{bin}/fj --version")
-              assert_match "Command-line tool for Forgejo", shell_output("#{bin}/fj --help")
+              assert_match "Command-line tool for Forgejo", shell_output("#{bin}/fj -h")
             end
           end
           RUBY

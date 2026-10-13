@@ -215,7 +215,9 @@ pub struct CreatePull<'a> {
     pub base: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body: Option<&'a str>,
-    #[serde(default)]
+    /// Not sent: the server has no draft field (see `WIP_PREFIXES`). `create`
+    /// turns it into a title prefix.
+    #[serde(skip)]
     pub draft: bool,
 }
 
@@ -226,6 +228,14 @@ pub async fn create(
     body: &CreatePull<'_>,
 ) -> Result<Pull> {
     let path = format!("{}/pulls", crate::api::repo_path(owner, name));
+    if body.draft {
+        let title = draft_title(body.title);
+        let body = CreatePull {
+            title: &title,
+            ..body.clone()
+        };
+        return client.json(Method::POST, &path, &[], Some(&body)).await;
+    }
     client.json(Method::POST, &path, &[], Some(body)).await
 }
 
@@ -254,21 +264,79 @@ pub async fn edit(
     client.json(Method::PATCH, &path, &[], Some(body)).await
 }
 
-/// Convert a draft PR to ready-for-review.
-pub async fn ready(client: &Client, owner: &str, name: &str, number: u64) -> Result<()> {
-    let path = format!("{}/pulls/{number}", crate::api::repo_path(owner, name));
-    // Forgejo accepts `allow_maintainer_edit` and the toggle for `draft` via
-    // PATCH; the more reliable form is the dedicated endpoint when present,
-    // but PATCH with `{ "draft": false }` works on 7.x.
-    #[derive(serde::Serialize)]
-    struct ReadyBody {
-        draft: bool,
+/// Forgejo's default `repository.pull-request.WORK_IN_PROGRESS_PREFIXES`.
+///
+/// Forgejo and Gitea have no draft column: `draft` is computed on every read
+/// from a case-insensitive match of the title against this list, and neither
+/// the create nor the edit option carries a draft field. An instance can
+/// configure other prefixes and no API exposes them, so these are the only
+/// ones fj can act on.
+pub const WIP_PREFIXES: &[&str] = &["WIP:", "[WIP]"];
+
+/// The work-in-progress prefix `title` starts with, matched the way the server
+/// matches it: anchored at the start, case-insensitive, no leading whitespace.
+fn wip_prefix(title: &str) -> Option<&'static str> {
+    WIP_PREFIXES.iter().copied().find(|prefix| {
+        title
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    })
+}
+
+/// `title` as a draft title: unchanged if it already carries a prefix.
+pub fn draft_title(title: &str) -> String {
+    match wip_prefix(title) {
+        Some(_) => title.to_string(),
+        None => format!("{} {title}", WIP_PREFIXES[0]),
     }
-    let body = ReadyBody { draft: false };
-    client
-        .json::<Pull, _>(Method::PATCH, &path, &[], Some(&body))
-        .await
-        .map(|_| ())
+}
+
+/// `title` with its work-in-progress prefix removed. Errors when there is no
+/// prefix fj recognises, or when nothing but the prefix is left.
+pub fn ready_title(number: u64, title: &str) -> Result<String> {
+    let Some(prefix) = wip_prefix(title) else {
+        anyhow::bail!(
+            "PR #{number} is a draft, but its title {title:?} starts with none of the prefixes fj knows ({}). \
+             This forge marks drafts by a title prefix it configures itself; remove it with `fj pr edit {number} --title <TITLE>`",
+            WIP_PREFIXES.join(", ")
+        );
+    };
+    let rest = title[prefix.len()..].trim();
+    if rest.is_empty() {
+        anyhow::bail!(
+            "PR #{number}'s title is only the work-in-progress prefix {prefix:?}; give it a title with `fj pr edit {number} --title <TITLE>`"
+        );
+    }
+    Ok(rest.to_string())
+}
+
+/// Convert a draft PR to ready-for-review by removing the work-in-progress
+/// prefix from its title. Returns `false` when it was not a draft to begin
+/// with. A PATCH with `{"draft": false}` is accepted and ignored by the
+/// server, so the result is confirmed against the response.
+pub async fn ready(client: &Client, owner: &str, name: &str, number: u64) -> Result<bool> {
+    let pr = get(client, owner, name, number).await?;
+    if !pr.draft {
+        return Ok(false);
+    }
+    let title = ready_title(number, &pr.title)?;
+    let updated = edit(
+        client,
+        owner,
+        name,
+        number,
+        &EditPull {
+            title: Some(&title),
+            ..Default::default()
+        },
+    )
+    .await?;
+    if updated.draft {
+        anyhow::bail!(
+            "the server accepted the new title {title:?} but PR #{number} is still a draft"
+        );
+    }
+    Ok(true)
 }
 
 /// Merge the pull request's base branch into its head (the "update branch"

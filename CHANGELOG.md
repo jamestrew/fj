@@ -14,6 +14,29 @@ All notable changes will be recorded here. The format follows
   the repository (`-R`, or the current clone) by default, or `--org`, `--user`
   or `--instance` (instance administrators only).
 
+### Fixed
+
+- **`fj pr ready` clears the draft state.** Forgejo and Gitea compute "draft"
+  from a work-in-progress title prefix and ignore a `draft` field on edit, so
+  the old `{"draft": false}` PATCH reported success and changed nothing.
+  `fj pr ready` now removes the `WIP:` or `[WIP]` prefix from the title and
+  confirms against the response that the pull request is no longer a draft. It
+  says so when the pull request was already ready, and fails with the fix
+  when the title carries a prefix only the instance knows about. `fj stack
+  sync --ready` shares the path.
+- **`fj pr create --draft` and `fj stack sync --draft` open a draft.** The
+  `draft` field they sent on create was ignored for the same reason. They now
+  prefix the title with `WIP:` unless it already has a recognised prefix.
+- **Ctrl+C exits 130 on the graceful path.** Only the forced backstop used the
+  conventional status; an interrupt the command loop caught itself exited 1.
+- **`fj issue list` and `fj issue create` explain a repo without a built-in
+  tracker.** A repo that keeps issues in an external tracker, or has them
+  switched off, answers 404 on the issue routes, which read as "not found:
+  owner/repo". The message now names the cause and the external tracker URL.
+  The exit status is still 3.
+- **The Homebrew formula test matches real output.** It looked for the short
+  description in `fj --help`, which prints the long one. It now reads `fj -h`.
+
 ## [0.6.0] - 2026-10-10
 
 ### Added

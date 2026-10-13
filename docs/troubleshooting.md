@@ -178,11 +178,17 @@ subcommand. The list of known subcommands lives in
 `src/main.rs::KNOWN_SUBCOMMANDS`. If your plugin name collides with a
 built-in, rename it.
 
-## `fj pr ready` returns "pull does not allow editing draft state"
+## `fj pr ready` says the title starts with none of the prefixes fj knows
 
-Forgejo only lets you flip `draft: false` via PATCH if the API user is
-the PR author or has write permissions. If you're not the author and
-not a maintainer, this fails. There's no workaround on the client side.
+Forgejo and Gitea have no draft flag. A pull request is a draft when its
+title starts with a work-in-progress prefix, `WIP:` or `[WIP]` by default.
+`fj pr create --draft` adds `WIP:`, and `fj pr ready` removes whichever of
+the two is there, then checks that the server no longer reports a draft.
+
+An instance can configure other prefixes
+(`repository.pull-request.WORK_IN_PROGRESS_PREFIXES`) and no API exposes
+them, so `fj` cannot remove one it does not know. Retitle the pull request
+yourself with `fj pr edit <N> --title <TITLE>`.
 
 ## The hook hangs on `cargo test`
 
