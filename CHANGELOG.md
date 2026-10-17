@@ -6,6 +6,8 @@ All notable changes will be recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-16
+
 ### Added
 
 - **`fj runner token`.** Prints an Actions runner registration token and
@@ -43,6 +45,12 @@ All notable changes will be recorded here. The format follows
   as not found. The lookup now asks the server for the run number directly, and
   `fj run list --paginate` follows `total_count`, so it returns every page too.
   `fj run view --log-failed` on a run with nothing failed says so (#248).
+
+### Security
+
+- **rustls 0.23.46.** Picks up the fixes for RUSTSEC-2026-0346 through 0349,
+  which include a ServerHello that could downgrade later connections to
+  classical key exchange and `Debug` output that exposed TLS session secrets.
 
 ## [0.6.0] - 2026-10-10
 
