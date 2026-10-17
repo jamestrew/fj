@@ -75,6 +75,11 @@ if ! runners=$(fj api "/api/v1/orgs/$ORG/actions/runners" 2>/dev/null); then
   runners='[]'
   REQUIRED_LABELS=()
 fi
+# Instance-scoped runners (e.g. hel-forge-01) serve the org's jobs too but are
+# missing from the org listing. Only a site administrator can list them.
+if instance=$(fj api "/api/v1/admin/actions/runners" 2>/dev/null); then
+  runners=$(jq -s 'map(if type == "array" then . else [] end) | add' <<<"$runners$instance")
+fi
 for lbl in ${REQUIRED_LABELS[@]+"${REQUIRED_LABELS[@]}"}; do
   n=$(printf '%s' "$runners" | jq -r --arg l "$lbl" \
         '[.[]? | select((.status // "") != "offline") | select((.labels // []) | index($l))] | length' 2>/dev/null || echo 0)
