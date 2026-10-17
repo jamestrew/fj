@@ -108,7 +108,9 @@ docs/                  architecture, jq, gh-to-fj, faq, troubleshooting
 ## Things to remember
 
 - Tokens are stored in the OS keychain (service `fj`, key = hostname).
-  Never serialized to disk. The keychain pins "Always Allow" to the
+  When the keychain is unavailable, or `FJ_NO_KEYCHAIN=1` is set, they
+  fall back to `tokens.toml` in the config dir with 0600 permissions
+  (`auth::token_file_path`). The keychain pins "Always Allow" to the
   binary's code signature; an ad-hoc signature (what `cargo build`
   emits) is pinned to the cdhash, which changes every rebuild, so the
   prompt keeps coming back. Fix: `make install` puts a real copy on

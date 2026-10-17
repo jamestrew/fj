@@ -39,7 +39,9 @@ Two environment gotchas that have broken releases:
 # 1. Update CHANGELOG.md and bump Cargo.toml + Cargo.lock to the new version,
 #    then commit. The Cargo.toml version MUST equal the tag minus its `v`: the
 #    Homebrew formula's `test do` asserts `fj --version` matches the tag, so a
-#    mismatch fails the release at the publish step.
+#    mismatch fails the release at the publish step. Bump the README install
+#    snippets (badge, tarball URL, `--tag`) in the same commit: `cargo test`
+#    fails until they match Cargo.toml.
 
 # 2. Preflight: version-vs-tag, an online runner per required label, and that the
 #    signing/notarization secrets are set. Seconds, vs one ~8-minute signed build

@@ -628,6 +628,76 @@ mod tests {
             .collect()
     }
 
+    /// Every `vX.Y.Z` that sits in a README install snippet: the release badge,
+    /// the tarball URL and directory, and `cargo install --tag`. Anything else
+    /// (example tags, `fj-cli-test`) is ignored.
+    fn install_versions(text: &str) -> Vec<(usize, String)> {
+        const MARKERS: [&str; 4] = ["release-", "releases/download/", "fj-", "--tag "];
+        let mut out = Vec::new();
+        for (n, line) in text.lines().enumerate() {
+            for marker in MARKERS {
+                for (idx, _) in line.match_indices(marker) {
+                    let rest = &line[idx + marker.len()..];
+                    let mut chars = rest.chars();
+                    if chars.next() != Some('v')
+                        || !chars.next().is_some_and(|c| c.is_ascii_digit())
+                    {
+                        continue;
+                    }
+                    let ver: String = rest
+                        .chars()
+                        .take_while(|c| *c == 'v' || c.is_ascii_digit() || *c == '.')
+                        .collect();
+                    out.push((n + 1, ver));
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn readme_install_snippets_match_cargo_version() {
+        let root = env!("CARGO_MANIFEST_DIR");
+        let readme = std::fs::read_to_string(format!("{root}/README.md")).expect("read README.md");
+        let want = format!("v{}", env!("CARGO_PKG_VERSION"));
+        let found = install_versions(&readme);
+        assert!(
+            !found.is_empty(),
+            "no install snippets found in README.md; update install_versions if they moved"
+        );
+        let stale: Vec<String> = found
+            .iter()
+            .filter(|(_, v)| *v != want)
+            .map(|(n, v)| format!("README.md:{n} has {v}"))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "README install snippets must match Cargo.toml ({want}); bump them in the release commit:\n{}",
+            stale.join("\n")
+        );
+    }
+
+    #[test]
+    fn install_versions_finds_every_snippet_form() {
+        let text = "\
+<img src=\"https://img.shields.io/badge/release-v0.6.0-blue\">
+curl -fsSL https://x/releases/download/v0.6.0/fj-v0.6.0-linux-x86_64.tar.gz | tar -xz
+cargo install --git https://x/fj --tag v0.6.0
+";
+        let got: Vec<String> = install_versions(text).into_iter().map(|(_, v)| v).collect();
+        assert_eq!(got, ["v0.6.0"; 4]);
+    }
+
+    #[test]
+    fn install_versions_ignores_non_snippet_text() {
+        let text = "\
+fj release create v1.2.3 --notes x
+/plugin marketplace add rasterandstate/fj-claude-plugin
+stephen/fj-cli-test
+";
+        assert!(install_versions(text).is_empty());
+    }
+
     /// Keep the coverage scope honest: the `COV_IGNORE` list in the Makefile
     /// must stay in sync with reality. A `cli/*.rs` with no `#[cfg(test)]`
     /// module is glue we don't unit-test and must be excluded; one that has
