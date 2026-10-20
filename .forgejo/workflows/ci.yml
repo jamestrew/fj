@@ -49,13 +49,14 @@ jobs:
         run: cargo install cargo-audit --locked --jobs 1
 
       - name: cargo audit
-        # All three are unmaintained-only advisories on transitively pulled
+        # All four are unmaintained-only advisories on transitively pulled
         # crates we don't depend on directly, tracked as known debt; new
         # advisories, yanks, or warnings fail this gate.
         #   RUSTSEC-2024-0370 proc-macro-error (via clap/tabled deriveds)
         #   RUSTSEC-2025-0141 bincode      (via fjord-core -> uniffi_macros)
         #   RUSTSEC-2024-0436 paste        (via fjord-core -> uniffi_core)
-        run: cargo audit --ignore RUSTSEC-2024-0370 --ignore RUSTSEC-2025-0141 --ignore RUSTSEC-2024-0436 -D warnings
+        #   RUSTSEC-2026-0374 basic-toml   (via fjord-core -> uniffi_bindgen -> askama)
+        run: cargo audit --ignore RUSTSEC-2024-0370 --ignore RUSTSEC-2025-0141 --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2026-0374 -D warnings
 
       - name: cargo build --release
         run: cargo build --release --locked
