@@ -6,6 +6,11 @@ All notable changes will be recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Validate artifact downloads and zip release assets before reporting success.
+  Retry incomplete bodies up to three attempts and install downloads atomically.
+
 ## [0.7.0] - 2026-10-16
 
 ### Added

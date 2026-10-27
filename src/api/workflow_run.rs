@@ -649,33 +649,40 @@ pub async fn download_artifact(
     artifact: &Artifact,
 ) -> Result<Vec<u8>> {
     let run_url = run_web_url(client, owner, name, run);
-    let res = if artifact.id != 0 {
-        let path = format!(
-            "{}/actions/artifacts/{}/zip",
-            crate::api::repo_path(owner, name),
-            artifact.id
-        );
-        client.request(Method::GET, &path, &[], None).await?
-    } else {
-        let web = web_client(client, "downloading an artifact", &run_url)?;
-        let url = format!(
-            "{run_url}/artifacts/{}",
-            crate::api::path_segment(&artifact.name)
-        );
-        web.request(Method::GET, &url, &[], None).await?
-    };
-    let status = res.status();
-    if !status.is_success() {
-        let body = res.text().await.unwrap_or_default();
-        return Err(anyhow!(
-            "could not download artifact '{}' from run #{run} (HTTP {}){}",
-            artifact.name,
-            status.as_u16(),
-            detail_suffix(&body)
-        ));
-    }
-    crate::client::check_body_size(&res)?;
-    Ok(res.bytes().await.context("reading artifact body")?.to_vec())
+    crate::download::verified_body(
+        || async {
+            let res = if artifact.id != 0 {
+                let path = format!(
+                    "{}/actions/artifacts/{}/zip",
+                    crate::api::repo_path(owner, name),
+                    artifact.id
+                );
+                client.request(Method::GET, &path, &[], None).await?
+            } else {
+                let web = web_client(client, "downloading an artifact", &run_url)?;
+                let url = format!(
+                    "{run_url}/artifacts/{}",
+                    crate::api::path_segment(&artifact.name)
+                );
+                web.request(Method::GET, &url, &[], None).await?
+            };
+            let status = res.status();
+            if !status.is_success() {
+                let body = res.text().await.unwrap_or_default();
+                return Err(anyhow!(
+                    "could not download artifact '{}' from run #{run} (HTTP {}){}",
+                    artifact.name,
+                    status.as_u16(),
+                    detail_suffix(&body)
+                ));
+            }
+            Ok(res)
+        },
+        None,
+        true,
+        "artifact",
+    )
+    .await
 }
 
 // ── Workflow definitions ─────────────────────────────────────────────────────

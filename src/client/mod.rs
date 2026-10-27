@@ -1119,7 +1119,7 @@ fn is_sensitive_path(path: &str) -> bool {
 /// misbehaving or hostile server otherwise gets to drive us to OOM, since the
 /// JSON/text helpers read the whole body. 256 MiB is far above any real
 /// Forgejo API payload.
-const MAX_RESPONSE_BYTES: u64 = 256 * 1024 * 1024;
+pub(crate) const MAX_RESPONSE_BYTES: u64 = 256 * 1024 * 1024;
 
 pub(crate) fn check_body_size(res: &Response) -> Result<()> {
     if let Some(len) = res.content_length() {

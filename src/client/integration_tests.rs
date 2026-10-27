@@ -2662,7 +2662,7 @@ async fn download_artifact_returns_bytes() {
     Mock::given(method("GET"))
         .and(path("/o/r/actions/runs/5/artifacts/binary"))
         .and(no_authorization)
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"PK\x03\x04zip".to_vec()))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(crate::download::tests::zip()))
         .expect(1)
         .mount(&server)
         .await;
@@ -10309,7 +10309,7 @@ async fn artifacts_use_the_api_routes_where_the_server_has_them() {
     Mock::given(method("GET"))
         .and(path("/api/v1/repos/o/r/actions/artifacts/4/zip"))
         .and(header("authorization", "token test-token"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"PK\x03\x04".to_vec()))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(crate::download::tests::zip()))
         .expect(1)
         .mount(&server)
         .await;
@@ -10604,4 +10604,290 @@ async fn runner_registration_token_reports_a_denial_and_an_empty_reply() {
         .await
         .expect_err("empty");
     assert!(err.to_string().contains("without a registration token"));
+}
+
+// Raw HTTP keeps the deliberately incorrect Content-Length and clean chunked
+// end intact; higher-level mock servers may repair the framing.
+async fn download_server(
+    bodies: Vec<Vec<u8>>,
+    expected: Option<usize>,
+) -> (String, tokio::task::JoinHandle<usize>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        let count = bodies.len();
+        for body in bodies {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut byte = [0];
+                socket.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let response = if let Some(size) = expected {
+                let mut response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {size}\r\nConnection: close\r\n\r\n"
+                )
+                .into_bytes();
+                response.extend_from_slice(&body);
+                response
+            } else {
+                let mut response = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n", body.len()).into_bytes();
+                response.extend_from_slice(&body);
+                response.extend_from_slice(b"\r\n0\r\n\r\n");
+                response
+            };
+            socket.write_all(&response).await.unwrap();
+            socket.shutdown().await.unwrap();
+        }
+        count
+    });
+    (url, task)
+}
+
+async fn artifact_download_case(bodies: Vec<Vec<u8>>, expected: Option<usize>, success: bool) {
+    let attempts = bodies.len();
+    let (url, server) = download_server(bodies, expected).await;
+    let client = Client::for_base_url(
+        Url::parse(&format!("{url}/api/v1/")).unwrap(),
+        "test-token".into(),
+    )
+    .unwrap();
+    let artifact = serde_json::from_value(json!({"id": 4, "name": "binary"})).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let destination = directory.path().join("binary.zip");
+    // Same adapter and installation boundary as run download; argument parsing
+    // and artifact listing are bypassed to isolate body completeness.
+    let result = async {
+        let bytes =
+            crate::api::workflow::download_artifact(&client, "o", "r", 5, &artifact).await?;
+        crate::download::write_atomic(&destination, &bytes)
+    }
+    .await;
+    assert_eq!(result.is_ok(), success, "{result:?}");
+    if success {
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            crate::download::tests::zip()
+        );
+    } else {
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("after 3 attempts"), "{error}");
+        if let Some(size) = expected {
+            assert!(error.contains(&format!("expected {size} bytes")), "{error}");
+            assert!(error.contains("received"), "{error}");
+        }
+        assert!(!destination.exists());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+    assert_eq!(server.await.unwrap(), attempts);
+}
+
+#[tokio::test]
+async fn artifact_clean_truncation_retries_then_fails_without_file() {
+    artifact_download_case(vec![b"PK\x03\x04short".to_vec(); 3], None, false).await;
+}
+
+#[tokio::test]
+async fn artifact_truncated_then_complete_succeeds_second_attempt() {
+    artifact_download_case(
+        vec![b"short".to_vec(), crate::download::tests::zip()],
+        None,
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn artifact_content_length_mismatch_retries_then_fails_without_file() {
+    let zip = crate::download::tests::zip();
+    let expected = zip.len() + 10;
+    artifact_download_case(vec![zip; 3], Some(expected), false).await;
+}
+
+#[tokio::test]
+async fn artifact_valid_zip_passes_first_attempt() {
+    artifact_download_case(vec![crate::download::tests::zip()], None, true).await;
+}
+
+#[tokio::test]
+async fn release_body_validation_retries_zip_but_accepts_non_zip() {
+    let (url, server) = download_server(vec![b"short".to_vec(); 3], None).await;
+    let http = reqwest::Client::new();
+    let result = crate::download::verified_body(
+        || async { Ok(http.get(&url).send().await?) },
+        None,
+        true,
+        "release asset",
+    )
+    .await;
+    assert!(result.unwrap_err().to_string().contains("invalid zip"));
+    assert_eq!(server.await.unwrap(), 3);
+
+    let (url, server) = download_server(vec![b"plain asset".to_vec()], None).await;
+    let bytes = crate::download::verified_body(
+        || async { Ok(http.get(&url).send().await?) },
+        None,
+        false,
+        "release asset",
+    )
+    .await
+    .unwrap();
+    assert_eq!(bytes, b"plain asset");
+    assert_eq!(server.await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn release_content_length_mismatch_retries() {
+    let (url, server) = download_server(vec![b"short".to_vec(); 3], Some(10)).await;
+    let http = reqwest::Client::new();
+    let result = crate::download::verified_body(
+        || async { Ok(http.get(&url).send().await?) },
+        None,
+        false,
+        "release asset",
+    )
+    .await;
+    let error = result.unwrap_err().to_string();
+    assert!(error.contains("expected 10 bytes"), "{error}");
+    assert!(error.contains("received"), "{error}");
+    assert_eq!(server.await.unwrap(), 3);
+}
+
+#[tokio::test]
+async fn release_zip_truncated_then_complete() {
+    let valid = crate::download::tests::zip();
+    let (url, server) = download_server(vec![b"short".to_vec(), valid.clone()], None).await;
+    let http = reqwest::Client::new();
+    let bytes = crate::download::verified_body(
+        || async { Ok(http.get(&url).send().await?) },
+        None,
+        true,
+        "release asset",
+    )
+    .await
+    .unwrap();
+    assert_eq!(bytes, valid);
+    assert_eq!(server.await.unwrap(), 2);
+}
+
+#[tokio::test]
+async fn artifact_matching_content_length_passes_first_attempt() {
+    let zip = crate::download::tests::zip();
+    let expected = zip.len();
+    artifact_download_case(vec![zip], Some(expected), true).await;
+}
+
+// These cases enter through the production HTTP verifier. Release lookup and
+// CLI parsing are bypassed so the server can control body framing and size.
+#[tokio::test]
+async fn release_known_size_rejects_clean_short_and_long_bodies() {
+    for body in [b"short".to_vec(), b"too long an asset".to_vec()] {
+        let (url, server) = download_server(vec![body.clone(); 3], Some(body.len())).await;
+        let http = reqwest::Client::new();
+        let error = crate::download::verified_body(
+            || async { Ok(http.get(&url).send().await?) },
+            Some(10),
+            false,
+            "release asset",
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("after 3 attempts"), "{error}");
+        assert!(error.contains("expected 10 bytes"), "{error}");
+        assert_eq!(server.await.unwrap(), 3);
+    }
+}
+
+#[tokio::test]
+async fn release_known_size_recovers_after_clean_short_body() {
+    let (url, server) =
+        download_server(vec![b"short".to_vec(), b"plain asset".to_vec()], None).await;
+    let http = reqwest::Client::new();
+    let bytes = crate::download::verified_body(
+        || async { Ok(http.get(&url).send().await?) },
+        Some(11),
+        false,
+        "release asset",
+    )
+    .await
+    .unwrap();
+    assert_eq!(bytes, b"plain asset");
+    assert_eq!(server.await.unwrap(), 2);
+}
+
+#[tokio::test]
+async fn download_transport_failures_exhaust_three_attempts() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    let http = reqwest::Client::new();
+    let mut attempts = 0;
+    let error = crate::download::verified_body(
+        || {
+            attempts += 1;
+            let request = http.get(&url).send();
+            async { Ok(request.await?) }
+        },
+        None,
+        false,
+        "asset",
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert_eq!(attempts, 3);
+    assert!(error.contains("after 3 attempts"), "{error}");
+}
+
+#[tokio::test]
+async fn download_short_body_then_timeout_then_success() {
+    let (url, server) =
+        download_server(vec![b"short".to_vec(), b"plain asset".to_vec()], None).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let stalled = format!("http://{}", listener.local_addr().unwrap());
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(100))
+        .build()
+        .unwrap();
+    let mut attempts = 0;
+    let bytes = crate::download::verified_body(
+        || {
+            attempts += 1;
+            let request = http.get(if attempts == 2 { &stalled } else { &url }).send();
+            async { Ok(request.await?) }
+        },
+        Some(11),
+        false,
+        "asset",
+    )
+    .await
+    .unwrap();
+    assert_eq!(bytes, b"plain asset");
+    assert_eq!(attempts, 3);
+    assert_eq!(server.await.unwrap(), 2);
+}
+
+#[tokio::test]
+async fn download_http_404_is_not_retried() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .respond_with(wiremock::ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let http = reqwest::Client::new();
+    let result = crate::download::verified_body(
+        || async { Ok(http.get(server.uri()).send().await?) },
+        None,
+        false,
+        "asset",
+    )
+    .await;
+    assert!(result.unwrap_err().to_string().contains("404"));
 }

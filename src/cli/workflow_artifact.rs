@@ -77,7 +77,7 @@ pub async fn download(args: DownloadArgs, host: Option<&str>) -> Result<()> {
         let bytes =
             api::workflow::download_artifact(&ctx.client, &ctx.owner, &ctx.name, args.run_id, a)
                 .await?;
-        std::fs::write(&dest, &bytes)?;
+        crate::download::write_atomic(&dest, &bytes)?;
         println!("✓ Downloaded {} → {}", a.name, dest.display());
         got += 1;
     }

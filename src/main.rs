@@ -10,6 +10,7 @@ mod auth;
 mod cli;
 mod client;
 mod config;
+mod download;
 mod fjord;
 mod git;
 /// Throwaway git repositories, shared by the tests that exercise real git

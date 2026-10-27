@@ -487,16 +487,21 @@ async fn download(args: DownloadArgs, host: Option<&str>) -> Result<()> {
             skipped += 1;
             continue;
         }
-        let resp = ctx
-            .client
-            .http()
-            .get(&a.browser_download_url)
-            .send()
-            .await?
-            .error_for_status()?;
-        crate::client::check_body_size(&resp)?;
-        let bytes = resp.bytes().await?;
-        std::fs::write(&dest, &bytes)?;
+        let bytes = crate::download::verified_body(
+            || async {
+                Ok(ctx
+                    .client
+                    .http()
+                    .get(&a.browser_download_url)
+                    .send()
+                    .await?)
+            },
+            Some(a.size),
+            a.name.to_ascii_lowercase().ends_with(".zip"),
+            "release asset",
+        )
+        .await?;
+        crate::download::write_atomic(&dest, &bytes)?;
         println!("✓ Downloaded {} → {}", a.name, dest.display());
         downloaded += 1;
     }
