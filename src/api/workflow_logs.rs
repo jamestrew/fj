@@ -871,19 +871,20 @@ fn response_suffix(body: &str) -> String {
 /// per-task container name and the query window), so the native API path must
 /// never pay for it.
 pub(crate) trait TaskSource: Send + Sync {
-    fn load(&self) -> Pin<Box<dyn Future<Output = Vec<WorkflowTask>> + Send + '_>>;
+    fn load(&self) -> Pin<Box<dyn Future<Output = Result<Vec<WorkflowTask>>> + Send + '_>>;
 }
 
 /// Tasks already in hand, which is how tests and callers with a cached list
 /// supply them.
 impl TaskSource for Vec<WorkflowTask> {
-    fn load(&self) -> Pin<Box<dyn Future<Output = Vec<WorkflowTask>> + Send + '_>> {
-        Box::pin(async move { self.clone() })
+    fn load(&self) -> Pin<Box<dyn Future<Output = Result<Vec<WorkflowTask>>> + Send + '_>> {
+        Box::pin(async move { Ok(self.clone()) })
     }
 }
 
-/// Tasks fetched from the server on first ask. A failure degrades to an empty
-/// list, which the Loki fallback reports as missing task metadata.
+/// Tasks fetched from the server on first ask. A failed read is an error, not
+/// an empty list: "the server could not say" must stay distinct from "the run
+/// has no tasks".
 pub(crate) struct RemoteTasks<'a> {
     pub client: &'a Client,
     pub owner: &'a str,
@@ -892,12 +893,8 @@ pub(crate) struct RemoteTasks<'a> {
 }
 
 impl TaskSource for RemoteTasks<'_> {
-    fn load(&self) -> Pin<Box<dyn Future<Output = Vec<WorkflowTask>> + Send + '_>> {
-        Box::pin(async move {
-            list_run_tasks(self.client, self.owner, self.name, self.run)
-                .await
-                .unwrap_or_default()
-        })
+    fn load(&self) -> Pin<Box<dyn Future<Output = Result<Vec<WorkflowTask>>> + Send + '_>> {
+        Box::pin(async move { list_run_tasks(self.client, self.owner, self.name, self.run).await })
     }
 }
 
@@ -1022,7 +1019,7 @@ async fn fetch_run_logs_with_sources(
 
     // Task metadata is only needed for a job Forgejo could not serve.
     let tasks = if loki.available() {
-        tasks.load().await
+        tasks.load().await?
     } else {
         Vec::new()
     };
@@ -1127,7 +1124,7 @@ async fn fetch_run_logs_from_tasks(
     loki: &impl LogSource,
     tasks: &dyn TaskSource,
 ) -> Result<RunLogs> {
-    let tasks = tasks.load().await;
+    let tasks = tasks.load().await?;
     if tasks.is_empty() {
         return Err(anyhow!(
             "Loki fallback found no workflow task metadata for run #{run}"
@@ -1441,14 +1438,13 @@ mod tests {
     }
 
     impl TaskSource for CountingTasks {
-        fn load(&self) -> Pin<Box<dyn Future<Output = Vec<WorkflowTask>> + Send + '_>> {
+        fn load(&self) -> Pin<Box<dyn Future<Output = Result<Vec<WorkflowTask>>> + Send + '_>> {
             Box::pin(async move {
                 self.loads.fetch_add(1, Ordering::SeqCst);
                 parse_workflow_tasks(serde_json::json!([
                     {"id": 10, "name": "a", "status": "failure"},
                     {"id": 11, "name": "b", "status": "failure"}
                 ]))
-                .unwrap()
             })
         }
     }
@@ -2072,6 +2068,39 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.to_string(), "loki down");
+    }
+
+    struct FailingTasks;
+
+    impl TaskSource for FailingTasks {
+        fn load(&self) -> Pin<Box<dyn Future<Output = Result<Vec<WorkflowTask>>> + Send + '_>> {
+            Box::pin(async move { Err(anyhow!("task list failed (500)")) })
+        }
+    }
+
+    /// A native-log 404 followed by a failed task-list read is a failed
+    /// retrieval, not a job with no log: it must not read as "log unavailable".
+    #[tokio::test]
+    async fn a_failed_task_list_read_fails_the_run_instead_of_reading_as_no_log() {
+        let client = test_client();
+        let jobs = two_failed_jobs();
+
+        let err = fetch_run_logs_with_sources(
+            &client,
+            "o",
+            "r",
+            12,
+            None,
+            None,
+            false,
+            &FakeLogSource::ok_except("forgejo", 1),
+            &FakeLogSource::ok("loki"),
+            &FailingTasks,
+            &jobs,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("task list failed"));
     }
 
     #[test]
