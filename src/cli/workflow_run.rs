@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use clap::{Args, Subcommand};
 
 use crate::api;
@@ -313,6 +313,7 @@ async fn view(args: ViewArgs, host: Option<&str>) -> Result<()> {
         } else {
             print_run_logs(&logs);
         }
+        ensure_logs_complete(&logs)?;
         return ensure_exit_status(logs.status().unwrap_or(""), args.exit_status);
     }
 
@@ -385,7 +386,8 @@ async fn log(args: LogArgs, host: Option<&str>) -> Result<()> {
     )
     .await?;
     if args.json {
-        return output::print_json(&serde_json::to_value(&logs)?);
+        output::print_json(&serde_json::to_value(&logs)?)?;
+        return ensure_logs_complete(&logs);
     }
     if logs.jobs.is_empty() && args.failed {
         println!(
@@ -395,7 +397,20 @@ async fn log(args: LogArgs, host: Option<&str>) -> Result<()> {
         return Ok(());
     }
     print_run_logs(&logs);
-    Ok(())
+    ensure_logs_complete(&logs)
+}
+
+/// Fails after the logs that did load were printed, so a partial read never
+/// exits as a complete one.
+fn ensure_logs_complete(logs: &api::workflow::RunLogs) -> Result<()> {
+    if logs.errors.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "{} job log(s) could not be retrieved: {}",
+        logs.errors.len(),
+        logs.errors.join("; ")
+    )
 }
 
 fn print_run_logs(logs: &api::workflow::RunLogs) {

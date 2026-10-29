@@ -39,6 +39,11 @@ pub(crate) const LOG_MAX_BYTES: u64 = 64 * 1024 * 1024;
 pub struct RunLogs {
     pub source: String,
     pub jobs: Vec<JobLogs>,
+    /// Jobs whose log could not be retrieved (as opposed to confirmed missing).
+    /// The logs that did load are still in `jobs`; the caller prints them and
+    /// then fails, so a partial read never exits as a complete one.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<String>,
 }
 
 impl RunLogs {
@@ -973,14 +978,17 @@ async fn fetch_run_logs_with_sources(
         return Ok(RunLogs {
             source: "none".into(),
             jobs: Vec::new(),
+            errors: Vec::new(),
         });
     }
 
     // Each job is settled on its own. One job whose log is missing (a job with
     // no task yet answers `resource does not exist`) must not discard the logs
-    // of the jobs that did load, or fail the whole command: that read a real
-    // failure as infrastructure (CLS-963).
-    let mut results: Vec<std::result::Result<JobLogs, String>> = Vec::with_capacity(selected.len());
+    // of the jobs that did load, or fail the command on its own: that read a
+    // real failure as infrastructure (CLS-963). A job whose retrieval *fails* is
+    // kept apart from one whose log is confirmed missing: the logs that loaded
+    // are still returned, and `errors` makes the caller fail after printing.
+    let mut outcomes: Vec<JobOutcome> = Vec::with_capacity(selected.len());
     if forgejo.available() {
         for &(index, api_job) in &selected {
             let req = LogRequest {
@@ -992,48 +1000,72 @@ async fn fetch_run_logs_with_sources(
                 task: None,
                 api_job: Some(api_job),
             };
-            match forgejo.fetch(req).await {
-                Ok(job) => results.push(Ok(job)),
-                Err(LogSourceError::Unavailable(msg)) => results.push(Err(msg)),
-                Err(LogSourceError::Other(err)) => return Err(err),
-            }
+            outcomes.push(match forgejo.fetch(req).await {
+                Ok(job) => JobOutcome::Got(job),
+                Err(LogSourceError::Unavailable(msg)) => JobOutcome::Missing(msg),
+                Err(LogSourceError::Other(err)) => JobOutcome::Failed(err.to_string()),
+            });
         }
-        if results.iter().all(|result| result.is_ok()) {
+        if outcomes.iter().all(|o| matches!(o, JobOutcome::Got(_))) {
             return Ok(RunLogs {
                 source: "forgejo-api".into(),
-                jobs: results.into_iter().flatten().collect(),
+                jobs: outcomes
+                    .into_iter()
+                    .filter_map(|o| match o {
+                        JobOutcome::Got(job) => Some(job),
+                        _ => None,
+                    })
+                    .collect(),
+                errors: Vec::new(),
             });
         }
     } else {
-        results.extend(
-            selected
-                .iter()
-                .map(|_| Err("Forgejo workflow logs are not available".to_string())),
+        outcomes.extend(
+            selected.iter().map(|_| {
+                JobOutcome::Missing("Forgejo workflow logs are not available".to_string())
+            }),
         );
     }
 
-    let served_by_forgejo = results.iter().any(|result| result.is_ok());
-    if !served_by_forgejo && !loki.available() {
+    let served_by_forgejo = outcomes.iter().any(|o| matches!(o, JobOutcome::Got(_)));
+    let needs_fallback = outcomes.iter().any(|o| matches!(o, JobOutcome::Missing(_)));
+    if !served_by_forgejo && needs_fallback && !loki.available() {
         return Err(anyhow!("no workflow log source is available"));
     }
 
-    // Task metadata is only needed for a job Forgejo could not serve.
-    let tasks = if loki.available() {
-        tasks.load().await?
+    // Task metadata is only needed for a job Forgejo could not serve. A failed
+    // read of it is a failure for those jobs, never a missing log.
+    let tasks = if needs_fallback && loki.available() {
+        tasks.load().await.map_err(|err| err.to_string())
     } else {
-        Vec::new()
+        Ok(Vec::new())
     };
     let mut served_by_loki = false;
     let mut jobs = Vec::with_capacity(selected.len());
-    for (result, &(index, api_job)) in results.into_iter().zip(&selected) {
-        let reason = match result {
-            Ok(job) => {
+    let mut errors: Vec<String> = Vec::new();
+    for (outcome, &(index, api_job)) in outcomes.into_iter().zip(&selected) {
+        let reason = match outcome {
+            JobOutcome::Got(job) => {
                 jobs.push(job);
                 continue;
             }
-            Err(reason) => reason,
+            JobOutcome::Failed(err) => {
+                jobs.push(failed_job(index, api_job, &err));
+                errors.push(err);
+                continue;
+            }
+            JobOutcome::Missing(reason) => reason,
         };
-        let Some(task) = tasks.get(index).filter(|_| loki.available()) else {
+        let task = match (&tasks, loki.available()) {
+            (Err(err), true) => {
+                jobs.push(failed_job(index, api_job, err));
+                errors.push(err.clone());
+                continue;
+            }
+            (Ok(tasks), true) => tasks.get(index),
+            (_, false) => None,
+        };
+        let Some(task) = task else {
             jobs.push(unavailable_job(index, api_job, &reason));
             continue;
         };
@@ -1054,10 +1086,20 @@ async fn fetch_run_logs_with_sources(
             Err(LogSourceError::Unavailable(msg)) => {
                 jobs.push(unavailable_job(index, api_job, &msg))
             }
-            Err(LogSourceError::Other(err)) => return Err(err),
+            Err(LogSourceError::Other(err)) => {
+                jobs.push(failed_job(index, api_job, &err.to_string()));
+                errors.push(err.to_string());
+            }
         }
     }
 
+    // Nothing was retrieved at all: that is the failure itself, not a partial
+    // read, so it stays the command's error.
+    if !served_by_forgejo && !served_by_loki {
+        if let Some(first) = errors.first() {
+            return Err(anyhow!(first.clone()));
+        }
+    }
     let source = match (served_by_forgejo, served_by_loki) {
         (true, true) => "forgejo-api+loki",
         (true, false) => "forgejo-api",
@@ -1067,7 +1109,30 @@ async fn fetch_run_logs_with_sources(
     Ok(RunLogs {
         source: source.into(),
         jobs,
+        errors,
     })
+}
+
+/// How one job's log read settled.
+enum JobOutcome {
+    Got(JobLogs),
+    /// The server confirmed there is no log (yet): try the next source.
+    Missing(String),
+    /// The read itself failed (transport, decoding, a server error).
+    Failed(String),
+}
+
+/// A job whose log could not be retrieved, marked in its own lines so the
+/// printed run shows where the gap is. The caller still fails on `errors`.
+fn failed_job(index: usize, api_job: &WorkflowRunJob, err: &str) -> JobLogs {
+    JobLogs {
+        lines: vec![LogLine {
+            timestamp: None,
+            stream: None,
+            message: format!("log retrieval failed for this job: {err}"),
+        }],
+        ..unavailable_job(index, api_job, "")
+    }
 }
 
 /// A job whose log no source could supply, reported as such in its own lines
@@ -1151,6 +1216,7 @@ async fn fetch_run_logs_from_tasks(
     Ok(RunLogs {
         source: "loki".into(),
         jobs,
+        errors: Vec::new(),
     })
 }
 
@@ -1614,18 +1680,21 @@ mod tests {
         let logs = RunLogs {
             source: "test".into(),
             jobs: vec![job("success"), job("failure"), job("cancelled")],
+            errors: Vec::new(),
         };
         assert_eq!(logs.status(), Some("failure"));
 
         let logs = RunLogs {
             source: "test".into(),
             jobs: vec![job("success"), job("cancelled"), job("timed_out")],
+            errors: Vec::new(),
         };
         assert_eq!(logs.status(), Some("cancelled"));
 
         let logs = RunLogs {
             source: "test".into(),
             jobs: vec![job("success"), job("timed_out")],
+            errors: Vec::new(),
         };
         assert_eq!(logs.status(), Some("timed_out"));
     }
@@ -1635,18 +1704,21 @@ mod tests {
         let logs = RunLogs {
             source: "test".into(),
             jobs: vec![job("success"), job("skipped")],
+            errors: Vec::new(),
         };
         assert_eq!(logs.status(), Some("success"));
 
         let logs = RunLogs {
             source: "test".into(),
             jobs: vec![job("queued"), job("")],
+            errors: Vec::new(),
         };
         assert_eq!(logs.status(), Some("queued"));
 
         let logs = RunLogs {
             source: "test".into(),
             jobs: Vec::new(),
+            errors: Vec::new(),
         };
         assert_eq!(logs.status(), Some("success"));
     }
@@ -2079,9 +2151,70 @@ mod tests {
     }
 
     /// A native-log 404 followed by a failed task-list read is a failed
-    /// retrieval, not a job with no log: it must not read as "log unavailable".
+    /// retrieval, not a job with no log. The job that loaded is kept and the
+    /// failure is recorded so the command fails after printing it.
     #[tokio::test]
-    async fn a_failed_task_list_read_fails_the_run_instead_of_reading_as_no_log() {
+    async fn a_failed_task_list_read_keeps_loaded_logs_and_records_the_failure() {
+        let client = test_client();
+        let jobs = two_failed_jobs();
+
+        let logs = fetch_run_logs_with_sources(
+            &client,
+            "o",
+            "r",
+            12,
+            None,
+            None,
+            false,
+            &FakeLogSource::ok_except("forgejo", 1),
+            &FakeLogSource::ok("loki"),
+            &FailingTasks,
+            &jobs,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(logs.jobs[0].lines[0].message, "forgejo-0");
+        assert!(logs.jobs[1].lines[0]
+            .message
+            .contains("log retrieval failed"));
+        assert_eq!(logs.errors, vec!["task list failed (500)".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_failing_loki_query_keeps_the_logs_that_loaded() {
+        let client = test_client();
+        let jobs = two_failed_jobs();
+        let tasks = parse_workflow_tasks(serde_json::json!([
+            {"id": 10, "name": "a", "status": "failure"},
+            {"id": 11, "name": "b", "status": "failure"}
+        ]))
+        .unwrap();
+
+        let logs = fetch_run_logs_with_sources(
+            &client,
+            "o",
+            "r",
+            12,
+            None,
+            None,
+            false,
+            &FakeLogSource::ok_except("forgejo", 1),
+            &FakeLogSource::other("loki down"),
+            &tasks,
+            &jobs,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(logs.source, "forgejo-api");
+        assert_eq!(logs.jobs[0].lines[0].message, "forgejo-0");
+        assert_eq!(logs.errors, vec!["loki down".to_string()]);
+    }
+
+    /// With nothing retrieved at all the failure is the command's error.
+    #[tokio::test]
+    async fn a_failed_task_list_read_with_no_logs_at_all_fails_the_run() {
         let client = test_client();
         let jobs = two_failed_jobs();
 
@@ -2093,7 +2226,7 @@ mod tests {
             None,
             None,
             false,
-            &FakeLogSource::ok_except("forgejo", 1),
+            &FakeLogSource::unavailable("no native logs"),
             &FakeLogSource::ok("loki"),
             &FailingTasks,
             &jobs,
