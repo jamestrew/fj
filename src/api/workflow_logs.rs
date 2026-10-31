@@ -1010,6 +1010,20 @@ pub async fn list_run_tasks(
         };
         // No new task on this page: the server ignores paging and sent the
         // whole list (or this is past its end), so all of it has been read.
+        // A page of nothing but tasks already seen, while the count says more
+        // exist, is the list shifting under the walk (tasks added between
+        // requests), not its end.
+        if fresh_ids.is_empty()
+            && !everything.is_empty()
+            && total.is_some_and(|n| (seen.len() as u64) < n)
+        {
+            return Ok(TaskList {
+                tasks: found,
+                incomplete: Some(format!(
+                    "page {page} repeated tasks already read while the list has more"
+                )),
+            });
+        }
         let exhausted = fresh_ids.is_empty() || total.is_some_and(|n| seen.len() as u64 >= n);
         if have_all || passed_wanted || exhausted {
             return Ok(TaskList::complete(found));
@@ -2198,6 +2212,27 @@ mod tests {
         assert_eq!(logs.jobs[0].task_id, Some(20));
         assert_eq!(logs.jobs[1].task_id, Some(10));
         assert!(logs.errors.is_empty(), "{:?}", logs.errors);
+    }
+
+    /// A repeated page while the count says more exist is a list that moved
+    /// under the walk: incomplete, not exhausted.
+    #[tokio::test]
+    async fn a_repeated_page_with_a_larger_total_is_incomplete() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/o/r/actions/tasks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(task_page(&[30, 29], 12, 500)))
+            .mount(&server)
+            .await;
+        let client = mock_tasks_client(&server);
+
+        let list = list_run_tasks(&client, "o", "r", 12, &[]).await.unwrap();
+
+        assert!(list.incomplete.is_some(), "{list:?}");
+        assert_eq!(list.tasks.len(), 2);
     }
 
     /// A first page that fails is the failure itself, not an empty list.
