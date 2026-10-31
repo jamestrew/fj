@@ -875,15 +875,44 @@ fn response_suffix(body: &str) -> String {
 /// moderately busy repo. Only the Loki fallback needs that metadata (for the
 /// per-task container name and the query window), so the native API path must
 /// never pay for it.
+///
+/// `wanted` names the task ids the caller must find. A source that has to page
+/// through a long list stops once it has them; an empty `wanted` means "the
+/// run's tasks, whichever they are".
 pub(crate) trait TaskSource: Send + Sync {
-    fn load(&self) -> Pin<Box<dyn Future<Output = Result<Vec<WorkflowTask>>> + Send + '_>>;
+    fn load<'a>(
+        &'a self,
+        wanted: &'a [u64],
+    ) -> Pin<Box<dyn Future<Output = Result<TaskList>> + Send + 'a>>;
+}
+
+/// The tasks a read found, and why it stopped short if it did. A task missing
+/// from an incomplete list is unresolved, not absent, and the tasks that were
+/// found stay usable: one page failing must not cost the logs of tasks already
+/// resolved.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TaskList {
+    pub tasks: Vec<WorkflowTask>,
+    pub incomplete: Option<String>,
+}
+
+impl TaskList {
+    fn complete(tasks: Vec<WorkflowTask>) -> Self {
+        Self {
+            tasks,
+            incomplete: None,
+        }
+    }
 }
 
 /// Tasks already in hand, which is how tests and callers with a cached list
 /// supply them.
 impl TaskSource for Vec<WorkflowTask> {
-    fn load(&self) -> Pin<Box<dyn Future<Output = Result<Vec<WorkflowTask>>> + Send + '_>> {
-        Box::pin(async move { Ok(self.clone()) })
+    fn load<'a>(
+        &'a self,
+        _wanted: &'a [u64],
+    ) -> Pin<Box<dyn Future<Output = Result<TaskList>> + Send + 'a>> {
+        Box::pin(async move { Ok(TaskList::complete(self.clone())) })
     }
 }
 
@@ -898,28 +927,114 @@ pub(crate) struct RemoteTasks<'a> {
 }
 
 impl TaskSource for RemoteTasks<'_> {
-    fn load(&self) -> Pin<Box<dyn Future<Output = Result<Vec<WorkflowTask>>> + Send + '_>> {
-        Box::pin(async move { list_run_tasks(self.client, self.owner, self.name, self.run).await })
+    fn load<'a>(
+        &'a self,
+        wanted: &'a [u64],
+    ) -> Pin<Box<dyn Future<Output = Result<TaskList>> + Send + 'a>> {
+        Box::pin(async move {
+            list_run_tasks(self.client, self.owner, self.name, self.run, wanted).await
+        })
     }
 }
 
+/// Tasks per page asked of `/actions/tasks`, and the most pages one lookup walks.
+/// The list is every task in the repository, newest first, so a run's tasks sit
+/// near the top; 40 pages of 50 reaches 2000 tasks back before giving up.
+const TASK_PAGE_SIZE: usize = 50;
+const TASK_PAGE_LIMIT: u32 = 40;
+
+/// The run's tasks, read page by page until the ids in `wanted` are found, the
+/// walk has passed them (the list is newest first), or the list is exhausted
+/// (its `total_count` is reached, or a page adds nothing new). A short page
+/// proves nothing, since a server may clamp the page size. A list cut off
+/// before that, by the page cap or by a page that fails after the first, comes
+/// back with the tasks found so far and `incomplete` set: never as a shorter
+/// answer. A first page that fails is an error. With no `wanted` ids (the
+/// older-server path) the walk goes to exhaustion, because a run's tasks need
+/// not be contiguous.
 pub async fn list_run_tasks(
     client: &Client,
     owner: &str,
     name: &str,
     run: u64,
-) -> Result<Vec<WorkflowTask>> {
+    wanted: &[u64],
+) -> Result<TaskList> {
     let path = format!("{}/actions/tasks", crate::api::repo_path(owner, name));
-    let query = vec![("run".to_string(), run.to_string())];
-    let value: Value = client
-        .json(
-            Method::GET,
-            &path,
-            &query,
-            Option::<&serde_json::Value>::None,
-        )
-        .await?;
-    parse_workflow_tasks_for_run(value, Some(run))
+    let mut found: Vec<WorkflowTask> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for page in 1..=TASK_PAGE_LIMIT {
+        let query = vec![
+            ("run".to_string(), run.to_string()),
+            ("limit".to_string(), TASK_PAGE_SIZE.to_string()),
+            ("page".to_string(), page.to_string()),
+        ];
+        let read = async {
+            let value: Value = client
+                .json(
+                    Method::GET,
+                    &path,
+                    &query,
+                    Option::<&serde_json::Value>::None,
+                )
+                .await?;
+            let total = value.get("total_count").and_then(Value::as_u64);
+            let everything = parse_workflow_tasks_for_run(value.clone(), None)?;
+            let ours = parse_workflow_tasks_for_run(value, Some(run))?;
+            Ok::<_, anyhow::Error>((total, everything, ours))
+        };
+        let (total, everything, ours) = match read.await {
+            Ok(page) => page,
+            Err(err) if page == 1 => return Err(err),
+            Err(err) => {
+                return Ok(TaskList {
+                    tasks: found,
+                    incomplete: Some(format!("page {page} failed: {err}")),
+                })
+            }
+        };
+        let fresh_ids: std::collections::HashSet<String> = everything
+            .iter()
+            .filter(|t| seen.insert(t.id.clone()))
+            .map(|t| t.id.clone())
+            .collect();
+        let page_min = everything.iter().filter_map(|t| t.id_u64().ok()).min();
+        found.extend(ours.into_iter().filter(|t| fresh_ids.contains(&t.id)));
+
+        let have_all = !wanted.is_empty()
+            && wanted
+                .iter()
+                .all(|id| found.iter().any(|t| t.id_u64().ok() == Some(*id)));
+        let passed_wanted = match (wanted.iter().min(), page_min) {
+            (Some(lowest), Some(min)) => min < *lowest,
+            _ => false,
+        };
+        // No new task on this page: the server ignores paging and sent the
+        // whole list (or this is past its end), so all of it has been read.
+        // A page of nothing but tasks already seen, while the count says more
+        // exist, is the list shifting under the walk (tasks added between
+        // requests), not its end.
+        if fresh_ids.is_empty()
+            && !everything.is_empty()
+            && total.is_some_and(|n| (seen.len() as u64) < n)
+        {
+            return Ok(TaskList {
+                tasks: found,
+                incomplete: Some(format!(
+                    "page {page} repeated tasks already read while the list has more"
+                )),
+            });
+        }
+        let exhausted = fresh_ids.is_empty() || total.is_some_and(|n| seen.len() as u64 >= n);
+        if have_all || passed_wanted || exhausted {
+            return Ok(TaskList::complete(found));
+        }
+    }
+    Ok(TaskList {
+        tasks: found,
+        incomplete: Some(format!(
+            "{TASK_PAGE_LIMIT} pages of {TASK_PAGE_SIZE} did not reach the end of the list"
+        )),
+    })
 }
 
 #[cfg(test)]
@@ -1035,10 +1150,25 @@ async fn fetch_run_logs_with_sources(
 
     // Task metadata is only needed for a job Forgejo could not serve. A failed
     // read of it is a failure for those jobs, never a missing log.
-    let tasks = if needs_fallback && loki.available() {
-        tasks.load().await.map_err(|err| err.to_string())
+    let fallback_jobs = || {
+        outcomes
+            .iter()
+            .zip(&selected)
+            .filter(|(outcome, _)| matches!(outcome, JobOutcome::Missing(_)))
+            .map(|(_, &(_, api_job))| api_job)
+    };
+    // Named tasks are found by id and the walk may stop once they are. A job
+    // that names no task is matched by position in the run's whole task list,
+    // and only an exhaustive read can say which task that is.
+    let wanted: Vec<u64> = if fallback_jobs().any(|job| job.task_id.is_none()) {
+        Vec::new()
     } else {
-        Ok(Vec::new())
+        fallback_jobs().filter_map(|job| job.task_id).collect()
+    };
+    let tasks = if needs_fallback && loki.available() {
+        tasks.load(&wanted).await.map_err(|err| err.to_string())
+    } else {
+        Ok(TaskList::complete(Vec::new()))
     };
     let mut served_by_loki = false;
     let mut jobs = Vec::with_capacity(selected.len());
@@ -1062,7 +1192,43 @@ async fn fetch_run_logs_with_sources(
                 errors.push(err.clone());
                 continue;
             }
-            (Ok(tasks), true) => tasks.get(index),
+            (Ok(list), true) => match api_job.task_id {
+                // The job names its task: find that task, and never read
+                // another job's in its place. The task list can be capped or
+                // ignore its run filter, so a task that is not in it is not
+                // proof there is no log: it is a retrieval error.
+                Some(task_id) => {
+                    match list.tasks.iter().find(|t| t.id_u64().ok() == Some(task_id)) {
+                        Some(task) => Some(task),
+                        None => {
+                            let err = format!(
+                            "task {task_id} for this job is not in the repository task list{}, \
+                             so its log cannot be read from Loki",
+                            list.incomplete
+                                .as_ref()
+                                .map_or(String::new(), |why| format!(" (the list is incomplete: {why})"))
+                        );
+                            jobs.push(failed_job(index, api_job, &err));
+                            errors.push(err);
+                            continue;
+                        }
+                    }
+                }
+                // A server that does not report the task id: the run's task
+                // list is in job order, as before, but only a complete list
+                // can say which task is this job's.
+                None => match &list.incomplete {
+                    Some(why) => {
+                        let err = format!(
+                            "this job cannot be matched to a task: the task list is incomplete ({why})"
+                        );
+                        jobs.push(failed_job(index, api_job, &err));
+                        errors.push(err);
+                        continue;
+                    }
+                    None => list.tasks.get(index),
+                },
+            },
             (_, false) => None,
         };
         let Some(task) = task else {
@@ -1189,14 +1355,21 @@ async fn fetch_run_logs_from_tasks(
     loki: &impl LogSource,
     tasks: &dyn TaskSource,
 ) -> Result<RunLogs> {
-    let tasks = tasks.load().await?;
+    let TaskList { tasks, incomplete } = tasks.load(&[]).await?;
     if tasks.is_empty() {
-        return Err(anyhow!(
-            "Loki fallback found no workflow task metadata for run #{run}"
-        ));
+        return Err(match incomplete {
+            Some(why) => anyhow!("the task list for run #{run} is incomplete: {why}"),
+            None => anyhow!("Loki fallback found no workflow task metadata for run #{run}"),
+        });
     }
     let selected = selected_tasks(&tasks, job, failed_only)?;
+    // Each task is settled on its own, as on the native path: one failed Loki
+    // query must not discard the logs of the tasks that loaded. A retrieval
+    // failure is kept in `errors` so the caller fails after printing; a task
+    // Loki confirms it has no log for reads as unavailable.
     let mut jobs = Vec::with_capacity(selected.len());
+    let mut errors: Vec<String> = Vec::new();
+    let mut served = false;
     for (index, task) in selected {
         let req = LogRequest {
             client,
@@ -1208,16 +1381,59 @@ async fn fetch_run_logs_from_tasks(
             api_job: None,
         };
         match loki.fetch(req).await {
-            Ok(job) => jobs.push(job),
-            Err(LogSourceError::Unavailable(msg)) => return Err(anyhow!(msg)),
-            Err(LogSourceError::Other(err)) => return Err(err),
+            Ok(job) => {
+                served = true;
+                jobs.push(job);
+            }
+            Err(LogSourceError::Unavailable(msg)) => jobs.push(task_log_note(
+                index,
+                task,
+                format!("log unavailable for this job: {msg}"),
+            )),
+            Err(LogSourceError::Other(err)) => {
+                let err = err.to_string();
+                jobs.push(task_log_note(
+                    index,
+                    task,
+                    format!("log retrieval failed for this job: {err}"),
+                ));
+                errors.push(err);
+            }
+        }
+    }
+    // Tasks the list never reached are unknown, not absent: the command fails
+    // after printing the ones that were read.
+    if let Some(why) = incomplete {
+        errors.push(format!("the task list for run #{run} is incomplete: {why}"));
+    }
+    // Nothing was retrieved at all: that is the failure itself.
+    if !served {
+        if let Some(first) = errors.first() {
+            return Err(anyhow!(first.clone()));
         }
     }
     Ok(RunLogs {
         source: "loki".into(),
         jobs,
-        errors: Vec::new(),
+        errors,
     })
+}
+
+/// A task whose log could not be shown, marked in its own lines so the printed
+/// run shows where the gap is.
+fn task_log_note(index: usize, task: &WorkflowTask, message: String) -> JobLogs {
+    JobLogs {
+        job: index,
+        task_id: task.id_u64().ok(),
+        job_id: None,
+        name: task.display_name(index),
+        status: task.display_status(),
+        lines: vec![LogLine {
+            timestamp: None,
+            stream: None,
+            message,
+        }],
+    }
 }
 
 fn selected_tasks(
@@ -1443,6 +1659,8 @@ mod tests {
         OkExcept(&'static str, usize),
         Unavailable(&'static str),
         Other(&'static str),
+        /// Serves every job except the one at this index, whose read fails.
+        OkExceptFailing(&'static str, usize),
     }
 
     impl FakeLogSource {
@@ -1466,6 +1684,14 @@ mod tests {
             Self {
                 available: true,
                 mode: FakeMode::Unavailable(message),
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn ok_except_failing(source: &'static str, job: usize) -> Self {
+            Self {
+                available: true,
+                mode: FakeMode::OkExceptFailing(source, job),
                 calls: Arc::new(AtomicUsize::new(0)),
             }
         }
@@ -1504,13 +1730,17 @@ mod tests {
     }
 
     impl TaskSource for CountingTasks {
-        fn load(&self) -> Pin<Box<dyn Future<Output = Result<Vec<WorkflowTask>>> + Send + '_>> {
+        fn load<'a>(
+            &'a self,
+            _wanted: &'a [u64],
+        ) -> Pin<Box<dyn Future<Output = Result<TaskList>> + Send + 'a>> {
             Box::pin(async move {
                 self.loads.fetch_add(1, Ordering::SeqCst);
                 parse_workflow_tasks(serde_json::json!([
                     {"id": 10, "name": "a", "status": "failure"},
                     {"id": 11, "name": "b", "status": "failure"}
                 ]))
+                .map(TaskList::complete)
             })
         }
     }
@@ -1533,8 +1763,15 @@ mod tests {
                         ));
                     }
                 }
+                if let FakeMode::OkExceptFailing(_, failing) = self.mode {
+                    if req.job == failing {
+                        return Err(LogSourceError::Other(anyhow!("loki query failed")));
+                    }
+                }
                 match self.mode {
-                    FakeMode::Ok(source) | FakeMode::OkExcept(source, _) => Ok(JobLogs {
+                    FakeMode::Ok(source)
+                    | FakeMode::OkExcept(source, _)
+                    | FakeMode::OkExceptFailing(source, _) => Ok(JobLogs {
                         job: req.job,
                         task_id: req.task.and_then(|task| task.id_u64().ok()),
                         job_id: req.api_job.map(|job| job.id),
@@ -1556,6 +1793,532 @@ mod tests {
                 }
             })
         }
+    }
+
+    fn job_with_task(id: u64, name: &str, task_id: Option<u64>) -> WorkflowRunJob {
+        WorkflowRunJob {
+            id,
+            attempt: 1,
+            name: name.into(),
+            status: "failure".into(),
+            task_id,
+        }
+    }
+
+    /// CLS-1022: a job that names its task reads THAT task's log, whatever
+    /// position the task has in a list that can be unordered or longer than the
+    /// run (Forgejo 16 ignores the `run` filter).
+    #[tokio::test]
+    async fn a_job_reads_the_task_it_names_not_the_one_at_its_position() {
+        let client = test_client();
+        let jobs = vec![
+            job_with_task(100, "a", Some(10)),
+            job_with_task(101, "b", Some(11)),
+        ];
+        let tasks = parse_workflow_tasks(serde_json::json!([
+            {"id": 99, "name": "other run", "status": "failure"},
+            {"id": 11, "name": "b", "status": "failure"},
+            {"id": 10, "name": "a", "status": "failure"}
+        ]))
+        .unwrap();
+
+        let logs = fetch_run_logs_with_sources(
+            &client,
+            "o",
+            "r",
+            12,
+            None,
+            None,
+            false,
+            &FakeLogSource::unavailable("no native logs"),
+            &FakeLogSource::ok("loki"),
+            &tasks,
+            &jobs,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(logs.jobs[0].task_id, Some(10));
+        assert_eq!(logs.jobs[1].task_id, Some(11));
+        assert!(logs.errors.is_empty());
+    }
+
+    /// CLS-1022: a task that is not in the list is not proof the job has no
+    /// log. It is a retrieval error, the log that loaded is kept, and the
+    /// command fails after printing.
+    #[tokio::test]
+    async fn a_named_task_missing_from_the_list_is_a_retrieval_error() {
+        let client = test_client();
+        let jobs = vec![
+            job_with_task(100, "a", Some(10)),
+            job_with_task(101, "b", Some(91)),
+        ];
+        let tasks = parse_workflow_tasks(serde_json::json!([
+            {"id": 10, "name": "a", "status": "failure"}
+        ]))
+        .unwrap();
+
+        let logs = fetch_run_logs_with_sources(
+            &client,
+            "o",
+            "r",
+            12,
+            None,
+            None,
+            false,
+            &FakeLogSource::ok_except("forgejo", 1),
+            &FakeLogSource::ok("loki"),
+            &tasks,
+            &jobs,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(logs.jobs.len(), 2);
+        assert_eq!(logs.errors.len(), 1);
+        assert!(logs.errors[0].contains("task 91"), "{:?}", logs.errors);
+        assert!(logs.jobs[1].lines[0]
+            .message
+            .contains("log retrieval failed"));
+    }
+
+    /// CLS-1022 item 2: on the older-server path one failed Loki query used to
+    /// return at once, discarding the tasks that had loaded.
+    #[tokio::test]
+    async fn the_older_server_path_keeps_loaded_logs_when_one_query_fails() {
+        let client = test_client();
+        let tasks = parse_workflow_tasks(serde_json::json!([
+            {"id": 10, "name": "a", "status": "failure"},
+            {"id": 11, "name": "b", "status": "failure"},
+            {"id": 12, "name": "c", "status": "failure"}
+        ]))
+        .unwrap();
+
+        let logs = fetch_run_logs_from_tasks(
+            &client,
+            "o",
+            "r",
+            12,
+            None,
+            None,
+            false,
+            &FakeLogSource::ok_except_failing("loki", 1),
+            &tasks,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(logs.jobs.len(), 3);
+        assert_eq!(logs.jobs[0].task_id, Some(10));
+        assert!(logs.jobs[1].lines[0]
+            .message
+            .contains("log retrieval failed"));
+        assert_eq!(logs.jobs[2].task_id, Some(12));
+        assert_eq!(logs.errors, vec!["loki query failed".to_string()]);
+    }
+
+    /// A confirmed-missing log on that path is a note on the job, not an error.
+    #[tokio::test]
+    async fn the_older_server_path_reads_a_missing_log_as_unavailable() {
+        let client = test_client();
+        let tasks = parse_workflow_tasks(serde_json::json!([
+            {"id": 10, "name": "a", "status": "failure"},
+            {"id": 11, "name": "b", "status": "failure"}
+        ]))
+        .unwrap();
+
+        let logs = fetch_run_logs_from_tasks(
+            &client,
+            "o",
+            "r",
+            12,
+            None,
+            None,
+            false,
+            &FakeLogSource::ok_except("loki", 1),
+            &tasks,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(logs.jobs.len(), 2);
+        assert!(logs.jobs[1].lines[0].message.contains("log unavailable"));
+        assert!(logs.errors.is_empty());
+    }
+
+    /// With every query failing nothing was retrieved: that is the command's error.
+    #[tokio::test]
+    async fn the_older_server_path_fails_when_nothing_loaded() {
+        let client = test_client();
+        let tasks = parse_workflow_tasks(serde_json::json!([
+            {"id": 10, "name": "a", "status": "failure"}
+        ]))
+        .unwrap();
+
+        let err = fetch_run_logs_from_tasks(
+            &client,
+            "o",
+            "r",
+            12,
+            None,
+            None,
+            false,
+            &FakeLogSource::other("loki down"),
+            &tasks,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.to_string(), "loki down");
+    }
+
+    fn task_page(ids: &[u64], run_number: u64, total: u64) -> serde_json::Value {
+        serde_json::json!({
+            "total_count": total,
+            "workflow_runs": ids.iter().map(|id| serde_json::json!({
+                "id": id, "name": format!("t{id}"), "status": "failure", "run_number": run_number
+            })).collect::<Vec<_>>()
+        })
+    }
+
+    /// CLS-1022: the task list is paged until the wanted tasks turn up; a task
+    /// beyond the first page is found, and later pages are not fetched.
+    #[tokio::test]
+    async fn the_task_list_is_paged_until_the_wanted_task_is_found() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let mut first: Vec<u64> = (1000..1050).rev().collect();
+        first.truncate(TASK_PAGE_SIZE);
+        // Page 1 holds other runs' tasks (run_number 5); page 2 holds ours (12).
+        let page_one = task_page(&first, 5, 120);
+        let page_two = task_page(&[900, 899], 12, 120);
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/o/r/actions/tasks"))
+            .and(query_param("page", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(page_one))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/o/r/actions/tasks"))
+            .and(query_param("page", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(page_two))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/o/r/actions/tasks"))
+            .and(query_param("page", "3"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let client = Client::anonymous_for_base_url(
+            Url::parse(&format!("{}/api/v1/", server.uri())).unwrap(),
+        )
+        .unwrap();
+
+        let list = list_run_tasks(&client, "o", "r", 12, &[900, 899])
+            .await
+            .unwrap();
+
+        assert!(list.incomplete.is_none());
+        let mut ids: Vec<u64> = list.tasks.iter().filter_map(|t| t.id_u64().ok()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![899, 900]);
+    }
+
+    fn mock_tasks_client(server: &wiremock::MockServer) -> Client {
+        Client::anonymous_for_base_url(Url::parse(&format!("{}/api/v1/", server.uri())).unwrap())
+            .unwrap()
+    }
+
+    /// CLS-1022 (review): a run's tasks need not be contiguous. With no wanted
+    /// ids the walk goes to the end of the list, so a task of the run that sits
+    /// behind an unrelated page is still found.
+    #[tokio::test]
+    async fn a_runs_tasks_separated_by_an_unrelated_page_are_all_found() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let pages = [
+            task_page(&[300], 12, 3),
+            task_page(&[250], 7, 3),
+            task_page(&[100], 12, 3),
+        ];
+        for (n, page) in pages.into_iter().enumerate() {
+            Mock::given(method("GET"))
+                .and(path("/api/v1/repos/o/r/actions/tasks"))
+                .and(query_param("page", (n + 1).to_string()))
+                .respond_with(ResponseTemplate::new(200).set_body_json(page))
+                .mount(&server)
+                .await;
+        }
+        let client = mock_tasks_client(&server);
+
+        let list = list_run_tasks(&client, "o", "r", 12, &[]).await.unwrap();
+
+        let mut ids: Vec<u64> = list.tasks.iter().filter_map(|t| t.id_u64().ok()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![100, 300]);
+        assert!(list.incomplete.is_none());
+    }
+
+    /// CLS-1022 (review): a server that clamps the page size and sends no count
+    /// still has the decisive task on page 2; a short page is not the end.
+    #[tokio::test]
+    async fn a_clamped_first_page_does_not_end_the_walk() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let no_count = |ids: &[u64], run: u64| {
+            let mut page = task_page(ids, run, 0);
+            page.as_object_mut().unwrap().remove("total_count");
+            page
+        };
+        let pages = [
+            no_count(&[900, 899, 898], 5),
+            no_count(&[500], 12),
+            no_count(&[], 12),
+        ];
+        for (n, page) in pages.into_iter().enumerate() {
+            Mock::given(method("GET"))
+                .and(path("/api/v1/repos/o/r/actions/tasks"))
+                .and(query_param("page", (n + 1).to_string()))
+                .respond_with(ResponseTemplate::new(200).set_body_json(page))
+                .mount(&server)
+                .await;
+        }
+        let client = mock_tasks_client(&server);
+
+        let list = list_run_tasks(&client, "o", "r", 12, &[500]).await.unwrap();
+
+        assert_eq!(list.tasks.len(), 1);
+        assert_eq!(list.tasks[0].id, "500");
+        assert!(list.incomplete.is_none());
+    }
+
+    /// CLS-1022 (review): page 2 failing after page 1 resolved task A keeps A.
+    /// Through the production adapter and the fallback, A's log is read and only
+    /// B, whose task was never reached, is marked failed.
+    #[tokio::test]
+    async fn a_later_page_failing_keeps_the_tasks_already_resolved() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/o/r/actions/tasks"))
+            .and(query_param("page", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(task_page(&[20], 12, 3)))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/o/r/actions/tasks"))
+            .and(query_param("page", "2"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let client = mock_tasks_client(&server);
+        let remote = RemoteTasks {
+            client: &client,
+            owner: "o",
+            name: "r",
+            run: 12,
+        };
+        let jobs = vec![
+            job_with_task(100, "a", Some(20)),
+            job_with_task(101, "b", Some(10)),
+        ];
+
+        let logs = fetch_run_logs_with_sources(
+            &client,
+            "o",
+            "r",
+            12,
+            None,
+            None,
+            false,
+            &FakeLogSource::unavailable("no native logs"),
+            &FakeLogSource::ok("loki"),
+            &remote,
+            &jobs,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(logs.jobs[0].task_id, Some(20));
+        assert_eq!(logs.jobs[0].name, "loki");
+        assert!(logs.jobs[1].lines[0]
+            .message
+            .contains("log retrieval failed"));
+        assert_eq!(logs.errors.len(), 1);
+        assert!(logs.errors[0].contains("task 10"), "{:?}", logs.errors);
+        assert!(logs.errors[0].contains("incomplete"), "{:?}", logs.errors);
+    }
+
+    /// CLS-1022 (review): one fallback job names its task and another does not.
+    /// Finding the named task on page 1 must not end the walk, because the
+    /// unnamed job is matched by position in the run's whole list.
+    #[tokio::test]
+    async fn an_unnamed_job_forces_the_whole_task_list_to_be_read() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        for (n, page) in [task_page(&[20], 12, 2), task_page(&[10], 12, 2)]
+            .into_iter()
+            .enumerate()
+        {
+            Mock::given(method("GET"))
+                .and(path("/api/v1/repos/o/r/actions/tasks"))
+                .and(query_param("page", (n + 1).to_string()))
+                .respond_with(ResponseTemplate::new(200).set_body_json(page))
+                .mount(&server)
+                .await;
+        }
+        let client = mock_tasks_client(&server);
+        let remote = RemoteTasks {
+            client: &client,
+            owner: "o",
+            name: "r",
+            run: 12,
+        };
+        let jobs = vec![
+            job_with_task(100, "a", Some(20)),
+            job_with_task(101, "b", None),
+        ];
+
+        let logs = fetch_run_logs_with_sources(
+            &client,
+            "o",
+            "r",
+            12,
+            None,
+            None,
+            false,
+            &FakeLogSource::unavailable("no native logs"),
+            &FakeLogSource::ok("loki"),
+            &remote,
+            &jobs,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(logs.jobs[0].task_id, Some(20));
+        assert_eq!(logs.jobs[1].task_id, Some(10));
+        assert!(logs.errors.is_empty(), "{:?}", logs.errors);
+    }
+
+    /// A repeated page while the count says more exist is a list that moved
+    /// under the walk: incomplete, not exhausted.
+    #[tokio::test]
+    async fn a_repeated_page_with_a_larger_total_is_incomplete() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/o/r/actions/tasks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(task_page(&[30, 29], 12, 500)))
+            .mount(&server)
+            .await;
+        let client = mock_tasks_client(&server);
+
+        let list = list_run_tasks(&client, "o", "r", 12, &[]).await.unwrap();
+
+        assert!(list.incomplete.is_some(), "{list:?}");
+        assert_eq!(list.tasks.len(), 2);
+    }
+
+    /// A first page that fails is the failure itself, not an empty list.
+    #[tokio::test]
+    async fn a_failing_first_page_is_an_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/o/r/actions/tasks"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let client = mock_tasks_client(&server);
+
+        assert!(list_run_tasks(&client, "o", "r", 12, &[1]).await.is_err());
+    }
+
+    /// A server that ignores paging sends the whole list every time; the walk
+    /// stops at the first repeat instead of looping.
+    #[tokio::test]
+    async fn a_server_that_ignores_paging_is_read_once() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/o/r/actions/tasks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                (100..100 + TASK_PAGE_SIZE as u64)
+                    .map(|id| {
+                        serde_json::json!({"id": id, "name": "a", "status": "failure", "run_number": 12})
+                    })
+                    .collect::<Vec<_>>(),
+            ))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let client = Client::anonymous_for_base_url(
+            Url::parse(&format!("{}/api/v1/", server.uri())).unwrap(),
+        )
+        .unwrap();
+
+        // A wanted task that is not there (id 5, below the page): page 1 is
+        // full and adds fifty tasks, page 2 repeats them, and the walk ends.
+        let list = list_run_tasks(&client, "o", "r", 12, &[5]).await.unwrap();
+        assert_eq!(list.tasks.len(), TASK_PAGE_SIZE);
+        assert!(list.incomplete.is_none());
+    }
+
+    /// A list cut off before the wanted tasks is marked incomplete, not a shorter answer.
+    #[tokio::test]
+    async fn a_task_list_that_never_reaches_the_task_is_incomplete() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
+
+        struct EndlessPages(Arc<AtomicUsize>);
+        impl Respond for EndlessPages {
+            fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+                let n = self.0.fetch_add(1, Ordering::SeqCst) as u64;
+                let ids: Vec<u64> = (0..TASK_PAGE_SIZE as u64)
+                    .map(|i| 1_000_000 - n * 100 - i)
+                    .collect();
+                ResponseTemplate::new(200).set_body_json(task_page(&ids, 5, 1_000_000))
+            }
+        }
+
+        let server = MockServer::start().await;
+        let pages = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/o/r/actions/tasks"))
+            .respond_with(EndlessPages(pages.clone()))
+            .mount(&server)
+            .await;
+        let client = Client::anonymous_for_base_url(
+            Url::parse(&format!("{}/api/v1/", server.uri())).unwrap(),
+        )
+        .unwrap();
+
+        // Newest first and never reaching id 1: the walk gives up at the cap
+        // and says the list is incomplete instead of answering short.
+        let list = list_run_tasks(&client, "o", "r", 12, &[1]).await.unwrap();
+
+        assert!(list.incomplete.is_some(), "{list:?}");
+        assert_eq!(pages.load(Ordering::SeqCst), TASK_PAGE_LIMIT as usize);
     }
 
     #[test]
@@ -2145,7 +2908,10 @@ mod tests {
     struct FailingTasks;
 
     impl TaskSource for FailingTasks {
-        fn load(&self) -> Pin<Box<dyn Future<Output = Result<Vec<WorkflowTask>>> + Send + '_>> {
+        fn load<'a>(
+            &'a self,
+            _wanted: &'a [u64],
+        ) -> Pin<Box<dyn Future<Output = Result<TaskList>> + Send + 'a>> {
             Box::pin(async move { Err(anyhow!("task list failed (500)")) })
         }
     }

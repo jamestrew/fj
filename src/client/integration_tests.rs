@@ -1442,7 +1442,8 @@ async fn run_logs_falls_back_to_loki_task_container_logs() {
                 "stopped_at": "2026-07-03T00:05:00Z"
             }
         ]})))
-        .expect(1)
+        // The task list is walked page by page; the second request only confirms the end.
+        .expect(1..=2)
         .mount(&server)
         .await;
     Mock::given(method("GET"))
@@ -1543,7 +1544,8 @@ async fn run_logs_reads_forgejo_16_workflow_runs_task_envelope() {
                 }
             ]})),
         )
-        .expect(1)
+        // The task list is walked page by page; the second request only confirms the end.
+        .expect(1..=2)
         .mount(&server)
         .await;
     Mock::given(method("GET"))
@@ -1631,7 +1633,8 @@ async fn run_logs_uses_selected_task_id_for_loki_query() {
                 "stopped_at": "2026-07-03T00:06:00Z"
             }
         ]})))
-        .expect(1)
+        // The task list is walked page by page; the second request only confirms the end.
+        .expect(1..=2)
         .mount(&server)
         .await;
     Mock::given(method("GET"))
@@ -10172,7 +10175,8 @@ async fn run_logs_on_an_older_server_use_a_configured_loki() {
                 "stopped_at": "2026-07-03T00:05:00Z"
             }
         ]})))
-        .expect(1)
+        // The task list is walked page by page; the second request only confirms the end.
+        .expect(1..=2)
         .mount(&server)
         .await;
     // The job and log routes are known absent, so they are never asked.
