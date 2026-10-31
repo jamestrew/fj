@@ -5934,6 +5934,13 @@ fn pull_json(number: u64, state: &str) -> serde_json::Value {
 async fn pull_edit_can_close() {
     use crate::api::pull::EditPull;
     let server = MockServer::start().await;
+    // An edit that is not a retarget reads the PR first, to check its base survives it (CLS-1063).
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/pulls/12"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(pull_json(12, "open")))
+        .expect(1)
+        .mount(&server)
+        .await;
     Mock::given(method("PATCH"))
         .and(path("/api/v1/repos/o/r/pulls/12"))
         .and(body_json(json!({ "state": "closed" })))
@@ -6053,7 +6060,8 @@ async fn pull_ready_strips_the_wip_prefix_from_the_title() {
             "wip: Add thing",
             true,
         )))
-        .expect(1)
+        // Once for `ready` itself and once for the edit's base check (CLS-1063).
+        .expect(2)
         .mount(&server)
         .await;
     Mock::given(method("PATCH"))
