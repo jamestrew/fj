@@ -759,7 +759,7 @@ async fn run_edit(ctx: &crate::cli::context::RepoContext, args: EditArgs) -> Res
             Some(pr) => pr.clone(),
             None => api::pull::get(&ctx.client, &ctx.owner, &ctx.name, args.number).await?,
         };
-        let refs = upload_attachments(&ctx, pr.number, &args.attach).await?;
+        let refs = upload_attachments(ctx, pr.number, &args.attach).await?;
         let new_body = append_attachments(&pr.body, &refs);
         let pr = api::pull::edit(
             &ctx.client,
