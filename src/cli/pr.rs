@@ -216,6 +216,10 @@ pub struct EditArgs {
     /// Open `$EDITOR` for the body (replaces the current body).
     #[arg(long)]
     pub body_editor: bool,
+    /// Retarget the pull request onto this base branch. Only sent when given:
+    /// an edit of anything else never touches the base.
+    #[arg(long, value_name = "BRANCH")]
+    pub base: Option<String>,
     /// Attach a file and link it at the end of the body (repeatable).
     #[arg(long = "attach", value_name = "FILE")]
     pub attach: Vec<PathBuf>,
@@ -704,6 +708,12 @@ async fn resolve_create_base(
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn edit(args: EditArgs, host: Option<&str>) -> Result<()> {
     let ctx = resolve_repo(args.r.repo.as_deref(), host)?;
+    run_edit(&ctx, args).await
+}
+
+/// `fj pr edit` against a resolved repository. Only the fields given on the
+/// command line are sent (CLS-1063): a body-only edit never carries `base`.
+async fn run_edit(ctx: &crate::cli::context::RepoContext, args: EditArgs) -> Result<()> {
     let add_labels = clean_csv_values(args.add_label);
     let remove_labels = clean_csv_values(args.remove_label);
     let add_assignees = clean_csv_values(args.add_assignee);
@@ -712,7 +722,9 @@ async fn edit(args: EditArgs, host: Option<&str>) -> Result<()> {
         || !remove_labels.is_empty()
         || !add_assignees.is_empty()
         || !remove_assignees.is_empty();
+    let base = clean_optional(args.base.clone());
     let should_patch = args.title.is_some()
+        || base.is_some()
         || args.body.is_some()
         || args.body_file.is_some()
         || args.body_editor
@@ -736,7 +748,7 @@ async fn edit(args: EditArgs, host: Option<&str>) -> Result<()> {
                 title: args.title.as_deref(),
                 body: body.as_deref(),
                 state: None,
-                base: None,
+                base: base.as_deref(),
             },
         )
         .await?;
@@ -747,7 +759,7 @@ async fn edit(args: EditArgs, host: Option<&str>) -> Result<()> {
             Some(pr) => pr.clone(),
             None => api::pull::get(&ctx.client, &ctx.owner, &ctx.name, args.number).await?,
         };
-        let refs = upload_attachments(&ctx, pr.number, &args.attach).await?;
+        let refs = upload_attachments(ctx, pr.number, &args.attach).await?;
         let new_body = append_attachments(&pr.body, &refs);
         let pr = api::pull::edit(
             &ctx.client,
@@ -1896,6 +1908,303 @@ mod tests {
                 assert_eq!(a.remove_assignee, vec!["bob", "carol"]);
             }
             other => panic!("expected pr edit, got {other:?}"),
+        }
+    }
+    // CLS-1063: `fj pr edit` sends only the fields it was given.
+
+    mod edit_requests {
+        use super::*;
+        use crate::cli::{Cli, Command};
+        use clap::Parser;
+        use serde_json::{json, Value};
+        use url::Url;
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const PULL_PATH: &str = "/api/v1/repos/o/r/pulls/7";
+
+        fn pull(base: &str, body: &str) -> Value {
+            json!({
+                "id": 1,
+                "number": 7,
+                "title": "A change",
+                "body": body,
+                "state": "open",
+                "user": { "id": 1, "login": "o" },
+                "labels": [],
+                "html_url": "https://x/o/r/pulls/7",
+                "head": { "label": "o:topic", "ref": "topic", "sha": "a" },
+                "base": { "label": format!("o:{base}"), "ref": base, "sha": "b" },
+                "created_at": "2026-10-31T00:00:00Z",
+                "updated_at": "2026-10-31T00:00:00Z"
+            })
+        }
+
+        fn ctx(server: &MockServer) -> crate::cli::context::RepoContext {
+            let base = Url::parse(&format!("{}/api/v1/", server.uri())).expect("base");
+            crate::cli::context::RepoContext {
+                client: crate::client::Client::for_base_url(base, "test-token".into()).unwrap(),
+                host: "mock".into(),
+                web_base: None,
+                owner: "o".into(),
+                name: "r".into(),
+            }
+        }
+
+        fn args(argv: &[&str]) -> EditArgs {
+            let mut full = vec!["fj", "pr", "edit", "7"];
+            full.extend_from_slice(argv);
+            match Cli::try_parse_from(full).expect("parses").command {
+                Command::Pr(PrCmd {
+                    command: PrSub::Edit(a),
+                }) => a,
+                other => panic!("expected pr edit, got {other:?}"),
+            }
+        }
+
+        async fn patch_bodies(server: &MockServer) -> Vec<Value> {
+            server
+                .received_requests()
+                .await
+                .expect("recorded")
+                .into_iter()
+                .filter(|r| r.method.as_str() == "PATCH")
+                .map(|r| serde_json::from_slice(&r.body).expect("json body"))
+                .collect()
+        }
+
+        /// The request that retargeted #1345 from `develop` to `main`: a body-only
+        /// edit of a PR that is not on the default branch.
+        #[tokio::test]
+        async fn a_body_only_edit_of_a_pr_on_develop_sends_only_the_body() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(PULL_PATH))
+                .respond_with(ResponseTemplate::new(200).set_body_json(pull("develop", "old")))
+                .mount(&server)
+                .await;
+            Mock::given(method("PATCH"))
+                .and(path(PULL_PATH))
+                .and(body_json(json!({ "body": "new body" })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(pull("develop", "new body")))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let file = tempfile::NamedTempFile::new().expect("file");
+            std::fs::write(file.path(), "new body").expect("write");
+            let path_arg = file.path().to_string_lossy().to_string();
+            run_edit(&ctx(&server), args(&["--body-file", &path_arg]))
+                .await
+                .expect("edit");
+
+            let bodies = patch_bodies(&server).await;
+            assert_eq!(bodies, vec![json!({ "body": "new body" })]);
+            assert!(
+                bodies[0].get("base").is_none(),
+                "a body-only edit never sends base"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_title_only_edit_sends_only_the_title() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(PULL_PATH))
+                .respond_with(ResponseTemplate::new(200).set_body_json(pull("develop", "old")))
+                .mount(&server)
+                .await;
+            Mock::given(method("PATCH"))
+                .and(path(PULL_PATH))
+                .and(body_json(json!({ "title": "Better" })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(pull("develop", "old")))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            run_edit(&ctx(&server), args(&["--title", "Better"]))
+                .await
+                .expect("edit");
+
+            assert_eq!(
+                patch_bodies(&server).await,
+                vec![json!({ "title": "Better" })]
+            );
+        }
+
+        #[tokio::test]
+        async fn base_is_sent_only_when_asked_for() {
+            let server = MockServer::start().await;
+            Mock::given(method("PATCH"))
+                .and(path(PULL_PATH))
+                .and(body_json(json!({ "base": "release" })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(pull("release", "old")))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            run_edit(&ctx(&server), args(&["--base", "release"]))
+                .await
+                .expect("edit");
+
+            assert_eq!(
+                patch_bodies(&server).await,
+                vec![json!({ "base": "release" })]
+            );
+        }
+
+        /// Whatever moves a PR's base during an edit that did not ask for it, the
+        /// edit fails and the base is put back, rather than leaving a PR aimed at
+        /// the default branch.
+        #[tokio::test]
+        async fn a_base_the_forge_moved_anyway_is_put_back_and_reported() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(PULL_PATH))
+                .respond_with(ResponseTemplate::new(200).set_body_json(pull("develop", "old")))
+                .mount(&server)
+                .await;
+            Mock::given(method("PATCH"))
+                .and(path(PULL_PATH))
+                .and(body_json(json!({ "body": "new body" })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(pull("main", "new body")))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("PATCH"))
+                .and(path(PULL_PATH))
+                .and(body_json(json!({ "base": "develop" })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(pull("develop", "new body")))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let file = tempfile::NamedTempFile::new().expect("file");
+            std::fs::write(file.path(), "new body").expect("write");
+            let path_arg = file.path().to_string_lossy().to_string();
+            let error = run_edit(&ctx(&server), args(&["--body-file", &path_arg]))
+                .await
+                .expect_err("a moved base is an error");
+
+            let message = format!("{error:#}");
+            assert!(message.contains("from `develop` to `main`"), "{message}");
+            assert!(message.contains("put back"), "{message}");
+            assert_eq!(
+                patch_bodies(&server).await,
+                vec![json!({ "body": "new body" }), json!({ "base": "develop" })]
+            );
+        }
+
+        #[tokio::test]
+        async fn a_base_that_cannot_be_put_back_says_how_to_set_it() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(PULL_PATH))
+                .respond_with(ResponseTemplate::new(200).set_body_json(pull("develop", "old")))
+                .mount(&server)
+                .await;
+            Mock::given(method("PATCH"))
+                .and(path(PULL_PATH))
+                .and(body_json(json!({ "title": "Better" })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(pull("main", "old")))
+                .mount(&server)
+                .await;
+            Mock::given(method("PATCH"))
+                .and(path(PULL_PATH))
+                .and(body_json(json!({ "base": "develop" })))
+                .respond_with(ResponseTemplate::new(403))
+                .mount(&server)
+                .await;
+
+            let error = run_edit(&ctx(&server), args(&["--title", "Better"]))
+                .await
+                .expect_err("a moved base is an error");
+
+            let message = format!("{error:#}");
+            assert!(message.contains("could not be put back"), "{message}");
+            assert!(message.contains("--base develop"), "{message}");
+        }
+
+        /// The PATCH may have been applied even though its answer never arrived:
+        /// the PR is looked at again, and a base that moved is put back.
+        #[tokio::test]
+        async fn a_lost_answer_does_not_hide_a_base_the_forge_moved() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(PULL_PATH))
+                .respond_with(ResponseTemplate::new(200).set_body_json(pull("develop", "old")))
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(PULL_PATH))
+                .respond_with(ResponseTemplate::new(200).set_body_json(pull("main", "new body")))
+                .mount(&server)
+                .await;
+            Mock::given(method("PATCH"))
+                .and(path(PULL_PATH))
+                .and(body_json(json!({ "body": "new body" })))
+                .respond_with(ResponseTemplate::new(422))
+                .mount(&server)
+                .await;
+            Mock::given(method("PATCH"))
+                .and(path(PULL_PATH))
+                .and(body_json(json!({ "base": "develop" })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(pull("develop", "new body")))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let file = tempfile::NamedTempFile::new().expect("file");
+            std::fs::write(file.path(), "new body").expect("write");
+            let path_arg = file.path().to_string_lossy().to_string();
+            let error = run_edit(&ctx(&server), args(&["--body-file", &path_arg]))
+                .await
+                .expect_err("a moved base is an error");
+
+            let message = format!("{error:#}");
+            assert!(message.contains("from `develop` to `main`"), "{message}");
+            assert!(message.contains("put back"), "{message}");
+        }
+
+        /// Every edit that is not a retarget keeps the base, not only the ones
+        /// `fj pr edit` makes: closing goes through the same guard.
+        #[tokio::test]
+        async fn closing_a_pr_cannot_move_its_base_either() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(PULL_PATH))
+                .respond_with(ResponseTemplate::new(200).set_body_json(pull("develop", "old")))
+                .mount(&server)
+                .await;
+            Mock::given(method("PATCH"))
+                .and(path(PULL_PATH))
+                .and(body_json(json!({ "state": "closed" })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(pull("main", "old")))
+                .mount(&server)
+                .await;
+            Mock::given(method("PATCH"))
+                .and(path(PULL_PATH))
+                .and(body_json(json!({ "base": "develop" })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(pull("develop", "old")))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let ctx = ctx(&server);
+            let error = api::pull::edit(
+                &ctx.client,
+                "o",
+                "r",
+                7,
+                &EditPull {
+                    state: Some("closed"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("a moved base is an error");
+            assert!(format!("{error:#}").contains("put back"));
         }
     }
 }

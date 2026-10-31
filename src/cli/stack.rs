@@ -3525,6 +3525,17 @@ mod tests {
             ])))
             .mount(&server)
             .await;
+        // The edit reads #7 first, to check its base survives it (CLS-1063).
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/o/r/pulls/7"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(pull_value_body(
+                7,
+                "feature/a",
+                "",
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
         // Only #7 should be PATCHed.
         Mock::given(method("PATCH"))
             .and(path("/api/v1/repos/o/r/pulls/7"))

@@ -253,7 +253,43 @@ pub struct EditPull<'a> {
     pub base: Option<&'a str>,
 }
 
+/// PATCH a pull request. A change that is not a retarget (`body.base` is
+/// `None`) never alters the base branch: it is read first and checked on the
+/// way out, and if it moved anyway (CLS-1063: a body-only edit was seen to
+/// retarget a PR from `develop` to the default branch) it is put back and the
+/// edit fails loudly, since a silent retarget can send work reviewed for
+/// `develop` straight to `main`. The check also runs when the PATCH's own
+/// answer is lost, because the forge may have applied it. A retarget is an
+/// edit that names its base (`--base`, `stack ship`) and goes straight through.
 pub async fn edit(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    number: u64,
+    body: &EditPull<'_>,
+) -> Result<Pull> {
+    if body.base.is_some() {
+        return edit_raw(client, owner, name, number, body).await;
+    }
+    let before = get(client, owner, name, number).await?;
+    let answer = edit_raw(client, owner, name, number, body).await;
+    let seen = match &answer {
+        Ok(after) => Some(after.base.ref_.clone()),
+        // The answer was lost, not necessarily the change: look at the PR.
+        Err(_) => get(client, owner, name, number)
+            .await
+            .ok()
+            .map(|now| now.base.ref_),
+    };
+    match seen {
+        Some(base) if !before.base.ref_.is_empty() && base != before.base.ref_ => {
+            Err(restore_base(client, owner, name, number, &before.base.ref_, &base).await)
+        }
+        _ => answer,
+    }
+}
+
+async fn edit_raw(
     client: &Client,
     owner: &str,
     name: &str,
@@ -262,6 +298,38 @@ pub async fn edit(
 ) -> Result<Pull> {
     let path = format!("{}/pulls/{number}", crate::api::repo_path(owner, name));
     client.json(Method::PATCH, &path, &[], Some(body)).await
+}
+
+/// Put a PR's base back after an edit moved it, and say so either way.
+async fn restore_base(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    number: u64,
+    wanted: &str,
+    found: &str,
+) -> anyhow::Error {
+    let restored = edit_raw(
+        client,
+        owner,
+        name,
+        number,
+        &EditPull {
+            base: Some(wanted),
+            ..Default::default()
+        },
+    )
+    .await;
+    match restored {
+        Ok(pr) if pr.base.ref_ == wanted => anyhow!(
+            "the base of PR #{number} changed from `{wanted}` to `{found}` during the edit; the base was put back. \
+             Check it with `fj pr view {number}`"
+        ),
+        _ => anyhow!(
+            "the base of PR #{number} changed from `{wanted}` to `{found}` during the edit and could not be put back; \
+             set it again with `fj pr edit {number} --base {wanted}`"
+        ),
+    }
 }
 
 /// Forgejo's default `repository.pull-request.WORK_IN_PROGRESS_PREFIXES`.

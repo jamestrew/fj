@@ -1031,6 +1031,38 @@ fn bearer_replaced_by_peer(bearer_before: &str, bearer_now: Option<&str>) -> Opt
         .map(str::to_string)
 }
 
+/// What to do with a refresh answer once the exchange is back and the lock is
+/// still held.
+#[derive(Debug, PartialEq, Eq)]
+enum AnswerAction {
+    /// The stored refresh token is still the one that was sent: the answer
+    /// moves the chain forward, store it.
+    Store,
+    /// The stored refresh token is not the one that was sent: a writer that
+    /// does not take the lock (an older fj, `fj auth login` in another
+    /// terminal) advanced the chain while the request was out. Keep what is
+    /// stored and use that.
+    ChainAdvanced,
+    /// Nothing is stored any more (`fj auth logout` ran meanwhile): do not
+    /// resurrect the session.
+    SessionGone,
+}
+
+/// Decide whether a refresh answer may be stored. Paragon answers a retired
+/// refresh token presented inside its reuse window with a fresh access token
+/// and the token it was SENT, so the loser of two racing refreshes carries a
+/// spent token, and storing it over the winner's replacement leaves the chain
+/// on a token that is revoked once the window closes (CLS-1061, PLAT-688).
+/// `sent` is the refresh token this exchange presented; `stored` is the record
+/// as it is now, read again after the network wait. Pure: no I/O.
+fn answer_action(sent: &str, stored: Option<&StoredRefresh>) -> AnswerAction {
+    match stored {
+        None => AnswerAction::SessionGone,
+        Some(record) if record.refresh_token == sent => AnswerAction::Store,
+        Some(_) => AnswerAction::ChainAdvanced,
+    }
+}
+
 /// Classify a non-2xx token-endpoint response into the error to return.
 ///
 /// A rotating OP answers a spent, replayed or aged-out grant with
@@ -1114,8 +1146,43 @@ pub async fn refresh_session(platform_url: &str) -> Result<String> {
     let tokens = exchange_refresh(platform_url, &client_id(), &refresh_token)
         .await
         .context("refreshing the Fjord Account session")?;
-    store_tokens(platform_url, &tokens)?;
-    Ok(tokens.access_token)
+    // The record is read again now that the answer is back: it is stored only
+    // while it still holds the token that was sent, so a late answer that
+    // repeats a spent token can never replace a newer one (CLS-1061).
+    settle_refresh_answer(
+        &refresh_token,
+        &tokens,
+        stored_refresh(platform_url)?.as_ref(),
+        || store_tokens(platform_url, &tokens).map(|_| ()),
+        || token_store::load_fjord_bearer(platform_url),
+    )
+}
+
+/// Apply [`answer_action`] to a refresh answer: store it, adopt what a peer
+/// stored, or fail without bringing a signed-out session back. The writers are
+/// passed in so a test can drive the whole decision, including that the store
+/// writer is not invoked for an answer that must not be stored.
+fn settle_refresh_answer(
+    sent: &str,
+    tokens: &TokenResponse,
+    stored: Option<&StoredRefresh>,
+    store: impl FnOnce() -> Result<()>,
+    current_bearer: impl FnOnce() -> Result<Option<String>>,
+) -> Result<String> {
+    match answer_action(sent, stored) {
+        AnswerAction::Store => {
+            store()?;
+            Ok(tokens.access_token.clone())
+        }
+        AnswerAction::ChainAdvanced => current_bearer()?.ok_or_else(|| {
+            anyhow!(
+                "the Fjord Account session changed while it was refreshing; run `fj auth login --fjord` to sign in again"
+            )
+        }),
+        AnswerAction::SessionGone => Err(anyhow!(
+            "the Fjord Account session ended while it was refreshing; run `fj auth login --fjord` to sign in again"
+        )),
+    }
 }
 
 /// Decode the non-cryptographic `payload` object from a stored bearer. The
@@ -2372,5 +2439,133 @@ mod tests {
 
         assert!(message.contains("502"), "{message}");
         assert!(message.contains("nope"), "{message}");
+    }
+    // CLS-1061: a refresh answer may only move the stored chain forward.
+
+    fn record(identity: &str, refresh_token: &str) -> StoredRefresh {
+        StoredRefresh {
+            identity: identity.to_string(),
+            refresh_token: refresh_token.to_string(),
+        }
+    }
+
+    #[test]
+    fn an_answer_is_stored_while_the_stored_token_is_the_one_that_was_sent() {
+        assert_eq!(
+            answer_action("t0", Some(&record("u", "t0"))),
+            AnswerAction::Store
+        );
+    }
+
+    #[test]
+    fn an_answer_is_not_stored_once_the_chain_moved_on() {
+        assert_eq!(
+            answer_action("t0", Some(&record("u", "t1"))),
+            AnswerAction::ChainAdvanced
+        );
+    }
+
+    #[test]
+    fn an_answer_does_not_bring_back_a_session_that_was_signed_out() {
+        assert_eq!(answer_action("t0", None), AnswerAction::SessionGone);
+    }
+
+    fn answer(access: &str, refresh: &str) -> TokenResponse {
+        TokenResponse {
+            access_token: access.to_string(),
+            refresh_token: Some(refresh.to_string()),
+        }
+    }
+
+    /// Two refreshes of one chain where the access-only answer (the platform
+    /// repeating the token it was sent) lands after the rotating one: the stored
+    /// token stays the rotated replacement, and the store writer is never invoked
+    /// for the late answer.
+    #[test]
+    fn a_late_answer_repeating_the_spent_token_leaves_the_rotated_token_stored() {
+        let stored = std::cell::RefCell::new(Some(record("u", "t0")));
+        let writes = std::cell::Cell::new(0);
+
+        let snapshot = || {
+            stored
+                .borrow()
+                .as_ref()
+                .map(|r| record(&r.identity, &r.refresh_token))
+        };
+
+        // The rotating answer is settled first and stored.
+        let rotating = answer("access-1", "t1");
+        let bearer = settle_refresh_answer(
+            "t0",
+            &rotating,
+            snapshot().as_ref(),
+            || {
+                writes.set(writes.get() + 1);
+                *stored.borrow_mut() = Some(record("u", "t1"));
+                Ok(())
+            },
+            || Ok(Some("access-1".to_string())),
+        )
+        .expect("the rotating answer is stored");
+        assert_eq!(bearer, "access-1");
+
+        // The other request's answer carries `t0` back and is settled last.
+        let late = answer("late-access", "t0");
+        let bearer = settle_refresh_answer(
+            "t0",
+            &late,
+            snapshot().as_ref(),
+            || {
+                writes.set(writes.get() + 1);
+                *stored.borrow_mut() = Some(record("u", "t0"));
+                Ok(())
+            },
+            || Ok(Some("access-1".to_string())),
+        )
+        .expect("the late answer adopts what is stored");
+
+        assert_eq!(
+            bearer, "access-1",
+            "the caller carries on with the stored bearer"
+        );
+        assert_eq!(writes.get(), 1, "only the rotating answer was written");
+        assert_eq!(
+            stored.borrow().as_ref().map(|r| r.refresh_token.as_str()),
+            Some("t1")
+        );
+    }
+
+    #[test]
+    fn an_answer_for_a_session_signed_out_meanwhile_is_not_written() {
+        let written = std::cell::Cell::new(false);
+        let result = settle_refresh_answer(
+            "t0",
+            &answer("access", "t1"),
+            None,
+            || {
+                written.set(true);
+                Ok(())
+            },
+            || Ok(None),
+        );
+        assert!(result.is_err());
+        assert!(!written.get(), "a signed-out session is not brought back");
+    }
+
+    #[test]
+    fn an_answer_whose_chain_advanced_with_no_bearer_left_is_an_error_not_a_write() {
+        let written = std::cell::Cell::new(false);
+        let result = settle_refresh_answer(
+            "t0",
+            &answer("access", "t0"),
+            Some(&record("u", "t1")),
+            || {
+                written.set(true);
+                Ok(())
+            },
+            || Ok(None),
+        );
+        assert!(result.is_err());
+        assert!(!written.get());
     }
 }
