@@ -264,6 +264,54 @@ pub async fn edit(
     client.json(Method::PATCH, &path, &[], Some(body)).await
 }
 
+/// [`edit`] for a change that is not a retarget (`body.base` is `None`): the
+/// PR's base branch is read first and checked on the answer, and if the forge
+/// moved it anyway (CLS-1063: a body-only edit was seen to retarget a PR from
+/// `develop` to the default branch) it is put back and the edit fails loudly.
+/// A silent retarget can send reviewed-for-`develop` work straight to `main`.
+pub async fn edit_keeping_base(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    number: u64,
+    body: &EditPull<'_>,
+) -> Result<Pull> {
+    if body.base.is_some() {
+        return edit(client, owner, name, number, body).await;
+    }
+    let before = get(client, owner, name, number).await?;
+    let after = edit(client, owner, name, number, body).await?;
+    if after.base.ref_ == before.base.ref_ || before.base.ref_.is_empty() {
+        return Ok(after);
+    }
+    let restored = edit(
+        client,
+        owner,
+        name,
+        number,
+        &EditPull {
+            base: Some(&before.base.ref_),
+            ..Default::default()
+        },
+    )
+    .await;
+    match restored {
+        Ok(pr) if pr.base.ref_ == before.base.ref_ => Err(anyhow!(
+            "the forge moved PR #{number} from base `{}` to `{}` during the edit; the base was put back. \
+             Check it with `fj pr view {number}`",
+            before.base.ref_,
+            after.base.ref_
+        )),
+        _ => Err(anyhow!(
+            "the forge moved PR #{number} from base `{}` to `{}` during the edit and the base could not be put back; \
+             set it again with `fj pr edit {number} --base {}`",
+            before.base.ref_,
+            after.base.ref_,
+            before.base.ref_
+        )),
+    }
+}
+
 /// Forgejo's default `repository.pull-request.WORK_IN_PROGRESS_PREFIXES`.
 ///
 /// Forgejo and Gitea have no draft column: `draft` is computed on every read
