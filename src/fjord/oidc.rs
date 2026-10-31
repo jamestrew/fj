@@ -1031,6 +1031,38 @@ fn bearer_replaced_by_peer(bearer_before: &str, bearer_now: Option<&str>) -> Opt
         .map(str::to_string)
 }
 
+/// What to do with a refresh answer once the exchange is back and the lock is
+/// still held.
+#[derive(Debug, PartialEq, Eq)]
+enum AnswerAction {
+    /// The stored refresh token is still the one that was sent: the answer
+    /// moves the chain forward, store it.
+    Store,
+    /// The stored refresh token is not the one that was sent: a writer that
+    /// does not take the lock (an older fj, `fj auth login` in another
+    /// terminal) advanced the chain while the request was out. Keep what is
+    /// stored and use that.
+    ChainAdvanced,
+    /// Nothing is stored any more (`fj auth logout` ran meanwhile): do not
+    /// resurrect the session.
+    SessionGone,
+}
+
+/// Decide whether a refresh answer may be stored. Paragon answers a retired
+/// refresh token presented inside its reuse window with a fresh access token
+/// and the token it was SENT, so the loser of two racing refreshes carries a
+/// spent token, and storing it over the winner's replacement leaves the chain
+/// on a token that is revoked once the window closes (CLS-1061, PLAT-688).
+/// `sent` is the refresh token this exchange presented; `stored` is the record
+/// as it is now, read again after the network wait. Pure: no I/O.
+fn answer_action(sent: &str, stored: Option<&StoredRefresh>) -> AnswerAction {
+    match stored {
+        None => AnswerAction::SessionGone,
+        Some(record) if record.refresh_token == sent => AnswerAction::Store,
+        Some(_) => AnswerAction::ChainAdvanced,
+    }
+}
+
 /// Classify a non-2xx token-endpoint response into the error to return.
 ///
 /// A rotating OP answers a spent, replayed or aged-out grant with
@@ -1114,8 +1146,23 @@ pub async fn refresh_session(platform_url: &str) -> Result<String> {
     let tokens = exchange_refresh(platform_url, &client_id(), &refresh_token)
         .await
         .context("refreshing the Fjord Account session")?;
-    store_tokens(platform_url, &tokens)?;
-    Ok(tokens.access_token)
+    // The record is read again now that the answer is back: it is stored only
+    // while it still holds the token that was sent, so a late answer that
+    // repeats a spent token can never replace a newer one (CLS-1061).
+    match answer_action(&refresh_token, stored_refresh(platform_url)?.as_ref()) {
+        AnswerAction::Store => {
+            store_tokens(platform_url, &tokens)?;
+            Ok(tokens.access_token)
+        }
+        AnswerAction::ChainAdvanced => token_store::load_fjord_bearer(platform_url)?.ok_or_else(|| {
+            anyhow!(
+                "the Fjord Account session changed while it was refreshing; run `fj auth login --fjord` to sign in again"
+            )
+        }),
+        AnswerAction::SessionGone => Err(anyhow!(
+            "the Fjord Account session ended while it was refreshing; run `fj auth login --fjord` to sign in again"
+        )),
+    }
 }
 
 /// Decode the non-cryptographic `payload` object from a stored bearer. The
@@ -2372,5 +2419,54 @@ mod tests {
 
         assert!(message.contains("502"), "{message}");
         assert!(message.contains("nope"), "{message}");
+    }
+    // CLS-1061: a refresh answer may only move the stored chain forward.
+
+    fn record(identity: &str, refresh_token: &str) -> StoredRefresh {
+        StoredRefresh {
+            identity: identity.to_string(),
+            refresh_token: refresh_token.to_string(),
+        }
+    }
+
+    #[test]
+    fn an_answer_is_stored_while_the_stored_token_is_the_one_that_was_sent() {
+        assert_eq!(
+            answer_action("t0", Some(&record("u", "t0"))),
+            AnswerAction::Store
+        );
+    }
+
+    #[test]
+    fn an_answer_is_not_stored_once_the_chain_moved_on() {
+        assert_eq!(
+            answer_action("t0", Some(&record("u", "t1"))),
+            AnswerAction::ChainAdvanced
+        );
+    }
+
+    #[test]
+    fn an_answer_does_not_bring_back_a_session_that_was_signed_out() {
+        assert_eq!(answer_action("t0", None), AnswerAction::SessionGone);
+    }
+
+    /// Two refreshes of one chain where the access-only answer (the platform
+    /// repeating the token it was sent) lands after the rotating one: the stored
+    /// token stays the rotated replacement.
+    #[test]
+    fn a_late_answer_repeating_the_spent_token_leaves_the_rotated_token_stored() {
+        let mut stored = Some(record("u", "t0"));
+
+        // The rotating answer arrives first and is stored.
+        assert_eq!(answer_action("t0", stored.as_ref()), AnswerAction::Store);
+        stored = Some(record("u", "t1"));
+
+        // The other request's answer carries `t0` back and lands last. It is
+        // not stored, so the writer is never invoked for it.
+        assert_eq!(
+            answer_action("t0", stored.as_ref()),
+            AnswerAction::ChainAdvanced
+        );
+        assert_eq!(stored.map(|r| r.refresh_token), Some("t1".to_string()));
     }
 }
