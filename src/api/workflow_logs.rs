@@ -1136,12 +1136,21 @@ async fn fetch_run_logs_with_sources(
 
     // Task metadata is only needed for a job Forgejo could not serve. A failed
     // read of it is a failure for those jobs, never a missing log.
-    let wanted: Vec<u64> = outcomes
-        .iter()
-        .zip(&selected)
-        .filter(|(outcome, _)| matches!(outcome, JobOutcome::Missing(_)))
-        .filter_map(|(_, &(_, api_job))| api_job.task_id)
-        .collect();
+    let fallback_jobs = || {
+        outcomes
+            .iter()
+            .zip(&selected)
+            .filter(|(outcome, _)| matches!(outcome, JobOutcome::Missing(_)))
+            .map(|(_, &(_, api_job))| api_job)
+    };
+    // Named tasks are found by id and the walk may stop once they are. A job
+    // that names no task is matched by position in the run's whole task list,
+    // and only an exhaustive read can say which task that is.
+    let wanted: Vec<u64> = if fallback_jobs().any(|job| job.task_id.is_none()) {
+        Vec::new()
+    } else {
+        fallback_jobs().filter_map(|job| job.task_id).collect()
+    };
     let tasks = if needs_fallback && loki.available() {
         tasks.load(&wanted).await.map_err(|err| err.to_string())
     } else {
@@ -2136,6 +2145,59 @@ mod tests {
         assert_eq!(logs.errors.len(), 1);
         assert!(logs.errors[0].contains("task 10"), "{:?}", logs.errors);
         assert!(logs.errors[0].contains("incomplete"), "{:?}", logs.errors);
+    }
+
+    /// CLS-1022 (review): one fallback job names its task and another does not.
+    /// Finding the named task on page 1 must not end the walk, because the
+    /// unnamed job is matched by position in the run's whole list.
+    #[tokio::test]
+    async fn an_unnamed_job_forces_the_whole_task_list_to_be_read() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        for (n, page) in [task_page(&[20], 12, 2), task_page(&[10], 12, 2)]
+            .into_iter()
+            .enumerate()
+        {
+            Mock::given(method("GET"))
+                .and(path("/api/v1/repos/o/r/actions/tasks"))
+                .and(query_param("page", (n + 1).to_string()))
+                .respond_with(ResponseTemplate::new(200).set_body_json(page))
+                .mount(&server)
+                .await;
+        }
+        let client = mock_tasks_client(&server);
+        let remote = RemoteTasks {
+            client: &client,
+            owner: "o",
+            name: "r",
+            run: 12,
+        };
+        let jobs = vec![
+            job_with_task(100, "a", Some(20)),
+            job_with_task(101, "b", None),
+        ];
+
+        let logs = fetch_run_logs_with_sources(
+            &client,
+            "o",
+            "r",
+            12,
+            None,
+            None,
+            false,
+            &FakeLogSource::unavailable("no native logs"),
+            &FakeLogSource::ok("loki"),
+            &remote,
+            &jobs,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(logs.jobs[0].task_id, Some(20));
+        assert_eq!(logs.jobs[1].task_id, Some(10));
+        assert!(logs.errors.is_empty(), "{:?}", logs.errors);
     }
 
     /// A first page that fails is the failure itself, not an empty list.
