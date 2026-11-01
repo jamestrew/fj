@@ -939,9 +939,187 @@ impl TaskSource for RemoteTasks<'_> {
 
 /// Tasks per page asked of `/actions/tasks`, and the most pages one lookup walks.
 /// The list is every task in the repository, newest first, so a run's tasks sit
-/// near the top; 40 pages of 50 reaches 2000 tasks back before giving up.
+/// near the top; 40 pages of 50 is the longest walk before giving up.
 const TASK_PAGE_SIZE: usize = 50;
 const TASK_PAGE_LIMIT: u32 = 40;
+/// Pages read one after another before a lookup that knows the list's size
+/// jumps to where the wanted ids are (CLS-1060).
+const LINEAR_PAGES: u32 = 4;
+
+type TaskPage = (Option<u64>, Vec<WorkflowTask>, Vec<WorkflowTask>);
+
+async fn read_task_page(client: &Client, path: &str, run: u64, page: u32) -> Result<TaskPage> {
+    let query = vec![
+        ("run".to_string(), run.to_string()),
+        ("limit".to_string(), TASK_PAGE_SIZE.to_string()),
+        ("page".to_string(), page.to_string()),
+    ];
+    let value: Value = client
+        .json(
+            Method::GET,
+            path,
+            &query,
+            Option::<&serde_json::Value>::None,
+        )
+        .await?;
+    let total = value.get("total_count").and_then(Value::as_u64);
+    let everything = parse_workflow_tasks_for_run(value.clone(), None)?;
+    let ours = parse_workflow_tasks_for_run(value, Some(run))?;
+    Ok((total, everything, ours))
+}
+
+/// The run's tasks found so far, by every read (walk and probe alike), each
+/// once. A page that fails later never costs a task an earlier read resolved.
+#[derive(Default)]
+struct Found {
+    tasks: Vec<WorkflowTask>,
+    ids: std::collections::HashSet<String>,
+}
+
+impl Found {
+    fn absorb(&mut self, ours: Vec<WorkflowTask>) {
+        for task in ours {
+            if self.ids.insert(task.id.clone()) {
+                self.tasks.push(task);
+            }
+        }
+    }
+
+    fn has(&self, id: u64) -> bool {
+        self.tasks.iter().any(|t| t.id_u64().ok() == Some(id))
+    }
+
+    fn has_all(&self, wanted: &[u64]) -> bool {
+        !wanted.is_empty() && wanted.iter().all(|id| self.has(*id))
+    }
+
+    /// The newest wanted task not found yet: the one the next jump aims for.
+    fn newest_unresolved(&self, wanted: &[u64]) -> Option<u64> {
+        wanted.iter().copied().filter(|id| !self.has(*id)).max()
+    }
+
+    fn incomplete(self, why: String) -> TaskList {
+        TaskList {
+            tasks: self.tasks,
+            incomplete: Some(why),
+        }
+    }
+}
+
+/// Where a lookup that has read `after` pages without finding its tasks goes next.
+enum Jump {
+    /// Resume the walk at this page.
+    To(u32),
+    /// Every wanted task has been found by the probes.
+    Resolved,
+    /// Every task listed is newer than the wanted ones: they are not in the list.
+    Absent,
+    /// The pages cannot be searched (no ids, nothing left to skip): keep walking.
+    Unknown,
+    Failed(String),
+}
+
+/// What one probed page says about where the wanted ids are.
+enum Probe {
+    /// Past the end of the list.
+    Empty,
+    /// Holds a task at or below the target.
+    Holds,
+    /// Every task on it is newer than the target.
+    Newer,
+    /// Has ids that cannot be read.
+    Unreadable,
+}
+
+/// Reads one page for the bisection. The run's tasks on it are kept.
+async fn probe_page(
+    client: &Client,
+    path: &str,
+    run: u64,
+    page: u32,
+    target: u64,
+    found: &mut Found,
+) -> std::result::Result<Probe, String> {
+    let (_, everything, ours) = read_task_page(client, path, run, page)
+        .await
+        .map_err(|err| format!("page {page} failed: {err}"))?;
+    found.absorb(ours);
+    if everything.is_empty() {
+        return Ok(Probe::Empty);
+    }
+    let ids: Vec<u64> = everything.iter().filter_map(|t| t.id_u64().ok()).collect();
+    Ok(match ids.iter().min() {
+        Some(min) if ids.len() == everything.len() => {
+            if *min <= target {
+                Probe::Holds
+            } else {
+                Probe::Newer
+            }
+        }
+        _ => Probe::Unreadable,
+    })
+}
+
+/// Finds, by bisection over the pages, the first page after `after` that holds
+/// a task at or below `target` (the list is newest first, so a page's lowest id
+/// falls as the page number rises). A run far back in a busy repository is then
+/// reached in about log2(pages) reads instead of a walk the page cap would cut
+/// short. The walk resumes one page early, since tasks added between reads push
+/// entries down a page.
+///
+/// `page_len` is how many tasks the server really put on a page (it may clamp
+/// the size asked for), which with `total` gives the last page. Nothing is
+/// certified absent from a last page alone: the page after it must be empty, so
+/// a clamped size or a list that grew since `total` was read cannot turn a
+/// task that is still there into an absent one. When the end cannot be shown
+/// the answer is `Unknown`, and the walk carries on to the page cap. Tasks the
+/// probes read are kept in `found`, and the search stops once `wanted` is all
+/// there.
+#[allow(clippy::too_many_arguments)]
+async fn find_start_page(
+    client: &Client,
+    path: &str,
+    run: u64,
+    after: u32,
+    total: u64,
+    page_len: usize,
+    target: u64,
+    wanted: &[u64],
+    found: &mut Found,
+) -> Jump {
+    if page_len == 0 {
+        return Jump::Unknown;
+    }
+    let last = total.div_ceil(page_len as u64).min(u64::from(u32::MAX - 1)) as u32;
+    if last <= after + 1 {
+        return Jump::Unknown;
+    }
+    let (mut lo, mut hi) = (after + 1, last);
+    match probe_page(client, path, run, hi, target, found).await {
+        Err(why) => return Jump::Failed(why),
+        Ok(Probe::Unreadable) => return Jump::Unknown,
+        Ok(Probe::Empty | Probe::Holds) => {}
+        Ok(Probe::Newer) => match probe_page(client, path, run, hi + 1, target, found).await {
+            Err(why) => return Jump::Failed(why),
+            Ok(Probe::Empty) => return Jump::Absent,
+            Ok(Probe::Holds) => hi += 1,
+            Ok(Probe::Newer | Probe::Unreadable) => return Jump::Unknown,
+        },
+    }
+    while lo < hi {
+        if found.has_all(wanted) {
+            return Jump::Resolved;
+        }
+        let mid = lo + (hi - lo) / 2;
+        match probe_page(client, path, run, mid, target, found).await {
+            Err(why) => return Jump::Failed(why),
+            Ok(Probe::Unreadable) => return Jump::Unknown,
+            Ok(Probe::Empty | Probe::Holds) => hi = mid,
+            Ok(Probe::Newer) => lo = mid + 1,
+        }
+    }
+    Jump::To(lo.saturating_sub(1).max(after + 1))
+}
 
 /// The run's tasks, read page by page until the ids in `wanted` are found, the
 /// walk has passed them (the list is newest first), or the list is exhausted
@@ -952,6 +1130,11 @@ const TASK_PAGE_LIMIT: u32 = 40;
 /// answer. A first page that fails is an error. With no `wanted` ids (the
 /// older-server path) the walk goes to exhaustion, because a run's tasks need
 /// not be contiguous.
+///
+/// With `wanted` ids and a `total_count`, a walk that goes `LINEAR_PAGES` pages
+/// without resolving one jumps by bisection (`find_start_page`) to the newest
+/// task still unresolved, so a run thousands of tasks back reads as complete
+/// (CLS-1060), and tasks of one run separated by a rerun are each reached.
 pub async fn list_run_tasks(
     client: &Client,
     owner: &str,
@@ -960,37 +1143,17 @@ pub async fn list_run_tasks(
     wanted: &[u64],
 ) -> Result<TaskList> {
     let path = format!("{}/actions/tasks", crate::api::repo_path(owner, name));
-    let mut found: Vec<WorkflowTask> = Vec::new();
+    let mut found = Found::default();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for page in 1..=TASK_PAGE_LIMIT {
-        let query = vec![
-            ("run".to_string(), run.to_string()),
-            ("limit".to_string(), TASK_PAGE_SIZE.to_string()),
-            ("page".to_string(), page.to_string()),
-        ];
-        let read = async {
-            let value: Value = client
-                .json(
-                    Method::GET,
-                    &path,
-                    &query,
-                    Option::<&serde_json::Value>::None,
-                )
-                .await?;
-            let total = value.get("total_count").and_then(Value::as_u64);
-            let everything = parse_workflow_tasks_for_run(value.clone(), None)?;
-            let ours = parse_workflow_tasks_for_run(value, Some(run))?;
-            Ok::<_, anyhow::Error>((total, everything, ours))
-        };
-        let (total, everything, ours) = match read.await {
-            Ok(page) => page,
-            Err(err) if page == 1 => return Err(err),
-            Err(err) => {
-                return Ok(TaskList {
-                    tasks: found,
-                    incomplete: Some(format!("page {page} failed: {err}")),
-                })
-            }
+    let mut page: u32 = 1;
+    let mut streak: u32 = 0;
+    let mut can_jump = true;
+    let mut skipped = false;
+    for read_no in 1..=TASK_PAGE_LIMIT {
+        let (total, everything, ours) = match read_task_page(client, &path, run, page).await {
+            Ok(read) => read,
+            Err(err) if read_no == 1 => return Err(err),
+            Err(err) => return Ok(found.incomplete(format!("page {page} failed: {err}"))),
         };
         let fresh_ids: std::collections::HashSet<String> = everything
             .iter()
@@ -998,12 +1161,14 @@ pub async fn list_run_tasks(
             .map(|t| t.id.clone())
             .collect();
         let page_min = everything.iter().filter_map(|t| t.id_u64().ok()).min();
-        found.extend(ours.into_iter().filter(|t| fresh_ids.contains(&t.id)));
+        let before = found.tasks.len();
+        found.absorb(ours);
+        streak = if found.tasks.len() > before {
+            0
+        } else {
+            streak + 1
+        };
 
-        let have_all = !wanted.is_empty()
-            && wanted
-                .iter()
-                .all(|id| found.iter().any(|t| t.id_u64().ok() == Some(*id)));
         let passed_wanted = match (wanted.iter().min(), page_min) {
             (Some(lowest), Some(min)) => min < *lowest,
             _ => false,
@@ -1017,24 +1182,47 @@ pub async fn list_run_tasks(
             && !everything.is_empty()
             && total.is_some_and(|n| (seen.len() as u64) < n)
         {
-            return Ok(TaskList {
-                tasks: found,
-                incomplete: Some(format!(
-                    "page {page} repeated tasks already read while the list has more"
-                )),
-            });
+            return Ok(found.incomplete(format!(
+                "page {page} repeated tasks already read while the list has more"
+            )));
         }
-        let exhausted = fresh_ids.is_empty() || total.is_some_and(|n| seen.len() as u64 >= n);
-        if have_all || passed_wanted || exhausted {
-            return Ok(TaskList::complete(found));
+        let exhausted =
+            fresh_ids.is_empty() || (!skipped && total.is_some_and(|n| seen.len() as u64 >= n));
+        if found.has_all(wanted) || passed_wanted || exhausted {
+            return Ok(TaskList::complete(found.tasks));
+        }
+        page += 1;
+        if can_jump && streak >= LINEAR_PAGES {
+            if let (Some(total), Some(target)) = (total, found.newest_unresolved(wanted)) {
+                let jump = find_start_page(
+                    client,
+                    &path,
+                    run,
+                    page - 1,
+                    total,
+                    everything.len(),
+                    target,
+                    wanted,
+                    &mut found,
+                )
+                .await;
+                match jump {
+                    Jump::To(start) => {
+                        skipped = true;
+                        streak = 0;
+                        page = start;
+                    }
+                    Jump::Resolved => return Ok(TaskList::complete(found.tasks)),
+                    Jump::Absent => return Ok(TaskList::complete(found.tasks)),
+                    Jump::Unknown => can_jump = false,
+                    Jump::Failed(why) => return Ok(found.incomplete(why)),
+                }
+            }
         }
     }
-    Ok(TaskList {
-        tasks: found,
-        incomplete: Some(format!(
-            "{TASK_PAGE_LIMIT} pages of {TASK_PAGE_SIZE} did not reach the end of the list"
-        )),
-    })
+    Ok(found.incomplete(format!(
+        "{TASK_PAGE_LIMIT} pages of {TASK_PAGE_SIZE} did not reach the end of the list"
+    )))
 }
 
 #[cfg(test)]
@@ -2284,6 +2472,240 @@ mod tests {
         assert!(list.incomplete.is_none());
     }
 
+    /// A repository whose task list is `total` ids long, newest first
+    /// (`total` down to 1), served by the page asked for. `ours` are the ids
+    /// that belong to run 12; `failing` pages answer 500; `hits` counts requests.
+    struct PagedRepo {
+        total: u64,
+        // What total_count says, when it is not the truth (a list that grew).
+        reported_total: u64,
+        size: u64,
+        ours: Vec<u64>,
+        failing: Vec<u64>,
+        hits: Arc<AtomicUsize>,
+    }
+
+    impl wiremock::Respond for PagedRepo {
+        fn respond(&self, req: &wiremock::Request) -> wiremock::ResponseTemplate {
+            self.hits.fetch_add(1, Ordering::SeqCst);
+            let page: u64 = req
+                .url
+                .query_pairs()
+                .find(|(k, _)| k == "page")
+                .and_then(|(_, v)| v.parse().ok())
+                .unwrap();
+            if self.failing.contains(&page) {
+                return wiremock::ResponseTemplate::new(500);
+            }
+            let size = self.size;
+            let first = self.total.saturating_sub((page - 1) * size);
+            let ids: Vec<u64> = (0..size)
+                .map_while(|i| first.checked_sub(i).filter(|id| *id >= 1))
+                .collect();
+            let runs: Vec<serde_json::Value> = ids
+                .iter()
+                .map(|id| {
+                    let run_number = if self.ours.contains(id) { 12 } else { 5 };
+                    serde_json::json!({
+                        "id": id, "name": format!("t{id}"), "status": "failure", "run_number": run_number
+                    })
+                })
+                .collect();
+            wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"total_count": self.reported_total, "workflow_runs": runs}),
+            )
+        }
+    }
+
+    async fn paged_repo(
+        total: u64,
+        ours: &[u64],
+        failing: &[u64],
+    ) -> (wiremock::MockServer, Client, Arc<AtomicUsize>) {
+        paged_repo_with(total, total, TASK_PAGE_SIZE as u64, ours, failing).await
+    }
+
+    async fn paged_repo_with(
+        total: u64,
+        reported_total: u64,
+        size: u64,
+        ours: &[u64],
+        failing: &[u64],
+    ) -> (wiremock::MockServer, Client, Arc<AtomicUsize>) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer};
+
+        let server = MockServer::start().await;
+        let hits = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/o/r/actions/tasks"))
+            .respond_with(PagedRepo {
+                total,
+                reported_total,
+                size,
+                ours: ours.to_vec(),
+                failing: failing.to_vec(),
+                hits: hits.clone(),
+            })
+            .mount(&server)
+            .await;
+        let client = mock_tasks_client(&server);
+        (server, client, hits)
+    }
+
+    fn found_ids(list: &TaskList) -> Vec<u64> {
+        let mut ids: Vec<u64> = list.tasks.iter().filter_map(|t| t.id_u64().ok()).collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// CLS-1060: a run 10,000 pages back is found by bisection in a handful of
+    /// reads, and reads as complete.
+    #[tokio::test]
+    async fn a_run_far_beyond_the_page_cap_is_found_by_bisection() {
+        let (_server, client, hits) = paged_repo(500_000, &[1_200, 1_199], &[]).await;
+
+        let list = list_run_tasks(&client, "o", "r", 12, &[1_200, 1_199])
+            .await
+            .unwrap();
+
+        assert!(list.incomplete.is_none(), "{list:?}");
+        assert_eq!(found_ids(&list), vec![1_199, 1_200]);
+        assert!(
+            hits.load(Ordering::SeqCst) <= 24,
+            "{} reads",
+            hits.load(Ordering::SeqCst)
+        );
+    }
+
+    /// The oldest task in the repository, on the last page, is reachable too.
+    #[tokio::test]
+    async fn a_run_on_the_last_page_is_found() {
+        let (_server, client, _) = paged_repo(120_000, &[3, 2], &[]).await;
+
+        let list = list_run_tasks(&client, "o", "r", 12, &[3, 2])
+            .await
+            .unwrap();
+
+        assert!(list.incomplete.is_none(), "{list:?}");
+        assert_eq!(found_ids(&list), vec![2, 3]);
+    }
+
+    /// A wanted task older than everything the repository lists is simply not
+    /// there: complete, with nothing found, and without walking the list.
+    #[tokio::test]
+    async fn a_task_older_than_the_whole_list_is_absent_not_incomplete() {
+        let (_server, client, hits) = paged_repo(50_000, &[], &[]).await;
+        // Ids run 50_000 down to 1, so 0 is older than all of them.
+        let list = list_run_tasks(&client, "o", "r", 12, &[0]).await.unwrap();
+
+        assert!(list.incomplete.is_none(), "{list:?}");
+        assert!(list.tasks.is_empty());
+        assert!(hits.load(Ordering::SeqCst) <= 6);
+    }
+
+    /// A probe that fails is a cut-off list, not an answer.
+    #[tokio::test]
+    async fn a_failing_probe_page_makes_the_list_incomplete() {
+        // The last page (1000) is the first probe.
+        let (_server, client, _) = paged_repo(50_000, &[7], &[1000]).await;
+
+        let list = list_run_tasks(&client, "o", "r", 12, &[7]).await.unwrap();
+
+        let why = list.incomplete.expect("incomplete");
+        assert!(why.contains("page 1000 failed"), "{why}");
+    }
+
+    /// A server that clamps the page size to 20: the last page is not
+    /// total / 50, and a task beyond page four must still be found, not
+    /// declared absent.
+    #[tokio::test]
+    async fn a_clamped_page_size_does_not_move_the_last_page() {
+        let (_server, client, _) = paged_repo_with(1_000, 1_000, 20, &[400, 399], &[]).await;
+
+        let list = list_run_tasks(&client, "o", "r", 12, &[400, 399])
+            .await
+            .unwrap();
+
+        assert!(list.incomplete.is_none(), "{list:?}");
+        assert_eq!(found_ids(&list), vec![399, 400]);
+    }
+
+    /// The list grew after total_count was read, so the page it calls last is
+    /// not the end. The wanted task is not certified absent from it: the walk
+    /// cannot show the end and says the list is incomplete.
+    #[tokio::test]
+    async fn a_list_longer_than_its_total_is_incomplete_not_absent() {
+        let (_server, client, _) = paged_repo_with(50_000, 10_000, 50, &[7], &[]).await;
+
+        let list = list_run_tasks(&client, "o", "r", 12, &[7]).await.unwrap();
+
+        assert!(list.incomplete.is_some(), "{list:?}");
+        assert!(list.tasks.is_empty());
+    }
+
+    /// A rerun of one job leaves a recent task and an old one in the same run.
+    /// The recent one is found on the first page; the old one, thousands back,
+    /// is still reached.
+    #[tokio::test]
+    async fn tasks_of_one_run_separated_by_a_rerun_are_each_found() {
+        let (_server, client, hits) = paged_repo(500_000, &[499_990, 1_200], &[]).await;
+
+        let list = list_run_tasks(&client, "o", "r", 12, &[499_990, 1_200])
+            .await
+            .unwrap();
+
+        assert!(list.incomplete.is_none(), "{list:?}");
+        assert_eq!(found_ids(&list), vec![1_200, 499_990]);
+        assert!(
+            hits.load(Ordering::SeqCst) <= 40,
+            "{} reads",
+            hits.load(Ordering::SeqCst)
+        );
+    }
+
+    /// Two tasks more pages apart than the walk cap, both far from the top.
+    #[tokio::test]
+    async fn two_tasks_further_apart_than_the_page_cap_are_both_found() {
+        let (_server, client, _) = paged_repo(500_000, &[300_000, 1_200], &[]).await;
+
+        let list = list_run_tasks(&client, "o", "r", 12, &[300_000, 1_200])
+            .await
+            .unwrap();
+
+        assert!(list.incomplete.is_none(), "{list:?}");
+        assert_eq!(found_ids(&list), vec![1_200, 300_000]);
+    }
+
+    /// The first probe reads task 7 on the last page; the next probe fails. Task
+    /// 7 stays resolved, and the list is incomplete for the other one.
+    #[tokio::test]
+    async fn a_task_read_by_a_probe_survives_a_later_probe_failing() {
+        let (_server, client, _) = paged_repo(50_000, &[7, 40_000], &[502]).await;
+
+        let list = list_run_tasks(&client, "o", "r", 12, &[7, 40_000])
+            .await
+            .unwrap();
+
+        let why = list.incomplete.clone().expect("incomplete");
+        assert!(why.contains("page 502 failed"), "{why}");
+        assert_eq!(found_ids(&list), vec![7]);
+    }
+
+    /// A run in the first pages never pays for a probe.
+    #[tokio::test]
+    async fn a_run_near_the_top_makes_no_probe_reads() {
+        let (_server, client, hits) = paged_repo(500_000, &[499_990], &[]).await;
+
+        let list = list_run_tasks(&client, "o", "r", 12, &[499_990])
+            .await
+            .unwrap();
+
+        assert!(list.incomplete.is_none(), "{list:?}");
+        assert_eq!(found_ids(&list), vec![499_990]);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
     /// A list cut off before the wanted tasks is marked incomplete, not a shorter answer.
     #[tokio::test]
     async fn a_task_list_that_never_reaches_the_task_is_incomplete() {
@@ -2297,7 +2719,10 @@ mod tests {
                 let ids: Vec<u64> = (0..TASK_PAGE_SIZE as u64)
                     .map(|i| 1_000_000 - n * 100 - i)
                     .collect();
-                ResponseTemplate::new(200).set_body_json(task_page(&ids, 5, 1_000_000))
+                // No total_count: the size is unknown, so the walk cannot jump.
+                let mut body = task_page(&ids, 5, 0);
+                body.as_object_mut().unwrap().remove("total_count");
+                ResponseTemplate::new(200).set_body_json(body)
             }
         }
 
