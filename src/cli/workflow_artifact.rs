@@ -11,6 +11,10 @@ use crate::api;
 use crate::cli::context::{resolve_repo, RepoFlag};
 use crate::output;
 
+#[cfg(all(test, unix))]
+#[path = "workflow_artifact_transfer_tests.rs"]
+mod transfer_tests;
+
 #[derive(Debug, Args)]
 pub struct DownloadArgs {
     #[command(flatten)]
