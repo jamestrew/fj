@@ -55,7 +55,7 @@ UNAME      := $(shell uname)
 # excluded as entry/dispatch even though cli/mod.rs carries a structural
 # command-tree guard test (that test validates the clap tree, not the
 # dispatch match, so counting the match arms would just re-add noise).
-COV_IGNORE := src/(main\.rs|output/pager\.rs|cli/(mod|branch|web|extension|auth|org|hook|protect|label|workflow_variable|runner|repo_mirror|repo_social|pr_inspect)\.rs)
+COV_IGNORE := src/(main\.rs|output/pager\.rs|cli/(mod|branch|web|extension|auth|org|hook|protect|label|workflow_variable|workflow_artifact_transfer_tests|runner|repo_mirror|repo_social|pr_inspect)\.rs)
 
 build:
 	cargo build --release
