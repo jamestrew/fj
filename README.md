@@ -261,7 +261,7 @@ Run `fj --help` for the live list; every group has its own `--help`.
 | Power and config| `api`, `alias`, `config`, `protect`, `hook`, `extension`, `completion`, `man` |
 | Preview         | `work`, `stack`, `agent`                                        |
 
-**Global flags** (work on every command): `--host` / `FJ_HOST`, `--debug`,
+**Global flags** (parsed on every command): `--host` / `FJ_HOST`, `--account` / `FJ_ACCOUNT`, `--debug`,
 `--color`, `--no-pager`, and `--json-fields`.
 
 `--color=auto|always|never` controls ANSI color output. Precedence is
@@ -314,3 +314,6 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the full workflow and
 ## License
 
 MIT.
+
+For per-invocation account selection without changing saved credentials, see
+[account overrides](docs/account-override.md).

@@ -72,23 +72,7 @@ pub fn resolve(host_flag: Option<&str>) -> Result<ResolvedHost> {
         (name, host_cfg)
     };
     let allow_generic_env = generic_env_allowed_for_resolved_host(&hosts, &name, host_flag);
-    let token = match host_cfg.auth_kind {
-        AuthKind::Pat => pat_token_for_resolved_host(&name, allow_generic_env)?,
-        AuthKind::FjordAccount => {
-            let fa = host_cfg.fjord_account.as_ref().ok_or_else(|| {
-                anyhow!(
-                    "host '{name}' is Fjord-Account but has no fjord_account config; \
-                     remove and re-run `fj auth login --fjord`"
-                )
-            })?;
-            Some(auth::load_fjord_bearer(&fa.platform_url)?.ok_or_else(|| {
-                anyhow!(
-                    "no Fjord Account session stored for '{}'. Run `fj auth login --fjord` again.",
-                    fa.platform_url
-                )
-            })?)
-        }
-    };
+    let token = super::account::resolve_token(&name, &host_cfg, allow_generic_env)?;
     let proxy = proxy_credential_for_host(&name, &host_cfg, allow_generic_env)?;
     Ok(ResolvedHost {
         name,
@@ -107,18 +91,6 @@ fn generic_env_allowed_for_resolved_host(
         return true;
     }
     matches!(hosts.resolve_host(None), Ok(default) if default == name)
-}
-
-fn pat_token_for_resolved_host(name: &str, allow_generic_env: bool) -> Result<Option<String>> {
-    if let Some(token) = auth::env_token_for_host(name) {
-        return Ok(Some(token));
-    }
-    if allow_generic_env {
-        if let Some(token) = auth::env_token() {
-            return Ok(Some(token));
-        }
-    }
-    auth::load_token(name)
 }
 
 /// Construct the `/api/v1`-rooted base URL for a PAT host. Older configs only
