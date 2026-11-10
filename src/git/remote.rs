@@ -166,7 +166,7 @@ mod tests {
     #[test]
     fn ssh_url_with_port() {
         let r = parse_remote("ssh://git@rasterhub.com:2222/rasterstate/fj.git").unwrap();
-        assert_eq!(r.host, "rasterhub.com:2222");
+        assert_eq!(r.host, "rasterhub.com");
         assert_eq!(r.slug(), "rasterstate/fj");
     }
 

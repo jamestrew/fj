@@ -7,6 +7,8 @@ mod profile_ports;
 mod profile_routes;
 #[path = "support/repo_clone.rs"]
 mod repo_clone;
+#[path = "support/ssh_entries.rs"]
+mod ssh_entries;
 #[path = "support/fjord_profiles.rs"]
 #[allow(dead_code)]
 mod support;
@@ -121,6 +123,7 @@ async fn profile_consumers_share_metadata_and_isolate_mutes() {
     assert!(!missing.status.success());
     assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 10);
     repo_clone::wrong_instance(dir.path(), &first).await;
+    ssh_entries::check(dir.path(), &first).await;
     mutes(dir.path(), &first, &second, a, b).await;
     let hosts: toml::Value = std::fs::read_to_string(dir.path().join("hosts.toml"))
         .unwrap()

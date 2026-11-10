@@ -2,7 +2,7 @@ use super::support::{call, success, token};
 use serde_json::{json, Value};
 use std::path::Path;
 use wiremock::{
-    matchers::{header, method, path},
+    matchers::{header, method, path, path_regex},
     Mock, MockServer, ResponseTemplate,
 };
 pub async fn command_json(dir: &Path, args: &[&str]) -> Value {
@@ -25,6 +25,14 @@ pub async fn routes(server: &MockServer, account: &str, instance: &str) {
                 "publicUrl":format!("https://{instance}.example/base")
             }]})),
         )
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(format!(
+            "/api/v1/forge-gateway/{instance}/api/v1/repos/o/r/(issues|pulls|releases)$"
+        )))
+        .and(header("authorization", authorization.as_str()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
         .mount(server)
         .await;
     Mock::given(method("GET")).and(path(format!("/api/v1/forge-gateway/{instance}/api/v1/notifications")))

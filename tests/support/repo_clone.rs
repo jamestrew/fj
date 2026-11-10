@@ -20,7 +20,12 @@ pub async fn clone(dir: &Path) -> MockServer {
     std::fs::write(file, toml::to_string(&hosts).unwrap()).unwrap();
     for args in [
         vec!["init", "--quiet"],
-        vec!["remote", "add", "origin", "git@first-a.example:o/r.git"],
+        vec![
+            "remote",
+            "add",
+            "origin",
+            "ssh://git@first-a.example:2222/o/r.git",
+        ],
     ] {
         assert!(std::process::Command::new("git")
             .current_dir(dir)
