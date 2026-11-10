@@ -76,14 +76,16 @@ pub fn resolve_repo(
     explicit_repo: Option<&str>,
     explicit_host: Option<&str>,
 ) -> Result<RepoContext> {
-    // `-R` wins; otherwise honor a per-repo default pinned by
-    // `fj repo set-default` (stored in local git config), then fall back to
-    // git-remote detection. The stored default behaves exactly like `-R`.
+    // A pinned slug supplies the repo name; only explicit -R overrides clone routing.
+    let infer_host = explicit_repo.is_none();
     let explicit_repo = resolved_repo_slug(explicit_repo, git::config_get_local("fj.resolved"));
     let (detected_host, owner, name) = match explicit_repo.as_deref() {
         Some(slug) => {
             let (o, n) = api::split_repo(slug)?;
-            (None, o.to_string(), n.to_string())
+            let remote = infer_host
+                .then(|| git::discover(explicit_host).ok())
+                .flatten();
+            (remote.map(|r| r.host), o.to_string(), n.to_string())
         }
         None => {
             let detected = git::discover(explicit_host)
@@ -110,7 +112,7 @@ pub fn resolve_repo(
             if explicit_host.is_some() {
                 Ok(h)
             } else {
-                crate::config::metadata::route(&Hosts::load()?, &h)
+                crate::config::metadata::route_selected(&Hosts::load()?, &h)
             }
         })
         .transpose()?;

@@ -333,12 +333,14 @@ fn render_human(wc: &WorkContext) -> String {
 /// Gather local context; validate profile metadata and enrich from the API when available.
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn gather(repo_flag: Option<&str>, host_flag: Option<&str>) -> Result<WorkContext> {
-    let remote = git::remote::discover(host_flag).ok();
+    let remote = git::remote::discover(host_flag)
+        .ok()
+        .filter(|_| repo_flag.is_none());
     let hosts = Hosts::load()?;
     let default_host = hosts.resolve_host(None).ok();
     let mut id = resolve_identity(repo_flag, host_flag, remote.as_ref(), default_host);
     if let Some(host) = id.host.as_mut().filter(|_| host_flag.is_none()) {
-        *host = crate::config::metadata::route(&hosts, host)?;
+        *host = crate::config::metadata::route_selected(&hosts, host)?;
     }
 
     let branch = git::current_branch();

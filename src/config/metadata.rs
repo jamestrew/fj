@@ -65,19 +65,18 @@ pub fn mute_scope(name: &str, config: Option<&Host>, legacy: String) -> Result<S
             .collect::<String>()
     ))
 }
-#[cfg(test)]
-#[path = "metadata_tests.rs"]
-mod tests;
 
-/// Map a public clone hostname back to its configured gateway, preferring the default.
-pub fn route(hosts: &Hosts, candidate: &str) -> Result<String> {
-    let mut matches = Vec::new();
-    let mut configured: Vec<_> = hosts
-        .hosts
-        .iter()
-        .filter(|(_, h)| h.auth_kind == AuthKind::FjordAccount)
-        .collect();
-    configured.sort_by_key(|(name, _)| hosts.resolve_host(None).ok() != Some(name.as_str()));
+/// Resolve an inferred clone host using only the selected account's destination.
+pub fn route(hosts: &Hosts, candidate: &str, account: Option<&str>) -> Result<(String, Host)> {
+    let canonical = account.map(profiles::canonical).transpose()?;
+    let account = canonical.as_deref();
+    let selected = |name: &str, mut config: Host| -> Result<(String, Host)> {
+        apply(hosts, name, &mut config, account)?;
+        Ok((name.into(), config))
+    };
+    if let Some(config) = hosts.hosts.get(candidate) {
+        return selected(candidate, config.clone());
+    }
     let public_matches = |metadata: Option<&super::hosts::FjordAccount>| {
         metadata
             .and_then(|f| f.default_instance_public_url.as_deref())
@@ -85,27 +84,47 @@ pub fn route(hosts: &Hosts, candidate: &str) -> Result<String> {
             .and_then(|u| u.host_str().map(str::to_string))
             .is_some_and(|h| h.eq_ignore_ascii_case(candidate))
     };
-    for (name, host) in configured {
-        let known = public_matches(host.fjord_account.as_ref())
+    let mut matches = Vec::new();
+    let mut known = false;
+    for (name, host) in hosts
+        .hosts
+        .iter()
+        .filter(|(_, h)| h.auth_kind == AuthKind::FjordAccount)
+    {
+        known |= public_matches(host.fjord_account.as_ref())
             || hosts.accounts.get(name).is_some_and(|set| {
                 set.profiles
                     .values()
                     .any(|p| public_matches(p.fjord.as_ref()))
             });
-        if name != candidate && !known {
+        let Ok(profile) = profiles::selection(hosts, name, account) else {
             continue;
+        };
+        let destination = match profile.as_ref() {
+            Some(profile) => profile.fjord.as_ref(),
+            None if account.is_none() => host.fjord_account.as_ref(),
+            None => None,
+        };
+        if public_matches(destination) {
+            matches.push((name, host));
         }
-        resolve(hosts, name)?;
-        if hosts.resolve_host(None).ok() == Some(name.as_str()) {
-            return Ok(name.clone());
-        }
-        matches.push(name.clone());
     }
-    match matches.len() {
-        0 => Ok(candidate.into()),
-        1 => Ok(matches.remove(0)),
+    match matches.as_slice() {
+        [(name, host)] => selected(name, (*host).clone()),
+        [] if !known => selected(candidate, Host::default()),
+        [] => Err(anyhow!(
+            "remote does not match the selected account instance; use --host/-R or switch account"
+        )),
         _ => Err(anyhow!(
-            "multiple configured gateways match this remote; select --host"
+            "multiple eligible gateways match this remote; select --host"
         )),
     }
 }
+pub fn route_selected(hosts: &Hosts, candidate: &str) -> Result<String> {
+    let account = crate::client::account::selected();
+    route(hosts, candidate, account.as_ref().map(|a| a.as_str())).map(|(name, _)| name)
+}
+
+#[cfg(test)]
+#[path = "metadata_tests.rs"]
+mod tests;

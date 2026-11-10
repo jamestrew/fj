@@ -49,11 +49,14 @@ pub async fn check(dir: &Path, other_gateway: &str) {
     super::work_clone::invalid_selection(dir).await;
     let file = dir.join("hosts.toml");
     let mut config: toml::Value = std::fs::read_to_string(&file).unwrap().parse().unwrap();
-    let pat = config["hosts"]["first-a.example"].clone();
-    config["hosts"]
-        .as_table_mut()
-        .unwrap()
-        .insert("pat.example".into(), pat);
+    for (_, host) in config["hosts"].as_table_mut().unwrap().iter_mut() {
+        if let Some(fa) = host.get_mut("fjord_account").and_then(|v| v.as_table_mut()) {
+            fa.insert(
+                "default_instance_public_url".into(),
+                toml::Value::String("https://pat.example".into()),
+            );
+        }
+    }
     std::fs::write(file, toml::to_string(&config).unwrap()).unwrap();
     assert!(std::process::Command::new("git")
         .args(["remote", "set-url", "origin", "git@pat.example:o/r.git"])

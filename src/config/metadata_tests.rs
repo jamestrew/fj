@@ -139,10 +139,62 @@ fn named_mute_identity_isolates_accounts_hosts_and_instances_and_retains_legacy(
     config.fjord_account.as_mut().unwrap().default_instance_id = Some("different".into());
     assert_ne!(muted::scope_key("p", Some(&config)).unwrap(), scopes[0]);
     hosts.current = Some("p".into());
-    assert_eq!(route(&hosts, "a-test.invalid").unwrap(), "p");
+    assert_eq!(route(&hosts, "p", None).unwrap().0, "p");
     hosts.current = None;
-    assert!(route(&hosts, "a-test.invalid").is_err());
+    assert!(route(&hosts, "a-test.invalid", None).is_err());
     hosts.accounts.get_mut("p").unwrap().default_account = Some("missing@test".into());
-    assert_eq!(route(&hosts, "pat.example").unwrap(), "pat.example");
+    assert_eq!(route(&hosts, "pat.example", None).unwrap().0, "pat.example");
     assert!(resolve(&hosts, "p").is_err());
+}
+
+#[test]
+fn routing_table_uses_selected_instance_and_exact_host_identity() {
+    let mut hosts = fixture();
+    hosts.hosts.insert("a-test.invalid".into(), Host::default());
+    hosts.current = Some("a-test.invalid".into());
+    hosts
+        .accounts
+        .get_mut("q")
+        .unwrap()
+        .profiles
+        .remove("b@test");
+    hosts
+        .hosts
+        .get_mut("p")
+        .unwrap()
+        .fjord_account
+        .as_mut()
+        .unwrap()
+        .default_instance_public_url = Some("https://legacy.test".into());
+    let profile = hosts
+        .accounts
+        .get_mut("p")
+        .unwrap()
+        .profiles
+        .get_mut("b@test")
+        .unwrap();
+    profile.fjord.as_mut().unwrap().default_instance_id = Some("other".into());
+    for (remote, account, expected) in [
+        ("a-test.invalid", "b@test", Some("a-test.invalid")),
+        ("b-test.invalid", "b@test", Some("p")),
+        ("b-test.invalid", " B@TEST ", Some("p")),
+        ("b-test.invalid", "a@test", None),
+        ("legacy.test", "b@test", None),
+        ("q", "b@test", None),
+    ] {
+        let routed = route(&hosts, remote, Some(account));
+        match expected {
+            Some(host) => {
+                let (name, config) = routed.unwrap();
+                assert_eq!(name, host);
+                if host == "p" {
+                    assert_eq!(
+                        config.fjord_account.unwrap().default_instance_id.as_deref(),
+                        Some("other")
+                    );
+                }
+            }
+            None => assert!(routed.is_err(), "{remote}"),
+        }
+    }
 }
