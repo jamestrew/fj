@@ -44,7 +44,7 @@ one: Forgejo 16 is not "at least Gitea 1.26".
 | Per-job logs (`run logs`, `run view --log`, `run watch`) | `GET actions/jobs/{id}/logs` | 16.0+ | 1.24+ |
 | Artifacts (`run download`) | `GET actions/runs/{id}/artifacts`, `GET actions/artifacts/{id}/zip` | 16.0+ | 1.24+ |
 | Cancel (`run cancel`) | `POST actions/runs/{id}/cancel` | 16.0+ | not offered (absent on 1.27.3) |
-| Rerun (`run rerun`, `--failed`, `--job`) | `POST actions/runs/{id}/rerun`, `/rerun-failed-jobs`, `/jobs/{job}/rerun` | not offered (no API route) | 1.26+ |
+| Rerun (`run rerun`, `--failed`, `--job`) | `POST actions/runs/{id}/rerun`, `/rerun-failed-jobs`, `/jobs/{job}/rerun` | 17.0+ (job route: `actions/jobs/{job}/rerun`) | 1.26+ |
 | Run-level log archive | `GET actions/runs/{id}/logs` | 16.0+ | absent on 1.27.3 |
 
 fj reads logs per job and never asks for the run-level archive, so per-job logs
@@ -52,7 +52,7 @@ stay usable on a Gitea that lacks it.
 
 What happens when a route is not there:
 
-- **Known absent** (for example cancel on Gitea, rerun on Forgejo, anything
+- **Known absent** (for example cancel on Gitea, rerun on Forgejo 16, anything
   Actions on Forgejo 15): fj makes no request and reports the limitation with
   the run URL, so you can act in the web UI.
 - **Unidentified server**: fj tries the API route and treats a 404 as the
@@ -60,7 +60,8 @@ What happens when a route is not there:
 - **Permission denied** (403) is reported as a permission problem, not as a
   missing feature.
 
-The Forgejo rows were checked against the Forgejo 16.0.4 API description. The
+Forgejo reruns were verified against rasterhub's Forgejo 17 Swagger and token
+authentication; other Forgejo rows use the 16.0.4 API description. The
 Gitea rows come from a route audit and were not exercised against a live Gitea.
 
 ### Web routes and the token
@@ -156,3 +157,10 @@ fj auth status
 If we drop support for a Forgejo version, it'll be called out under
 "BREAKING CHANGES" in CHANGELOG.md ahead of the release, and we'll
 emit a stronger error (not just a warning) from the version probe.
+
+Forgejo `run rerun --failed` selects failed/cancelled jobs. If all jobs are
+selected it reruns the run once. Otherwise it reruns sequentially, refreshing
+the job list before each POST and skipping jobs already rescheduled as
+dependents. Individual errors are reported together with partial progress and
+produce a nonzero exit. `-j` remains the zero-based index from `run view`.
+Reruns use the API token and do not depend on the cookie/CSRF work in #103.

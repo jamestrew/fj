@@ -175,10 +175,10 @@ pub struct RerunArgs {
     pub r: RepoFlag,
     /// Run number, as shown in the `#` column of `fj run list`.
     pub run_id: u64,
-    /// Rerun only the jobs that did not succeed, instead of the whole run.
+    /// Rerun failed/cancelled jobs and their dependents, instead of the whole run.
     #[arg(long, conflicts_with = "job")]
     pub failed: bool,
-    /// Rerun a single job by its index (the row order shown by `fj run view`).
+    /// Rerun a job and its dependents by zero-based index in `fj run view`.
     #[arg(short = 'j', long)]
     pub job: Option<usize>,
 }

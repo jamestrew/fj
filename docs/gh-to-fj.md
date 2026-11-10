@@ -135,7 +135,7 @@ called out.
 | `gh run watch N`                  | `fj run watch N`                  | Streams logs live until the job finishes.       |
 | `gh run watch N --exit-status`    | `fj run watch N --exit-status`    | Exits 1 unless the conclusion is success/skipped. |
 | `gh run download N`               | `fj run download N`               | `--list` to list, `-n` to pick one.             |
-| `gh run rerun N`                  | `fj run rerun N`                  | Gitea 1.26+. Forgejo has no rerun API: prints the run URL. |
+| `gh run rerun N`                  | `fj run rerun N`                  | Forgejo 17+ or Gitea 1.26+. Uses the API token on private repos. |
 | `gh run rerun N --failed`         | `fj run rerun N --failed`         | Reruns only the non-green jobs in the run.      |
 | `gh run rerun --job ID`           | `fj run rerun N --job J`          | Reruns one job; `J` is the job index from `fj run view`. |
 | `gh run cancel N`                 | `fj run cancel N`                 | Forgejo 16+. Elsewhere prints the run URL.      |

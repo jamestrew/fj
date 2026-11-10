@@ -31,6 +31,7 @@ pub mod template;
 pub mod user;
 pub mod workflow;
 mod workflow_logs;
+mod workflow_rerun;
 mod workflow_run;
 mod workflow_secrets;
 mod workflow_view;

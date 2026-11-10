@@ -31,7 +31,7 @@ pub enum AuthSub {
     /// Re-verify the stored token. Replaces it if a new one is given.
     Refresh(RefreshArgs),
     /// Import a Forgejo web session cookie for cookie-gated Actions web routes
-    /// such as watch/rerun/cancel (a PAT is rejected there; see fj#103).
+    /// such as watch (a PAT is rejected by web routes; see fj#103).
     Session(SessionArgs),
     /// Install a git credential helper that uses fj's stored token.
     SetupGit(SetupGitArgs),
@@ -492,9 +492,7 @@ async fn status(args: StatusArgs, global_host: Option<&str>) -> Result<()> {
         let session_label = if session_present {
             "present (Actions web routes)".to_string()
         } else {
-            output::dim(
-                "none (run `fj auth session` to enable Actions watch/rerun on private repos)",
-            )
+            output::dim("none (run `fj auth session` to enable Actions watch on private repos)")
         };
         println!("  Web session: {session_label}");
         if args.show_token {
