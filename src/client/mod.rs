@@ -1,4 +1,6 @@
+pub mod account;
 pub mod capability;
+mod construct;
 pub mod error;
 #[cfg(test)]
 mod integration_tests;
@@ -83,6 +85,7 @@ where
 /// Fjord-Account mode, to a per-instance gateway endpoint that fronts one).
 #[derive(Clone)]
 pub struct Client {
+    account: Option<Arc<account::Guard>>,
     http: reqwest::Client,
     #[allow(dead_code)]
     host: String,
@@ -151,74 +154,6 @@ fn build_http(strict_redirects: bool) -> Result<reqwest::Client> {
 }
 
 impl Client {
-    pub fn new(resolved: ResolvedHost) -> Result<Self> {
-        let (base, auth_scheme, platform_url) = match resolved.host.auth_kind {
-            AuthKind::Pat => (
-                build_base_url(&resolved.name, &resolved.host)?,
-                AuthScheme::Pat,
-                None,
-            ),
-            AuthKind::FjordAccount => {
-                let fa = resolved.host.fjord_account.as_ref().ok_or_else(|| {
-                    anyhow!(
-                        "host '{}' is Fjord-Account but missing fjord_account config",
-                        resolved.name
-                    )
-                })?;
-                let instance_id = fa.default_instance_id.as_deref().ok_or_else(|| {
-                    anyhow!(
-                        "no default Fjord instance selected. \
-                         Run `fj instances list` and then `fj instances use <id>`."
-                    )
-                })?;
-                (
-                    fjord::gateway_base_url(&fa.platform_url, instance_id)?,
-                    AuthScheme::FjordBearer,
-                    // Remember where to refresh: the platform origin owns the
-                    // OIDC token endpoint and the stored refresh token.
-                    Some(fa.platform_url.clone()),
-                )
-            }
-        };
-        // A proxy credential only ever applies to a direct PAT host.
-        let proxy = resolved
-            .proxy
-            .filter(|_| auth_scheme == AuthScheme::Pat)
-            .map(Arc::new);
-        let http = build_http(proxy.is_some())?;
-        let redirect_http = match proxy {
-            Some(_) => Some(build_http(false)?),
-            None => None,
-        };
-        let server_seed = resolved
-            .host
-            .flavor
-            .as_deref()
-            .map(Flavor::parse)
-            .filter(|flavor| *flavor != Flavor::Unidentified)
-            .map(|flavor| {
-                ServerInfo::new(
-                    flavor,
-                    resolved.host.server_version.as_deref().unwrap_or(""),
-                )
-            });
-        Ok(Self {
-            http,
-            host: resolved.name,
-            base,
-            token: Arc::new(RwLock::new(resolved.token)),
-            auth_scheme,
-            platform_url,
-            proxy,
-            proxy_mode: Arc::new(AtomicU8::new(ProxyMode::Direct.to_u8())),
-            redirect_http,
-            server: Arc::new(RwLock::new(None)),
-            server_seed,
-            #[cfg(test)]
-            refresh_hook: None,
-        })
-    }
-
     /// Construct a client from an explicit host flag, loading config + token.
     pub fn connect(host_flag: Option<&str>) -> Result<Self> {
         Self::new(resolve(host_flag)?)
@@ -247,6 +182,7 @@ impl Client {
         let host = base_url.host_str().map(str::to_string).unwrap_or_default();
         let http = build_http(false)?;
         Ok(Self {
+            account: None,
             http,
             host,
             base: base_url,
@@ -345,6 +281,13 @@ impl Client {
     /// Fjord-Account-mode hosts. Returns an `HeaderValue` so the caller
     /// can plug it into any `HeaderMap` directly.
     pub fn auth_header_value(&self) -> Result<Option<HeaderValue>> {
+        if self
+            .account
+            .as_ref()
+            .is_some_and(|guard| !guard.verified() || self.current_token().is_none())
+        {
+            anyhow::bail!("account override must be verified before direct HTTP use");
+        }
         let Some(token) = self.current_token() else {
             return Ok(None);
         };
@@ -516,7 +459,7 @@ impl Client {
     /// The request is constructed once and cloned per retry attempt via
     /// `reqwest::Request::try_clone`, which avoids re-allocating headers and
     /// re-parsing the URL on each attempt.
-    pub async fn request_with_headers(
+    async fn request_unchecked(
         &self,
         method: Method,
         path: &str,

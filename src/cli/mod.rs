@@ -20,6 +20,7 @@ pub mod editor;
 pub mod extension;
 pub mod hook;
 pub mod instances;
+mod invocation;
 pub mod issue;
 mod issue_comment;
 mod issue_dependency;
@@ -71,7 +72,7 @@ mod workflow_run;
 mod workflow_secret;
 mod workflow_variable;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use crate::output::ColorChoice;
@@ -89,7 +90,7 @@ secrets, variables), plus stacked-PR and working-session helpers.\n\
 \n\
 Most subcommands accept -R <owner>/<name> and otherwise infer the repository from the current \
 git remote (preferring `upstream`, then `origin`). Authenticate once with `fj auth login`. Global \
-flags --host, --debug, --color, --no-pager, and --json-fields work on every command.\n\
+flags --host, --account, --debug, --color, --no-pager, and --json-fields are parsed on every command.\n\
 \n\
 Examples:\n\
 \n\
@@ -112,6 +113,10 @@ pub struct Cli {
     /// `fj auth login` is used).
     #[arg(long, global = true, env = "FJ_HOST")]
     pub host: Option<String>,
+
+    /// Use an environment PAT for this account for this invocation only.
+    #[arg(long, global = true, env = "FJ_ACCOUNT", hide_env_values = true)]
+    pub account: Option<crate::client::account::Account>,
 
     /// Log every HTTP request fj makes to stderr.
     #[arg(long, global = true, env = "FJ_DEBUG")]
@@ -222,40 +227,7 @@ pub struct CompletionArgs {
     pub shell: clap_complete::Shell,
 }
 
-pub async fn run(cli: Cli) -> Result<()> {
-    // Before anything that can park this thread in a syscall. The select
-    // below is the graceful path; this is the backstop for when the command
-    // future stops being pollable and the select never gets another look in.
-    // See `crate::interrupt`.
-    crate::interrupt::arm();
-
-    crate::client::set_debug(cli.debug);
-    crate::output::set_color_choice(cli.color, config::no_color_enabled());
-    crate::output::set_json_fields(cli.json_fields.as_deref());
-    // Page only the commands whose output can genuinely run long (see
-    // `paging::should_page`). Pass `cli.no_pager` through explicitly so we
-    // don't have to mutate the process environment to opt out, which would be
-    // a process-wide side effect and an unsafe set_var.
-    let _pager = if paging::should_page(&cli.command) {
-        crate::output::pager::maybe_start(cli.no_pager)
-    } else {
-        None
-    };
-
-    // Run the command, racing it against Ctrl+C. On SIGINT we return an error
-    // and let `_pager` drop naturally — its Drop impl restores stdout and
-    // waits on the pager child, leaving the terminal in a clean state.
-    let cli_host = cli.host.clone();
-    let cmd_future = dispatch(cli.command, cli_host.as_deref());
-    tokio::select! {
-        biased;
-        sig = tokio::signal::ctrl_c() => {
-            sig.context("installing SIGINT handler")?;
-            Err(crate::interrupt::Interrupted.into())
-        }
-        res = cmd_future => res,
-    }
-}
+pub use invocation::run;
 
 async fn dispatch(command: Command, host: Option<&str>) -> Result<()> {
     match command {
