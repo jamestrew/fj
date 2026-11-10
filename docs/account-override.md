@@ -36,9 +36,15 @@ verification errors do not print either identity or the token. Existing
 same-origin credential and redirect restrictions still apply.
 
 Anonymous or stored web-session fallbacks are refused with account selection.
-Custom authorization headers conflict with account selection. Direct HTTP
-helpers cannot construct an authentication header until the client has
-verified its identity. Stored-auth commands (`fj auth`, `fj instances`) reject
+Alternate auth query parameters (`token`, `access_token`) and `sudo`
+impersonation conflict with account selection, as do
+custom authorization headers. Both URL query strings and separately supplied
+query fields are checked before verification, without printing their values.
+Custom URL-encoded form content types are also refused because Forgejo reads
+form tokens before the authorization header.
+Multipart issue/PR attachments and release uploads initiate identity
+verification before constructing upload headers, even as the first request.
+Synchronous direct HTTP helpers still require completed verification. Stored-auth commands (`fj auth`, `fj instances`) reject
 account overrides. This step supports direct Forgejo PAT hosts; a stored
 Fjord Account gateway session cannot be replaced with a PAT. Named profiles
 and separate Fjord Account bearer sessions require a later storage design.

@@ -137,22 +137,29 @@ impl Client {
         body: Option<&serde_json::Value>,
         extra: &HeaderMap,
     ) -> Result<Response> {
+        if self.account.is_some() {
+            query::check(self, path, query, extra)?;
+        }
+        self.verify_account().await?;
+        self.request_unchecked(method, path, query, body, extra)
+            .await
+    }
+    pub async fn verify_account(&self) -> Result<()> {
         if let Some(guard) = &self.account {
             if self.current_token().is_none() {
                 return Err(anyhow!(
                     "account override cannot use anonymous or stored web-session fallbacks"
                 ));
             }
-            if extra.contains_key(AUTHORIZATION) || extra.contains_key(proxy::FORWARDED_AUTH_HEADER)
-            {
-                return Err(anyhow!(
-                    "custom authorization headers conflict with account override"
-                ));
-            }
             guard.verify(self).await?;
         }
-        self.request_unchecked(method, path, query, body, extra)
-            .await
+        Ok(())
+    }
+
+    /// Verify invocation identity before preparing a multipart upload.
+    pub async fn upload_headers(&self, context: &str) -> Result<HeaderMap> {
+        self.verify_account().await?;
+        self.upload_auth_headers(context)
     }
     #[cfg(test)]
     fn with_account(mut self, name: &str) -> Self {
@@ -164,3 +171,9 @@ impl Client {
 #[cfg(test)]
 #[path = "account_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "account_fix1_tests.rs"]
+mod fix1_tests;
+#[path = "account_query.rs"]
+mod query;

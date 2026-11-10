@@ -164,7 +164,7 @@ pub async fn upload_asset(
     // Pull the auth headers straight from the client so it picks the right
     // scheme (PAT vs Fjord bearer) and, behind a reverse proxy, the header
     // the proxy asked for, without this call site knowing which is active.
-    let headers = client.upload_auth_headers("release asset upload")?;
+    let headers = client.upload_headers("release asset upload").await?;
     let res = client
         .http()
         .post(url)

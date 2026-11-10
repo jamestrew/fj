@@ -171,7 +171,7 @@ async fn account_override_blocks_unverified_raw_http_auth() {
 async fn account_override_rejects_custom_authorization_before_verification() {
     let server = MockServer::start().await;
     let client = client(&server).await;
-    for name in ["authorization", "x-forge-authorization"] {
+    for name in ["authorization", "x-forge-authorization", "sudo"] {
         let mut headers = HeaderMap::new();
         headers.insert(
             HeaderName::from_bytes(name.as_bytes()).unwrap(),

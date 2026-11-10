@@ -412,7 +412,7 @@ pub async fn upload_asset(
         .file_name(asset_name.to_string())
         .mime_str("application/octet-stream")?;
     let form = reqwest::multipart::Form::new().part("attachment", part);
-    let headers = client.upload_auth_headers("issue asset upload")?;
+    let headers = client.upload_headers("issue asset upload").await?;
     let res = client
         .http()
         .post(url)
