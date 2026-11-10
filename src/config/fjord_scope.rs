@@ -112,12 +112,6 @@ pub fn resolve(host: &str, config: &mut super::hosts::Host) -> Result<Option<Str
             .selected_profile
             .as_ref()
             .ok_or_else(|| anyhow!("requested Fjord profile is unavailable"))?;
-        config.fjord_account = Some(
-            profile
-                .fjord
-                .clone()
-                .ok_or_else(|| anyhow!("profile auth kind mismatch"))?,
-        );
         return load(host, profile).map(|s| Some(s.bearer));
     }
     let fa = config

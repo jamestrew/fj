@@ -94,16 +94,10 @@ impl MutedRepos {
     }
 }
 
-/// The key a mute list is stored under for a host entry.
-///
-/// A PAT host is one account on one forge, so the hostname is the scope. A
-/// Fjord Account host fronts several forge instances behind one hostname, and
-/// `owner/repo` on one instance is a different repository from the same name
-/// on another, so the selected instance is part of the scope. Switching with
-/// `fj instances use` therefore switches mute lists too.
+/// Keep legacy scopes intact; named profiles isolate host, account and instance.
 pub fn scope_key(name: &str, host: Option<&Host>) -> Result<String> {
     let Some(host) = host.filter(|h| h.auth_kind == AuthKind::FjordAccount) else {
-        return Ok(name.to_string());
+        return super::metadata::mute_scope(name, host, name.to_string());
     };
     let instance = host
         .fjord_account
@@ -116,7 +110,7 @@ pub fn scope_key(name: &str, host: Option<&Host>) -> Result<String> {
                  Run `fj instances list` and then `fj instances use <id>`."
             )
         })?;
-    Ok(format!("{name}#{instance}"))
+    super::metadata::mute_scope(name, Some(host), format!("{name}#{instance}"))
 }
 
 /// Resolve the account scope for the host a command targets, with the same
@@ -128,7 +122,8 @@ pub fn account_scope(host_flag: Option<&str>) -> Result<String> {
         Some(name) => name,
         None => hosts.resolve_host(None)?,
     };
-    scope_key(name, hosts.hosts.get(name))
+    let config = super::metadata::resolve(&hosts, name)?;
+    scope_key(name, Some(&config))
 }
 
 #[cfg(test)]

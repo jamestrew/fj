@@ -107,12 +107,9 @@ pub fn resolve_repo(
 
     let client = Client::connect(client_host.as_deref())?;
     let host = client_host.unwrap_or_else(|| client.host().to_string());
-    let web_base = Hosts::load().ok().and_then(|hosts| {
-        hosts
-            .hosts
-            .get(&host)
-            .and_then(|cfg| web_base_url(&host, cfg).ok().flatten())
-    });
+    let hosts = Hosts::load()?;
+    let config = crate::config::metadata::resolve(&hosts, &host)?;
+    let web_base = web_base_url(&host, &config)?;
 
     Ok(RepoContext {
         client,

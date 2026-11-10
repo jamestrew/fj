@@ -51,12 +51,8 @@ pub(crate) fn resolve_token(
     generic: bool,
 ) -> Result<Option<String>> {
     let account = selected();
-    let profile =
-        crate::config::profiles::selection(hosts, host, account.as_ref().map(Account::as_str))?;
-    config.selected_profile = profile.clone();
-    config.selected_account = account
-        .clone()
-        .or_else(|| profile.as_ref().map(|p| p.user.parse().unwrap()));
+    crate::config::metadata::apply(hosts, host, config, account.as_ref().map(Account::as_str))?;
+    let profile = config.selected_profile.clone();
     if config.auth_kind == AuthKind::Pat {
         return select_pat(
             account.is_some() && profile.is_none(),

@@ -337,10 +337,9 @@ fn render_human(wc: &WorkContext) -> String {
 /// (offline, no token, server down) degrades to `None` rather than erroring.
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn gather(repo_flag: Option<&str>, host_flag: Option<&str>) -> Result<WorkContext> {
-    // --- local, offline ---
     let remote = git::remote::discover(host_flag).ok();
     let hosts = Hosts::load().ok();
-    let default_host = hosts.as_ref().and_then(|h| h.current.as_deref());
+    let default_host = hosts.as_ref().and_then(|h| h.resolve_host(None).ok());
     let id = resolve_identity(repo_flag, host_flag, remote.as_ref(), default_host);
 
     let branch = git::current_branch();
@@ -352,20 +351,19 @@ async fn gather(repo_flag: Option<&str>, host_flag: Option<&str>) -> Result<Work
     let host_cfg = hosts
         .as_ref()
         .zip(id.host.as_deref())
-        .and_then(|(h, name)| h.hosts.get(name));
-    let account = account_info(host_cfg);
+        .and_then(|(h, name)| crate::config::metadata::resolve(h, name).ok());
+    let account = account_info(host_cfg.as_ref());
     let stack = stack_state::load()
         .ok()
         .flatten()
         .map(|s| stack_summary(&s));
 
-    // --- Forgejo API, best-effort ---
     let mut default_branch = None;
     let mut pull_request = None;
     let mut checks = None;
     let mut api_reachable = false;
     if let (Some(owner), Some(name)) = (id.owner.as_deref(), id.name.as_deref()) {
-        if let Ok(client) = Client::connect(host_flag) {
+        if let Ok(client) = Client::connect(id.host.as_deref()) {
             if let Ok(repo) = api::repo::get(&client, owner, name).await {
                 api_reachable = true;
                 default_branch = Some(repo.default_branch);
