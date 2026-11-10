@@ -22,8 +22,11 @@ impl Scope {
             return Err(anyhow!("profile session changed; log in again"));
         }
         if stored.bearer != bearer {
-            verify(self.platform(), &stored.bearer, &self.profile.user).await?;
-            return Ok(Some(stored.bearer));
+            match verify(self.platform(), &stored.bearer, &self.profile.user).await {
+                Ok(()) => return Ok(Some(stored.bearer)),
+                Err(e) if e.downcast_ref::<crate::fjord::SessionExpired>().is_some() => {}
+                Err(e) => return Err(e),
+            }
         }
         let Some(refresh) = stored.refresh.as_deref() else {
             return Ok(None);
@@ -47,8 +50,8 @@ impl Scope {
             bearer: tokens.access_token,
             refresh: tokens.refresh_token.or(stored.refresh),
         };
-        verify(self.platform(), &next.bearer, &self.profile.user).await?;
         write(&self.host, &self.profile, &next)?;
+        verify(self.platform(), &next.bearer, &self.profile.user).await?;
         Ok(Some(next.bearer))
     }
     pub fn select_instance(&self, target: &crate::fjord::ForgeInstance) -> Result<()> {
@@ -124,3 +127,7 @@ pub(super) fn lock(
     let name: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
     crate::fjord::lock::acquire(&name)
 }
+
+#[cfg(test)]
+#[path = "fjord_scope_tests.rs"]
+mod tests;

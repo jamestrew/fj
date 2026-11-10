@@ -89,3 +89,7 @@ credential manager for Git authentication.
 
 Use `fj auth login --fjord --platform-url URL --account EMAIL` with loopback, `--manual`, or `--device`.
 Select instances with `fj --host URL --account EMAIL instances use ID`; default switching and migration follow the rules above.
+
+Named Fjord profiles currently support API and instance commands only. Browser
+shortcuts, status/work metadata, mute/inbox identity, cookies and remaining
+maintenance will gain profile scope in 2b-ii.

@@ -70,6 +70,29 @@ async fn fjord_switch_refreshes_expired_target_and_preserves_default_on_rejectio
         .expect(1)
         .mount(&server)
         .await;
+    let state = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(503));
+    let response = state.clone();
+    Mock::given(method("GET"))
+        .and(path("/api/v1/me/forge-instances"))
+        .and(wiremock::matchers::header(
+            "authorization",
+            format!("Bearer {}", token(target, 1)),
+        ))
+        .respond_with(move |_: &wiremock::Request| {
+            ResponseTemplate::new(response.load(std::sync::atomic::Ordering::SeqCst))
+        })
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    assert!(!call(dir.path(), &args).await.status.success());
+    assert_eq!(
+        std::fs::read(dir.path().join("hosts.toml")).unwrap(),
+        before
+    );
+    assert!(std::fs::read_to_string(dir.path().join("tokens.toml"))
+        .unwrap()
+        .contains("renewed-target"));
+    state.store(200, std::sync::atomic::Ordering::SeqCst);
     success(call(dir.path(), &args).await);
     let changed = config(dir.path());
     assert_eq!(
