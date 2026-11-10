@@ -10,6 +10,11 @@ use tokio::sync::OnceCell;
 
 #[derive(Clone)]
 pub struct Account(String);
+impl Account {
+    pub(crate) fn as_str(&self) -> &str {
+        self.0.trim()
+    }
+}
 impl fmt::Debug for Account {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("[redacted account]")
@@ -39,19 +44,32 @@ pub(super) fn selected() -> Option<Account> {
     SELECTED.get().cloned().flatten()
 }
 
-pub(super) fn resolve_token(host: &str, config: &Host, generic: bool) -> Result<Option<String>> {
+pub(super) fn resolve_token(
+    hosts: &crate::config::hosts::Hosts,
+    host: &str,
+    config: &mut Host,
+    generic: bool,
+) -> Result<Option<String>> {
     let account = selected();
-    if account.is_some() && config.auth_kind != AuthKind::Pat {
+    let profile =
+        crate::config::profiles::selection(hosts, host, account.as_ref().map(Account::as_str))?;
+    config.selected_account = account
+        .clone()
+        .or_else(|| profile.as_ref().map(|p| p.user.parse().unwrap()));
+    if config.selected_account.is_some() && config.auth_kind != AuthKind::Pat {
         return Err(anyhow!(
             "account override requires a direct Forgejo PAT host, not a Fjord Account gateway"
         ));
     }
     if config.auth_kind == AuthKind::Pat {
         return select_pat(
-            account.is_some(),
+            account.is_some() && profile.is_none(),
             auth::env_token_for_host(host),
             generic.then(auth::env_token).flatten(),
-            || auth::load_token(host),
+            || match profile {
+                Some(profile) => crate::config::profiles::token(host, &profile).map(Some),
+                None => auth::load_token(host),
+            },
         );
     }
     let fa = config.fjord_account.as_ref().ok_or_else(|| anyhow!(
@@ -77,7 +95,7 @@ fn select_pat(
         return Ok(Some(token));
     }
     if explicit {
-        return Err(anyhow!("account override requires an environment PAT scoped to the target host; stored credentials are not used"));
+        return Err(anyhow!("account override needs an eligible environment PAT or matching profile; no fallback credentials are used"));
     }
     stored()
 }

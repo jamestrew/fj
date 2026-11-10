@@ -3,9 +3,14 @@ use anyhow::Context;
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub async fn run(cli: Cli) -> Result<()> {
-    crate::client::account::initialize(cli.account.clone())?;
-    if cli.account.is_some() && matches!(cli.command, Command::Auth(_) | Command::Instances(_)) {
-        anyhow::bail!("account override is for API commands, not stored authentication changes");
+    let auth_command = matches!(cli.command, Command::Auth(_));
+    crate::client::account::initialize(if auth_command {
+        None
+    } else {
+        cli.account.clone()
+    })?;
+    if cli.account.is_some() && matches!(cli.command, Command::Instances(_)) {
+        anyhow::bail!("account profiles for Fjord gateway sessions are not supported yet");
     }
     // Before anything that can park this thread in a syscall. The select
     // below is the graceful path; this is the backstop for when the command
@@ -30,7 +35,12 @@ pub async fn run(cli: Cli) -> Result<()> {
     // and let `_pager` drop naturally — its Drop impl restores stdout and
     // waits on the pager child, leaving the terminal in a clean state.
     let cli_host = cli.host.clone();
-    let cmd_future = dispatch(cli.command, cli_host.as_deref());
+    let cmd_future = async {
+        match cli.command {
+            Command::Auth(cmd) => profiles::run(cmd, cli.account, cli_host.as_deref()).await,
+            command => dispatch(command, cli_host.as_deref()).await,
+        }
+    };
     tokio::select! {
         biased;
         sig = tokio::signal::ctrl_c() => {
@@ -53,3 +63,6 @@ mod tests {
         assert!(!format!("{cli:?}").contains("qa-private"));
     }
 }
+
+#[path = "invocation_profiles.rs"]
+mod profiles;

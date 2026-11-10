@@ -1,5 +1,7 @@
 pub mod hosts;
 pub mod muted;
+mod profile_publish;
+pub mod profiles;
 
 use std::path::PathBuf;
 

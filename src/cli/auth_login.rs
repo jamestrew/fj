@@ -1025,7 +1025,7 @@ fn settle_outcome(o: crate::fjord::SignInResponse) -> Result<crate::fjord::SignI
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
-fn read_token(args: &LoginArgs) -> Result<String> {
+pub(super) fn read_token(args: &LoginArgs) -> Result<String> {
     if let Some(t) = &args.token {
         eprintln!(
             "warning: passing --token on the command line exposes it in shell history and `ps`; prefer `--with-token` (stdin) or the interactive prompt"

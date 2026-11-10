@@ -53,7 +53,11 @@ impl Client {
                 )
             });
         Ok(Self {
-            account: account::selected().map(account::Guard::new).map(Arc::new),
+            account: resolved
+                .host
+                .selected_account
+                .map(account::Guard::new)
+                .map(Arc::new),
             http,
             host: resolved.name,
             base,

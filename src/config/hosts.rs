@@ -13,6 +13,8 @@ pub struct Host {
     /// Username (login) of the authenticated user on this host. For Fjord
     /// Account hosts this is the Fjord email.
     pub user: Option<String>,
+    #[serde(skip)]
+    pub selected_account: Option<crate::client::account::Account>,
     /// Protocol used for git operations (`https` or `ssh`).
     #[serde(default = "default_git_protocol")]
     pub git_protocol: String,
@@ -117,6 +119,8 @@ pub struct Hosts {
     /// Map of hostname -> host config.
     #[serde(default)]
     pub hosts: BTreeMap<String, Host>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(super) accounts: BTreeMap<String, super::profiles::HostProfiles>,
     /// User-named groups: group name -> the hosts assigned to it. A purely
     /// organizational label; nothing about auth or host resolution reads it.
     /// A host appears under at most one group (the mutators below keep that
@@ -163,13 +167,7 @@ impl Hosts {
     }
 
     pub fn save(&self) -> Result<()> {
-        let path = hosts_path()?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-        }
-        let text = toml::to_string_pretty(self).context("serializing hosts.toml")?;
-        fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
-        Ok(())
+        super::profile_publish::save(self)
     }
 
     /// Resolve which hostname to use given an explicit override (e.g. from `--host`).
