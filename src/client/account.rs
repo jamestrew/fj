@@ -1,4 +1,4 @@
-//! Invocation-only PAT selection. Stored host and credential formats are untouched.
+//! Resolve named credentials and verify the selected account before requests.
 use super::*;
 use crate::{
     auth,
@@ -40,11 +40,11 @@ pub fn initialize(account: Option<Account>) -> Result<()> {
         .set(account)
         .map_err(|_| anyhow!("account override already initialized"))
 }
-pub(super) fn selected() -> Option<Account> {
+pub(crate) fn selected() -> Option<Account> {
     SELECTED.get().cloned().flatten()
 }
 
-pub(super) fn resolve_token(
+pub(crate) fn resolve_token(
     hosts: &crate::config::hosts::Hosts,
     host: &str,
     config: &mut Host,
@@ -53,14 +53,10 @@ pub(super) fn resolve_token(
     let account = selected();
     let profile =
         crate::config::profiles::selection(hosts, host, account.as_ref().map(Account::as_str))?;
+    config.selected_profile = profile.clone();
     config.selected_account = account
         .clone()
         .or_else(|| profile.as_ref().map(|p| p.user.parse().unwrap()));
-    if config.selected_account.is_some() && config.auth_kind != AuthKind::Pat {
-        return Err(anyhow!(
-            "account override requires a direct Forgejo PAT host, not a Fjord Account gateway"
-        ));
-    }
     if config.auth_kind == AuthKind::Pat {
         return select_pat(
             account.is_some() && profile.is_none(),
@@ -72,17 +68,7 @@ pub(super) fn resolve_token(
             },
         );
     }
-    let fa = config.fjord_account.as_ref().ok_or_else(|| anyhow!(
-        "host '{host}' is Fjord-Account but has no fjord_account config; remove and re-run `fj auth login --fjord`"
-    ))?;
-    Ok(Some(
-        auth::load_fjord_bearer(&fa.platform_url)?.ok_or_else(|| {
-            anyhow!(
-                "no Fjord Account session stored for '{}'. Run `fj auth login --fjord` again.",
-                fa.platform_url
-            )
-        })?,
-    ))
+    crate::config::fjord_profiles::resolve(host, config)
 }
 
 fn select_pat(
@@ -120,12 +106,28 @@ impl Guard {
                 // Remove only the guard on this clone to avoid recursive verification.
                 let mut probe = client.clone();
                 probe.account = None;
+                let target = match client.platform_url.as_ref() {
+                    Some((platform, _)) => format!("{platform}/api/v1/me/forge-instances"),
+                    None => "user".into(),
+                };
                 let response = probe
-                    .request_unchecked(Method::GET, "user", &[], None, &HeaderMap::new())
+                    .request_unchecked(Method::GET, &target, &[], None, &HeaderMap::new())
                     .await
                     .map_err(|_| anyhow!("could not verify account override credential"))?;
                 if !response.status().is_success() {
                     return Err(anyhow!("account override credential verification failed"));
+                }
+                if client.auth_scheme == AuthScheme::FjordBearer {
+                    return if response.status() == StatusCode::OK
+                        && crate::fjord::oidc::bearer_email(
+                            &client.current_token().unwrap_or_default(),
+                        )
+                        .is_some_and(|u| u.eq_ignore_ascii_case(self.account.as_str()))
+                    {
+                        Ok(())
+                    } else {
+                        Err(anyhow!("profile identity verification failed"))
+                    };
                 }
                 #[derive(serde::Deserialize)]
                 struct Identity {

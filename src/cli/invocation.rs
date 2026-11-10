@@ -9,9 +9,6 @@ pub async fn run(cli: Cli) -> Result<()> {
     } else {
         cli.account.clone()
     })?;
-    if cli.account.is_some() && matches!(cli.command, Command::Instances(_)) {
-        anyhow::bail!("account profiles for Fjord gateway sessions are not supported yet");
-    }
     // Before anything that can park this thread in a syscall. The select
     // below is the graceful path; this is the backstop for when the command
     // future stops being pollable and the select never gets another look in.

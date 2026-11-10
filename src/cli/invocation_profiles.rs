@@ -1,13 +1,13 @@
 //! Auth commands for PAT profiles; other auth flows retain the legacy path.
 use crate::cli::{
     auth::{AuthCmd, AuthSub, LoginArgs},
-    auth_login, auth_probe,
+    auth_login,
 };
 use crate::{
-    api, auth,
+    auth,
     client::account::Account,
     config::{
-        hosts::{AuthKind, Host, Hosts},
+        hosts::{Host, Hosts},
         profiles,
     },
 };
@@ -35,18 +35,20 @@ pub(super) async fn run(
         AuthSub::Switch(args) if selected.is_some() => {
             let profile = profiles::selection(&hosts, &args.host, selected)?
                 .ok_or_else(|| anyhow!("requested account profile is unavailable"))?;
-            let config = hosts
+            let mut config = hosts
                 .hosts
                 .get(&args.host)
+                .cloned()
                 .ok_or_else(|| anyhow!("host not configured"))?;
+            config.selected_profile = Some(profile.clone());
             verify(
                 &args.host,
-                config,
+                &config,
                 &profiles::token(&args.host, &profile)?,
                 &profile.user,
             )
             .await?;
-            profiles::switch(&args.host, &profile, config)?;
+            profiles::switch(&args.host, &profile, &config)?;
             println!("Default account profile selected [redacted]");
             Ok(())
         }
@@ -124,32 +126,24 @@ pub(super) async fn run(
         }
     }
 }
-async fn verify(host: &str, config: &Host, token: &str, account: &str) -> Result<String> {
-    if config.auth_kind != AuthKind::Pat {
-        return Err(anyhow!(
-            "Fjord gateway profiles are deferred to the next step"
-        ));
-    }
-    let hosts = Hosts::load()?;
-    let proxy = crate::client::proxy_credential_for_host(
-        host,
-        config,
-        profiles::generic_env(&hosts, host, Some(host)),
-    )?;
-    let client = auth_probe::build_probe_client(host, config, token, proxy)?;
-    let user = api::user::current(&client)
-        .await
-        .map_err(|_| anyhow!("profile identity verification failed"))?;
-    if !user.login.eq_ignore_ascii_case(account) {
-        return Err(anyhow!("credential does not match requested account"));
-    }
-    Ok(user.login.to_ascii_lowercase())
-}
 async fn login(mut args: LoginArgs, account: &str) -> Result<()> {
     if args.fjord {
-        return Err(anyhow!(
-            "Fjord gateway profiles are deferred to the next step"
-        ));
+        let platform = crate::fjord::normalize_platform_url(
+            args.platform_url
+                .as_deref()
+                .unwrap_or(crate::fjord::DEFAULT_PLATFORM_URL),
+        )?;
+        if !matches!(
+            crate::fjord::oidc::probe_strategy(&platform)
+                .await
+                .map_err(|_| anyhow!("could not probe profile sign-in strategy"))?,
+            crate::fjord::oidc::AuthStrategy::Oidc
+        ) {
+            return Err(anyhow!("named Fjord login requires an OIDC deployment"));
+        }
+        return auth_login::login_fjord_oidc(args, platform, Some(account))
+            .await
+            .map_err(|_| anyhow!("named Fjord sign-in failed; retry login"));
     }
     let input = args
         .host
@@ -193,3 +187,7 @@ async fn login(mut args: LoginArgs, account: &str) -> Result<()> {
     println!("Saved verified PAT profile [redacted]; legacy credentials retained");
     Ok(())
 }
+
+#[path = "profile_verify.rs"]
+mod verification;
+use verification::verify;

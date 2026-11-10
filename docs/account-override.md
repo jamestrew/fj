@@ -47,9 +47,9 @@ form tokens before the authorization header.
 Multipart issue/PR attachments and release uploads initiate identity
 verification before constructing upload headers, even as the first request.
 Synchronous direct HTTP helpers still require completed verification. Named PAT login, default switching and redacted status support profiles;
-legacy credential maintenance and Fjord instance commands reject account
-overrides. Rotate a PAT through named login. This step supports direct Forgejo PAT hosts; a stored
-Fjord Account gateway session cannot be replaced with a PAT. Separate Fjord Account bearer profiles remain deferred to the next PR.
+legacy credential maintenance rejects account overrides. Rotate a PAT through
+named login. Fjord OIDC profiles support gateway requests and instance commands;
+a stored Fjord gateway session cannot be replaced with an environment PAT.
 
 ## Named PAT profiles
 
@@ -79,8 +79,17 @@ fields remain for at least one release, with no automatic cleanup.
 Status reports configured counts and a redacted default marker, not a fresh
 authentication result. Legacy logout/refresh/token-export/session/setup-git maintenance
 on profiled hosts is refused so it cannot operate on a different credential.
-Fjord gateway sessions and profile-scoped instance/refresh handling are 2b.
+Scoped cookies and remaining maintenance are deferred to 2b-ii.
 
 Remove an existing fj Git helper with `git config --global --unset-all
 credential.https://HOST.helper` (replace HOST), then configure a standard Git
 credential manager for Git authentication.
+
+## Named Fjord OIDC profiles
+
+Use `fj auth login --fjord --platform-url URL --account EMAIL` with loopback, `--manual`, or `--device`.
+Select instances with `fj --host URL --account EMAIL instances use ID`; default switching and migration follow the rules above.
+
+Named Fjord profiles currently support API and instance commands only. Browser
+shortcuts, status/work metadata, mute/inbox identity, cookies and remaining
+maintenance will gain profile scope in 2b-ii.

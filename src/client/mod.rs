@@ -95,10 +95,7 @@ pub struct Client {
     /// 401 and have every later request, and every clone, pick it up.
     token: Arc<RwLock<Option<String>>>,
     auth_scheme: AuthScheme,
-    /// The fjord-platform origin for a Fjord-Account host, used to drive the
-    /// silent OIDC refresh on a 401. `None` for PAT hosts (their tokens are not
-    /// refreshable) and for Fjord hosts we lack platform config for.
-    platform_url: Option<String>,
+    platform_url: Option<(String, Option<crate::config::fjord_profiles::Scope>)>,
     /// Credential for a reverse proxy in front of this host, if the user
     /// configured one. Never sent until the proxy asks for it.
     proxy: Option<Arc<ProxyCredential>>,
@@ -733,12 +730,15 @@ impl Client {
         if let Some(hook) = &self.refresh_hook {
             return hook().await;
         }
-        let Some(platform_url) = self.platform_url.as_deref() else {
+        let Some((platform_url, scope)) = self.platform_url.as_ref() else {
             return Ok(None);
         };
         let Some(current) = self.current_token() else {
             return Ok(None);
         };
+        if let Some(scope) = scope {
+            return scope.refresh(&current).await;
+        }
         if fjord::oidc::valid_refresh_token(platform_url, &current)?.is_none() {
             return Ok(None);
         }

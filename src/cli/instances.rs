@@ -1,16 +1,10 @@
-//! `fj instances`: list the Fjord Account user's Forgejo instances and set
-//! the default one to route all other commands through.
-//!
-//! These calls go to fjord-platform (the gateway), not to a Forgejo instance.
-//! See `crate::fjord` for the underlying HTTP layer.
-
+//! List Fjord instances and select one for the resolved account.
 use std::future::Future;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Subcommand};
 
-use crate::auth as token_store;
 use crate::config::hosts::{AuthKind, Hosts};
 use crate::fjord::{self, CommonsInfo, ForgeInstance};
 use crate::output;
@@ -55,7 +49,6 @@ pub struct UseArgs {
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub async fn run(cmd: InstancesCmd, top_host: Option<&str>) -> Result<()> {
-    // `--host` on the subcommand wins over the top-level `--host`.
     let host_flag = cmd.host.as_deref().or(top_host);
     match cmd.command {
         None => list(host_flag, cmd.json).await,
@@ -229,12 +222,6 @@ pub(crate) async fn fetch_listing_once(platform_url: &str, bearer: &str) -> Resu
 /// original 401 (`SessionExpired`) surfaces so the user re-runs
 /// `fj auth login --fjord`.
 ///
-/// This refresh stays here (rather than folding into the shared `Client`'s new
-/// central refresh) because `fj instances` talks to the platform's
-/// `/api/v1/me/forge-instances` and `/api/v1/me/commons` endpoints directly,
-/// NOT through `Client` (which is scoped to a single forge gateway). The two
-/// paths are independent; the `Client` refresh covers `fj api`/`pr`/`issue`.
-///
 /// Only the instance list can fail this call. The Commons lookup is
 /// best-effort and independent: an error or a slow answer leaves the Commons
 /// unsurfaced (see [`CommonsLookup::Unavailable`]) and the list is returned
@@ -248,13 +235,27 @@ pub(crate) async fn fetch_listing_once(platform_url: &str, bearer: &str) -> Resu
 /// path at all, since the gateway mints and attaches the forge token
 /// server-side per call.
 #[cfg_attr(coverage_nightly, coverage(off))]
-async fn fetch_listing(platform_url: &str, bearer: &str) -> Result<Listing> {
-    match fetch_listing_once(platform_url, bearer).await {
+async fn fetch_listing_scoped(
+    platform_url: &str,
+    bearer: &str,
+    scope: Option<&crate::config::fjord_profiles::Scope>,
+) -> Result<Listing> {
+    let result = match scope {
+        Some(scope) => scope.fetch_listing(bearer).await,
+        None => fetch_listing_once(platform_url, bearer).await,
+    };
+    match result {
         Ok(listing) => Ok(listing),
         Err(e) => {
-            // Only the instance list's 401 gets here. The refreshed bearer is
-            // used for both calls on the retry, since they share it.
             let expired = e.downcast_ref::<fjord::SessionExpired>().is_some();
+            if expired {
+                if let Some(scope) = scope {
+                    if let Some(fresh) = scope.refresh(bearer).await? {
+                        return scope.fetch_listing(&fresh).await;
+                    }
+                    return Err(e);
+                }
+            }
             if expired && fjord::oidc::valid_refresh_token(platform_url, bearer)?.is_some() {
                 let fresh = fjord::oidc::refresh_session(platform_url)
                     .await
@@ -291,7 +292,7 @@ fn commons_hint(commons: Option<&fjord::CommonsInfo>) -> Option<String> {
 fn resolve_fjord(host_flag: Option<&str>) -> Result<(String, crate::config::hosts::Host, String)> {
     let hosts = Hosts::load()?;
     let name = hosts.resolve_host(host_flag)?.to_string();
-    let cfg = hosts
+    let mut cfg = hosts
         .hosts
         .get(&name)
         .cloned()
@@ -302,15 +303,8 @@ fn resolve_fjord(host_flag: Option<&str>) -> Result<(String, crate::config::host
              Run `fj auth login --fjord` first."
         ));
     }
-    let fa = cfg.fjord_account.as_ref().ok_or_else(|| {
-        anyhow!("host '{name}' is fjord_account but missing fjord_account config")
-    })?;
-    let bearer = token_store::load_fjord_bearer(&fa.platform_url)?.ok_or_else(|| {
-        anyhow!(
-            "no Fjord Account session in keychain for {}. Run `fj auth login --fjord`.",
-            fa.platform_url
-        )
-    })?;
+    let bearer = crate::client::account::resolve_token(&hosts, &name, &mut cfg, false)?
+        .ok_or_else(|| anyhow!("no Fjord session available"))?;
     Ok((name, cfg, bearer))
 }
 
@@ -395,12 +389,13 @@ fn commons_notes(listing: &Listing) -> Vec<String> {
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn list(host_flag: Option<&str>, json: bool) -> Result<()> {
-    let (_name, cfg, bearer) = resolve_fjord(host_flag)?;
+    let (name, cfg, bearer) = resolve_fjord(host_flag)?;
     let fa = cfg
         .fjord_account
         .as_ref()
         .expect("resolve_fjord guarantees fjord_account is Some");
-    let listing = fetch_listing(&fa.platform_url, &bearer)
+    let scope = crate::config::fjord_profiles::scope(&name, &cfg)?;
+    let listing = fetch_listing_scoped(&fa.platform_url, &bearer, scope.as_ref())
         .await
         .with_context(|| format!("listing forge instances at {}", fa.platform_url))?;
 
@@ -418,9 +413,6 @@ async fn list(host_flag: Option<&str>, json: bool) -> Result<()> {
             "(no Forgejo instances yet for this account at {})",
             fa.platform_url
         );
-        // Printed before the provisioning hint: a user with no instances who
-        // has not joined the Commons is being told about the wrong thing
-        // otherwise.
         for note in &notes {
             println!("{}", output::dim(note));
         }
@@ -433,8 +425,6 @@ async fn list(host_flag: Option<&str>, json: bool) -> Result<()> {
         println!("{}", output::dim(note));
     }
     if listing.instances.is_empty() {
-        // Only the Commons is listed. It is not the account's own forge, so
-        // the empty state for those still applies.
         println!(
             "{}",
             output::dim(&format!(
@@ -574,7 +564,8 @@ async fn use_instance(host_flag: Option<&str>, args: UseArgs) -> Result<()> {
     // Refresh the list and look up by id or slug. We do this fetch every
     // time rather than letting the user pick something stale; instance ids
     // are stable but plans / states aren't.
-    let listing = fetch_listing(&fa.platform_url, &bearer)
+    let scope = crate::config::fjord_profiles::scope(&name, &cfg)?;
+    let listing = fetch_listing_scoped(&fa.platform_url, &bearer, scope.as_ref())
         .await
         .with_context(|| format!("listing forge instances at {}", fa.platform_url))?;
     let target = match resolve_use_target(&listing, &args.id_or_slug, &fa.platform_url)? {
@@ -582,21 +573,25 @@ async fn use_instance(host_flag: Option<&str>, args: UseArgs) -> Result<()> {
         UseTarget::BrowserHandoff { name, url } => return hand_off_to_browser(&name, &url),
     };
 
-    // Persist the new default into hosts.toml.
-    let mut hosts = Hosts::load()?;
-    let host_mut = hosts
-        .hosts
-        .get_mut(&name)
-        .ok_or_else(|| anyhow!("host '{name}' disappeared from hosts.toml between calls"))?;
-    let fa_mut = host_mut
-        .fjord_account
-        .as_mut()
-        .ok_or_else(|| anyhow!("host '{name}' lost its fjord_account config between calls"))?;
-    fa_mut.default_instance_id = Some(target.id.clone());
-    fa_mut.default_instance_display_name = Some(target.display_name.clone());
-    fa_mut.default_instance_slug = Some(target.slug.clone());
-    fa_mut.default_instance_public_url = target.public_url.clone();
-    hosts.save()?;
+    if let Some(scope) = scope {
+        scope.select_instance(&target)?;
+    } else {
+        // Persist the new default into hosts.toml.
+        let mut hosts = Hosts::load()?;
+        let host_mut = hosts
+            .hosts
+            .get_mut(&name)
+            .ok_or_else(|| anyhow!("host '{name}' disappeared from hosts.toml between calls"))?;
+        let fa_mut = host_mut
+            .fjord_account
+            .as_mut()
+            .ok_or_else(|| anyhow!("host '{name}' lost its fjord_account config between calls"))?;
+        fa_mut.default_instance_id = Some(target.id.clone());
+        fa_mut.default_instance_display_name = Some(target.display_name.clone());
+        fa_mut.default_instance_slug = Some(target.slug.clone());
+        fa_mut.default_instance_public_url = target.public_url.clone();
+        hosts.save()?;
+    }
 
     println!(
         "{} Default instance is now {} ({})",

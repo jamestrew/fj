@@ -6,8 +6,6 @@ use serde::{Deserialize, Serialize};
 
 use super::hosts_path;
 
-/// A single Forgejo host entry. The auth token is intentionally NOT serialized
-/// here: tokens live in the `auth` module stores, not hosts.toml.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Host {
     /// Username (login) of the authenticated user on this host. For Fjord
@@ -15,6 +13,8 @@ pub struct Host {
     pub user: Option<String>,
     #[serde(skip)]
     pub selected_account: Option<crate::client::account::Account>,
+    #[serde(skip)]
+    pub selected_profile: Option<super::profiles::Profile>,
     /// Protocol used for git operations (`https` or `ssh`).
     #[serde(default = "default_git_protocol")]
     pub git_protocol: String,

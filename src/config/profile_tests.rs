@@ -3,6 +3,7 @@ use super::*;
 #[test]
 fn profile_keys_scope_host_account_kind_and_generation() {
     let p = Profile {
+        fjord: None,
         user: "qa".into(),
         generation: "1".into(),
     };
@@ -12,6 +13,7 @@ fn profile_keys_scope_host_account_kind_and_generation() {
         key(
             "a",
             &Profile {
+                fjord: None,
                 user: "other".into(),
                 generation: "1".into()
             }
@@ -22,6 +24,7 @@ fn profile_keys_scope_host_account_kind_and_generation() {
         key(
             "a",
             &Profile {
+                fjord: None,
                 user: "qa".into(),
                 generation: "2".into()
             }
@@ -32,6 +35,7 @@ fn profile_keys_scope_host_account_kind_and_generation() {
         key(
             "a",
             &Profile {
+                fjord: None,
                 user: "qa:qa".into(),
                 generation: "1".into()
             }
@@ -72,6 +76,7 @@ fn profile_staging_requires_successful_write_and_matching_readback() {
 fn profile_selection_is_host_scoped_and_status_is_redacted() {
     let mut hosts = Hosts::default();
     let profile = Profile {
+        fjord: None,
         user: "private-account".into(),
         generation: "1".into(),
     };

@@ -1,3 +1,5 @@
+pub mod fjord_profiles;
+mod fjord_scope;
 pub mod hosts;
 pub mod muted;
 mod profile_publish;
