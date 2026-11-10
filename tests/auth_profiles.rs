@@ -3,7 +3,8 @@ pub mod profile_support;
 #[path = "support/account_override.rs"]
 pub mod support;
 use profile_support::{call, login, server};
-use wiremock::MockServer;
+use wiremock::matchers::{header, method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[tokio::test]
 async fn pat_profiles_preserve_legacy_default_migrate_switch_and_isolate_hosts() {
@@ -164,4 +165,33 @@ async fn pat_profiles_preserve_legacy_default_migrate_switch_and_isolate_hosts()
     for secret in ["qa-private", "operator", "qa-pat", "stored-pat"] {
         assert!(!String::from_utf8_lossy(&status.stdout).contains(secret));
     }
+    first.reset().await;
+    let file = dir.path().join("fj/hosts.toml");
+    let mut changed = config;
+    changed["hosts"]["first.example"]["web_url"] = toml::Value::String(second.uri());
+    let changed = toml::to_string(&changed).unwrap();
+    Mock::given(method("GET"))
+        .and(path("/api/v1/user"))
+        .and(header("authorization", "token stored-pat"))
+        .respond_with(move |_: &wiremock::Request| {
+            std::fs::write(&file, &changed).unwrap();
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"id":1,"login":"operator"}))
+        })
+        .expect(1)
+        .mount(&first)
+        .await;
+    let out = call(
+        dir.path(),
+        &["auth", "switch", "first.example", "--account", "operator"],
+    )
+    .await;
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("host configuration changed"));
+    let after: toml::Value =
+        toml::from_str(&std::fs::read_to_string(dir.path().join("fj/hosts.toml")).unwrap())
+            .unwrap();
+    assert_eq!(
+        after["accounts"]["first.example"]["default_account"].as_str(),
+        Some("qa-private")
+    );
 }

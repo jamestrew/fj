@@ -17,6 +17,7 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+mod diagnostics;
 mod file_mutation;
 use file_mutation::{delete_file_token, store_file_token};
 
@@ -164,16 +165,7 @@ fn handle_load_keyring_error(
             log_keychain_unavailable(host, operation, cause.as_ref());
             load_file_token(file_path, host)
         }
-        keyring::Error::BadEncoding(bytes) => Err(keyring::Error::BadEncoding(bytes))
-            .with_context(|| format!("{operation} for {host}")),
-        keyring::Error::TooLong(name, len) => Err(keyring::Error::TooLong(name, len))
-            .with_context(|| format!("{operation} for {host}")),
-        keyring::Error::Invalid(attr, reason) => Err(keyring::Error::Invalid(attr, reason))
-            .with_context(|| format!("{operation} for {host}")),
-        keyring::Error::Ambiguous(items) => {
-            Err(keyring::Error::Ambiguous(items)).with_context(|| format!("{operation} for {host}"))
-        }
-        err => Err(err).with_context(|| format!("{operation} for {host}")),
+        err => Err(diagnostics::error(host, operation, err)),
     }
 }
 
@@ -199,7 +191,7 @@ fn log_keychain_unavailable(
     cause: &(dyn std::error::Error + 'static),
 ) {
     if crate::client::debug_enabled() {
-        eprintln!("keychain unavailable while {operation} for {host}: {cause}");
+        eprintln!("{}", diagnostics::line(host, operation, cause));
     }
 }
 
@@ -360,14 +352,17 @@ pub fn delete_token(host: &str) -> Result<()> {
                 log_keychain_unavailable_from_error(host, "removing token from keychain", &err);
             }
             Err(err) => {
-                return Err(err)
-                    .with_context(|| format!("removing token for {host} from keychain"));
+                return Err(diagnostics::error(
+                    host,
+                    "removing token from keychain",
+                    err,
+                ));
             }
         },
         Err(err) if is_keychain_unavailable(&err) => {
             log_keychain_unavailable_from_error(host, "opening keychain entry", &err);
         }
-        Err(err) => return Err(err).with_context(|| format!("opening keychain entry for {host}")),
+        Err(err) => return Err(diagnostics::error(host, "opening keychain entry", err)),
     }
     delete_file_token(&file_path, host)
 }

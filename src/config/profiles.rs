@@ -130,8 +130,19 @@ fn stage(
     }
     Ok(())
 }
-pub fn switch(host: &str, verified: &Profile) -> Result<()> {
+pub fn switch(host: &str, verified: &Profile, destination: &Host) -> Result<()> {
     super::profile_publish::edit(|hosts| {
+        let actual = hosts
+            .hosts
+            .get(host)
+            .ok_or_else(|| anyhow!("host configuration changed; retry switch"))?;
+        if actual.web_url != destination.web_url
+            || actual.api_base_path != destination.api_base_path
+            || actual.auth_kind != destination.auth_kind
+            || actual.proxy != destination.proxy
+        {
+            return Err(anyhow!("host configuration changed; retry switch"));
+        }
         let current = selection(hosts, host, Some(&verified.user))?
             .ok_or_else(|| anyhow!("profile is missing"))?;
         if current.generation != verified.generation {

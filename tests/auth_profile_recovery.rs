@@ -155,4 +155,29 @@ async fn pat_profile_recovery_and_credential_boundaries() {
     .await;
     assert!(!out.status.success());
     assert!(!String::from_utf8_lossy(&out.stderr).contains("legacy maintenance"));
+    let out = call(dir.path(), &["auth", "logout"]).await;
+    assert!(String::from_utf8_lossy(&out.stderr).contains("multiple hosts"));
+    let file = dir.path().join("fj/hosts.toml");
+    let mut sole: toml::Value = toml::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    sole.as_table_mut().unwrap().remove("current");
+    for table in ["hosts", "accounts"] {
+        sole[table].as_table_mut().unwrap().remove("second.example");
+    }
+    let before = toml::to_string(&sole).unwrap();
+    std::fs::write(&file, &before).unwrap();
+    for action in ["token", "refresh", "session", "setup-git", "logout"] {
+        let args = match action {
+            "setup-git" => vec!["auth", action, "--dry-run"],
+            "session" => vec!["auth", action, "--clear"],
+            _ => vec!["auth", action],
+        };
+        let out = call(dir.path(), &args).await;
+        assert!(!out.status.success(), "{action}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("profiled"),
+            "{action}"
+        );
+        assert!(out.stdout.is_empty());
+    }
+    assert_eq!(std::fs::read_to_string(file).unwrap(), before);
 }

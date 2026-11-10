@@ -46,7 +46,7 @@ pub(super) async fn run(
                 &profile.user,
             )
             .await?;
-            profiles::switch(&args.host, &profile)?;
+            profiles::switch(&args.host, &profile, config)?;
             println!("Default account profile selected [redacted]");
             Ok(())
         }
@@ -99,7 +99,17 @@ pub(super) async fn run(
                 command,
                 AuthSub::Logout(_) | AuthSub::Token(_) | AuthSub::Refresh(_) | AuthSub::Session(_)
             );
-            let target = local.or(global).or(hosts.current.as_deref());
+            let guarded = maintenance || matches!(command, AuthSub::SetupGit(_));
+            let explicit = local.or(global);
+            let target = if !guarded
+                || matches!(command, AuthSub::Logout(_))
+                    && explicit.is_none()
+                    && hosts.hosts.len() != 1
+            {
+                None
+            } else {
+                Some(hosts.resolve_host(explicit)?)
+            };
             if matches!(command, AuthSub::SetupGit(_))
                 && target.is_some_and(|h| profiles::has_profiles(&hosts, h))
             {
