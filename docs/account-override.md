@@ -60,6 +60,7 @@ fj auth switch rasterhub.com --account qa
 fj auth status
 ```
 
+`--with-token` reads only stdin, even when `FJ_TOKEN` is set.
 Login verifies the token and saves the named profile without changing another
 account's default. With no token input, named login can migrate the matching
 legacy account or re-verify an existing profile. `auth switch HOST --account`
@@ -76,6 +77,10 @@ the same login. Old generations, legacy credential keys and legacy host
 fields remain for at least one release, with no automatic cleanup.
 
 Status reports configured counts and a redacted default marker, not a fresh
-authentication result. Legacy logout/refresh/token-export/session maintenance
+authentication result. Legacy logout/refresh/token-export/session/setup-git maintenance
 on profiled hosts is refused so it cannot operate on a different credential.
 Fjord gateway sessions and profile-scoped instance/refresh handling are 2b.
+
+Remove an existing fj Git helper with `git config --global --unset-all
+credential.https://HOST.helper` (replace HOST), then configure a standard Git
+credential manager for Git authentication.

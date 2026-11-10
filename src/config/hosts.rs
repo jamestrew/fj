@@ -114,6 +114,8 @@ fn default_git_protocol() -> String {
 /// Top-level shape of `hosts.toml`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Hosts {
+    #[serde(skip)]
+    pub(super) base: Option<Box<Hosts>>,
     /// Hostname currently selected as the default for commands that don't pass `--host`.
     pub current: Option<String>,
     /// Map of hostname -> host config.
@@ -163,7 +165,7 @@ impl Hosts {
             fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
         let parsed: Self =
             toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-        Ok(parsed)
+        Ok(super::profile_publish::remember(parsed))
     }
 
     pub fn save(&self) -> Result<()> {

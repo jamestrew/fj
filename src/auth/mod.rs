@@ -17,6 +17,9 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+mod file_mutation;
+use file_mutation::{delete_file_token, store_file_token};
+
 const SERVICE: &str = "fj";
 
 /// Prefix on the keychain key that flags a Fjord Account bearer rather than
@@ -280,20 +283,6 @@ fn load_file_store(path: &Path) -> Result<FileTokenStore> {
 
 fn load_file_token(path: &Path, host: &str) -> Result<Option<String>> {
     Ok(load_file_store(path)?.tokens.get(host).cloned())
-}
-
-fn store_file_token(path: &Path, host: &str, token: &str) -> Result<()> {
-    let mut store = load_file_store(path)?;
-    store.tokens.insert(host.to_string(), token.to_string());
-    write_file_store(path, &store)
-}
-
-fn delete_file_token(path: &Path, host: &str) -> Result<()> {
-    let mut store = load_file_store(path)?;
-    if store.tokens.remove(host).is_some() {
-        write_file_store(path, &store)?;
-    }
-    Ok(())
 }
 
 /// Rewrite the token store atomically.

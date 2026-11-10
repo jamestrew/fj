@@ -92,31 +92,23 @@ pub(super) async fn run(
                 AuthSub::Token(a) => a.host.as_deref(),
                 AuthSub::Refresh(a) => a.host.as_deref(),
                 AuthSub::Session(a) => a.host.as_deref(),
-                AuthSub::Login(a) => a.host.as_deref(),
+                AuthSub::SetupGit(a) => a.host.as_deref(),
                 _ => None,
             };
             let maintenance = matches!(
                 command,
-                AuthSub::Logout(_)
-                    | AuthSub::Token(_)
-                    | AuthSub::Refresh(_)
-                    | AuthSub::Session(_)
-                    | AuthSub::Login(_)
+                AuthSub::Logout(_) | AuthSub::Token(_) | AuthSub::Refresh(_) | AuthSub::Session(_)
             );
             let target = local.or(global).or(hosts.current.as_deref());
-            let normalized = if matches!(command, AuthSub::Login(_)) {
-                target
-                    .map(auth_login::normalize_pat_host)
-                    .transpose()?
-                    .map(|v| v.0)
-            } else {
-                target.map(str::to_string)
-            };
-            let target = normalized.as_deref();
+            if matches!(command, AuthSub::SetupGit(_))
+                && target.is_some_and(|h| profiles::has_profiles(&hosts, h))
+            {
+                return Err(anyhow!("profiled hosts cannot use the fj git helper; remove it with git config --global --unset-all credential.https://HOST.helper and configure a standard Git credential helper"));
+            }
             if selected.is_some()
                 || maintenance && target.is_some_and(|h| profiles::has_profiles(&hosts, h))
             {
-                return Err(anyhow!("use auth login --account to migrate or update a PAT profile; this legacy maintenance operation is unavailable for profiled credentials"));
+                return Err(anyhow!("profiled credentials require named login; existing fj git helpers must be removed with git config --global --unset-all credential.https://HOST.helper and replaced with a standard Git credential helper"));
             }
             crate::cli::auth::run(AuthCmd { command }, global).await
         }

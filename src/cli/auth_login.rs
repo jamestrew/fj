@@ -96,10 +96,9 @@ async fn login_pat(args: LoginArgs) -> Result<()> {
         None => prompt_hostname()?,
     };
     let (hostname, web_url) = normalize_pat_host(&host_input)?;
-    if hostname.is_empty() {
-        return Err(anyhow!("hostname is required"));
+    if crate::config::profiles::has_profiles(&Hosts::load()?, &hostname) {
+        return Err(anyhow!("profiled host: use auth login --account"));
     }
-
     let token = read_token(&args)?;
     if token.trim().is_empty() {
         return Err(anyhow!("token is required"));
@@ -1026,6 +1025,12 @@ fn settle_outcome(o: crate::fjord::SignInResponse) -> Result<crate::fjord::SignI
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub(super) fn read_token(args: &LoginArgs) -> Result<String> {
+    if args.with_token {
+        use std::io::Read;
+        let mut buf = String::new();
+        std::io::stdin().read_to_string(&mut buf)?;
+        return Ok(buf.trim().to_string());
+    }
     if let Some(t) = &args.token {
         eprintln!(
             "warning: passing --token on the command line exposes it in shell history and `ps`; prefer `--with-token` (stdin) or the interactive prompt"
@@ -1034,12 +1039,6 @@ pub(super) fn read_token(args: &LoginArgs) -> Result<String> {
     }
     if let Some(t) = token_store::env_token() {
         return Ok(t);
-    }
-    if args.with_token {
-        use std::io::Read;
-        let mut buf = String::new();
-        std::io::stdin().read_to_string(&mut buf)?;
-        return Ok(buf.trim().to_string());
     }
     let t = Password::new()
         .with_prompt("Paste a Forgejo access token")
