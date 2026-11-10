@@ -26,7 +26,10 @@ impl Client {
                     AuthScheme::FjordBearer,
                     // Remember where to refresh: the platform origin owns the
                     // OIDC token endpoint and the stored refresh token.
-                    Some(fa.platform_url.clone()),
+                    Some((
+                        fa.platform_url.clone(),
+                        crate::config::fjord_profiles::scope(&resolved.name, &resolved.host)?,
+                    )),
                 )
             }
         };

@@ -8,6 +8,13 @@ use std::collections::BTreeMap;
 pub struct Profile {
     pub user: String,
     pub generation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fjord: Option<super::hosts::FjordAccount>,
+}
+impl std::fmt::Debug for Profile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[redacted profile]")
+    }
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct HostProfiles {
@@ -58,6 +65,9 @@ pub fn key(host: &str, profile: &Profile) -> String {
     )
 }
 pub fn token(host: &str, profile: &Profile) -> Result<String> {
+    if profile.fjord.is_some() {
+        return super::fjord_profiles::load(host, profile).map(|s| s.bearer);
+    }
     crate::auth::load_token(&key(host, profile))
         .map_err(|_| anyhow!("profile credential read failed"))?
         .ok_or_else(|| anyhow!("selected profile credential is unavailable; log in again"))
@@ -68,7 +78,7 @@ pub fn has_profiles(hosts: &Hosts, host: &str) -> bool {
 pub fn status(hosts: &Hosts, host: &str) -> String {
     let set = hosts.accounts.get(host);
     format!(
-        "{host}: {} PAT profile(s); default: {}",
+        "{host}: {} profile(s); default: {}",
         set.map_or(0, |s| s.profiles.len()),
         if set.is_some_and(|s| s.default_account.is_some()) {
             "profile [redacted]"
@@ -81,6 +91,7 @@ pub fn store(host: &str, user: &str, value: &str, candidate: Host) -> Result<()>
     let mut nonce = [0u8; 16];
     getrandom::getrandom(&mut nonce).map_err(|_| anyhow!("could not stage profile credentials"))?;
     let profile = Profile {
+        fjord: None,
         user: user.to_ascii_lowercase(),
         generation: nonce.iter().map(|b| format!("{b:02x}")).collect(),
     };
@@ -140,6 +151,8 @@ pub fn switch(host: &str, verified: &Profile, destination: &Host) -> Result<()> 
             || actual.api_base_path != destination.api_base_path
             || actual.auth_kind != destination.auth_kind
             || actual.proxy != destination.proxy
+            || actual.fjord_account.as_ref().map(|a| &a.platform_url)
+                != destination.fjord_account.as_ref().map(|a| &a.platform_url)
         {
             return Err(anyhow!("host configuration changed; retry switch"));
         }

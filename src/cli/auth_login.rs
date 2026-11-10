@@ -185,11 +185,14 @@ async fn login_fjord(args: LoginArgs) -> Result<()> {
         None => DEFAULT_PLATFORM_URL.to_string(),
     };
 
+    if crate::config::profiles::has_profiles(&Hosts::load()?, &platform_url) {
+        return Err(anyhow!("profiled Fjord hosts require named login"));
+    }
     // Pick the sign-in shape from the deployment. A probe failure is
     // non-fatal: fall back to the credentials flow, which still surfaces a
     // clear `StrategyMismatch` error if the deployment is actually OIDC.
     match oidc::probe_strategy(&platform_url).await {
-        Ok(AuthStrategy::Oidc) => return login_fjord_oidc(args, platform_url).await,
+        Ok(AuthStrategy::Oidc) => return login_fjord_oidc(args, platform_url, None).await,
         Ok(AuthStrategy::Mock) => {
             eprintln!(
                 "note: this deployment reports no live Fjord Account sign-in (dev/pending mode); \
@@ -210,50 +213,32 @@ async fn login_fjord(args: LoginArgs) -> Result<()> {
     login_fjord_credentials(args, platform_url).await
 }
 
-/// Fjord Account sign-in via SSO/OIDC. Three ways to obtain the session, all
-/// sharing the token persistence in [`persist_oidc_session`] so the result is
-/// identical whichever ran:
-/// - default (same-device): bind a loopback listener, open the browser, and
-///   capture the Authorization Code + PKCE redirect on `127.0.0.1` (zero
-///   copy-paste);
-/// - `--device`: the OAuth 2.0 Device Authorization Grant (RFC 8628); show a
-///   short code + link + QR, poll for approval from any device. The durable
-///   cross-device path; auto-selected on a headless / SSH session (see
-///   [`choose_oidc_capture`]);
-/// - `--manual`: the interim paste path (superseded by `--device` for the
-///   cross-device case); print the authorize URL and read back the redirected
-///   URL (or bare code) the user pastes.
+/// OIDC sign-in via loopback PKCE, manual callback, or device authorization.
+/// All three flows use the same persistence and profile publication path.
 #[cfg_attr(coverage_nightly, coverage(off))]
-async fn login_fjord_oidc(args: LoginArgs, platform_url: String) -> Result<()> {
+pub(super) async fn login_fjord_oidc(
+    args: LoginArgs,
+    platform_url: String,
+    account: Option<&str>,
+) -> Result<()> {
     use crate::fjord::oidc;
-
-    match choose_oidc_capture(args.device, args.manual, env_prefers_device_flow()) {
-        OidcCapture::Device { auto } => return login_device_flow(&args, platform_url, auto).await,
+    let client = oidc::client_id();
+    let tokens = match choose_oidc_capture(args.device, args.manual, env_prefers_device_flow()) {
+        OidcCapture::Device { auto } => {
+            return login_device_flow(&args, platform_url, auto, account).await
+        }
         OidcCapture::Manual => {
-            let client = oidc::client_id();
             let pkce = oidc::Pkce::generate()?;
-            let (code, redirect_uri) = acquire_code_manual(&platform_url, &client, &pkce)?;
-            let tokens =
-                oidc::exchange_code(&platform_url, &client, &code, &redirect_uri, &pkce.verifier)
-                    .await?;
-            let bearer = tokens.access_token.clone();
-            persist_oidc_session(&args, platform_url.clone(), tokens)?;
-            finish_fjord_login(&platform_url, &bearer).await;
-            Ok(())
+            let (code, redirect) = acquire_code_manual(&platform_url, &client, &pkce)?;
+            oidc::exchange_code(&platform_url, &client, &code, &redirect, &pkce.verifier).await?
         }
         OidcCapture::Loopback => {
-            let client = oidc::client_id();
             let pkce = oidc::Pkce::generate()?;
-            let (code, redirect_uri) = acquire_code_loopback(&platform_url, &client, &pkce).await?;
-            let tokens =
-                oidc::exchange_code(&platform_url, &client, &code, &redirect_uri, &pkce.verifier)
-                    .await?;
-            let bearer = tokens.access_token.clone();
-            persist_oidc_session(&args, platform_url.clone(), tokens)?;
-            finish_fjord_login(&platform_url, &bearer).await;
-            Ok(())
+            let (code, redirect) = acquire_code_loopback(&platform_url, &client, &pkce).await?;
+            oidc::exchange_code(&platform_url, &client, &code, &redirect, &pkce.verifier).await?
         }
-    }
+    };
+    persist_oidc_session(&args, platform_url, tokens, account).await
 }
 
 /// Which OIDC code-capture strategy `fj auth login --fjord` runs.
@@ -315,7 +300,12 @@ fn env_prefers_device_flow() -> bool {
 /// session lands. `auto` distinguishes an auto-selected run (headless / SSH)
 /// from an explicit `--device` so the intro line can explain the choice.
 #[cfg_attr(coverage_nightly, coverage(off))]
-async fn login_device_flow(args: &LoginArgs, platform_url: String, auto: bool) -> Result<()> {
+async fn login_device_flow(
+    args: &LoginArgs,
+    platform_url: String,
+    auto: bool,
+    account: Option<&str>,
+) -> Result<()> {
     use crate::fjord::oidc;
     use std::time::{Duration, Instant};
 
@@ -336,10 +326,7 @@ async fn login_device_flow(args: &LoginArgs, platform_url: String, auto: bool) -
         deadline,
     )
     .await?;
-    let bearer = tokens.access_token.clone();
-    persist_oidc_session(args, platform_url.clone(), tokens)?;
-    finish_fjord_login(&platform_url, &bearer).await;
-    Ok(())
+    persist_oidc_session(args, platform_url, tokens, account).await
 }
 
 /// Print the branded device-flow instructions: the verification URL, the code
@@ -776,13 +763,23 @@ fn acquire_code_manual(
 /// the Fjord-Account host entry, and print the success line. Shared by the
 /// loopback and manual paths.
 #[cfg_attr(coverage_nightly, coverage(off))]
-fn persist_oidc_session(
+async fn persist_oidc_session(
     args: &LoginArgs,
     platform_url: String,
     tokens: crate::fjord::oidc::TokenResponse,
+    account: Option<&str>,
 ) -> Result<()> {
     use crate::fjord::oidc;
 
+    if let Some(account) = account {
+        return crate::config::fjord_profiles::login(
+            &platform_url,
+            account,
+            &tokens,
+            &args.git_protocol,
+        )
+        .await;
+    }
     if tokens.refresh_token.is_none() {
         eprintln!(
             "{}",
@@ -821,6 +818,7 @@ fn persist_oidc_session(
             None => String::new(),
         }
     );
+    finish_fjord_login(&platform_url, &tokens.access_token).await;
     Ok(())
 }
 
