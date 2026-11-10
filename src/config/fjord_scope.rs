@@ -1,5 +1,5 @@
 //! Profile-scoped refresh and instance publication.
-use super::fjord_profiles::{load, write, Scope, Session};
+use super::fjord_profiles::{load, verify, write, Scope, Session};
 use super::profiles;
 use crate::fjord::oidc;
 use anyhow::{anyhow, Result};
@@ -22,6 +22,7 @@ impl Scope {
             return Err(anyhow!("profile session changed; log in again"));
         }
         if stored.bearer != bearer {
+            verify(self.platform(), &stored.bearer, &self.profile.user).await?;
             return Ok(Some(stored.bearer));
         }
         let Some(refresh) = stored.refresh.as_deref() else {
@@ -46,6 +47,7 @@ impl Scope {
             bearer: tokens.access_token,
             refresh: tokens.refresh_token.or(stored.refresh),
         };
+        verify(self.platform(), &next.bearer, &self.profile.user).await?;
         write(&self.host, &self.profile, &next)?;
         Ok(Some(next.bearer))
     }

@@ -14,17 +14,22 @@ pub(super) async fn verify(
     account: &str,
 ) -> Result<String> {
     if config.auth_kind != AuthKind::Pat {
-        return crate::config::fjord_profiles::verify(
-            &config
-                .fjord_account
-                .as_ref()
-                .ok_or_else(|| anyhow!("missing profile platform"))?
-                .platform_url,
-            token,
-            account,
-        )
-        .await
-        .map(|_| account.to_string());
+        let scope = crate::config::fjord_profiles::scope(host, config)?
+            .ok_or_else(|| anyhow!("requested Fjord profile is unavailable"))?;
+        let checked = crate::config::fjord_profiles::verify(scope.platform(), token, account).await;
+        if checked
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.downcast_ref::<crate::fjord::SessionExpired>().is_some())
+        {
+            scope
+                .refresh(token)
+                .await?
+                .ok_or_else(|| anyhow!("profile cannot be refreshed; log in again"))?;
+        } else {
+            checked?;
+        }
+        return Ok(account.to_string());
     }
     let hosts = Hosts::load()?;
     let proxy = crate::client::proxy_credential_for_host(

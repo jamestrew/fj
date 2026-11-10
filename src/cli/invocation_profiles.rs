@@ -35,18 +35,20 @@ pub(super) async fn run(
         AuthSub::Switch(args) if selected.is_some() => {
             let profile = profiles::selection(&hosts, &args.host, selected)?
                 .ok_or_else(|| anyhow!("requested account profile is unavailable"))?;
-            let config = hosts
+            let mut config = hosts
                 .hosts
                 .get(&args.host)
+                .cloned()
                 .ok_or_else(|| anyhow!("host not configured"))?;
+            config.selected_profile = Some(profile.clone());
             verify(
                 &args.host,
-                config,
+                &config,
                 &profiles::token(&args.host, &profile)?,
                 &profile.user,
             )
             .await?;
-            profiles::switch(&args.host, &profile, config)?;
+            profiles::switch(&args.host, &profile, &config)?;
             println!("Default account profile selected [redacted]");
             Ok(())
         }

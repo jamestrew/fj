@@ -80,6 +80,9 @@ pub async fn verify(platform: &str, bearer: &str, account: &str) -> Result<()> {
         .send()
         .await
         .map_err(|_| anyhow!("profile identity verification failed"))?;
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(crate::fjord::SessionExpired.into());
+    }
     if response.status() != reqwest::StatusCode::OK
         || !oidc::bearer_email(bearer).is_some_and(|u| u.eq_ignore_ascii_case(account))
         || oidc::bearer_identity(bearer).is_none()
