@@ -68,3 +68,39 @@ pub fn mute_scope(name: &str, config: Option<&Host>, legacy: String) -> Result<S
 #[cfg(test)]
 #[path = "metadata_tests.rs"]
 mod tests;
+
+/// Map a public clone hostname back to its configured gateway, preferring the default.
+pub fn route(hosts: &Hosts, candidate: &str) -> Result<String> {
+    let mut matches = Vec::new();
+    let mut configured: Vec<_> = hosts
+        .hosts
+        .iter()
+        .filter(|(_, h)| h.auth_kind == AuthKind::FjordAccount)
+        .collect();
+    configured.sort_by_key(|(name, _)| hosts.resolve_host(None).ok() != Some(name.as_str()));
+    for (name, _) in configured {
+        let config = resolve(hosts, name)?;
+        let public = config
+            .fjord_account
+            .as_ref()
+            .and_then(|f| f.default_instance_public_url.as_deref());
+        if name == candidate
+            || public
+                .and_then(|p| url::Url::parse(p).ok())
+                .and_then(|u| u.host_str().map(str::to_string))
+                .is_some_and(|h| h.eq_ignore_ascii_case(candidate))
+        {
+            if hosts.resolve_host(None).ok() == Some(name.as_str()) {
+                return Ok(name.clone());
+            }
+            matches.push(name.clone());
+        }
+    }
+    match matches.len() {
+        0 => Ok(candidate.into()),
+        1 => Ok(matches.remove(0)),
+        _ => Err(anyhow!(
+            "multiple configured gateways match this remote; select --host"
+        )),
+    }
+}

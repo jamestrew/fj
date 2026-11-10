@@ -32,7 +32,10 @@ fn fixture() -> Hosts {
                     generation: "generation".into(),
                     fjord: Some(FjordAccount {
                         default_instance_id: Some("shared-instance".into()),
-                        default_instance_public_url: Some(format!("https://{account}.invalid")),
+                        default_instance_public_url: Some(format!(
+                            "https://{}.invalid",
+                            account.replace('@', "-")
+                        )),
                         ..metadata.clone()
                     }),
                 },
@@ -135,4 +138,8 @@ fn named_mute_identity_isolates_accounts_hosts_and_instances_and_retains_legacy(
     assert_eq!(muted::scope_key("p", Some(&config)).unwrap(), scopes[0]);
     config.fjord_account.as_mut().unwrap().default_instance_id = Some("different".into());
     assert_ne!(muted::scope_key("p", Some(&config)).unwrap(), scopes[0]);
+    hosts.current = Some("p".into());
+    assert_eq!(route(&hosts, "a-test.invalid").unwrap(), "p");
+    hosts.current = None;
+    assert!(route(&hosts, "a-test.invalid").is_err());
 }

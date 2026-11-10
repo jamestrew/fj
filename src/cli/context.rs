@@ -105,6 +105,15 @@ pub fn resolve_repo(
     };
     let client_host = resolve_client_host(explicit_host, detected_host.as_deref(), default_host());
 
+    let client_host = client_host
+        .map(|h| {
+            if explicit_host.is_some() {
+                Ok(h)
+            } else {
+                crate::config::metadata::route(&Hosts::load()?, &h)
+            }
+        })
+        .transpose()?;
     let client = Client::connect(client_host.as_deref())?;
     let host = client_host.unwrap_or_else(|| client.host().to_string());
     let hosts = Hosts::load()?;

@@ -169,9 +169,7 @@ struct Identity {
     host: Option<String>,
 }
 
-/// Resolve repo identity without any network or keychain access. `-R` (a
-/// `owner/name` slug) wins for the repo; the host comes from `--host`, then
-/// the git remote, then the configured default. Pure for testability.
+/// Resolve repo from -R/remote, with host precedence explicit, remote, default.
 fn resolve_identity(
     repo_flag: Option<&str>,
     host_flag: Option<&str>,
@@ -189,10 +187,10 @@ fn resolve_identity(
         .map(str::to_string)
         .or_else(|| remote.map(|r| r.host.clone()))
         .or_else(|| default_host.map(str::to_string));
-    let repo = match (&owner, &name) {
-        (Some(o), Some(n)) => Some(format!("{o}/{n}")),
-        _ => None,
-    };
+    let repo = owner
+        .as_ref()
+        .zip(name.as_ref())
+        .map(|(o, n)| format!("{o}/{n}"));
     Identity {
         repo,
         owner,
@@ -332,15 +330,16 @@ fn render_human(wc: &WorkContext) -> String {
     s
 }
 
-/// Gather the working context. Local git/config/stack data is always
-/// collected (offline); the Forgejo API is best-effort and any failure
-/// (offline, no token, server down) degrades to `None` rather than erroring.
+/// Gather local context; propagate configuration errors and tolerate network failures.
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn gather(repo_flag: Option<&str>, host_flag: Option<&str>) -> Result<WorkContext> {
     let remote = git::remote::discover(host_flag).ok();
-    let hosts = Hosts::load().ok();
-    let default_host = hosts.as_ref().and_then(|h| h.resolve_host(None).ok());
-    let id = resolve_identity(repo_flag, host_flag, remote.as_ref(), default_host);
+    let hosts = Hosts::load()?;
+    let default_host = hosts.resolve_host(None).ok();
+    let mut id = resolve_identity(repo_flag, host_flag, remote.as_ref(), default_host);
+    if let Some(host) = id.host.as_mut().filter(|_| host_flag.is_none()) {
+        *host = crate::config::metadata::route(&hosts, host)?;
+    }
 
     let branch = git::current_branch();
     let (dirty, changed_files) = git::working_tree_status().unwrap_or((false, 0));
@@ -348,10 +347,11 @@ async fn gather(repo_flag: Option<&str>, host_flag: Option<&str>) -> Result<Work
         Some((a, b)) => (Some(a), Some(b)),
         None => (None, None),
     };
-    let host_cfg = hosts
-        .as_ref()
-        .zip(id.host.as_deref())
-        .and_then(|(h, name)| crate::config::metadata::resolve(h, name).ok());
+    let host_cfg = id
+        .host
+        .as_deref()
+        .map(|name| crate::config::metadata::resolve(&hosts, name))
+        .transpose()?;
     let account = account_info(host_cfg.as_ref());
     let stack = stack_state::load()
         .ok()
@@ -363,7 +363,8 @@ async fn gather(repo_flag: Option<&str>, host_flag: Option<&str>) -> Result<Work
     let mut checks = None;
     let mut api_reachable = false;
     if let (Some(owner), Some(name)) = (id.owner.as_deref(), id.name.as_deref()) {
-        if let Ok(client) = Client::connect(id.host.as_deref()) {
+        {
+            let client = Client::connect(id.host.as_deref())?;
             if let Ok(repo) = api::repo::get(&client, owner, name).await {
                 api_reachable = true;
                 default_branch = Some(repo.default_branch);

@@ -4,6 +4,8 @@ mod consumers;
 #[path = "support/fjord_profiles.rs"]
 #[allow(dead_code)]
 mod support;
+#[path = "support/work_clone.rs"]
+mod work_clone;
 use consumers::*;
 use support::*;
 use wiremock::MockServer;
@@ -49,6 +51,7 @@ async fn profile_consumers_share_metadata_and_isolate_mutes() {
         )
         .await,
     );
+    let _direct_host_trap = work_clone::clone(dir.path()).await;
     // Legacy mute state must be retained without leaking into named profiles.
     std::fs::write(
         dir.path().join("muted_repos.toml"),
@@ -111,12 +114,19 @@ async fn profile_consumers_share_metadata_and_isolate_mutes() {
             assert!(captured.contains(&format!("https://{instance}.example/base/o/r/{suffix}")));
         }
     }
-    let implicit = command_json(dir.path(), &["work", "context", "-R", "o/r", "--json"]).await;
+    let implicit = command_json(dir.path(), &["work", "context", "--json"]).await;
+    assert_eq!(implicit["api_reachable"], serde_json::json!(true));
     assert_eq!(
         implicit["account"]["fjord_instance"].as_str(),
         Some("first-a")
     );
-    success(call(dir.path(), &["issue", "list", "-R", "o/r", "--web"]).await);
+    let resumed = command_json(dir.path(), &["work", "resume", "--json"]).await;
+    assert_eq!(resumed["current"]["api_reachable"], serde_json::json!(true));
+    assert_eq!(
+        resumed["current"]["host"].as_str(),
+        Some(first.uri().as_str())
+    );
+    success(call(dir.path(), &["issue", "list", "--web"]).await);
     assert_eq!(
         std::fs::read_to_string(&log).unwrap().lines().last(),
         Some("https://first-a.example/base/o/r/issues")
@@ -138,6 +148,7 @@ async fn profile_consumers_share_metadata_and_isolate_mutes() {
     .await;
     assert!(!missing.status.success());
     assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 10);
+    work_clone::invalid_selection(dir.path()).await;
     mutes(dir.path(), &first, &second, a, b).await;
     let hosts: toml::Value = std::fs::read_to_string(dir.path().join("hosts.toml"))
         .unwrap()
