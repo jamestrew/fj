@@ -7,6 +7,17 @@ impl Scope {
     pub fn platform(&self) -> &str {
         &self.profile.fjord.as_ref().unwrap().platform_url
     }
+    pub async fn fetch_listing(&self, bearer: &str) -> Result<crate::cli::instances::Listing> {
+        crate::cli::instances::fetch_listing_once(self.platform(), bearer)
+            .await
+            .map_err(|e| {
+                if e.downcast_ref::<crate::fjord::SessionExpired>().is_some() {
+                    e
+                } else {
+                    anyhow!("profile instance listing failed")
+                }
+            })
+    }
     pub async fn refresh(&self, bearer: &str) -> Result<Option<String>> {
         let _guard = lock(&self.host, &self.profile)?;
         let hosts = super::hosts::Hosts::load()?;

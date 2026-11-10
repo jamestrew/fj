@@ -222,12 +222,6 @@ pub(crate) async fn fetch_listing_once(platform_url: &str, bearer: &str) -> Resu
 /// original 401 (`SessionExpired`) surfaces so the user re-runs
 /// `fj auth login --fjord`.
 ///
-/// This refresh stays here (rather than folding into the shared `Client`'s new
-/// central refresh) because `fj instances` talks to the platform's
-/// `/api/v1/me/forge-instances` and `/api/v1/me/commons` endpoints directly,
-/// NOT through `Client` (which is scoped to a single forge gateway). The two
-/// paths are independent; the `Client` refresh covers `fj api`/`pr`/`issue`.
-///
 /// Only the instance list can fail this call. The Commons lookup is
 /// best-effort and independent: an error or a slow answer leaves the Commons
 /// unsurfaced (see [`CommonsLookup::Unavailable`]) and the list is returned
@@ -246,14 +240,18 @@ async fn fetch_listing_scoped(
     bearer: &str,
     scope: Option<&crate::config::fjord_profiles::Scope>,
 ) -> Result<Listing> {
-    match fetch_listing_once(platform_url, bearer).await {
+    let result = match scope {
+        Some(scope) => scope.fetch_listing(bearer).await,
+        None => fetch_listing_once(platform_url, bearer).await,
+    };
+    match result {
         Ok(listing) => Ok(listing),
         Err(e) => {
             let expired = e.downcast_ref::<fjord::SessionExpired>().is_some();
             if expired {
                 if let Some(scope) = scope {
                     if let Some(fresh) = scope.refresh(bearer).await? {
-                        return fetch_listing_once(platform_url, &fresh).await;
+                        return scope.fetch_listing(&fresh).await;
                     }
                     return Err(e);
                 }
