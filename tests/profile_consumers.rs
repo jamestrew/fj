@@ -4,6 +4,8 @@ mod consumers;
 #[path = "support/fjord_profiles.rs"]
 #[allow(dead_code)]
 mod support;
+#[path = "support/work_availability.rs"]
+mod work_availability;
 #[path = "support/work_clone.rs"]
 mod work_clone;
 use consumers::*;
@@ -172,4 +174,5 @@ async fn profile_consumers_share_metadata_and_isolate_mutes() {
     .await
     .status
     .success());
+    work_availability::check(dir.path(), &second.uri()).await;
 }

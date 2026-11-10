@@ -78,23 +78,28 @@ pub fn route(hosts: &Hosts, candidate: &str) -> Result<String> {
         .filter(|(_, h)| h.auth_kind == AuthKind::FjordAccount)
         .collect();
     configured.sort_by_key(|(name, _)| hosts.resolve_host(None).ok() != Some(name.as_str()));
-    for (name, _) in configured {
-        let config = resolve(hosts, name)?;
-        let public = config
-            .fjord_account
-            .as_ref()
-            .and_then(|f| f.default_instance_public_url.as_deref());
-        if name == candidate
-            || public
-                .and_then(|p| url::Url::parse(p).ok())
-                .and_then(|u| u.host_str().map(str::to_string))
-                .is_some_and(|h| h.eq_ignore_ascii_case(candidate))
-        {
-            if hosts.resolve_host(None).ok() == Some(name.as_str()) {
-                return Ok(name.clone());
-            }
-            matches.push(name.clone());
+    let public_matches = |metadata: Option<&super::hosts::FjordAccount>| {
+        metadata
+            .and_then(|f| f.default_instance_public_url.as_deref())
+            .and_then(|p| url::Url::parse(p).ok())
+            .and_then(|u| u.host_str().map(str::to_string))
+            .is_some_and(|h| h.eq_ignore_ascii_case(candidate))
+    };
+    for (name, host) in configured {
+        let known = public_matches(host.fjord_account.as_ref())
+            || hosts.accounts.get(name).is_some_and(|set| {
+                set.profiles
+                    .values()
+                    .any(|p| public_matches(p.fjord.as_ref()))
+            });
+        if name != candidate && !known {
+            continue;
         }
+        resolve(hosts, name)?;
+        if hosts.resolve_host(None).ok() == Some(name.as_str()) {
+            return Ok(name.clone());
+        }
+        matches.push(name.clone());
     }
     match matches.len() {
         0 => Ok(candidate.into()),

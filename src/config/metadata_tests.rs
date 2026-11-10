@@ -142,4 +142,7 @@ fn named_mute_identity_isolates_accounts_hosts_and_instances_and_retains_legacy(
     assert_eq!(route(&hosts, "a-test.invalid").unwrap(), "p");
     hosts.current = None;
     assert!(route(&hosts, "a-test.invalid").is_err());
+    hosts.accounts.get_mut("p").unwrap().default_account = Some("missing@test".into());
+    assert_eq!(route(&hosts, "pat.example").unwrap(), "pat.example");
+    assert!(resolve(&hosts, "p").is_err());
 }

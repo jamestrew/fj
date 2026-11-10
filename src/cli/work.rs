@@ -330,7 +330,7 @@ fn render_human(wc: &WorkContext) -> String {
     s
 }
 
-/// Gather local context; propagate configuration errors and tolerate network failures.
+/// Gather local context; validate profile metadata and enrich from the API when available.
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn gather(repo_flag: Option<&str>, host_flag: Option<&str>) -> Result<WorkContext> {
     let remote = git::remote::discover(host_flag).ok();
@@ -363,8 +363,7 @@ async fn gather(repo_flag: Option<&str>, host_flag: Option<&str>) -> Result<Work
     let mut checks = None;
     let mut api_reachable = false;
     if let (Some(owner), Some(name)) = (id.owner.as_deref(), id.name.as_deref()) {
-        {
-            let client = Client::connect(id.host.as_deref())?;
+        if let Ok(client) = Client::connect(id.host.as_deref()) {
             if let Ok(repo) = api::repo::get(&client, owner, name).await {
                 api_reachable = true;
                 default_branch = Some(repo.default_branch);
