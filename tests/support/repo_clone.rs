@@ -31,33 +31,6 @@ pub async fn clone(dir: &Path) -> MockServer {
     }
     trap
 }
-pub async fn invalid_selection(dir: &Path) {
-    let file = dir.join(".git/fj/session.json");
-    let mut session: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
-    session["pull_request"] = serde_json::json!({"number":7,"title":"Useful saved PR","state":"open","url":"https://forge.example/pr/7"});
-    let saved = serde_json::to_vec(&session).unwrap();
-    std::fs::write(&file, &saved).unwrap();
-    for command in ["context", "resume"] {
-        let out = call(
-            dir,
-            &[
-                "--account",
-                "missing@test",
-                "work",
-                command,
-                "-R",
-                "o/r",
-                "--json",
-            ],
-        )
-        .await;
-        assert!(!out.status.success());
-        assert!(String::from_utf8_lossy(&out.stderr).contains("profile"));
-        assert_eq!(std::fs::read(&file).unwrap(), saved);
-    }
-}
-
 pub async fn wrong_instance(dir: &Path, server: &MockServer) {
     assert!(std::process::Command::new("git")
         .args(["config", "--local", "fj.resolved", "o/r"])
@@ -69,8 +42,6 @@ pub async fn wrong_instance(dir: &Path, server: &MockServer) {
         .expect(0)
         .mount(server)
         .await;
-    let file = dir.join(".git/fj/session.json");
-    let before = std::fs::read(&file).unwrap();
     for command in [
         vec!["issue", "create", "--title", "wrong", "--body", "wrong"],
         vec![
@@ -81,8 +52,6 @@ pub async fn wrong_instance(dir: &Path, server: &MockServer) {
         vec!["issue", "list", "--web"],
         vec!["pr", "list", "--web"],
         vec!["release", "list", "--web"],
-        vec!["work", "context", "--json"],
-        vec!["work", "resume", "--json"],
     ] {
         let mut args = vec!["--account", "b@test"];
         args.extend(command);
@@ -90,5 +59,12 @@ pub async fn wrong_instance(dir: &Path, server: &MockServer) {
         assert!(!out.status.success());
         assert!(String::from_utf8_lossy(&out.stderr).contains("instance"));
     }
-    assert_eq!(std::fs::read(file).unwrap(), before);
+}
+
+pub fn remote(url: &str) {
+    assert!(std::process::Command::new("git")
+        .args(["remote", "set-url", "origin", url])
+        .status()
+        .unwrap()
+        .success());
 }

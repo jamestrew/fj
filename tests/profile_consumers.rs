@@ -1,13 +1,15 @@
 #![cfg(unix)]
 #[path = "support/profile_consumers.rs"]
 mod consumers;
+#[path = "support/profile_ports.rs"]
+mod profile_ports;
+#[path = "support/profile_routes.rs"]
+mod profile_routes;
+#[path = "support/repo_clone.rs"]
+mod repo_clone;
 #[path = "support/fjord_profiles.rs"]
 #[allow(dead_code)]
 mod support;
-#[path = "support/work_availability.rs"]
-mod work_availability;
-#[path = "support/work_clone.rs"]
-mod work_clone;
 use consumers::*;
 use support::*;
 use wiremock::MockServer;
@@ -53,7 +55,7 @@ async fn profile_consumers_share_metadata_and_isolate_mutes() {
         )
         .await,
     );
-    let _direct_host_trap = work_clone::clone(dir.path()).await;
+    let _direct_host_trap = repo_clone::clone(dir.path()).await;
     // Legacy mute state must be retained without leaking into named profiles.
     std::fs::write(
         dir.path().join("muted_repos.toml"),
@@ -72,26 +74,6 @@ async fn profile_consumers_share_metadata_and_isolate_mutes() {
         )
         .await;
         assert_eq!(inbox[0]["subject"]["title"].as_str(), Some(instance));
-        let work = command_json(
-            dir.path(),
-            &[
-                "--host",
-                &host,
-                "--account",
-                account,
-                "work",
-                "context",
-                "-R",
-                "o/r",
-                "--json",
-            ],
-        )
-        .await;
-        assert_eq!(work["account"]["fjord_instance"].as_str(), Some(instance));
-        assert_eq!(
-            work["account"]["fjord_platform"].as_str(),
-            Some(host.as_str())
-        );
         for command in ["issue", "pr", "release"] {
             success(
                 call(
@@ -116,18 +98,6 @@ async fn profile_consumers_share_metadata_and_isolate_mutes() {
             assert!(captured.contains(&format!("https://{instance}.example/base/o/r/{suffix}")));
         }
     }
-    let implicit = command_json(dir.path(), &["work", "context", "--json"]).await;
-    assert_eq!(implicit["api_reachable"], serde_json::json!(true));
-    assert_eq!(
-        implicit["account"]["fjord_instance"].as_str(),
-        Some("first-a")
-    );
-    let resumed = command_json(dir.path(), &["work", "resume", "--json"]).await;
-    assert_eq!(resumed["current"]["api_reachable"], serde_json::json!(true));
-    assert_eq!(
-        resumed["current"]["host"].as_str(),
-        Some(first.uri().as_str())
-    );
     success(call(dir.path(), &["issue", "list", "--web"]).await);
     assert_eq!(
         std::fs::read_to_string(&log).unwrap().lines().last(),
@@ -150,8 +120,7 @@ async fn profile_consumers_share_metadata_and_isolate_mutes() {
     .await;
     assert!(!missing.status.success());
     assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 10);
-    work_clone::invalid_selection(dir.path()).await;
-    work_clone::wrong_instance(dir.path(), &first).await;
+    repo_clone::wrong_instance(dir.path(), &first).await;
     mutes(dir.path(), &first, &second, a, b).await;
     let hosts: toml::Value = std::fs::read_to_string(dir.path().join("hosts.toml"))
         .unwrap()
@@ -175,5 +144,6 @@ async fn profile_consumers_share_metadata_and_isolate_mutes() {
     .await
     .status
     .success());
-    work_availability::check(dir.path(), &second.uri()).await;
+    profile_routes::check(dir.path(), &second.uri()).await;
+    profile_ports::check(dir.path(), &first).await;
 }

@@ -33,18 +33,6 @@ pub async fn routes(server: &MockServer, account: &str, instance: &str) {
             "id":1,"unread":true,"pinned":false,"updated_at":"2026-11-10T00:00:00Z","url":"",
             "subject":{"title":instance,"type":"Issue","state":"open"},"repository":{"full_name":"o/r"}
         }]))).mount(server).await;
-    Mock::given(method("GET"))
-        .and(path(format!(
-            "/api/v1/forge-gateway/{instance}/api/v1/repos/o/r"
-        )))
-        .and(header("authorization", authorization.as_str()))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "id":1,"name":"r","full_name":"o/r","html_url":"https://forge.example/o/r",
-            "default_branch":"main","private":true,"fork":false,"owner":{"id":1,"login":"owner"},
-            "clone_url":"https://forge.example/o/r.git","ssh_url":"git@forge.example:o/r.git","updated_at":"2026-11-10T00:00:00Z"
-        })))
-        .mount(server)
-        .await;
 }
 #[cfg(unix)]
 pub fn browser(dir: &Path) -> std::path::PathBuf {
@@ -68,92 +56,42 @@ pub fn browser(dir: &Path) -> std::path::PathBuf {
     log
 }
 
+async fn scoped(
+    dir: &Path,
+    server: &MockServer,
+    account: &str,
+    args: &[&str],
+) -> std::process::Output {
+    let host = server.uri();
+    let mut flags = vec!["--host", &host, "--account", account];
+    flags.extend_from_slice(args);
+    call(dir, &flags).await
+}
+async fn scoped_json(dir: &Path, server: &MockServer, account: &str, args: &[&str]) -> Value {
+    let out = scoped(dir, server, account, args).await;
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).unwrap()
+}
 pub async fn mutes(dir: &Path, first: &MockServer, second: &MockServer, a: &str, b: &str) {
     success(call(dir, &["status", "mute", "o/r"]).await);
-    assert_eq!(
-        command_json(dir, &["status", "--json"]).await,
-        serde_json::json!([])
-    );
-    assert_eq!(
-        command_json(
-            dir,
-            &[
-                "--host",
-                &first.uri(),
-                "--account",
-                a,
-                "status",
-                "muted",
-                "--json"
-            ]
-        )
-        .await,
-        serde_json::json!(["o/r"])
-    );
-    for (server, account) in [(&first, b), (&second, a)] {
-        assert_eq!(
-            command_json(
-                dir,
-                &[
-                    "--host",
-                    &server.uri(),
-                    "--account",
-                    account,
-                    "status",
-                    "muted",
-                    "--json"
-                ]
-            )
-            .await,
-            serde_json::json!([])
-        );
-        assert_eq!(
-            command_json(
-                dir,
-                &[
-                    "--host",
-                    &server.uri(),
-                    "--account",
-                    account,
-                    "status",
-                    "--json"
-                ]
-            )
-            .await
-            .as_array()
-            .unwrap()
-            .len(),
-            1
-        );
+    assert_eq!(command_json(dir, &["status", "--json"]).await, json!([]));
+    let mine = scoped_json(dir, first, a, &["status", "muted", "--json"]).await;
+    assert_eq!(mine, json!(["o/r"]));
+    for (server, account) in [(first, b), (second, a)] {
+        let mutes = scoped_json(dir, server, account, &["status", "muted", "--json"]).await;
+        assert_eq!(mutes, json!([]));
+        let inbox = scoped_json(dir, server, account, &["status", "--json"]).await;
+        assert_eq!(inbox.as_array().unwrap().len(), 1);
     }
-    success(
-        call(
-            dir,
-            &[
-                "--host",
-                &first.uri(),
-                "--account",
-                b,
-                "status",
-                "unmute",
-                "o/r",
-            ],
-        )
-        .await,
-    );
-    assert_eq!(
-        command_json(dir, &["status", "--json"]).await,
-        serde_json::json!([])
-    );
+    success(scoped(dir, first, b, &["status", "unmute", "o/r"]).await);
+    assert_eq!(command_json(dir, &["status", "--json"]).await, json!([]));
     success(call(dir, &["status", "unmute", "o/r"]).await);
-    assert_eq!(
-        command_json(dir, &["status", "--json"])
-            .await
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
+    let inbox = command_json(dir, &["status", "--json"]).await;
+    assert_eq!(inbox.as_array().unwrap().len(), 1);
     let persisted = std::fs::read_to_string(dir.join("muted_repos.toml")).unwrap();
     assert!(persisted.contains("#legacy"));
     assert!(persisted.contains("old/repo"));

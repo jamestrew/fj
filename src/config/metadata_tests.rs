@@ -45,6 +45,15 @@ fn fixture() -> Hosts {
     }
     hosts
 }
+fn profile<'a>(hosts: &'a mut Hosts, user: &str) -> &'a mut Profile {
+    hosts
+        .accounts
+        .get_mut("p")
+        .unwrap()
+        .profiles
+        .get_mut(user)
+        .unwrap()
+}
 #[test]
 fn metadata_resolves_profiles_without_credentials_or_instance_and_refuses_mismatch() {
     let mut hosts = fixture();
@@ -53,25 +62,11 @@ fn metadata_resolves_profiles_without_credentials_or_instance_and_refuses_mismat
     let mut explicit = hosts.hosts["p"].clone();
     apply(&hosts, "p", &mut explicit, Some("A@TEST")).unwrap();
     assert_eq!(
-        default
-            .fjord_account
-            .as_ref()
-            .unwrap()
-            .default_instance_public_url,
-        explicit
-            .fjord_account
-            .as_ref()
-            .unwrap()
-            .default_instance_public_url
+        serde_json::to_value(&default.fjord_account).unwrap(),
+        serde_json::to_value(&explicit.fjord_account).unwrap()
     );
     assert_eq!(default.user.as_deref(), Some("[redacted account]"));
-    hosts
-        .accounts
-        .get_mut("p")
-        .unwrap()
-        .profiles
-        .get_mut("a@test")
-        .unwrap()
+    profile(&mut hosts, "a@test")
         .fjord
         .as_mut()
         .unwrap()
@@ -125,14 +120,7 @@ fn named_mute_identity_isolates_accounts_hosts_and_instances_and_retains_legacy(
         muted::scope_key("p", hosts.hosts.get("p")).unwrap(),
         "p#legacy"
     );
-    let p = hosts
-        .accounts
-        .get_mut("p")
-        .unwrap()
-        .profiles
-        .get_mut("a@test")
-        .unwrap();
-    p.generation = "rotated".into();
+    profile(&mut hosts, "a@test").generation = "rotated".into();
     let mut config = hosts.hosts["p"].clone();
     apply(&hosts, "p", &mut config, None).unwrap();
     assert_eq!(muted::scope_key("p", Some(&config)).unwrap(), scopes[0]);
@@ -150,7 +138,13 @@ fn named_mute_identity_isolates_accounts_hosts_and_instances_and_retains_legacy(
 #[test]
 fn routing_table_uses_selected_instance_and_exact_host_identity() {
     let mut hosts = fixture();
-    hosts.hosts.insert("a-test.invalid".into(), Host::default());
+    hosts.hosts.insert(
+        "a-test.invalid".into(),
+        Host {
+            web_url: Some("http://a-test.invalid".into()),
+            ..Default::default()
+        },
+    );
     hosts.current = Some("a-test.invalid".into());
     hosts
         .accounts
@@ -166,16 +160,14 @@ fn routing_table_uses_selected_instance_and_exact_host_identity() {
         .as_mut()
         .unwrap()
         .default_instance_public_url = Some("https://legacy.test".into());
-    let profile = hosts
-        .accounts
-        .get_mut("p")
+    profile(&mut hosts, "b@test")
+        .fjord
+        .as_mut()
         .unwrap()
-        .profiles
-        .get_mut("b@test")
-        .unwrap();
-    profile.fjord.as_mut().unwrap().default_instance_id = Some("other".into());
+        .default_instance_id = Some("other".into());
     for (remote, account, expected) in [
         ("a-test.invalid", "b@test", Some("a-test.invalid")),
+        ("a-test.invalid:80", "b@test", Some("a-test.invalid")),
         ("b-test.invalid", "b@test", Some("p")),
         ("b-test.invalid", " B@TEST ", Some("p")),
         ("b-test.invalid", "a@test", None),

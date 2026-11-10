@@ -2,9 +2,12 @@
 //! reading git remotes. Used so `fj pr list` (etc.) work without `-R` inside
 //! a clone.
 
+#[path = "authority.rs"]
+mod authority;
 use anyhow::{anyhow, Context, Result};
+pub use authority::authority;
 
-/// A parsed `owner/name` plus the hostname it lives on.
+/// A parsed `owner/name` plus its normalized host/port authority.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteRepo {
     pub host: String,
@@ -112,11 +115,9 @@ pub fn parse_remote(url: &str) -> Result<RemoteRepo> {
     }
 
     let parsed = url::Url::parse(url).with_context(|| format!("parsing remote URL '{url}'"))?;
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| anyhow!("remote URL has no host: {url}"))?;
+    let host = authority(&parsed).ok_or_else(|| anyhow!("remote URL has no host: {url}"))?;
     let path = parsed.path();
-    split_path(host, path)
+    split_path(&host, path)
 }
 
 fn split_path(host: &str, path: &str) -> Result<RemoteRepo> {
@@ -165,7 +166,7 @@ mod tests {
     #[test]
     fn ssh_url_with_port() {
         let r = parse_remote("ssh://git@rasterhub.com:2222/rasterstate/fj.git").unwrap();
-        assert_eq!(r.host, "rasterhub.com");
+        assert_eq!(r.host, "rasterhub.com:2222");
         assert_eq!(r.slug(), "rasterstate/fj");
     }
 

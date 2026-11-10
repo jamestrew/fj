@@ -77,11 +77,28 @@ pub fn route(hosts: &Hosts, candidate: &str, account: Option<&str>) -> Result<(S
     if let Some(config) = hosts.hosts.get(candidate) {
         return selected(candidate, config.clone());
     }
+    let input = url::Url::parse(&format!("https://{candidate}")).ok();
+    let normalized = input.as_ref().and_then(crate::git::remote::authority);
+    let candidate = normalized.as_deref().unwrap_or(candidate);
+    if let Some((name, config)) = input
+        .as_ref()
+        .and_then(|u| u.host_str())
+        .and_then(|h| hosts.hosts.get_key_value(h))
+    {
+        let configured = config
+            .web_url
+            .as_deref()
+            .and_then(|u| url::Url::parse(u).ok())
+            .and_then(|u| crate::git::remote::authority(&u));
+        if config.auth_kind == AuthKind::Pat && configured.as_deref() == Some(candidate) {
+            return selected(name, config.clone());
+        }
+    }
     let public_matches = |metadata: Option<&super::hosts::FjordAccount>| {
         metadata
             .and_then(|f| f.default_instance_public_url.as_deref())
             .and_then(|p| url::Url::parse(p).ok())
-            .and_then(|u| u.host_str().map(str::to_string))
+            .and_then(|u| crate::git::remote::authority(&u))
             .is_some_and(|h| h.eq_ignore_ascii_case(candidate))
     };
     let mut matches = Vec::new();
