@@ -24,27 +24,45 @@ pub async fn check(dir: &Path, gateway: &MockServer) {
         .and(path_regex("/api/v1/repos/o/r/(issues|pulls|releases)$"))
         .and(header("authorization", "token legacy"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
-        .expect(6)
+        .expect(36)
         .mount(&direct)
         .await;
-    for (root, host, account) in [
-        (dir, gateway.uri(), Some("a@test")),
-        (pat.path(), "first-a.example".into(), None),
+    for remote in [
+        "ssh://git@first-a.example:2222/o/r.git",
+        "http://FIRST-A.EXAMPLE:80/o/r.git",
+        "https://first-a.example:443/o/r.git",
     ] {
-        for explicit in [false, true] {
-            let mut flags = Vec::new();
-            if explicit {
-                flags.extend(["--host", host.as_str()]);
-            }
-            if let Some(account) = account {
-                flags.extend(["--account", account]);
-            }
-            for command in ["issue", "pr", "release"] {
-                let mut args = flags.clone();
-                args.extend([command, "list", "--json"]);
-                success(call(root, &args).await);
-                *args.last_mut().unwrap() = "--web";
-                success(call(root, &args).await);
+        super::repo_clone::remote(remote);
+        for pinned in [false, true] {
+            let status = std::process::Command::new("git")
+                .args(if pinned {
+                    vec!["config", "fj.resolved", "o/r"]
+                } else {
+                    vec!["config", "--unset", "fj.resolved"]
+                })
+                .status()
+                .unwrap();
+            assert!(status.success(), "pin state {pinned}");
+            for (root, host, account) in [
+                (dir, gateway.uri(), Some("a@test")),
+                (pat.path(), "first-a.example".into(), None),
+            ] {
+                for explicit in [false, true] {
+                    let mut flags = Vec::new();
+                    if explicit {
+                        flags.extend(["--host", host.as_str()]);
+                    }
+                    if let Some(account) = account {
+                        flags.extend(["--account", account]);
+                    }
+                    for command in ["issue", "pr", "release"] {
+                        let mut args = flags.clone();
+                        args.extend([command, "list", "--json"]);
+                        success(call(root, &args).await);
+                        *args.last_mut().unwrap() = "--web";
+                        success(call(root, &args).await);
+                    }
+                }
             }
         }
     }

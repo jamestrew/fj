@@ -167,7 +167,7 @@ fn routing_table_uses_selected_instance_and_exact_host_identity() {
         .default_instance_id = Some("other".into());
     for (remote, account, expected) in [
         ("a-test.invalid", "b@test", Some("a-test.invalid")),
-        ("a-test.invalid:80", "b@test", Some("a-test.invalid")),
+        ("http://a-test.invalid:80", "b@test", Some("a-test.invalid")),
         ("b-test.invalid", "b@test", Some("p")),
         ("b-test.invalid", " B@TEST ", Some("p")),
         ("b-test.invalid", "a@test", None),
