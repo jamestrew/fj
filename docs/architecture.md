@@ -134,8 +134,8 @@ routes reports a single job's log as missing, `fj` queries
 - `fj run watch` polls the job list and tails each job log from its last byte
   offset with a ranged read, until every job is terminal.
 - `fj run cancel` posts `actions/runs/{id}/cancel` (Forgejo 16+).
-- `fj run rerun` posts the Gitea 1.26+ rerun routes. Forgejo has no rerun
-  route, so there it reports the limitation and the run URL.
+- `fj run rerun` uses token-authenticated API routes on Forgejo 17+ and
+  Gitea 1.26+. Job reruns on Forgejo also restart dependent jobs.
 
 Where the server has no API route, the read commands fall back to Forgejo's
 human-facing web routes **without credentials** (`api::workflow::web_client`

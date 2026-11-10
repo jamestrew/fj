@@ -1990,7 +1990,7 @@ async fn run_summary_reads_run_level_state() {
 }
 
 // ── Rerun and cancel (token API, gated per flavor and version) ───────────────
-// Gitea 1.26 has rerun routes; Forgejo has none. Forgejo 16 has a cancel route;
+// Gitea 1.26 and Forgejo 17 have rerun routes. Forgejo 16 has a cancel route;
 // Gitea 1.27.3 has none. A withheld action makes no request at all.
 
 async fn mount_run_900(server: &MockServer) {
@@ -2090,7 +2090,7 @@ async fn rerun_is_withheld_where_the_route_does_not_exist() {
     use crate::api::workflow::{is_actions_unavailable, rerun, RerunTarget};
     let server = MockServer::start().await;
     refuse_everything(&server).await;
-    // Forgejo has no rerun route at any version, and a Forgejo version number
+    // Forgejo 16 has no rerun route, and a Forgejo version number
     // is never read as a Gitea one: 16 is not "at least Gitea 1.26".
     for (flavor, version) in [(Flavor::Forgejo, "16.0.4"), (Flavor::Gitea, "1.25.4")] {
         let c = pinned_client(&server, flavor, version).await;

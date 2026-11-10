@@ -199,7 +199,7 @@ Two things to know, because they look like bugs but aren't:
 
 `fj run watch`, plain `fj run view`, and `fj run download` use the same API
 where the server has it. `fj run cancel` needs Forgejo 16+, and `fj run rerun`
-needs Gitea 1.26+ (Forgejo has no rerun route); elsewhere they print the run
+needs Forgejo 17+ or Gitea 1.26+; elsewhere they print the run
 URL. See `docs/compatibility.md` for the full table.
 
 routes. Those are not available for hosts logged in through a Fjord Account

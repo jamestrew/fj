@@ -472,7 +472,7 @@ fn detail_suffix(body: &str) -> String {
 
 /// Classify a failed run action. A 404 is the limitation (with the run URL), a
 /// 403 is a permission denial, and the two are never worded alike.
-fn run_action_error(
+pub(super) fn run_action_error(
     verb: &str,
     run: u64,
     status: StatusCode,
@@ -823,79 +823,7 @@ async fn set_workflow_state(
 
 // ── Rerun and cancel ─────────────────────────────────────────────────────────
 //
-// Gitea 1.26 added three rerun routes under `/api/v1`; no Forgejo has any.
-// Forgejo 16 added a cancel route; Gitea has none before 28.0. Main used to
-// POST the web actions with the token attached, which the web router ignores
-// (it wants a session cookie and a CSRF token), so that path is gone: a server
-// without the API route gets the limitation and the run URL, and no request.
-// `run` is the per-repo run number, as in `run view` / `run list`.
-
-/// What `fj run rerun` should restart.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RerunTarget {
-    /// Every job in the run.
-    Run,
-    /// Only the jobs that did not succeed.
-    Failed,
-    /// One job, by its 0-based index in the run (the row order of
-    /// `fj run view`). The index is mapped to the job id the route wants.
-    Job(usize),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RerunOutcome {
-    Started,
-    /// `Failed` was asked for and the server reports nothing failed.
-    NothingFailed,
-}
-
-pub async fn rerun(
-    client: &Client,
-    owner: &str,
-    name: &str,
-    run: u64,
-    target: RerunTarget,
-) -> Result<RerunOutcome> {
-    let info = client.server_info().await;
-    let run_url = run_web_url(client, owner, name, run);
-    if info.supports(Capability::RunRerun) == Support::Unsupported {
-        return Err(actions_limitation(
-            &unsupported_reason(&info, Capability::RunRerun, "rerun a workflow run"),
-            &run_url,
-        ));
-    }
-    let run_id = crate::api::workflow_logs::resolve_run_api_id(client, owner, name, run).await?;
-    let repo = crate::api::repo_path(owner, name);
-    let path = match target {
-        RerunTarget::Run => format!("{repo}/actions/runs/{run_id}/rerun"),
-        RerunTarget::Failed => format!("{repo}/actions/runs/{run_id}/rerun-failed-jobs"),
-        RerunTarget::Job(index) => {
-            let jobs =
-                crate::api::workflow_logs::list_run_jobs_api(client, owner, name, run, run_id)
-                    .await?;
-            let job = jobs.get(index).ok_or_else(|| {
-                anyhow!(
-                    "job index {index} is out of range: this run has {} job(s)",
-                    jobs.len()
-                )
-            })?;
-            format!("{repo}/actions/runs/{run_id}/jobs/{}/rerun", job.id)
-        }
-    };
-    let res = client.request(Method::POST, &path, &[], None).await?;
-    let status = res.status();
-    if status.is_success() {
-        return Ok(RerunOutcome::Started);
-    }
-    let body = res.text().await.unwrap_or_default();
-    if target == RerunTarget::Failed
-        && status == StatusCode::BAD_REQUEST
-        && body.to_ascii_lowercase().contains("no failed jobs")
-    {
-        return Ok(RerunOutcome::NothingFailed);
-    }
-    Err(run_action_error("rerun", run, status, &body, &run_url))
-}
+// Reruns live in workflow_rerun; cancellation uses the token API below.
 
 pub async fn cancel(client: &Client, owner: &str, name: &str, run: u64) -> Result<()> {
     let info = client.server_info().await;
@@ -942,7 +870,7 @@ mod tests {
 
     #[test]
     fn limitation_carries_the_run_url_and_is_typed() {
-        let err = actions_limitation("Forgejo has no API route to rerun a workflow run.", "U");
+        let err = actions_limitation("This server cannot rerun a workflow run.", "U");
         assert!(is_actions_unavailable(&err));
         let msg = err.to_string();
         assert!(msg.contains("rerun a workflow run. Open the run"), "{msg}");

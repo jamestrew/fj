@@ -172,7 +172,7 @@ pub enum Capability {
     /// The artifact list for a run and the artifact zip by id.
     Artifacts,
     /// `POST .../actions/runs/{run_id}/rerun`, `.../rerun-failed-jobs` and
-    /// `.../jobs/{job_id}/rerun`. Gitea only: no Forgejo serves them.
+    /// `.../jobs/{job_id}/rerun`. Forgejo 17 uses repo-level job routes.
     RunRerun,
 }
 
@@ -198,7 +198,7 @@ pub fn minimum_version(flavor: Flavor, cap: Capability) -> Option<Version> {
             | Capability::RunLogs
             | Capability::RunCancel
             | Capability::Artifacts => Some(Version::new(16, 0)),
-            Capability::RunRerun => None,
+            Capability::RunRerun => Some(Version::new(17, 0)),
         },
         Flavor::Gitea => match cap {
             Capability::RunJobs => Some(Version::new(1, 25)),
@@ -498,7 +498,7 @@ mod tests {
             info(Flavor::Gitea, "1.27.3").supports(Capability::JobLogs),
             Support::Supported
         );
-        // And 16 is above the Gitea rerun entry (1.26) yet no Forgejo reruns.
+        // Forgejo 16 predates reruns despite exceeding Gitea 1.26 numerically.
         assert_eq!(
             info(Flavor::Forgejo, "16.0.4").supports(Capability::RunRerun),
             Support::Unsupported
@@ -531,10 +531,10 @@ mod tests {
             info(Flavor::Gitea, "").supports(Capability::RunRerun),
             Support::Unknown
         );
-        // A settled no does not need a version.
+        // Forgejo reruns require a known version too.
         assert_eq!(
             info(Flavor::Forgejo, "").supports(Capability::RunRerun),
-            Support::Unsupported
+            Support::Unknown
         );
     }
 
@@ -543,7 +543,7 @@ mod tests {
         let forgejo = info(Flavor::Forgejo, "16.0.4");
         assert_eq!(
             unsupported_reason(&forgejo, Capability::RunRerun, "rerun a workflow run"),
-            "Forgejo has no API route to rerun a workflow run"
+            "Forgejo 16.0.4 cannot rerun a workflow run over the API: Forgejo added the route in 17.0"
         );
         let gitea = info(Flavor::Gitea, "1.27.3");
         let msg = unsupported_reason(&gitea, Capability::RunCancel, "cancel a workflow run");
