@@ -76,26 +76,10 @@ pub async fn login(dir: &Path, server: &MockServer, email: &str) -> std::process
     drop((device, answer));
     out
 }
-pub fn config(dir: &Path) -> toml::Value {
-    std::fs::read_to_string(dir.join("hosts.toml"))
-        .unwrap()
-        .parse()
-        .unwrap()
-}
 pub fn success(out: std::process::Output) {
     assert!(
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-}
-
-pub async fn expire(server: &MockServer, bearer: &str) {
-    Mock::given(method("GET"))
-        .and(path("/api/v1/me/forge-instances"))
-        .and(header("authorization", format!("Bearer {bearer}")))
-        .respond_with(ResponseTemplate::new(401))
-        .with_priority(1)
-        .mount(server)
-        .await;
 }

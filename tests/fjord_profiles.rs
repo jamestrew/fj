@@ -1,4 +1,4 @@
-#[path = "support/fjord_profiles.rs"]
+#[path = "support/fjord_profile_refresh.rs"]
 mod support;
 use serde_json::json;
 use support::*;
