@@ -56,7 +56,7 @@ pub fn proxy_credential_for_host(
 /// Look up the host config and token for the host the user is targeting.
 pub fn resolve(host_flag: Option<&str>) -> Result<ResolvedHost> {
     let hosts = Hosts::load()?;
-    let (name, host_cfg) = if let Some(name) = host_flag {
+    let (name, mut host_cfg) = if let Some(name) = host_flag {
         let host_cfg = hosts.hosts.get(name).cloned().unwrap_or_else(|| Host {
             git_protocol: "https".into(),
             ..Default::default()
@@ -71,8 +71,8 @@ pub fn resolve(host_flag: Option<&str>) -> Result<ResolvedHost> {
             .ok_or_else(|| anyhow!("host '{name}' not configured"))?;
         (name, host_cfg)
     };
-    let allow_generic_env = generic_env_allowed_for_resolved_host(&hosts, &name, host_flag);
-    let token = super::account::resolve_token(&name, &host_cfg, allow_generic_env)?;
+    let allow_generic_env = crate::config::profiles::generic_env(&hosts, &name, host_flag);
+    let token = super::account::resolve_token(&hosts, &name, &mut host_cfg, allow_generic_env)?;
     let proxy = proxy_credential_for_host(&name, &host_cfg, allow_generic_env)?;
     Ok(ResolvedHost {
         name,
@@ -80,17 +80,6 @@ pub fn resolve(host_flag: Option<&str>) -> Result<ResolvedHost> {
         token,
         proxy,
     })
-}
-
-fn generic_env_allowed_for_resolved_host(
-    hosts: &Hosts,
-    name: &str,
-    host_flag: Option<&str>,
-) -> bool {
-    if host_flag.is_none() {
-        return true;
-    }
-    matches!(hosts.resolve_host(None), Ok(default) if default == name)
 }
 
 /// Construct the `/api/v1`-rooted base URL for a PAT host. Older configs only

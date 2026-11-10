@@ -17,6 +17,10 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+mod diagnostics;
+mod file_mutation;
+use file_mutation::{delete_file_token, store_file_token};
+
 const SERVICE: &str = "fj";
 
 /// Prefix on the keychain key that flags a Fjord Account bearer rather than
@@ -161,16 +165,7 @@ fn handle_load_keyring_error(
             log_keychain_unavailable(host, operation, cause.as_ref());
             load_file_token(file_path, host)
         }
-        keyring::Error::BadEncoding(bytes) => Err(keyring::Error::BadEncoding(bytes))
-            .with_context(|| format!("{operation} for {host}")),
-        keyring::Error::TooLong(name, len) => Err(keyring::Error::TooLong(name, len))
-            .with_context(|| format!("{operation} for {host}")),
-        keyring::Error::Invalid(attr, reason) => Err(keyring::Error::Invalid(attr, reason))
-            .with_context(|| format!("{operation} for {host}")),
-        keyring::Error::Ambiguous(items) => {
-            Err(keyring::Error::Ambiguous(items)).with_context(|| format!("{operation} for {host}"))
-        }
-        err => Err(err).with_context(|| format!("{operation} for {host}")),
+        err => Err(diagnostics::error(host, operation, err)),
     }
 }
 
@@ -196,7 +191,7 @@ fn log_keychain_unavailable(
     cause: &(dyn std::error::Error + 'static),
 ) {
     if crate::client::debug_enabled() {
-        eprintln!("keychain unavailable while {operation} for {host}: {cause}");
+        eprintln!("{}", diagnostics::line(host, operation, cause));
     }
 }
 
@@ -282,20 +277,6 @@ fn load_file_token(path: &Path, host: &str) -> Result<Option<String>> {
     Ok(load_file_store(path)?.tokens.get(host).cloned())
 }
 
-fn store_file_token(path: &Path, host: &str, token: &str) -> Result<()> {
-    let mut store = load_file_store(path)?;
-    store.tokens.insert(host.to_string(), token.to_string());
-    write_file_store(path, &store)
-}
-
-fn delete_file_token(path: &Path, host: &str) -> Result<()> {
-    let mut store = load_file_store(path)?;
-    if store.tokens.remove(host).is_some() {
-        write_file_store(path, &store)?;
-    }
-    Ok(())
-}
-
 /// Rewrite the token store atomically.
 ///
 /// Truncate-then-write left the store at zero bytes between `open` and
@@ -371,14 +352,17 @@ pub fn delete_token(host: &str) -> Result<()> {
                 log_keychain_unavailable_from_error(host, "removing token from keychain", &err);
             }
             Err(err) => {
-                return Err(err)
-                    .with_context(|| format!("removing token for {host} from keychain"));
+                return Err(diagnostics::error(
+                    host,
+                    "removing token from keychain",
+                    err,
+                ));
             }
         },
         Err(err) if is_keychain_unavailable(&err) => {
             log_keychain_unavailable_from_error(host, "opening keychain entry", &err);
         }
-        Err(err) => return Err(err).with_context(|| format!("opening keychain entry for {host}")),
+        Err(err) => return Err(diagnostics::error(host, "opening keychain entry", err)),
     }
     delete_file_token(&file_path, host)
 }

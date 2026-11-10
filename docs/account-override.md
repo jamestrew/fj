@@ -1,6 +1,7 @@
 # Choose an account for one invocation
 
-Use `--account LOGIN` or `FJ_ACCOUNT` with an environment PAT to act as a
+Use `--account LOGIN` or `FJ_ACCOUNT` with an environment PAT or a named
+PAT profile to act as a
 non-default Forgejo account. This works for rasterhub identities and accounts
 on independent Forgejo hosts, using each host's own PAT.
 
@@ -11,7 +12,8 @@ FJ_TOKEN="$QA_PAT" fj --account qa issue create --title 'Follow-up'
 ```
 
 The flag overrides `FJ_ACCOUNT`. With neither set, authentication is unchanged.
-The account and token are not written to hosts.toml, keychain or tokens.toml.
+Environment overrides are not persisted. Named profiles use the separate
+verified login flow below.
 Do not place token values in command-line arguments; the existing `--token`
 on auth subcommands still controls persistent authentication.
 
@@ -27,8 +29,8 @@ FJ_TOKEN_H7365636F6E642E6578616D706C65="$CUSTOMER_PAT" \
   fj --host second.example --account qa issue create --title 'Follow-up'
 ```
 
-Explicit account selection requires an environment PAT. It never falls back
-to a stored credential. Before making API requests, fj checks the token's
+Explicit account selection uses an eligible environment PAT first, otherwise
+the exact stored profile. It never falls back to another account. Before making API requests, fj checks the token's
 `/user` identity against the selected login. A mismatch, failed identity read
 or missing credential stops the command. Successful verification is shared
 by clones of that client. The selected login is redacted in CLI debug output;
@@ -44,7 +46,41 @@ Custom URL-encoded form content types are also refused because Forgejo reads
 form tokens before the authorization header.
 Multipart issue/PR attachments and release uploads initiate identity
 verification before constructing upload headers, even as the first request.
-Synchronous direct HTTP helpers still require completed verification. Stored-auth commands (`fj auth`, `fj instances`) reject
-account overrides. This step supports direct Forgejo PAT hosts; a stored
-Fjord Account gateway session cannot be replaced with a PAT. Named profiles
-and separate Fjord Account bearer sessions require a later storage design.
+Synchronous direct HTTP helpers still require completed verification. Named PAT login, default switching and redacted status support profiles;
+legacy credential maintenance and Fjord instance commands reject account
+overrides. Rotate a PAT through named login. This step supports direct Forgejo PAT hosts; a stored
+Fjord Account gateway session cannot be replaced with a PAT. Separate Fjord Account bearer profiles remain deferred to the next PR.
+
+## Named PAT profiles
+
+```sh
+fj auth login --host rasterhub.com --account qa --with-token
+fj --account qa pr comment 42 --body 'Reviewed'
+fj auth switch rasterhub.com --account qa
+fj auth status
+```
+
+`--with-token` reads only stdin, even when `FJ_TOKEN` is set.
+Login verifies the token and saves the named profile without changing another
+account's default. With no token input, named login can migrate the matching
+legacy account or re-verify an existing profile. `auth switch HOST --account`
+verifies the stored credential before selecting that account and host as the
+default. A first named login on a new host needs this explicit switch.
+
+Descriptors/default pointers live under `[accounts.HOST]` in hosts.toml;
+URL, API mount and proxy settings remain host-wide. Named login uses the
+existing configured URL for a known host. Each PAT is stored in the
+keychain or existing 0600 fallback under a distinct host/account/generation
+key. Login stages and reads back a fresh generation before atomically
+publishing metadata. Failure leaves the old active descriptor intact; retry
+the same login. Old generations, legacy credential keys and legacy host
+fields remain for at least one release, with no automatic cleanup.
+
+Status reports configured counts and a redacted default marker, not a fresh
+authentication result. Legacy logout/refresh/token-export/session/setup-git maintenance
+on profiled hosts is refused so it cannot operate on a different credential.
+Fjord gateway sessions and profile-scoped instance/refresh handling are 2b.
+
+Remove an existing fj Git helper with `git config --global --unset-all
+credential.https://HOST.helper` (replace HOST), then configure a standard Git
+credential manager for Git authentication.
