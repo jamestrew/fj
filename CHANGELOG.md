@@ -6,6 +6,8 @@ All notable changes will be recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-11-11
+
 ### Fixed
 
 - Logging out and clearing a web session no longer report success when the OS
