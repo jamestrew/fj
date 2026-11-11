@@ -338,7 +338,7 @@ pub fn delete_token(host: &str) -> Result<()> {
     if keychain_disabled() {
         return delete_file_token(&file_path, host);
     }
-    delete_token_with_entry_and_file_path(host, entry(host), &file_path)
+    delete_token_with_entry_and_file_path(host, entry(host), &file_path, keychain_may_be_absent())
 }
 
 /// Remove `host`'s token from the keychain and the file store.
@@ -346,13 +346,15 @@ pub fn delete_token(host: &str) -> Result<()> {
 /// A keychain that exists but refuses access (`NoStorageAccess`: locked, or
 /// denied) may still hold the secret, so that is an error, reported after the
 /// file entry is gone; callers keep the profile or session selectable and the
-/// user can retry. `PlatformFailure` is also what a machine with no keychain
-/// service at all reports, where logging out must still work, so it only warns,
-/// once per run.
+/// user can retry. `PlatformFailure` is also what a Linux machine with no
+/// secret service reports, where logging out must still work, so there (and only
+/// there, see [`keychain_may_be_absent`]) it warns once per run; elsewhere it is
+/// a real failure, such as a locked or denied macOS keychain.
 fn delete_token_with_entry_and_file_path(
     host: &str,
     entry: keyring::Result<Entry>,
     file_path: &Path,
+    absent_ok: bool,
 ) -> Result<()> {
     let outcome = match entry {
         Ok(entry) => (entry.delete_credential(), "removing token from keychain"),
@@ -363,10 +365,11 @@ fn delete_token_with_entry_and_file_path(
     match result {
         Ok(()) | Err(keyring::Error::NoEntry) => {}
         Err(err @ keyring::Error::NoStorageAccess(_)) => locked = Some(err),
-        Err(keyring::Error::PlatformFailure(cause)) => {
+        Err(keyring::Error::PlatformFailure(cause)) if absent_ok => {
             log_keychain_unavailable(host, operation, cause.as_ref());
             warn_keychain_unconfirmed();
         }
+        Err(err @ keyring::Error::PlatformFailure(_)) => locked = Some(err),
         Err(err) => return Err(diagnostics::error(host, operation, err)),
     }
     delete_file_token(file_path, host)?;
@@ -374,6 +377,13 @@ fn delete_token_with_entry_and_file_path(
         Some(err) => Err(diagnostics::error(host, operation, err)),
         None => Ok(()),
     }
+}
+
+/// Whether this platform can lack a keychain service entirely. macOS and
+/// Windows always have one, so a `PlatformFailure` there (a locked keychain
+/// reached from a headless session, a denied prompt) means the secret may remain.
+fn keychain_may_be_absent() -> bool {
+    cfg!(not(any(target_os = "macos", windows)))
 }
 
 fn warn_keychain_unconfirmed() {
@@ -855,6 +865,7 @@ mod tests {
     fn delete_with(
         err: keyring::Error,
         key: &str,
+        absent_ok: bool,
     ) -> (Result<()>, Option<String>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tokens.toml");
@@ -865,7 +876,7 @@ mod tests {
             .downcast_ref::<keyring::mock::MockCredential>()
             .unwrap()
             .set_error(err);
-        let result = delete_token_with_entry_and_file_path(key, Ok(entry), &path);
+        let result = delete_token_with_entry_and_file_path(key, Ok(entry), &path, absent_ok);
         let left = load_file_token(&path, key).unwrap();
         (result, left, dir)
     }
@@ -873,7 +884,7 @@ mod tests {
     #[test]
     fn delete_fails_when_a_locked_keychain_may_still_hold_the_secret() {
         let locked = keyring::Error::NoStorageAccess(Box::new(std::io::Error::other("locked")));
-        let (result, left, _dir) = delete_with(locked, "example.test");
+        let (result, left, _dir) = delete_with(locked, "example.test", true);
         assert!(result.is_err(), "a locked keychain must not report success");
         // The file entry is still removed, so a retry only has the keychain left.
         assert_eq!(left, None);
@@ -883,7 +894,7 @@ mod tests {
     fn delete_error_for_a_profile_key_does_not_name_the_account() {
         let key = "profile:686f7374:71612d70726976617465:pat:nonce";
         let locked = keyring::Error::NoStorageAccess(Box::new(std::io::Error::other("locked")));
-        let (result, _, _dir) = delete_with(locked, key);
+        let (result, _, _dir) = delete_with(locked, key, true);
         let text = format!("{:#}", result.unwrap_err());
         assert!(!text.contains("71612d70726976617465"), "{text}");
     }
@@ -891,23 +902,35 @@ mod tests {
     #[test]
     fn delete_succeeds_without_a_keychain_service_or_entry() {
         let none = keyring::Error::PlatformFailure(Box::new(std::io::Error::other("no dbus")));
-        let (result, left, _dir) = delete_with(none, "example.test");
+        let (result, left, _dir) = delete_with(none, "example.test", true);
         assert!(result.is_ok());
         assert_eq!(left, None);
-        let (result, left, _dir) = delete_with(keyring::Error::NoEntry, "example.test");
+        let (result, left, _dir) = delete_with(keyring::Error::NoEntry, "example.test", false);
         assert!(result.is_ok());
+        assert_eq!(left, None);
+    }
+
+    #[test]
+    fn a_platform_failure_where_a_keychain_always_exists_fails_the_delete() {
+        // macOS maps a locked keychain or a denied prompt to PlatformFailure.
+        let denied = keyring::Error::PlatformFailure(Box::new(std::io::Error::other("denied")));
+        let (result, left, _dir) = delete_with(denied, "example.test", false);
+        assert!(result.is_err());
         assert_eq!(left, None);
     }
 
     #[test]
     fn delete_propagates_unexpected_keychain_errors_and_failed_entry_creation() {
         let bad = keyring::Error::Invalid("service".into(), "bad".into());
-        let (result, left, _dir) = delete_with(bad, "example.test");
+        let (result, left, _dir) = delete_with(bad, "example.test", true);
         assert!(result.is_err());
         assert_eq!(left.as_deref(), Some("file-secret"));
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tokens.toml");
         let locked = keyring::Error::NoStorageAccess(Box::new(std::io::Error::other("locked")));
-        assert!(delete_token_with_entry_and_file_path("example.test", Err(locked), &path).is_err());
+        assert!(
+            delete_token_with_entry_and_file_path("example.test", Err(locked), &path, true)
+                .is_err()
+        );
     }
 }
