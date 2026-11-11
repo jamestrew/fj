@@ -214,6 +214,21 @@ impl Hosts {
         removed
     }
 
+    /// Run `cleanup` on the host's entry, and remove it only if that succeeds.
+    /// A cleanup that fails (a locked keychain) leaves the entry in place, so
+    /// running the command again still knows what to clean up.
+    pub fn remove_after_cleanup(
+        &mut self,
+        hostname: &str,
+        cleanup: impl FnOnce(&Host) -> anyhow::Result<()>,
+    ) -> anyhow::Result<Option<Host>> {
+        let Some(host) = self.hosts.get(hostname).cloned() else {
+            return Ok(None);
+        };
+        cleanup(&host)?;
+        Ok(self.remove(hostname))
+    }
+
     /// The group `hostname` is assigned to, if any.
     pub fn group_of(&self, hostname: &str) -> Option<&str> {
         self.groups
@@ -599,6 +614,23 @@ git_protocol = "https"
         assert!(back.groups["empty"].is_empty());
         assert_eq!(back.current.as_deref(), Some("a.example"));
         assert_eq!(back.hosts.len(), 2);
+    }
+
+    #[test]
+    fn a_failed_cleanup_keeps_the_host_so_logout_can_be_retried() {
+        let mut h = two_hosts();
+        let err = h
+            .remove_after_cleanup("b.example", |_| Err(anyhow!("keychain locked")))
+            .unwrap_err();
+        assert!(err.to_string().contains("locked"));
+        assert!(h.hosts.contains_key("b.example"));
+        // The retry, once the keychain opens, removes it.
+        let gone = h.remove_after_cleanup("b.example", |_| Ok(())).unwrap();
+        assert!(gone.is_some() && !h.hosts.contains_key("b.example"));
+        assert!(h
+            .remove_after_cleanup("b.example", |_| Ok(()))
+            .unwrap()
+            .is_none());
     }
 
     #[test]

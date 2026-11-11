@@ -547,28 +547,37 @@ fn logout(mut args: LogoutArgs, global_host: Option<&str>) -> Result<()> {
             hosts.hosts.keys().next().cloned().unwrap()
         }
     };
-    let removed = match hosts.remove(&target) {
-        Some(h) => h,
-        None => return Err(anyhow!("no entry for host '{target}'")),
-    };
+    // Secrets first: if the keychain refuses a delete, the host stays configured
+    // so running logout again can finish.
+    if hosts
+        .remove_after_cleanup(&target, |host| delete_host_secrets(host, &target))?
+        .is_none()
+    {
+        return Err(anyhow!("no entry for host '{target}'"));
+    }
     hosts.save()?;
-    // Clear the right keychain slot for the auth scheme we just removed.
-    match removed.auth_kind {
+    println!("✓ Logged out of {target}");
+    Ok(())
+}
+
+/// Delete every secret the host's auth scheme stores. Each delete is attempted
+/// even if an earlier one failed; the first failure is returned.
+fn delete_host_secrets(host: &crate::config::hosts::Host, target: &str) -> Result<()> {
+    let mut results = Vec::new();
+    match host.auth_kind {
         crate::config::hosts::AuthKind::Pat => {
-            token_store::delete_token(&target)?;
+            results.push(token_store::delete_token(target));
             // The proxy password is a secret of its own, under its own key.
-            // Logging out forgets it too.
-            token_store::delete_proxy_password(&target)?;
+            results.push(token_store::delete_proxy_password(target));
         }
         crate::config::hosts::AuthKind::FjordAccount => {
-            if let Some(fa) = removed.fjord_account.as_ref() {
-                token_store::delete_fjord_bearer(&fa.platform_url)?;
-                token_store::delete_fjord_refresh(&fa.platform_url)?;
+            if let Some(fa) = host.fjord_account.as_ref() {
+                results.push(token_store::delete_fjord_bearer(&fa.platform_url));
+                results.push(token_store::delete_fjord_refresh(&fa.platform_url));
             }
         }
     }
-    println!("✓ Logged out of {target}");
-    Ok(())
+    results.into_iter().collect::<Result<Vec<_>>>().map(|_| ())
 }
 
 fn list() -> Result<()> {
