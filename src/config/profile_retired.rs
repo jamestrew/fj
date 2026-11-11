@@ -6,7 +6,7 @@
 //! login or logout retries it. Nothing selects a retired generation.
 use super::{hosts::Hosts, profile_publish, profiles::Profile};
 use crate::auth;
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 
 /// Replaced credentials that could not be deleted yet. Callers that sanitize
 /// errors let this one through: it names no account and tells the user the retry.
@@ -71,10 +71,12 @@ fn drain_with(host: &str, delete: impl Fn(&str) -> Result<()>) -> Result<()> {
 /// Attempt every secret of the generation, even after one fails: a refresh
 /// credential must not outlive a retry just because its bearer would not delete.
 fn delete_all(host: &str, profile: &Profile, delete: &impl Fn(&str) -> Result<()>) -> bool {
+    // `count` consumes every key; `all` would stop at the first failure.
     secret_keys(host, profile)
         .iter()
-        .map(|k| delete(k).is_ok())
-        .fold(true, |all, ok| all && ok)
+        .filter(|k| delete(k).is_err())
+        .count()
+        == 0
 }
 
 /// A staged generation that never got published and whose delete failed: keep

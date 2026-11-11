@@ -1,6 +1,7 @@
 use super::*;
 use crate::config::hosts::{AuthKind, Host};
 use crate::config::profiles::{self, Profile};
+use anyhow::anyhow;
 use std::cell::RefCell;
 
 fn pat_host() -> Host {
