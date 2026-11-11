@@ -196,4 +196,20 @@ default_instance_id = "legacy-instance"
     .await
     .status
     .success());
+    // Cookies and logout are scoped to one Fjord account; the other keeps working.
+    let (d, host) = (dir.path(), first.uri());
+    let run = |account: &'static str, args: &'static [&'static str]| {
+        let host = host.clone();
+        async move {
+            let mut full = vec!["--host", host.as_str(), "--account", account, "auth"];
+            full.extend(args);
+            call(d, &full).await.status.success()
+        }
+    };
+    assert!(run(a, &["session", "--cookie", "ck-fjord"]).await);
+    let status = call(d, &["auth", "status"]).await;
+    assert!(String::from_utf8_lossy(&status.stdout).contains("web session(s): 1"));
+    assert!(run(b, &["logout"]).await);
+    assert!(!run(b, &["token", "--force"]).await);
+    assert!(run(a, &["token", "--force"]).await);
 }

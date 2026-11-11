@@ -4,6 +4,7 @@ pub mod hosts;
 pub mod metadata;
 pub mod muted;
 mod profile_publish;
+pub mod profile_session;
 pub mod profiles;
 
 use std::path::PathBuf;
