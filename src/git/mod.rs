@@ -1,3 +1,4 @@
+pub mod pinned;
 pub mod remote;
 
 use std::io::Write;

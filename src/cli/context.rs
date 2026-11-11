@@ -76,28 +76,36 @@ pub fn resolve_repo(
     explicit_repo: Option<&str>,
     explicit_host: Option<&str>,
 ) -> Result<RepoContext> {
-    // `-R` wins; otherwise honor a per-repo default pinned by
-    // `fj repo set-default` (stored in local git config), then fall back to
-    // git-remote detection. The stored default behaves exactly like `-R`.
+    // A pinned slug supplies the repo name; only explicit -R overrides clone routing.
+    let configured = Hosts::load()?;
+    let stored = explicit_host
+        .map(|h| crate::config::metadata::existing_key(&configured, h))
+        .transpose()?
+        .flatten();
+    let explicit_host = stored.as_deref().or(explicit_host);
+    let discovery_host = explicit_host.filter(|h| {
+        configured
+            .hosts
+            .get(*h)
+            .is_none_or(|c| c.auth_kind == crate::config::hosts::AuthKind::Pat)
+    });
+    let infer_host = explicit_repo.is_none();
     let explicit_repo = resolved_repo_slug(explicit_repo, git::config_get_local("fj.resolved"));
     let (detected_host, owner, name) = match explicit_repo.as_deref() {
         Some(slug) => {
             let (o, n) = api::split_repo(slug)?;
-            (None, o.to_string(), n.to_string())
+            let pin = infer_host
+                .then(|| git::pinned::pinned_remote(discovery_host, explicit_host.is_some()));
+            let remote = pin.transpose()?.flatten();
+            (remote.map(|r| r.host), o.to_string(), n.to_string())
         }
         None => {
-            let detected = git::discover(explicit_host)
+            let detected = git::discover(discovery_host)
                 .context("repository not specified and could not be inferred from git remote")?;
-            // If the user passed --host, keep that as the API host even though
-            // the remote URL also happens to name a host. They should match in
-            // practice, but the explicit flag wins (handled in
-            // `resolve_client_host`).
             (Some(detected.host), detected.owner, detected.name)
         }
     };
 
-    // If the user didn't pass --host AND we didn't autodetect, fall back to
-    // the configured default host.
     let default_host = || {
         Hosts::load()
             .ok()
@@ -105,14 +113,20 @@ pub fn resolve_repo(
     };
     let client_host = resolve_client_host(explicit_host, detected_host.as_deref(), default_host());
 
+    let client_host = client_host
+        .map(|h| {
+            if explicit_host.is_some() {
+                Ok(h)
+            } else {
+                crate::config::metadata::route_selected(&Hosts::load()?, &h)
+            }
+        })
+        .transpose()?;
     let client = Client::connect(client_host.as_deref())?;
-    let host = client_host.unwrap_or_else(|| client.host().to_string());
-    let web_base = Hosts::load().ok().and_then(|hosts| {
-        hosts
-            .hosts
-            .get(&host)
-            .and_then(|cfg| web_base_url(&host, cfg).ok().flatten())
-    });
+    let host = client.host().to_string();
+    let hosts = Hosts::load()?;
+    let config = crate::config::metadata::resolve(&hosts, &host)?;
+    let web_base = web_base_url(&host, &config)?;
 
     Ok(RepoContext {
         client,

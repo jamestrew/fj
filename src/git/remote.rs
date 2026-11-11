@@ -2,9 +2,12 @@
 //! reading git remotes. Used so `fj pr list` (etc.) work without `-R` inside
 //! a clone.
 
+#[path = "authority.rs"]
+mod authority;
 use anyhow::{anyhow, Context, Result};
+pub use authority::authority;
 
-/// A parsed `owner/name` plus the hostname it lives on.
+/// A parsed `owner/name` plus its normalized host/port authority.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteRepo {
     pub host: String,
@@ -49,7 +52,7 @@ pub fn discover(preferred_host: Option<&str>) -> Result<RemoteRepo> {
     for (_, url) in ordered {
         match parse_remote(url) {
             Ok(r) => {
-                if preferred_host.is_none_or(|h| h.eq_ignore_ascii_case(&r.host)) {
+                if preferred_host.is_none_or(|h| authority(h).as_deref() == Some(r.host.as_str())) {
                     return Ok(r);
                 }
             }
@@ -62,7 +65,7 @@ pub fn discover(preferred_host: Option<&str>) -> Result<RemoteRepo> {
         .context("could not infer the repository from git remotes"))
 }
 
-fn list_remotes() -> Result<Vec<(String, String)>> {
+pub(super) fn list_remotes() -> Result<Vec<(String, String)>> {
     let out = super::command()
         .args(["remote", "-v"])
         .output()
@@ -106,17 +109,17 @@ pub fn parse_remote(url: &str) -> Result<RemoteRepo> {
                 .rsplit_once('@')
                 .map(|(_, h)| h)
                 .unwrap_or(user_host);
-            return split_path(host, path);
+            let host = authority(host).ok_or_else(|| anyhow!("remote has no host"))?;
+            return split_path(&host, path);
         }
         return Err(anyhow!("can't parse remote URL: {url}"));
     }
 
     let parsed = url::Url::parse(url).with_context(|| format!("parsing remote URL '{url}'"))?;
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| anyhow!("remote URL has no host: {url}"))?;
+    let host =
+        authority(parsed.as_str()).ok_or_else(|| anyhow!("remote URL has no host: {url}"))?;
     let path = parsed.path();
-    split_path(host, path)
+    split_path(&host, path)
 }
 
 fn split_path(host: &str, path: &str) -> Result<RemoteRepo> {

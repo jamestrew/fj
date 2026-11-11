@@ -96,7 +96,10 @@ async fn login_pat(args: LoginArgs) -> Result<()> {
         None => prompt_hostname()?,
     };
     let (hostname, web_url) = normalize_pat_host(&host_input)?;
-    if crate::config::profiles::has_profiles(&Hosts::load()?, &hostname) {
+    // Log in under the stored key (a legacy mixed-case one) rather than add a second entry.
+    let existing = Hosts::load()?;
+    let hostname = crate::config::metadata::existing_key(&existing, &hostname)?.unwrap_or(hostname);
+    if crate::config::profiles::has_profiles(&existing, &hostname) {
         return Err(anyhow!("profiled host: use auth login --account"));
     }
     let token = read_token(&args)?;
@@ -1077,7 +1080,9 @@ pub(crate) fn normalize_pat_host(raw: &str) -> Result<(String, Option<String>)> 
         // stored as a host key and later interpolated into the credential
         // helper. (The URL branches below already go through `url::Url`.)
         super::auth_setup_git::validate_hostname(trimmed)?;
-        return Ok((trimmed.to_string(), None));
+        return crate::git::remote::authority(trimmed)
+            .map(|key| (key, None))
+            .ok_or_else(|| anyhow!("invalid host authority"));
     };
 
     let parsed =
@@ -1090,14 +1095,8 @@ pub(crate) fn normalize_pat_host(raw: &str) -> Result<(String, Option<String>)> 
             ))
         }
     }
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| anyhow!("Forgejo host URL '{raw}' has no host"))?;
-    let mut key = host.to_string();
-    if let Some(port) = parsed.port() {
-        key.push(':');
-        key.push_str(&port.to_string());
-    }
+    let mut key = crate::git::remote::authority(parsed.as_str())
+        .ok_or_else(|| anyhow!("Forgejo host URL has no host"))?;
     let path = parsed.path().trim_end_matches('/');
     if !path.is_empty() && path != "/" {
         key.push_str(path);
@@ -1552,3 +1551,7 @@ mod tests {
         assert_eq!(theirs.default_instance_id.as_deref(), Some("inst_theirs"));
     }
 }
+
+#[cfg(test)]
+#[path = "auth_authority_tests.rs"]
+mod authority_tests;

@@ -56,6 +56,11 @@ pub fn proxy_credential_for_host(
 /// Look up the host config and token for the host the user is targeting.
 pub fn resolve(host_flag: Option<&str>) -> Result<ResolvedHost> {
     let hosts = Hosts::load()?;
+    let stored = host_flag
+        .map(|n| crate::config::metadata::existing_key(&hosts, n))
+        .transpose()?
+        .flatten();
+    let host_flag = stored.as_deref().or(host_flag);
     let (name, mut host_cfg) = if let Some(name) = host_flag {
         let host_cfg = hosts.hosts.get(name).cloned().unwrap_or_else(|| Host {
             git_protocol: "https".into(),

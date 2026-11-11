@@ -151,6 +151,7 @@ async fn login(mut args: LoginArgs, account: &str) -> Result<()> {
         .ok_or_else(|| anyhow!("profile login requires --host"))?;
     let (name, url) = auth_login::normalize_pat_host(input)?;
     let hosts = Hosts::load()?;
+    let name = crate::config::metadata::existing_key(&hosts, &name)?.unwrap_or(name);
     let config = hosts.hosts.get(&name).cloned().unwrap_or_else(|| Host {
         web_url: url,
         git_protocol: args.git_protocol.clone(),

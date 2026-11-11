@@ -79,7 +79,7 @@ fields remain for at least one release, with no automatic cleanup.
 Status reports configured counts and a redacted default marker, not a fresh
 authentication result. Legacy logout/refresh/token-export/session/setup-git maintenance
 on profiled hosts is refused so it cannot operate on a different credential.
-Scoped cookies and remaining maintenance are deferred to 2b-ii.
+Scoped cookies and remaining maintenance are deferred to 2b-iii.
 
 Remove an existing fj Git helper with `git config --global --unset-all
 credential.https://HOST.helper` (replace HOST), then configure a standard Git
@@ -90,6 +90,11 @@ credential manager for Git authentication.
 Use `fj auth login --fjord --platform-url URL --account EMAIL` with loopback, `--manual`, or `--device`.
 Select instances with `fj --host URL --account EMAIL instances use ID`; default switching and migration follow the rules above.
 
-Named Fjord profiles currently support API and instance commands only. Browser
-shortcuts, status/work metadata, mute/inbox identity, cookies and remaining
-maintenance will gain profile scope in 2b-ii.
+Named Fjord profiles support API, instance, status/web and mute
+commands. Mute lists are independent per host, account and instance; rotating
+credentials preserves the list. Retained legacy mute entries remain in their
+legacy scope and are not implicitly applied to named profiles.
+Profile-scoped cookies and remaining maintenance follow in 2b-iii.
+
+Work context/resume/continue remain legacy-host-based and are not yet profile-aware.
+Work-session account/instance identity will be handled separately in 2b-iv.
