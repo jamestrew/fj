@@ -175,9 +175,12 @@ pub async fn login(
         if set.default_account.is_none() && migrating {
             set.default_account = Some(account.into());
         }
-        set.profiles.insert(account.into(), profile);
+        if let Some(old) = set.profiles.insert(account.into(), profile) {
+            set.retired.push(old);
+        }
         Ok(())
     })?;
+    super::profile_retired::drain(platform)?;
     println!("Saved verified Fjord profile [redacted]; legacy credentials retained");
     Ok(())
 }

@@ -10,6 +10,12 @@ All notable changes will be recorded here. The format follows
 
 ### Fixed
 
+- Replacing a profile (PAT login, `auth refresh --token`, Fjord login) now deletes
+  the previous generation's stored credential. If the delete fails, the replaced
+  generation is kept in a new optional `retired` list per account in `hosts.toml`
+  (older files load unchanged), the command reports it, and the next login,
+  refresh or logout on that host retries until it is gone. A staged credential
+  whose own cleanup fails is listed the same way.
 - Saving a PAT profile (login or `auth refresh --token`) now takes the same
   per-account lock as web-session import, clear and logout, so a replacement and
   a stale logout can no longer interleave. `auth refresh --token` publishes only
