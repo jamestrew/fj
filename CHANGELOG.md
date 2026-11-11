@@ -52,6 +52,8 @@ All notable changes will be recorded here. The format follows
 - **rustls-webpki 0.103.16, webpki-roots 1.0.11 and tokio 1.54.1.** Picks up
   the fixes for RUSTSEC-2026-0381, RUSTSEC-2026-0382 and RUSTSEC-2026-0386
   (#299).
+- **rustix 1.1.6.** Picks up the fix for RUSTSEC-2026-0486, unsound handling
+  of extended-attribute buffers.
 - **One account per command.** Account overrides and profile routing cannot
   fall back to another stored identity, and a pinned repository with an
   unparseable remote fails instead of using another host (#307, #310).
