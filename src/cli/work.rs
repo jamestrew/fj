@@ -350,14 +350,12 @@ async fn gather(repo_flag: Option<&str>, host_flag: Option<&str>) -> Result<Work
         Some((a, b)) => (Some(a), Some(b)),
         None => (None, None),
     };
-    let host_cfg = hosts
+    let target = resolve_target(host_flag, remote.as_ref()).ok();
+    let host_cfg = target
         .as_ref()
-        .zip(id.host.as_deref())
-        .and_then(|(h, name)| {
-            let key = metadata::existing_key(h, name).ok().flatten()?;
-            metadata::resolve(h, &key).ok()
-        });
-    let account = account_info(host_cfg.as_ref());
+        .filter(|t| t.configured)
+        .and_then(|t| t.config.as_ref());
+    let account = account_info(host_cfg);
     let stack = stack_state::load()
         .ok()
         .flatten()
@@ -369,7 +367,9 @@ async fn gather(repo_flag: Option<&str>, host_flag: Option<&str>) -> Result<Work
     let mut checks = None;
     let mut api_reachable = false;
     if let (Some(owner), Some(name)) = (id.owner.as_deref(), id.name.as_deref()) {
-        if let Ok(client) = Client::connect(host_flag) {
+        if let Ok(client) =
+            Client::connect(target.as_ref().and_then(|t| t.key.as_deref()).or(host_flag))
+        {
             if let Ok(repo) = api::repo::get(&client, owner, name).await {
                 api_reachable = true;
                 default_branch = Some(repo.default_branch);
@@ -444,28 +444,53 @@ fn to_session(
     }
 }
 
+/// The one destination a work command uses: for the account snapshot it
+/// renders, the API client it connects, and the identity it saves or checks.
+struct Target {
+    key: Option<String>,
+    config: Option<Host>,
+    configured: bool,
+}
+
+/// Resolve the destination once. `--host` wins, then the clone's host routed
+/// through the selected account, then the configured default (`current`, or
+/// the sole host), as the other repo commands do.
+fn resolve_target(host_flag: Option<&str>, remote: Option<&RemoteRepo>) -> Result<Target> {
+    let hosts = Hosts::load()?;
+    let key = match (host_flag, remote) {
+        (Some(h), _) => Some(metadata::existing_key(&hosts, h)?.unwrap_or_else(|| h.to_string())),
+        (None, Some(r)) => Some(metadata::route_selected(&hosts, &r.host)?),
+        (None, None) => hosts.resolve_host(None).ok().map(str::to_string),
+    };
+    let config = key
+        .as_deref()
+        .map(|k| metadata::resolve(&hosts, k))
+        .transpose()?;
+    let configured = key.as_deref().is_some_and(|k| hosts.hosts.contains_key(k));
+    Ok(Target {
+        key,
+        config,
+        configured,
+    })
+}
+
 /// Digest of the host, account and Fjord instance a command runs under, or
 /// `None` for the legacy default (no account selected). Reads `hosts.toml`
-/// only. `--host` overrides the remote, as in [`gather`].
+/// only. An explicitly selected account that resolves to no host is refused,
+/// never saved as the legacy identity.
 fn current_identity(host_flag: Option<&str>) -> Result<Option<String>> {
-    let hosts = Hosts::load()?;
-    let key = match host_flag {
-        Some(h) => Some(h.to_string()),
-        None => git::remote::discover(None)
-            .ok()
-            .map(|r| r.host)
-            .or_else(|| hosts.current.clone()),
+    let remote = git::remote::discover(host_flag).ok();
+    let target = resolve_target(host_flag, remote.as_ref())?;
+    let (Some(key), Some(config)) = (target.key.as_deref(), target.config.as_ref()) else {
+        if crate::client::account::selected().is_some() {
+            bail!("the selected account has no host to run against. Pass --host.");
+        }
+        return Ok(None);
     };
-    let Some(key) = key else { return Ok(None) };
-    let key = match host_flag {
-        Some(_) => metadata::existing_key(&hosts, &key)?.unwrap_or(key),
-        None => metadata::route_selected(&hosts, &key)?,
-    };
-    let config = metadata::resolve(&hosts, &key)?;
     config
         .selected_account
         .is_some()
-        .then(|| metadata::mute_scope(&key, Some(&config), String::new()))
+        .then(|| metadata::mute_scope(key, Some(config), String::new()))
         .transpose()
 }
 

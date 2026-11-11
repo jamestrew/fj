@@ -99,3 +99,68 @@ async fn legacy_sessions_stay_valid_for_the_legacy_identity_only() {
     assert!(!other.status.success());
     assert!(stderr(&other).contains("different account or instance"));
 }
+
+fn git(d: &std::path::Path, args: &[&str]) {
+    assert!(std::process::Command::new("git")
+        .args(args)
+        .current_dir(d)
+        .status()
+        .unwrap()
+        .success());
+}
+
+#[tokio::test]
+async fn the_clone_host_not_the_default_host_binds_the_session() {
+    let first = MockServer::start().await;
+    let second = MockServer::start().await;
+    let dir = support::config(&first, &second);
+    let d = dir.path();
+    git(d, &["init", "-q"]);
+    server(&first, "tok-a", "qa-a").await;
+    server(&first, "tok-b", "qa-b").await;
+    login(d, "first.example", "qa-a", "tok-a").await;
+    login(d, "first.example", "qa-b", "tok-b").await;
+    // The clone lives on second.example; the configured default is first.example.
+    git(
+        d,
+        &["remote", "add", "origin", "https://second.example/o/r.git"],
+    );
+    let saved = call(d, &["work", "context"]).await;
+    assert!(saved.status.success(), "{}", stderr(&saved));
+    assert!(session(d).contains("\"identity\": null"));
+    // An account selected for first.example never reads the clone's legacy session.
+    let other = call(d, &["--account", "qa-a", "work", "resume"]).await;
+    assert!(!other.status.success());
+    // The same clone host, resolved the same way, resumes.
+    assert!(call(d, &["work", "resume"]).await.status.success());
+}
+
+#[tokio::test]
+async fn a_sole_host_without_current_still_binds_the_selected_account() {
+    let first = MockServer::start().await;
+    let second = MockServer::start().await;
+    let dir = support::config(&first, &second);
+    let d = dir.path();
+    git(d, &["init", "-q"]);
+    server(&first, "tok-a", "qa-a").await;
+    server(&first, "tok-b", "qa-b").await;
+    login(d, "first.example", "qa-a", "tok-a").await;
+    login(d, "first.example", "qa-b", "tok-b").await;
+    let hosts = std::fs::read_to_string(d.join("fj/hosts.toml")).unwrap();
+    let mut doc: toml::Value = toml::from_str(&hosts).unwrap();
+    let table = doc.as_table_mut().unwrap();
+    table.remove("current");
+    table["hosts"]
+        .as_table_mut()
+        .unwrap()
+        .remove("second.example");
+    std::fs::write(d.join("fj/hosts.toml"), toml::to_string(&doc).unwrap()).unwrap();
+    let saved = call(d, &["--account", "qa-a", "work", "context"]).await;
+    assert!(saved.status.success(), "{}", stderr(&saved));
+    assert!(!session(d).contains("\"identity\": null"));
+    for sub in ["resume", "continue"] {
+        let out = call(d, &["--account", "qa-b", "work", sub]).await;
+        assert!(!out.status.success(), "{sub}");
+        assert!(stderr(&out).contains("different account or instance"));
+    }
+}
