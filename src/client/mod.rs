@@ -6,6 +6,7 @@ pub mod error;
 mod integration_tests;
 pub mod pagination;
 pub mod proxy;
+mod release_asset;
 mod resolve;
 
 use resolve::build_base_url;
