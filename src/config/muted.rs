@@ -118,10 +118,9 @@ pub fn scope_key(name: &str, host: Option<&Host>) -> Result<String> {
 /// default. Reads only `hosts.toml` (no token, no network).
 pub fn account_scope(host_flag: Option<&str>) -> Result<String> {
     let hosts = Hosts::load()?;
-    let name = match host_flag {
-        Some(name) => name,
-        None => hosts.resolve_host(None)?,
-    };
+    let name = host_flag.map_or_else(|| hosts.resolve_host(None), Ok)?;
+    let stored = super::metadata::existing_key(&hosts, name)?;
+    let name = stored.as_deref().unwrap_or(name);
     let config = super::metadata::resolve(&hosts, name)?;
     scope_key(name, Some(&config))
 }

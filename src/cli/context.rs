@@ -78,6 +78,11 @@ pub fn resolve_repo(
 ) -> Result<RepoContext> {
     // A pinned slug supplies the repo name; only explicit -R overrides clone routing.
     let configured = Hosts::load()?;
+    let stored = explicit_host
+        .map(|h| crate::config::metadata::existing_key(&configured, h))
+        .transpose()?
+        .flatten();
+    let explicit_host = stored.as_deref().or(explicit_host);
     let discovery_host = explicit_host.filter(|h| {
         configured
             .hosts
@@ -97,16 +102,10 @@ pub fn resolve_repo(
         None => {
             let detected = git::discover(discovery_host)
                 .context("repository not specified and could not be inferred from git remote")?;
-            // If the user passed --host, keep that as the API host even though
-            // the remote URL also happens to name a host. They should match in
-            // practice, but the explicit flag wins (handled in
-            // `resolve_client_host`).
             (Some(detected.host), detected.owner, detected.name)
         }
     };
 
-    // If the user didn't pass --host AND we didn't autodetect, fall back to
-    // the configured default host.
     let default_host = || {
         Hosts::load()
             .ok()
@@ -124,7 +123,7 @@ pub fn resolve_repo(
         })
         .transpose()?;
     let client = Client::connect(client_host.as_deref())?;
-    let host = client_host.unwrap_or_else(|| client.host().to_string());
+    let host = client.host().to_string();
     let hosts = Hosts::load()?;
     let config = crate::config::metadata::resolve(&hosts, &host)?;
     let web_base = web_base_url(&host, &config)?;

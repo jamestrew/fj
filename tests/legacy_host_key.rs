@@ -51,6 +51,117 @@ async fn legacy_mixed_case_host_key_resolves_and_login_updates_it() {
         "lookup: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let log = dir.path().join("browser.log");
+        for program in ["open", "xdg-open"] {
+            let file = bin.join(program);
+            std::fs::write(
+                &file,
+                "#!/bin/sh\nprintf '%s\\n' \"$1\" > \"$FJ_BROWSER_LOG\"\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut paths = vec![bin];
+        paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+        let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_fj"))
+            .env("FJ_CONFIG_DIR", dir.path().join("fj"))
+            .env("FJ_NO_KEYCHAIN", "1")
+            .env("PATH", std::env::join_paths(paths).unwrap())
+            .env("FJ_BROWSER_LOG", &log)
+            .current_dir(dir.path())
+            .args(["--host", &bare, "issue", "list", "-R", "o/r", "--web"])
+            .output()
+            .await
+            .unwrap();
+        success(&out);
+        assert_eq!(
+            std::fs::read_to_string(log).unwrap().trim(),
+            format!("{url}/o/r/issues")
+        );
+    }
+    // Discovery must treat the legacy key as a gateway, not a PAT remote filter.
+    let original = std::fs::read_to_string(&hosts).unwrap();
+    std::fs::write(&hosts, format!(
+        "current = '{legacy}'\n[hosts.'{legacy}']\nauth_kind = 'fjord_account'\n[hosts.'{legacy}'.fjord_account]\nplatform_url = '{url}'\ndefault_instance_id = 'instance'\ndefault_instance_public_url = 'https://instance.example'\n"
+    )).unwrap();
+    for args in [
+        vec!["init", "-q"],
+        vec![
+            "remote",
+            "add",
+            "origin",
+            "https://instance.example/o/r.git",
+        ],
+    ] {
+        assert!(std::process::Command::new("git")
+            .current_dir(dir.path())
+            .args(args)
+            .status()
+            .unwrap()
+            .success());
+    }
+    Mock::given(method("GET"))
+        .and(path(
+            "/api/v1/forge-gateway/instance/api/v1/repos/o/r/issues",
+        ))
+        .and(header("authorization", "Bearer old-pat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let out = run(vec!["--host", &bare, "issue", "list", "--json"])
+        .await
+        .unwrap();
+    success(&out);
+    std::fs::write(&hosts, original).unwrap();
+    Mock::given(method("GET"))
+        .and(path("/api/v1/notifications"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                "id":1,"unread":true,"pinned":false,"updated_at":"2026-11-10T00:00:00Z","url":"",
+                "subject":{"title":"hidden","type":"Issue","state":"open"},
+                "repository":{"full_name":"o/r"}
+            }])),
+        )
+        .mount(&server)
+        .await;
+    let out = run(vec!["--host", &bare, "status", "mute", "o/r"])
+        .await
+        .unwrap();
+    success(&out);
+    for host in [&bare, &legacy] {
+        let out = run(vec!["--host", host, "status", "muted", "--json"])
+            .await
+            .unwrap();
+        success(&out);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap(),
+            serde_json::json!(["o/r"])
+        );
+        let out = run(vec!["--host", host, "status", "--json"]).await.unwrap();
+        success(&out);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap(),
+            serde_json::json!([])
+        );
+    }
+    let out = run(vec!["--host", &legacy, "status", "unmute", "o/r"])
+        .await
+        .unwrap();
+    success(&out);
+    let out = run(vec!["--host", &bare, "status", "muted", "--json"])
+        .await
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap(),
+        serde_json::json!([])
+    );
     let out = run(vec!["auth", "login", "--host", &url, "--token", "new-pat"])
         .await
         .unwrap();
@@ -66,6 +177,14 @@ async fn legacy_mixed_case_host_key_resolves_and_login_updates_it() {
     assert!(
         out.status.success(),
         "after login: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn success(out: &std::process::Output) {
+    assert!(
+        out.status.success(),
+        "{}",
         String::from_utf8_lossy(&out.stderr)
     );
 }
