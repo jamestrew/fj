@@ -13,7 +13,9 @@ All notable changes will be recorded here. The format follows
   generation is kept in a new optional `retired` list per account in `hosts.toml`
   (older files load unchanged), the command reports it, and the next login,
   refresh or logout on that host retries until it is gone. A staged credential
-  whose own cleanup fails is listed the same way.
+  whose own cleanup fails is listed the same way when its host is already
+  configured. Deleting from a keychain that cannot be reached (Linux, or
+  `FJ_NO_KEYCHAIN=1`) is not confirmed, as for logout.
 
 ## [0.8.1] - 2026-11-11
 

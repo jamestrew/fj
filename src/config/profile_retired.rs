@@ -8,6 +8,21 @@ use super::{hosts::Hosts, profile_publish, profiles::Profile};
 use crate::auth;
 use anyhow::{anyhow, Result};
 
+/// Replaced credentials that could not be deleted yet. Callers that sanitize
+/// errors let this one through: it names no account and tells the user the retry.
+#[derive(Debug)]
+pub struct CleanupPending(usize);
+impl std::fmt::Display for CleanupPending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} previous credential(s) could not be removed yet; running this command again retries",
+            self.0
+        )
+    }
+}
+impl std::error::Error for CleanupPending {}
+
 /// Every secret key a generation of `profile` can hold.
 pub(super) fn secret_keys(host: &str, profile: &Profile) -> Vec<String> {
     if profile.fjord.is_some() {
@@ -49,9 +64,7 @@ fn drain_with(host: &str, delete: impl Fn(&str) -> Result<()>) -> Result<()> {
     }
     match failed {
         0 => Ok(()),
-        n => Err(anyhow!(
-            "{n} previous credential(s) could not be removed yet; running this command again retries"
-        )),
+        n => Err(anyhow::Error::new(CleanupPending(n))),
     }
 }
 
