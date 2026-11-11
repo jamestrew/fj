@@ -135,7 +135,8 @@ async fn pat_profiles_preserve_legacy_default_migrate_switch_and_isolate_hosts()
         tokens["tokens"]["second.example"].as_str(),
         Some("second-stored")
     );
-    assert!(tokens["tokens"]
+    // The login that rotated the PAT replaced that generation, so its secret is gone.
+    assert!(!tokens["tokens"]
         .as_table()
         .unwrap()
         .values()
