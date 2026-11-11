@@ -184,4 +184,29 @@ async fn an_explicit_repo_uses_the_default_host_not_the_clone_host() {
     assert!(!session(d).contains("\"identity\": null"));
     let same = call(d, &["--account", "qa-a", "work", "resume", "-R", "o/r"]).await;
     assert!(same.status.success(), "{}", stderr(&same));
+    // `continue` has no -R and follows how the session was saved.
+    for extra in [vec!["--dry-run"], vec![]] {
+        let mut args = vec!["--account", "qa-a", "work", "continue"];
+        args.extend(extra);
+        let out = call(d, &args).await;
+        assert!(out.status.success(), "{}", stderr(&out));
+    }
+    let json = call(
+        d,
+        &[
+            "--account",
+            "qa-a",
+            "work",
+            "context",
+            "-R",
+            "o/r",
+            "--json",
+        ],
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(
+        v["host"], "first.example",
+        "the data host, not the clone host"
+    );
 }

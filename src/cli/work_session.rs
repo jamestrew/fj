@@ -36,6 +36,10 @@ pub struct Session {
     /// saved under. `None` is the legacy default identity. Never a login name.
     #[serde(default)]
     pub identity: Option<String>,
+    /// The session was saved with `-R`, so its destination ignored the clone's
+    /// host; `work continue`, which has no `-R`, must resolve it the same way.
+    #[serde(default)]
+    pub explicit_repo: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -155,6 +159,7 @@ mod tests {
             next_steps: vec!["a".into(), "b".into()],
             cursor: 1,
             identity: None,
+            explicit_repo: false,
         };
         let json = serde_json::to_string(&s).unwrap();
         let back: Session = serde_json::from_str(&json).unwrap();
@@ -174,6 +179,7 @@ mod tests {
             next_steps: vec![],
             cursor: 0,
             identity: identity.map(str::to_string),
+            explicit_repo: false,
         }
     }
 
