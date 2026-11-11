@@ -97,6 +97,46 @@ pub fn status(hosts: &Hosts, host: &str) -> String {
     )
 }
 pub fn store(host: &str, user: &str, value: &str, candidate: Host) -> Result<()> {
+    store_checked(host, user, value, candidate, None)
+}
+/// Like [`store`], but publishes only if the account's profile is still the
+/// generation the caller verified; a logout or replacement in between wins and
+/// this fails with nothing written.
+pub fn store_fenced(
+    host: &str,
+    user: &str,
+    value: &str,
+    candidate: Host,
+    seen: &Profile,
+) -> Result<()> {
+    store_checked(host, user, value, candidate, Some(seen))
+}
+fn unchanged(hosts: &Hosts, host: &str, user: &str, seen: &Profile) -> Result<()> {
+    selection(hosts, host, Some(user))?
+        .filter(|p| p.generation == seen.generation)
+        .map(|_| ())
+        .ok_or_else(|| anyhow!("profile changed; retry"))
+}
+fn store_checked(
+    host: &str,
+    user: &str,
+    value: &str,
+    candidate: Host,
+    seen: Option<&Profile>,
+) -> Result<()> {
+    // The lock profile_session import, clear and logout already take, so a
+    // replacement and a stale destructive operation cannot interleave.
+    let _guard = super::fjord_scope::lock(
+        host,
+        &Profile {
+            fjord: None,
+            user: user.to_ascii_lowercase(),
+            generation: String::new(),
+        },
+    )?;
+    if let Some(seen) = seen {
+        unchanged(&Hosts::load()?, host, user, seen)?;
+    }
     let mut nonce = [0u8; 16];
     getrandom::getrandom(&mut nonce).map_err(|_| anyhow!("could not stage profile credentials"))?;
     let profile = Profile {
@@ -105,7 +145,7 @@ pub fn store(host: &str, user: &str, value: &str, candidate: Host) -> Result<()>
         generation: nonce.iter().map(|b| format!("{b:02x}")).collect(),
     };
     let key = key(host, &profile);
-    stage(
+    let staged = stage(
         &key,
         value,
         |k, v| {
@@ -114,8 +154,16 @@ pub fn store(host: &str, user: &str, value: &str, candidate: Host) -> Result<()>
                 .map_err(|_| anyhow!("profile credential write failed"))
         },
         |k| crate::auth::load_token(k).map_err(|_| anyhow!("profile credential read failed")),
-    )?;
-    super::profile_publish::edit(|hosts| {
+    );
+    // A write that landed but failed its read-back is unpublished too.
+    if let Err(error) = staged {
+        let _ = crate::auth::delete_token(&key);
+        return Err(error);
+    }
+    let published = super::profile_publish::edit(|hosts| {
+        if let Some(seen) = seen {
+            unchanged(hosts, host, user, seen)?;
+        }
         if let Some(current) = hosts.hosts.get(host) {
             if current.auth_kind != AuthKind::Pat
                 || current.web_url != candidate.web_url
@@ -134,8 +182,12 @@ pub fn store(host: &str, user: &str, value: &str, candidate: Host) -> Result<()>
         if set.default_account.is_none() && legacy.is_some_and(|u| u.eq_ignore_ascii_case(user)) {
             set.default_account = Some(profile.user.clone());
         }
-        set.profiles.insert(profile.user.clone(), profile);
+        set.profiles.insert(profile.user.clone(), profile.clone());
         Ok(())
+    });
+    // A refused or failed publication must not leave the staged secret behind.
+    published.inspect_err(|_| {
+        let _ = crate::auth::delete_token(&key);
     })
 }
 fn stage(

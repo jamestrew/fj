@@ -108,3 +108,114 @@ fn profile_legacy_config_roundtrip_remains_without_profile_tables() {
     assert!(!text.contains("accounts"));
     assert!(text.contains("operator"));
 }
+
+fn pat_host() -> Host {
+    Host {
+        user: Some("operator".into()),
+        auth_kind: AuthKind::Pat,
+        ..Default::default()
+    }
+}
+
+/// Runs `body` in a child process with its own config dir and no keychain, so
+/// the tests below can use real files without racing the others on process env.
+fn isolated(name: &str, body: impl FnOnce()) {
+    if std::env::var_os("FJ_PROFILE_CHILD").is_none() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env("FJ_PROFILE_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("FJ_CONFIG_DIR", dir.path());
+    std::env::set_var("FJ_NO_KEYCHAIN", "1");
+    body();
+}
+
+#[test]
+fn a_stale_logout_after_a_replacement_leaves_the_new_secret() {
+    isolated(
+        "config::profiles::tests::a_stale_logout_after_a_replacement_leaves_the_new_secret",
+        || {
+            store("h", "Operator", "pat-1", pat_host()).unwrap();
+            let old = selection(&Hosts::load().unwrap(), "h", Some("operator"))
+                .unwrap()
+                .unwrap();
+            store("h", "operator", "pat-2", pat_host()).unwrap();
+            let new = selection(&Hosts::load().unwrap(), "h", Some("operator"))
+                .unwrap()
+                .unwrap();
+            assert_ne!(old.generation, new.generation);
+            let stale = super::super::profile_session::logout("h", &old);
+            assert!(stale.is_err(), "a stale logout must not run");
+            assert_eq!(token("h", &new).unwrap(), "pat-2");
+        },
+    );
+}
+
+#[test]
+fn a_fenced_store_refuses_a_changed_profile_and_stages_nothing() {
+    isolated(
+        "config::profiles::tests::a_fenced_store_refuses_a_changed_profile_and_stages_nothing",
+        || {
+            store("h", "operator", "pat-1", pat_host()).unwrap();
+            let seen = selection(&Hosts::load().unwrap(), "h", Some("operator"))
+                .unwrap()
+                .unwrap();
+            let tokens = || {
+                std::fs::read_to_string(crate::config::config_dir().unwrap().join("tokens.toml"))
+                    .unwrap()
+            };
+            // Unchanged: the fenced store publishes.
+            store_fenced("h", "operator", "pat-2", pat_host(), &seen).unwrap();
+            let current = selection(&Hosts::load().unwrap(), "h", Some("operator"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(token("h", &current).unwrap(), "pat-2");
+            // `seen` is now stale: a replacement happened in between.
+            let before = tokens();
+            let refused = store_fenced("h", "operator", "pat-3", pat_host(), &seen);
+            assert!(refused.is_err());
+            assert_eq!(tokens(), before, "the refused store staged a secret");
+            assert_eq!(token("h", &current).unwrap(), "pat-2");
+        },
+    );
+}
+
+#[test]
+fn a_replacement_waits_for_the_account_lock() {
+    isolated(
+        "config::profiles::tests::a_replacement_waits_for_the_account_lock",
+        || {
+            let held = super::super::fjord_scope::lock(
+                "h",
+                &Profile {
+                    fjord: None,
+                    user: "operator".into(),
+                    generation: String::new(),
+                },
+            )
+            .unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                store("h", "operator", "pat-1", pat_host()).unwrap();
+                tx.send(()).unwrap();
+            });
+            assert!(
+                rx.recv_timeout(std::time::Duration::from_millis(300))
+                    .is_err(),
+                "store ran while another holder had the account lock"
+            );
+            drop(held);
+            rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+            worker.join().unwrap();
+        },
+    );
+}

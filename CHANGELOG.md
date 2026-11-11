@@ -10,6 +10,12 @@ All notable changes will be recorded here. The format follows
 
 ### Fixed
 
+- Saving a PAT profile (login or `auth refresh --token`) now takes the same
+  per-account lock as web-session import, clear and logout, so a replacement and
+  a stale logout can no longer interleave. `auth refresh --token` publishes only
+  if the profile is still the one it verified; a logout or replacement in between
+  wins and the refresh fails with "profile changed; retry". A save that fails or
+  is refused removes the credential it staged.
 - Logging out and clearing a web session no longer report success when the OS
   keychain refuses access (locked or denied) and may still hold the secret: the
   file entry is removed, the command fails, and running it again finishes the

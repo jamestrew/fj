@@ -123,7 +123,7 @@ pub(super) async fn run(
             crate::cli::auth_probe::record_server(updated.hosts.get_mut(&host).unwrap(), &server);
             updated.save()?;
             if pasted.is_some() {
-                profiles::store(&host, &profile.user, &token, config)?;
+                profiles::store_fenced(&host, &profile.user, &token, config, &profile)?;
             }
             println!("Verified the PAT profile [redacted]");
         }
