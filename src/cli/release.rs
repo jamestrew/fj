@@ -487,8 +487,18 @@ async fn download(args: DownloadArgs, host: Option<&str>) -> Result<()> {
             skipped += 1;
             continue;
         }
+        let gateway = ctx.client.gateway_release_asset(
+            (&ctx.owner, &ctx.name),
+            &release.html_url,
+            &a.browser_download_url,
+            &release.tag_name,
+            &a.name,
+        )?;
         let bytes = crate::download::verified_body(
             || async {
+                if let Some(url) = &gateway {
+                    return ctx.client.get_release_asset(url).await;
+                }
                 Ok(ctx
                     .client
                     .http()
