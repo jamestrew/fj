@@ -26,6 +26,7 @@ use crate::cli::stack_state::{self, Stack};
 use crate::cli::work_session::{self, PrRef, Session};
 use crate::client::Client;
 use crate::config::hosts::{AuthKind, Host, Hosts};
+use crate::config::metadata;
 use crate::git::remote::RemoteRepo;
 use crate::{git, output};
 
@@ -341,7 +342,7 @@ async fn gather(repo_flag: Option<&str>, host_flag: Option<&str>) -> Result<Work
     let remote = git::remote::discover(host_flag).ok();
     let hosts = Hosts::load().ok();
     let default_host = hosts.as_ref().and_then(|h| h.current.as_deref());
-    let id = resolve_identity(repo_flag, host_flag, remote.as_ref(), default_host);
+    let mut id = resolve_identity(repo_flag, host_flag, remote.as_ref(), default_host);
 
     let branch = git::current_branch();
     let (dirty, changed_files) = git::working_tree_status().unwrap_or((false, 0));
@@ -349,10 +350,16 @@ async fn gather(repo_flag: Option<&str>, host_flag: Option<&str>) -> Result<Work
         Some((a, b)) => (Some(a), Some(b)),
         None => (None, None),
     };
-    let host_cfg = hosts
-        .as_ref()
-        .zip(id.host.as_deref())
-        .and_then(|(h, name)| h.hosts.get(name));
+    // A routing refusal is an error, never a reason to query another host.
+    let target = resolve_target(
+        host_flag,
+        clone_remote(repo_flag.is_some(), remote.as_ref()),
+    )?;
+    // Show and save the host the data is gathered from.
+    id.host = target.key.clone().or(id.host);
+    let host_cfg = Some(&target)
+        .filter(|t| t.configured)
+        .and_then(|t| t.config.as_ref());
     let account = account_info(host_cfg);
     let stack = stack_state::load()
         .ok()
@@ -365,7 +372,7 @@ async fn gather(repo_flag: Option<&str>, host_flag: Option<&str>) -> Result<Work
     let mut checks = None;
     let mut api_reachable = false;
     if let (Some(owner), Some(name)) = (id.owner.as_deref(), id.name.as_deref()) {
-        if let Ok(client) = Client::connect(host_flag) {
+        if let Ok(client) = Client::connect(target.key.as_deref().or(host_flag)) {
             if let Ok(repo) = api::repo::get(&client, owner, name).await {
                 api_reachable = true;
                 default_branch = Some(repo.default_branch);
@@ -407,7 +414,12 @@ async fn gather(repo_flag: Option<&str>, host_flag: Option<&str>) -> Result<Work
 
 /// Build the persisted session snapshot from a live context. `now` is the
 /// RFC3339 save timestamp; `remote` the primary remote URL, if any.
-fn to_session(wc: &WorkContext, remote: Option<String>, now: String) -> Session {
+fn to_session(
+    wc: &WorkContext,
+    remote: Option<String>,
+    now: String,
+    identity: Option<String>,
+) -> Session {
     let next_steps = work_session::derive_next_steps(
         wc.branch.as_deref(),
         wc.dirty,
@@ -431,7 +443,65 @@ fn to_session(wc: &WorkContext, remote: Option<String>, now: String) -> Session 
         }),
         next_steps,
         cursor: 0,
+        identity,
+        explicit_repo: false,
     }
+}
+
+/// The one destination a work command uses: for the account snapshot it
+/// renders, the API client it connects, and the identity it saves or checks.
+struct Target {
+    key: Option<String>,
+    config: Option<Host>,
+    configured: bool,
+}
+
+/// `-R` names the repository, so, as in the other repo commands, the clone's
+/// host does not pick the destination then.
+fn clone_remote(explicit_repo: bool, remote: Option<&RemoteRepo>) -> Option<&RemoteRepo> {
+    remote.filter(|_| !explicit_repo)
+}
+
+/// Resolve the destination once. `--host` wins, then the clone's host routed
+/// through the selected account, then the configured default (`current`, or
+/// the sole host), as the other repo commands do.
+fn resolve_target(host_flag: Option<&str>, remote: Option<&RemoteRepo>) -> Result<Target> {
+    let hosts = Hosts::load()?;
+    let key = match (host_flag, remote) {
+        (Some(h), _) => Some(metadata::existing_key(&hosts, h)?.unwrap_or_else(|| h.to_string())),
+        (None, Some(r)) => Some(metadata::route_selected(&hosts, &r.host)?),
+        (None, None) => hosts.resolve_host(None).ok().map(str::to_string),
+    };
+    let config = key
+        .as_deref()
+        .map(|k| metadata::resolve(&hosts, k))
+        .transpose()?;
+    let configured = key.as_deref().is_some_and(|k| hosts.hosts.contains_key(k));
+    Ok(Target {
+        key,
+        config,
+        configured,
+    })
+}
+
+/// Digest of the host, account and Fjord instance a command runs under, or
+/// `None` for the legacy default (no account selected). Reads `hosts.toml`
+/// only. An explicitly selected account that resolves to no host is refused,
+/// never saved as the legacy identity.
+fn current_identity(explicit_repo: bool, host_flag: Option<&str>) -> Result<Option<String>> {
+    let remote = git::remote::discover(host_flag).ok();
+    let target = resolve_target(host_flag, clone_remote(explicit_repo, remote.as_ref()))?;
+    let (Some(key), Some(config)) = (target.key.as_deref(), target.config.as_ref()) else {
+        if crate::client::account::selected().is_some() {
+            bail!("the selected account has no host to run against. Pass --host.");
+        }
+        return Ok(None);
+    };
+    config
+        .selected_account
+        .is_some()
+        .then(|| metadata::mute_scope(key, Some(config), String::new()))
+        .transpose()
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -440,8 +510,14 @@ async fn context(args: ContextArgs, host: Option<&str>) -> Result<()> {
 
     // Persist the session as a convenience for `work resume` / `continue`.
     // A failure to write the cache must never sink the inspect command.
-    let session = to_session(&wc, git::remote_url(), Utc::now().to_rfc3339());
-    let _ = work_session::save(&session);
+    match current_identity(args.r.repo.is_some(), host) {
+        Ok(identity) => {
+            let mut session = to_session(&wc, git::remote_url(), Utc::now().to_rfc3339(), identity);
+            session.explicit_repo = args.r.repo.is_some();
+            let _ = work_session::save(&session);
+        }
+        Err(e) => eprintln!("warning: work session not saved: {e}"),
+    }
 
     if args.json {
         return output::print_json(&serde_json::to_value(&wc)?);
@@ -538,6 +614,10 @@ async fn resume(args: ResumeArgs, host: Option<&str>) -> Result<()> {
     let Some(session) = work_session::load()? else {
         bail!("no saved work session for this repo. Run `fj work context` first.");
     };
+    work_session::check_identity(
+        &session,
+        current_identity(args.r.repo.is_some(), host)?.as_deref(),
+    )?;
 
     if args.dry_run {
         println!("would: resume the session saved at {}", session.saved_at);
@@ -604,10 +684,14 @@ fn advance(session: &mut Session) -> ContinueOutcome {
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
-async fn continue_(args: ContinueArgs, _host: Option<&str>) -> Result<()> {
+async fn continue_(args: ContinueArgs, host: Option<&str>) -> Result<()> {
     let Some(mut session) = work_session::load()? else {
         bail!("no saved work session for this repo. Run `fj work context` first.");
     };
+    work_session::check_identity(
+        &session,
+        current_identity(session.explicit_repo, host)?.as_deref(),
+    )?;
 
     if args.dry_run {
         match session.next_steps.get(session.cursor) {
@@ -929,6 +1013,7 @@ mod tests {
             &sample_context(),
             Some("git@git.example.com:o/n.git".into()),
             "2026-06-01T08:00:00+00:00".into(),
+            None,
         )
     }
 
