@@ -112,6 +112,16 @@ pub(super) async fn run(
                 None => profiles::token(&host, &profile)?,
             };
             verify(&host, &config, &token, &profile.user).await?;
+            let proxy = crate::client::proxy_credential_for_host(
+                &host,
+                &config,
+                profiles::generic_env(hosts, &host, Some(&host)),
+            )?;
+            let probe = crate::cli::auth_probe::build_probe_client(&host, &config, &token, proxy)?;
+            let server = crate::cli::auth_probe::probe_server(&probe).await;
+            let mut updated = hosts.clone();
+            crate::cli::auth_probe::record_server(updated.hosts.get_mut(&host).unwrap(), &server);
+            updated.save()?;
             if pasted.is_some() {
                 profiles::store(&host, &profile.user, &token, config)?;
             }
