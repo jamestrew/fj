@@ -100,6 +100,7 @@ pub(super) async fn run(
                 .await?
                 .ok_or_else(|| anyhow!("profile has no refresh token; log in again"))?;
             println!("Refreshed the Fjord profile [redacted]");
+            crate::config::profile_retired::drain(&host)?;
         }
         AuthSub::Refresh(args) => {
             let pasted = match (args.token, args.with_token) {
@@ -126,6 +127,7 @@ pub(super) async fn run(
                 profiles::store_fenced(&host, &profile.user, &token, config, &profile)?;
             }
             println!("Verified the PAT profile [redacted]");
+            crate::config::profile_retired::drain(&host)?;
         }
         _ => unreachable!("only maintenance commands are routed here"),
     }

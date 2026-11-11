@@ -19,7 +19,7 @@ pub(super) fn secret_keys(host: &str, profile: &Profile) -> Vec<String> {
 
 /// Delete the secrets of every retired generation on `host`, dropping each one
 /// from the list only once all its secrets are gone.
-pub(super) fn drain(host: &str) -> Result<()> {
+pub fn drain(host: &str) -> Result<()> {
     drain_with(host, auth::delete_token)
 }
 

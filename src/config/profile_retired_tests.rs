@@ -177,3 +177,30 @@ fn logout_retries_a_leftover_retired_generation() {
 fn profile_session_logout(p: &Profile) {
     crate::config::profile_session::logout("h", p).unwrap();
 }
+
+#[test]
+fn an_abandoned_generation_whose_delete_fails_is_kept_then_removed() {
+    isolated(
+        "config::profile_retired::tests::an_abandoned_generation_whose_delete_fails_is_kept_then_removed",
+        || {
+            let tokens = crate::config::config_dir().unwrap().join("tokens.toml");
+            for (n, fjord) in [None, Some(crate::config::hosts::FjordAccount::default())]
+                .into_iter()
+                .enumerate()
+            {
+                let staged = Profile {
+                    user: "operator".into(),
+                    generation: format!("staged-{n}"),
+                    fjord,
+                };
+                // An unreadable token store makes every delete fail.
+                std::fs::create_dir(&tokens).unwrap();
+                abandon("h", &staged);
+                assert_eq!(retired("h"), 1, "the failed delete lost the identity");
+                std::fs::remove_dir(&tokens).unwrap();
+                drain("h").unwrap();
+                assert_eq!(retired("h"), 0);
+            }
+        },
+    );
+}

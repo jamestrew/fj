@@ -4,7 +4,7 @@ pub mod hosts;
 pub mod metadata;
 pub mod muted;
 mod profile_publish;
-mod profile_retired;
+pub mod profile_retired;
 pub mod profile_session;
 pub mod profiles;
 
