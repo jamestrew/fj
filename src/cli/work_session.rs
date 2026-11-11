@@ -32,6 +32,14 @@ pub struct Session {
     pub next_steps: Vec<String>,
     /// Index into `next_steps` that `work continue` advances.
     pub cursor: usize,
+    /// Opaque digest of the host, account and Fjord instance the session was
+    /// saved under. `None` is the legacy default identity. Never a login name.
+    #[serde(default)]
+    pub identity: Option<String>,
+    /// The session was saved with `-R`, so its destination ignored the clone's
+    /// host; `work continue`, which has no `-R`, must resolve it the same way.
+    #[serde(default)]
+    pub explicit_repo: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -74,6 +82,18 @@ pub fn save(session: &Session) -> Result<()> {
     let json = serde_json::to_string_pretty(session)?;
     std::fs::write(&path, json).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
+}
+
+/// Refuse a session saved under another account or instance, before anything
+/// is shown or written. Both sides are digests, so no login name is printed.
+pub fn check_identity(saved: &Session, current: Option<&str>) -> Result<()> {
+    if saved.identity.as_deref() == current {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "the saved work session belongs to a different account or instance than the \
+         current one. Run `fj work context` to start a session for this one."
+    )
 }
 
 /// Advisory, non-destructive next steps derived from the current context.
@@ -138,10 +158,53 @@ mod tests {
             }),
             next_steps: vec!["a".into(), "b".into()],
             cursor: 1,
+            identity: None,
+            explicit_repo: false,
         };
         let json = serde_json::to_string(&s).unwrap();
         let back: Session = serde_json::from_str(&json).unwrap();
         assert_eq!(s, back);
+    }
+
+    fn saved(identity: Option<&str>) -> Session {
+        Session {
+            saved_at: "t".into(),
+            host: "h".into(),
+            repo: "o/n".into(),
+            remote: None,
+            branch: None,
+            dirty: false,
+            changed_files: 0,
+            pull_request: None,
+            next_steps: vec![],
+            cursor: 0,
+            identity: identity.map(str::to_string),
+            explicit_repo: false,
+        }
+    }
+
+    #[test]
+    fn identity_must_match_exactly() {
+        assert!(check_identity(&saved(None), None).is_ok());
+        assert!(check_identity(&saved(Some("id-a")), Some("id-a")).is_ok());
+        let cases = [
+            (None, Some("id-b")),
+            (Some("id-a"), None),
+            (Some("id-a"), Some("id-b")),
+        ];
+        for (s, c) in cases {
+            let e = check_identity(&saved(s), c).unwrap_err().to_string();
+            assert!(e.contains("different account or instance"), "{e}");
+            assert!(e.contains("fj work context") && !e.contains("id-"), "{e}");
+        }
+    }
+
+    #[test]
+    fn sessions_saved_before_identity_existed_still_parse() {
+        let old = r#"{"saved_at":"t","host":"h","repo":"o/n","dirty":false,"changed_files":0,
+            "next_steps":[],"cursor":0}"#;
+        let s: Session = serde_json::from_str(old).unwrap();
+        assert_eq!(s.identity, None);
     }
 
     #[test]

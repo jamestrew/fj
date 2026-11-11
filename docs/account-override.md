@@ -103,5 +103,10 @@ commands. Mute lists are independent per host, account and instance; rotating
 credentials preserves the list. Retained legacy mute entries remain in their
 legacy scope and are not implicitly applied to named profiles.
 
-Work context/resume/continue remain legacy-host-based and are not yet profile-aware.
-Work-session account/instance identity will be handled separately in 2b-iv.
+`fj work context` shows and saves the selected account's host and instance.
+A saved work session records only an opaque digest of the host, account and
+Fjord instance (never a login name). `fj work resume` and `fj work continue`
+refuse a session saved under a different identity, before showing or changing
+anything (`--dry-run` included), and tell you to run `fj work context`. Sessions
+saved before this change count as the legacy identity: they stay valid when no
+account is selected and are refused when one is.
