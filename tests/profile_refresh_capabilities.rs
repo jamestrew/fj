@@ -34,8 +34,9 @@ async fn pat_refresh_publishes_upgraded_server_capabilities() {
     for explicit in [false, true] {
         for replacement in [false, true] {
             let mut stale: toml::Value = std::fs::read_to_string(&file).unwrap().parse().unwrap();
-            stale["hosts"]["first.example"]["flavor"] = "forgejo".into();
-            stale["hosts"]["first.example"]["server_version"] = "15.0.0".into();
+            let host = stale["hosts"]["first.example"].as_table_mut().unwrap();
+            host.insert("flavor".into(), "forgejo".into());
+            host.insert("server_version".into(), "15.0.0".into());
             std::fs::write(&file, toml::to_string(&stale).unwrap()).unwrap();
             let mut args = Vec::new();
             if explicit {
