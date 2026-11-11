@@ -26,6 +26,7 @@ use crate::cli::stack_state::{self, Stack};
 use crate::cli::work_session::{self, PrRef, Session};
 use crate::client::Client;
 use crate::config::hosts::{AuthKind, Host, Hosts};
+use crate::config::metadata;
 use crate::git::remote::RemoteRepo;
 use crate::{git, output};
 
@@ -352,8 +353,11 @@ async fn gather(repo_flag: Option<&str>, host_flag: Option<&str>) -> Result<Work
     let host_cfg = hosts
         .as_ref()
         .zip(id.host.as_deref())
-        .and_then(|(h, name)| h.hosts.get(name));
-    let account = account_info(host_cfg);
+        .and_then(|(h, name)| {
+            let key = metadata::existing_key(h, name).ok().flatten()?;
+            metadata::resolve(h, &key).ok()
+        });
+    let account = account_info(host_cfg.as_ref());
     let stack = stack_state::load()
         .ok()
         .flatten()
@@ -407,7 +411,12 @@ async fn gather(repo_flag: Option<&str>, host_flag: Option<&str>) -> Result<Work
 
 /// Build the persisted session snapshot from a live context. `now` is the
 /// RFC3339 save timestamp; `remote` the primary remote URL, if any.
-fn to_session(wc: &WorkContext, remote: Option<String>, now: String) -> Session {
+fn to_session(
+    wc: &WorkContext,
+    remote: Option<String>,
+    now: String,
+    identity: Option<String>,
+) -> Session {
     let next_steps = work_session::derive_next_steps(
         wc.branch.as_deref(),
         wc.dirty,
@@ -431,7 +440,33 @@ fn to_session(wc: &WorkContext, remote: Option<String>, now: String) -> Session 
         }),
         next_steps,
         cursor: 0,
+        identity,
     }
+}
+
+/// Digest of the host, account and Fjord instance a command runs under, or
+/// `None` for the legacy default (no account selected). Reads `hosts.toml`
+/// only. `--host` overrides the remote, as in [`gather`].
+fn current_identity(host_flag: Option<&str>) -> Result<Option<String>> {
+    let hosts = Hosts::load()?;
+    let key = match host_flag {
+        Some(h) => Some(h.to_string()),
+        None => git::remote::discover(None)
+            .ok()
+            .map(|r| r.host)
+            .or_else(|| hosts.current.clone()),
+    };
+    let Some(key) = key else { return Ok(None) };
+    let key = match host_flag {
+        Some(_) => metadata::existing_key(&hosts, &key)?.unwrap_or(key),
+        None => metadata::route_selected(&hosts, &key)?,
+    };
+    let config = metadata::resolve(&hosts, &key)?;
+    config
+        .selected_account
+        .is_some()
+        .then(|| metadata::mute_scope(&key, Some(&config), String::new()))
+        .transpose()
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -440,8 +475,10 @@ async fn context(args: ContextArgs, host: Option<&str>) -> Result<()> {
 
     // Persist the session as a convenience for `work resume` / `continue`.
     // A failure to write the cache must never sink the inspect command.
-    let session = to_session(&wc, git::remote_url(), Utc::now().to_rfc3339());
-    let _ = work_session::save(&session);
+    if let Ok(identity) = current_identity(host) {
+        let session = to_session(&wc, git::remote_url(), Utc::now().to_rfc3339(), identity);
+        let _ = work_session::save(&session);
+    }
 
     if args.json {
         return output::print_json(&serde_json::to_value(&wc)?);
@@ -538,6 +575,7 @@ async fn resume(args: ResumeArgs, host: Option<&str>) -> Result<()> {
     let Some(session) = work_session::load()? else {
         bail!("no saved work session for this repo. Run `fj work context` first.");
     };
+    work_session::check_identity(&session, current_identity(host)?.as_deref())?;
 
     if args.dry_run {
         println!("would: resume the session saved at {}", session.saved_at);
@@ -604,10 +642,11 @@ fn advance(session: &mut Session) -> ContinueOutcome {
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
-async fn continue_(args: ContinueArgs, _host: Option<&str>) -> Result<()> {
+async fn continue_(args: ContinueArgs, host: Option<&str>) -> Result<()> {
     let Some(mut session) = work_session::load()? else {
         bail!("no saved work session for this repo. Run `fj work context` first.");
     };
+    work_session::check_identity(&session, current_identity(host)?.as_deref())?;
 
     if args.dry_run {
         match session.next_steps.get(session.cursor) {
@@ -929,6 +968,7 @@ mod tests {
             &sample_context(),
             Some("git@git.example.com:o/n.git".into()),
             "2026-06-01T08:00:00+00:00".into(),
+            None,
         )
     }
 
