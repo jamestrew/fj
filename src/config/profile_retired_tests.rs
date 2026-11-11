@@ -184,6 +184,8 @@ fn an_abandoned_generation_whose_delete_fails_is_kept_then_removed() {
         "config::profile_retired::tests::an_abandoned_generation_whose_delete_fails_is_kept_then_removed",
         || {
             let tokens = crate::config::config_dir().unwrap().join("tokens.toml");
+            // Keeping an identity needs a configured host (see keep_unremoved).
+            profiles::store("h", "operator", "pat-0", pat_host()).unwrap();
             for (n, fjord) in [None, Some(crate::config::hosts::FjordAccount::default())]
                 .into_iter()
                 .enumerate()
@@ -194,6 +196,7 @@ fn an_abandoned_generation_whose_delete_fails_is_kept_then_removed() {
                     fjord,
                 };
                 // An unreadable token store makes every delete fail.
+                let _ = std::fs::remove_file(&tokens);
                 std::fs::create_dir(&tokens).unwrap();
                 abandon("h", &staged);
                 assert_eq!(retired("h"), 1, "the failed delete lost the identity");
@@ -201,6 +204,43 @@ fn an_abandoned_generation_whose_delete_fails_is_kept_then_removed() {
                 drain("h").unwrap();
                 assert_eq!(retired("h"), 0);
             }
+        },
+    );
+}
+
+#[test]
+fn one_failed_delete_does_not_stop_the_generations_other_secrets() {
+    isolated(
+        "config::profile_retired::tests::one_failed_delete_does_not_stop_the_generations_other_secrets",
+        || {
+            profiles::store("h", "operator", "pat-0", pat_host()).unwrap();
+            let fjord = Profile {
+                user: "operator".into(),
+                generation: "fg".into(),
+                fjord: Some(crate::config::hosts::FjordAccount::default()),
+            };
+            crate::config::profile_publish::edit(|hosts| {
+                hosts.accounts.get_mut("h").unwrap().retired.push(fjord.clone());
+                Ok(())
+            })
+            .unwrap();
+            let seen = RefCell::new(Vec::new());
+            let result = drain_with("h", |k| {
+                seen.borrow_mut().push(k.to_string());
+                if k.ends_with(":bearer") {
+                    Err(anyhow!("locked"))
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(result.is_err());
+            let seen = seen.into_inner();
+            assert!(seen.iter().any(|k| k.ends_with(":bearer")));
+            assert!(
+                seen.iter().any(|k| k.ends_with(":refresh")),
+                "the refresh secret was never attempted"
+            );
+            assert_eq!(retired("h"), 1, "the generation must stay until all deletes succeed");
         },
     );
 }

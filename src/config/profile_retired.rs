@@ -32,10 +32,7 @@ fn drain_with(host: &str, delete: impl Fn(&str) -> Result<()>) -> Result<()> {
     let mut gone = Vec::new();
     let mut failed = 0;
     for profile in pending {
-        if secret_keys(host, &profile)
-            .iter()
-            .all(|k| delete(k).is_ok())
-        {
+        if delete_all(host, &profile, &delete) {
             gone.push((profile.user, profile.generation));
         } else {
             failed += 1;
@@ -58,27 +55,38 @@ fn drain_with(host: &str, delete: impl Fn(&str) -> Result<()>) -> Result<()> {
     }
 }
 
+/// Attempt every secret of the generation, even after one fails: a refresh
+/// credential must not outlive a retry just because its bearer would not delete.
+fn delete_all(host: &str, profile: &Profile, delete: &impl Fn(&str) -> Result<()>) -> bool {
+    secret_keys(host, profile)
+        .iter()
+        .map(|k| delete(k).is_ok())
+        .fold(true, |all, ok| all && ok)
+}
+
 /// A staged generation that never got published and whose delete failed: keep
 /// its identity so a later run removes it. Best effort, the caller is already
-/// returning the original error.
+/// returning the original error. Only for a host that is configured: listing a
+/// generation under a host that does not exist would leave an account entry
+/// with no host, which every later save rejects. A first login that fails this
+/// way leaves its staged secret unrecorded.
 pub(super) fn keep_unremoved(host: &str, profile: &Profile) {
     let _ = profile_publish::edit(|hosts| {
-        hosts
-            .accounts
-            .entry(host.into())
-            .or_default()
-            .retired
-            .push(profile.clone());
+        if hosts.hosts.contains_key(host) {
+            hosts
+                .accounts
+                .entry(host.into())
+                .or_default()
+                .retired
+                .push(profile.clone());
+        }
         Ok(())
     });
 }
 
 /// Delete a staged, unpublished generation's secrets, retaining it if that fails.
 pub(super) fn abandon(host: &str, profile: &Profile) {
-    if !secret_keys(host, profile)
-        .iter()
-        .all(|k| auth::delete_token(k).is_ok())
-    {
+    if !delete_all(host, profile, &auth::delete_token) {
         keep_unremoved(host, profile);
     }
 }
