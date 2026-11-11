@@ -86,6 +86,11 @@ async fn legacy_mixed_case_host_key_resolves_and_login_updates_it() {
     }
     // Discovery must treat the legacy key as a gateway, not a PAT remote filter.
     let original = std::fs::read_to_string(&hosts).unwrap();
+    // The gateway authenticates with the platform-scoped Fjord session, not the PAT.
+    let tokens = dir.path().join("fj/tokens.toml");
+    let mut stored = std::fs::read_to_string(&tokens).unwrap();
+    stored.push_str(&format!("'fjord-account:{url}' = 'old-pat'\n"));
+    std::fs::write(&tokens, stored).unwrap();
     std::fs::write(&hosts, format!(
         "current = '{legacy}'\n[hosts.'{legacy}']\nauth_kind = 'fjord_account'\n[hosts.'{legacy}'.fjord_account]\nplatform_url = '{url}'\ndefault_instance_id = 'instance'\ndefault_instance_public_url = 'https://instance.example'\n"
     )).unwrap();
