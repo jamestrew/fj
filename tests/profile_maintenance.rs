@@ -25,9 +25,16 @@ async fn fails(dir: &Path, args: &[&str]) -> String {
     );
     text
 }
-fn read_only(d: &Path, on: bool) {
-    let mode = std::os::unix::fs::PermissionsExt::from_mode(if on { 0o555 } else { 0o755 });
-    std::fs::set_permissions(d.join("fj"), mode).unwrap();
+/// Make the credential store unusable (even for root) and restore it afterwards.
+fn block_store(d: &Path, on: bool) {
+    let (file, saved) = (d.join("fj/tokens.toml"), d.join("fj/tokens.saved"));
+    if on {
+        std::fs::rename(&file, &saved).unwrap();
+        std::fs::create_dir(&file).unwrap();
+    } else {
+        std::fs::remove_dir(&file).unwrap();
+        std::fs::rename(saved, file).unwrap();
+    }
 }
 fn first_url(dir: &Path, url: Option<&str>) {
     let file = dir.join("fj/hosts.toml");
@@ -88,13 +95,13 @@ async fn profile_maintenance_scopes_cookies_tokens_refresh_and_logout() {
         .unwrap();
     assert!(String::from_utf8_lossy(&o.stderr).contains("empty cookie value"));
     // A failed staging write keeps the previous cookie and stores no new one.
-    read_only(d, true);
+    block_store(d, true);
     fails(
         d,
         &["--account", "qa-a", "auth", "session", "--cookie", "ck-a2"],
     )
     .await;
-    read_only(d, false);
+    block_store(d, false);
     let stored = std::fs::read_to_string(d.join("fj/tokens.toml")).unwrap();
     assert!(stored.contains("ck-a") && !stored.contains("ck-a2") && !stored.contains("ck-env"));
     out(d, &["--account", "qa-a", "auth", "session", "--clear"]).await;
@@ -131,9 +138,9 @@ async fn profile_maintenance_scopes_cookies_tokens_refresh_and_logout() {
     let stored = std::fs::read_to_string(d.join("fj/tokens.toml")).unwrap();
     assert!(stored.contains("ck-b2") && !stored.contains("\"ck-b\"") && !stored.contains("'ck-b'"));
     // A failed secret delete keeps the profile selectable, so logout can be retried.
-    read_only(d, true);
+    block_store(d, true);
     fails(d, &["auth", "logout", "--host", "first.example"]).await;
-    read_only(d, false);
+    block_store(d, false);
     assert_eq!(
         out(d, &["--account", "qa-a", "auth", "token", "--force"]).await,
         "tok-a"
