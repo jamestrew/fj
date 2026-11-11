@@ -51,4 +51,21 @@ pub async fn check(dir: &Path, gateway: &MockServer) {
             .success());
     }
     repo_clone::wrong_instance(dir, gateway, "cannot infer the instance").await;
+    // An unparseable lower-priority backup remote is never consulted.
+    for args in [
+        [
+            "remote",
+            "set-url",
+            "upstream",
+            "https://forge.example:443/o/r.git",
+        ],
+        ["remote", "add", "backup", "/mnt/backup/r.git"],
+    ] {
+        assert!(std::process::Command::new("git")
+            .args(args)
+            .status()
+            .unwrap()
+            .success());
+    }
+    success(call(dir, &["--account", "a@test", "issue", "list", "--web"]).await);
 }
