@@ -6,10 +6,59 @@ All notable changes will be recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-11
+
+### Added
+
+- **Account overrides and named profiles (#157, #307, #308, #309, #310, #311).**
+  `fj --account <login>` (or `FJ_ACCOUNT`) runs one command as a named account
+  without touching stored credentials. For a PAT host it pairs with `FJ_TOKEN`
+  or a host-scoped variable, and the login is verified against `/user` before
+  any other request goes out. With an override active, fj refuses every other
+  way a request could pick its identity (stored, anonymous and web-session
+  fallbacks, custom auth headers, `Sudo`, and tokens in the URL or form body).
+  `fj auth login --account <name>` stores verified PAT and Fjord OIDC profiles
+  per host and account, with an explicit default. Fjord instances, browser
+  shortcuts, mute and inbox filtering, `fj status` and the `fj work` display
+  follow the selected account. `fj auth token`, `refresh`, `session` and
+  `logout` work per profile, and session cookies are stored per profile. No
+  command sends a stored profile cookie yet. Usage is in
+  `docs/account-override.md`. Behavior without `--account` is unchanged.
+- **`fj run rerun` on Forgejo 17 (#305).** `fj run rerun <n> [--failed | -j
+  <job>]` uses the token-accepting rerun endpoints, so it works with an API
+  token on private repositories.
+- **`fj pr edit --base <branch>`.** The base is sent only when this flag is
+  given (#302).
+
 ### Fixed
 
 - Validate artifact downloads and zip release assets before reporting success.
-  Retry incomplete bodies up to three attempts and install downloads atomically.
+  Retry incomplete bodies up to three attempts and install downloads atomically
+  (#298).
+- **`fj run view --log-failed` keeps the logs that loaded.** One job with a
+  missing or failed log no longer fails the whole command. Each job is settled
+  on its own, and a failed read exits non-zero after printing (#300).
+- **`fj run logs` finds the run's task.** Jobs are matched by task id, the task
+  list is paged, and a run far back in a busy repository is found by
+  bisection instead of reading as an incomplete list (#301, #303).
+- **`fj pr edit` never moves the base of a pull request.** The shared edit
+  path reads the base back and restores it, with an error, if the server
+  changed it (#302).
+- **A late Fjord refresh answer no longer replaces a newer stored refresh
+  token.** The stored record is checked again before the answer is saved (#302).
+
+### Security
+
+- **rustls-webpki 0.103.16, webpki-roots 1.0.11 and tokio 1.54.1.** Picks up
+  the fixes for RUSTSEC-2026-0381, RUSTSEC-2026-0382 and RUSTSEC-2026-0386
+  (#299).
+- **rustix 1.1.6.** Picks up the fix for RUSTSEC-2026-0486, unsound handling
+  of extended-attribute buffers.
+- **One account per command.** Account overrides and profile routing cannot
+  fall back to another stored identity, and a pinned repository with an
+  unparseable remote fails instead of using another host (#307, #310).
+- `cargo audit` ignores RUSTSEC-2026-0374 (`basic-toml` unmaintained), which
+  comes through the `uniffi` chain already tracked as debt (#296).
 
 ## [0.7.0] - 2026-10-16
 
