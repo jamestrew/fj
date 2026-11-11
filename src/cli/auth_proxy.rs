@@ -217,6 +217,7 @@ pub(crate) fn run(args: ProxyArgs) -> Result<()> {
     let (name, created) = match args.host.as_deref() {
         Some(raw) if !hosts.hosts.contains_key(raw) => {
             let (key, web_url) = super::auth_login::normalize_pat_host(raw)?;
+            let key = crate::config::metadata::existing_key(&hosts, &key)?.unwrap_or(key);
             if hosts.hosts.contains_key(&key) {
                 (key, false)
             } else if args.clear {

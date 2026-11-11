@@ -66,11 +66,19 @@ pub fn mute_scope(name: &str, config: Option<&Host>, legacy: String) -> Result<S
     ))
 }
 
-/// The stored host key that equals `key` ignoring ASCII case. Releases before
-/// authority canonicalization stored mixed-case keys; they must stay reachable.
-/// Two keys differing only by case are ambiguous and refused.
+/// The stored host key for `key`. An exact key wins. Otherwise only the
+/// authority folds case (older releases stored mixed-case hosts); a mount path
+/// is case-sensitive. Several folded matches are ambiguous and refused.
 pub fn existing_key(hosts: &Hosts, key: &str) -> Result<Option<String>> {
-    let mut found = hosts.hosts.keys().filter(|k| k.eq_ignore_ascii_case(key));
+    if hosts.hosts.contains_key(key) {
+        return Ok(Some(key.to_string()));
+    }
+    let fold = |k: &str| match k.split_once('/') {
+        Some((authority, path)) => format!("{}/{path}", authority.to_ascii_lowercase()),
+        None => k.to_ascii_lowercase(),
+    };
+    let wanted = fold(key);
+    let mut found = hosts.hosts.keys().filter(|k| fold(k) == wanted);
     match (found.next(), found.next()) {
         (Some(_), Some(_)) => Err(anyhow!("host '{key}' is configured under several casings")),
         (name, _) => Ok(name.cloned()),
@@ -147,3 +155,7 @@ pub fn route_selected(hosts: &Hosts, candidate: &str) -> Result<String> {
 #[cfg(test)]
 #[path = "metadata_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "existing_key_tests.rs"]
+mod existing_key_tests;
