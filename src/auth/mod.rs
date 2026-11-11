@@ -169,13 +169,6 @@ fn handle_load_keyring_error(
     }
 }
 
-fn is_keychain_unavailable(err: &keyring::Error) -> bool {
-    matches!(
-        err,
-        keyring::Error::NoStorageAccess(_) | keyring::Error::PlatformFailure(_)
-    )
-}
-
 fn log_keychain_unavailable_from_error(host: &str, operation: &str, err: &keyring::Error) {
     match err {
         keyring::Error::NoStorageAccess(cause) | keyring::Error::PlatformFailure(cause) => {
@@ -345,26 +338,51 @@ pub fn delete_token(host: &str) -> Result<()> {
     if keychain_disabled() {
         return delete_file_token(&file_path, host);
     }
-    match entry(host) {
-        Ok(entry) => match entry.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => {}
-            Err(err) if is_keychain_unavailable(&err) => {
-                log_keychain_unavailable_from_error(host, "removing token from keychain", &err);
-            }
-            Err(err) => {
-                return Err(diagnostics::error(
-                    host,
-                    "removing token from keychain",
-                    err,
-                ));
-            }
-        },
-        Err(err) if is_keychain_unavailable(&err) => {
-            log_keychain_unavailable_from_error(host, "opening keychain entry", &err);
+    delete_token_with_entry_and_file_path(host, entry(host), &file_path)
+}
+
+/// Remove `host`'s token from the keychain and the file store.
+///
+/// A keychain that exists but refuses access (`NoStorageAccess`: locked, or
+/// denied) may still hold the secret, so that is an error, reported after the
+/// file entry is gone; callers keep the profile or session selectable and the
+/// user can retry. `PlatformFailure` is also what a machine with no keychain
+/// service at all reports, where logging out must still work, so it only warns,
+/// once per run.
+fn delete_token_with_entry_and_file_path(
+    host: &str,
+    entry: keyring::Result<Entry>,
+    file_path: &Path,
+) -> Result<()> {
+    let outcome = match entry {
+        Ok(entry) => (entry.delete_credential(), "removing token from keychain"),
+        Err(err) => (Err(err), "opening keychain entry"),
+    };
+    let (result, operation) = outcome;
+    let mut locked = None;
+    match result {
+        Ok(()) | Err(keyring::Error::NoEntry) => {}
+        Err(err @ keyring::Error::NoStorageAccess(_)) => locked = Some(err),
+        Err(keyring::Error::PlatformFailure(cause)) => {
+            log_keychain_unavailable(host, operation, cause.as_ref());
+            warn_keychain_unconfirmed();
         }
-        Err(err) => return Err(diagnostics::error(host, "opening keychain entry", err)),
+        Err(err) => return Err(diagnostics::error(host, operation, err)),
     }
-    delete_file_token(&file_path, host)
+    delete_file_token(file_path, host)?;
+    match locked {
+        Some(err) => Err(diagnostics::error(host, operation, err)),
+        None => Ok(()),
+    }
+}
+
+fn warn_keychain_unconfirmed() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        eprintln!(
+            "warning: could not confirm the keychain entry was removed (no keychain available)"
+        );
+    });
 }
 
 /// Convenience: store a Fjord Account bearer for `platform_url`.
@@ -832,5 +850,64 @@ mod tests {
         .expect_err("invalid keyring error should propagate");
 
         assert!(err.to_string().contains("reading token"));
+    }
+
+    fn delete_with(
+        err: keyring::Error,
+        key: &str,
+    ) -> (Result<()>, Option<String>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokens.toml");
+        store_file_token(&path, key, "file-secret").unwrap();
+        let entry = Entry::new_with_credential(Box::<keyring::mock::MockCredential>::default());
+        entry
+            .get_credential()
+            .downcast_ref::<keyring::mock::MockCredential>()
+            .unwrap()
+            .set_error(err);
+        let result = delete_token_with_entry_and_file_path(key, Ok(entry), &path);
+        let left = load_file_token(&path, key).unwrap();
+        (result, left, dir)
+    }
+
+    #[test]
+    fn delete_fails_when_a_locked_keychain_may_still_hold_the_secret() {
+        let locked = keyring::Error::NoStorageAccess(Box::new(std::io::Error::other("locked")));
+        let (result, left, _dir) = delete_with(locked, "example.test");
+        assert!(result.is_err(), "a locked keychain must not report success");
+        // The file entry is still removed, so a retry only has the keychain left.
+        assert_eq!(left, None);
+    }
+
+    #[test]
+    fn delete_error_for_a_profile_key_does_not_name_the_account() {
+        let key = "profile:686f7374:71612d70726976617465:pat:nonce";
+        let locked = keyring::Error::NoStorageAccess(Box::new(std::io::Error::other("locked")));
+        let (result, _, _dir) = delete_with(locked, key);
+        let text = format!("{:#}", result.unwrap_err());
+        assert!(!text.contains("71612d70726976617465"), "{text}");
+    }
+
+    #[test]
+    fn delete_succeeds_without_a_keychain_service_or_entry() {
+        let none = keyring::Error::PlatformFailure(Box::new(std::io::Error::other("no dbus")));
+        let (result, left, _dir) = delete_with(none, "example.test");
+        assert!(result.is_ok());
+        assert_eq!(left, None);
+        let (result, left, _dir) = delete_with(keyring::Error::NoEntry, "example.test");
+        assert!(result.is_ok());
+        assert_eq!(left, None);
+    }
+
+    #[test]
+    fn delete_propagates_unexpected_keychain_errors_and_failed_entry_creation() {
+        let bad = keyring::Error::Invalid("service".into(), "bad".into());
+        let (result, left, _dir) = delete_with(bad, "example.test");
+        assert!(result.is_err());
+        assert_eq!(left.as_deref(), Some("file-secret"));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokens.toml");
+        let locked = keyring::Error::NoStorageAccess(Box::new(std::io::Error::other("locked")));
+        assert!(delete_token_with_entry_and_file_path("example.test", Err(locked), &path).is_err());
     }
 }
