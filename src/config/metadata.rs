@@ -66,6 +66,17 @@ pub fn mute_scope(name: &str, config: Option<&Host>, legacy: String) -> Result<S
     ))
 }
 
+/// The stored host key that equals `key` ignoring ASCII case. Releases before
+/// authority canonicalization stored mixed-case keys; they must stay reachable.
+/// Two keys differing only by case are ambiguous and refused.
+pub fn existing_key(hosts: &Hosts, key: &str) -> Result<Option<String>> {
+    let mut found = hosts.hosts.keys().filter(|k| k.eq_ignore_ascii_case(key));
+    match (found.next(), found.next()) {
+        (Some(_), Some(_)) => Err(anyhow!("host '{key}' is configured under several casings")),
+        (name, _) => Ok(name.cloned()),
+    }
+}
+
 /// Resolve an inferred clone host using only the selected account's destination.
 pub fn route(hosts: &Hosts, candidate: &str, account: Option<&str>) -> Result<(String, Host)> {
     let canonical = account.map(profiles::canonical).transpose()?;
@@ -82,6 +93,9 @@ pub fn route(hosts: &Hosts, candidate: &str, account: Option<&str>) -> Result<(S
     let candidate = normalized.as_str();
     if let Some(config) = hosts.hosts.get(candidate) {
         return selected(candidate, config.clone());
+    }
+    if let Some(name) = existing_key(hosts, candidate)? {
+        return selected(&name, hosts.hosts[&name].clone());
     }
     let public_matches = |metadata: Option<&super::hosts::FjordAccount>| {
         metadata

@@ -96,7 +96,10 @@ async fn login_pat(args: LoginArgs) -> Result<()> {
         None => prompt_hostname()?,
     };
     let (hostname, web_url) = normalize_pat_host(&host_input)?;
-    if crate::config::profiles::has_profiles(&Hosts::load()?, &hostname) {
+    // Log in under the stored key (a legacy mixed-case one) rather than add a second entry.
+    let existing = Hosts::load()?;
+    let hostname = crate::config::metadata::existing_key(&existing, &hostname)?.unwrap_or(hostname);
+    if crate::config::profiles::has_profiles(&existing, &hostname) {
         return Err(anyhow!("profiled host: use auth login --account"));
     }
     let token = read_token(&args)?;
