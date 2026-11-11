@@ -14,7 +14,7 @@ pub async fn check(dir: &Path, gateway: &MockServer) {
     }
     std::fs::write(&file, toml::to_string(&config).unwrap()).unwrap();
     repo_clone::remote("https://forge.example:3001/o/r.git");
-    repo_clone::wrong_instance(dir, gateway).await;
+    repo_clone::wrong_instance(dir, gateway, "instance").await;
     for command in ["issue", "pr", "release"] {
         success(call(dir, &["--account", "a@test", command, "list", "--web"]).await);
     }
@@ -31,4 +31,12 @@ pub async fn check(dir: &Path, gateway: &MockServer) {
         std::fs::read_to_string(&log).unwrap().lines().last(),
         Some("https://forge.example/base/o/r/issues")
     );
+    // A pinned slug with an unparseable (path-mounted) remote must refuse, not
+    // fall back to the default host, for mutations and browser shortcuts.
+    repo_clone::remote("https://forge.example/base/o/r.git");
+    repo_clone::wrong_instance(dir, gateway, "cannot infer the instance").await;
+    for command in ["issue", "pr", "release"] {
+        let args = ["--account", "a@test", command, "list", "--web"];
+        assert!(!call(dir, &args).await.status.success());
+    }
 }

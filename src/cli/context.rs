@@ -89,9 +89,9 @@ pub fn resolve_repo(
     let (detected_host, owner, name) = match explicit_repo.as_deref() {
         Some(slug) => {
             let (o, n) = api::split_repo(slug)?;
-            let remote = infer_host
-                .then(|| git::discover(discovery_host).ok())
-                .flatten();
+            let pin = infer_host
+                .then(|| git::pinned::pinned_remote(discovery_host, explicit_host.is_some()));
+            let remote = pin.transpose()?.flatten();
             (remote.map(|r| r.host), o.to_string(), n.to_string())
         }
         None => {

@@ -36,7 +36,7 @@ pub async fn clone(dir: &Path) -> MockServer {
     }
     trap
 }
-pub async fn wrong_instance(dir: &Path, server: &MockServer) {
+pub async fn wrong_instance(dir: &Path, server: &MockServer, needle: &str) {
     assert!(std::process::Command::new("git")
         .args(["config", "--local", "fj.resolved", "o/r"])
         .status()
@@ -62,7 +62,7 @@ pub async fn wrong_instance(dir: &Path, server: &MockServer) {
         args.extend(command);
         let out = call(dir, &args).await;
         assert!(!out.status.success());
-        assert!(String::from_utf8_lossy(&out.stderr).contains("instance"));
+        assert!(String::from_utf8_lossy(&out.stderr).contains(needle));
     }
 }
 
