@@ -578,6 +578,7 @@ dependencies = [
  "keyring",
  "libc",
  "owo-colors",
+ "percent-encoding",
  "qrcode",
  "reqwest",
  "ring",

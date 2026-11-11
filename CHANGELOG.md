@@ -15,6 +15,12 @@ All notable changes will be recorded here. The format follows
   profile), logout still succeeds, with one warning that the keychain entry could
   not be confirmed removed.
 
+- `fj release download` on a Fjord Account host fetches release assets through the
+  gateway with the Fjord session instead of an unauthenticated request to the
+  forge's web origin, which answered 404 for a private repository. The asset URL
+  must be the exact download route of the release being downloaded; anything else
+  is refused.
+
 ## [0.8.0] - 2026-11-11
 
 ### Added

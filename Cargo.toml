@@ -38,6 +38,7 @@ serde_path_to_error = "0.1"
 toml = "0.8"
 directories = "5"
 keyring = { version = "3", features = ["apple-native", "linux-native", "windows-native"] }
+percent-encoding = "2"
 url = "2"
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
 tabled = { version = "0.16", features = ["ansi"] }
