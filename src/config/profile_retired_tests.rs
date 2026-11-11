@@ -185,7 +185,7 @@ fn an_abandoned_generation_whose_delete_fails_is_kept_then_removed() {
         "config::profile_retired::tests::an_abandoned_generation_whose_delete_fails_is_kept_then_removed",
         || {
             let tokens = crate::config::config_dir().unwrap().join("tokens.toml");
-            // Keeping an identity needs a configured host (see keep_unremoved).
+            // Keeping an identity needs a host that already has profiles (see keep_unremoved).
             profiles::store("h", "operator", "pat-0", pat_host()).unwrap();
             for (n, fjord) in [None, Some(crate::config::hosts::FjordAccount::default())]
                 .into_iter()

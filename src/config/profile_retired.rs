@@ -81,19 +81,14 @@ fn delete_all(host: &str, profile: &Profile, delete: &impl Fn(&str) -> Result<()
 
 /// A staged generation that never got published and whose delete failed: keep
 /// its identity so a later run removes it. Best effort, the caller is already
-/// returning the original error. Only for a host that is configured: listing a
-/// generation under a host that does not exist would leave an account entry
-/// with no host, which every later save rejects. A first login that fails this
-/// way leaves its staged secret unrecorded.
+/// returning the original error. Only for a host that already has named
+/// profiles: an account entry for a host that does not exist is rejected by
+/// every later save, and one for a legacy-only host would make it look profiled.
+/// A first named login that fails this way leaves its staged secret unrecorded.
 pub(super) fn keep_unremoved(host: &str, profile: &Profile) {
     let _ = profile_publish::edit(|hosts| {
-        if hosts.hosts.contains_key(host) {
-            hosts
-                .accounts
-                .entry(host.into())
-                .or_default()
-                .retired
-                .push(profile.clone());
+        if let Some(set) = hosts.accounts.get_mut(host) {
+            set.retired.push(profile.clone());
         }
         Ok(())
     });
