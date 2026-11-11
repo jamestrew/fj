@@ -8,11 +8,12 @@ All notable changes will be recorded here. The format follows
 
 ### Fixed
 
-- Logging out, clearing a web session and replacing a profile no longer report
-  success when the OS keychain refuses access (locked or denied) and may still
-  hold the secret: the file entry is removed, the command fails, and running it
-  again finishes the job. A Linux machine with no secret service at all still logs
-  out, with one warning that the keychain entry could not be confirmed removed.
+- Logging out and clearing a web session no longer report success when the OS
+  keychain refuses access (locked or denied) and may still hold the secret: the
+  file entry is removed, the command fails, and running it again finishes the
+  job. Where keyutils is blocked on Linux (a container with the default seccomp
+  profile), logout still succeeds, with one warning that the keychain entry could
+  not be confirmed removed.
 
 ## [0.8.0] - 2026-11-11
 
