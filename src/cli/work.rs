@@ -350,9 +350,9 @@ async fn gather(repo_flag: Option<&str>, host_flag: Option<&str>) -> Result<Work
         Some((a, b)) => (Some(a), Some(b)),
         None => (None, None),
     };
-    let target = resolve_target(host_flag, remote.as_ref()).ok();
-    let host_cfg = target
-        .as_ref()
+    // A routing refusal is an error, never a reason to query another host.
+    let target = resolve_target(host_flag, clone_remote(repo_flag, remote.as_ref()))?;
+    let host_cfg = Some(&target)
         .filter(|t| t.configured)
         .and_then(|t| t.config.as_ref());
     let account = account_info(host_cfg);
@@ -367,9 +367,7 @@ async fn gather(repo_flag: Option<&str>, host_flag: Option<&str>) -> Result<Work
     let mut checks = None;
     let mut api_reachable = false;
     if let (Some(owner), Some(name)) = (id.owner.as_deref(), id.name.as_deref()) {
-        if let Ok(client) =
-            Client::connect(target.as_ref().and_then(|t| t.key.as_deref()).or(host_flag))
-        {
+        if let Ok(client) = Client::connect(target.key.as_deref().or(host_flag)) {
             if let Ok(repo) = api::repo::get(&client, owner, name).await {
                 api_reachable = true;
                 default_branch = Some(repo.default_branch);
@@ -452,6 +450,15 @@ struct Target {
     configured: bool,
 }
 
+/// `-R` names the repository, so, as in the other repo commands, the clone's
+/// host does not pick the destination then.
+fn clone_remote<'a>(
+    repo_flag: Option<&str>,
+    remote: Option<&'a RemoteRepo>,
+) -> Option<&'a RemoteRepo> {
+    remote.filter(|_| repo_flag.is_none())
+}
+
 /// Resolve the destination once. `--host` wins, then the clone's host routed
 /// through the selected account, then the configured default (`current`, or
 /// the sole host), as the other repo commands do.
@@ -478,9 +485,9 @@ fn resolve_target(host_flag: Option<&str>, remote: Option<&RemoteRepo>) -> Resul
 /// `None` for the legacy default (no account selected). Reads `hosts.toml`
 /// only. An explicitly selected account that resolves to no host is refused,
 /// never saved as the legacy identity.
-fn current_identity(host_flag: Option<&str>) -> Result<Option<String>> {
+fn current_identity(repo_flag: Option<&str>, host_flag: Option<&str>) -> Result<Option<String>> {
     let remote = git::remote::discover(host_flag).ok();
-    let target = resolve_target(host_flag, remote.as_ref())?;
+    let target = resolve_target(host_flag, clone_remote(repo_flag, remote.as_ref()))?;
     let (Some(key), Some(config)) = (target.key.as_deref(), target.config.as_ref()) else {
         if crate::client::account::selected().is_some() {
             bail!("the selected account has no host to run against. Pass --host.");
@@ -500,9 +507,12 @@ async fn context(args: ContextArgs, host: Option<&str>) -> Result<()> {
 
     // Persist the session as a convenience for `work resume` / `continue`.
     // A failure to write the cache must never sink the inspect command.
-    if let Ok(identity) = current_identity(host) {
-        let session = to_session(&wc, git::remote_url(), Utc::now().to_rfc3339(), identity);
-        let _ = work_session::save(&session);
+    match current_identity(args.r.repo.as_deref(), host) {
+        Ok(identity) => {
+            let session = to_session(&wc, git::remote_url(), Utc::now().to_rfc3339(), identity);
+            let _ = work_session::save(&session);
+        }
+        Err(e) => eprintln!("warning: work session not saved: {e}"),
     }
 
     if args.json {
@@ -600,7 +610,10 @@ async fn resume(args: ResumeArgs, host: Option<&str>) -> Result<()> {
     let Some(session) = work_session::load()? else {
         bail!("no saved work session for this repo. Run `fj work context` first.");
     };
-    work_session::check_identity(&session, current_identity(host)?.as_deref())?;
+    work_session::check_identity(
+        &session,
+        current_identity(args.r.repo.as_deref(), host)?.as_deref(),
+    )?;
 
     if args.dry_run {
         println!("would: resume the session saved at {}", session.saved_at);
@@ -671,7 +684,7 @@ async fn continue_(args: ContinueArgs, host: Option<&str>) -> Result<()> {
     let Some(mut session) = work_session::load()? else {
         bail!("no saved work session for this repo. Run `fj work context` first.");
     };
-    work_session::check_identity(&session, current_identity(host)?.as_deref())?;
+    work_session::check_identity(&session, current_identity(None, host)?.as_deref())?;
 
     if args.dry_run {
         match session.next_steps.get(session.cursor) {

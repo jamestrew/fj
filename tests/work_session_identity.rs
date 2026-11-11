@@ -164,3 +164,24 @@ async fn a_sole_host_without_current_still_binds_the_selected_account() {
         assert!(stderr(&out).contains("different account or instance"));
     }
 }
+
+#[tokio::test]
+async fn an_explicit_repo_uses_the_default_host_not_the_clone_host() {
+    let first = MockServer::start().await;
+    let second = MockServer::start().await;
+    let dir = support::config(&first, &second);
+    let d = dir.path();
+    git(d, &["init", "-q"]);
+    server(&first, "tok-a", "qa-a").await;
+    login(d, "first.example", "qa-a", "tok-a").await;
+    git(
+        d,
+        &["remote", "add", "origin", "https://second.example/o/r.git"],
+    );
+    // -R selects the repository only; the destination stays the configured default.
+    let saved = call(d, &["--account", "qa-a", "work", "context", "-R", "o/r"]).await;
+    assert!(saved.status.success(), "{}", stderr(&saved));
+    assert!(!session(d).contains("\"identity\": null"));
+    let same = call(d, &["--account", "qa-a", "work", "resume", "-R", "o/r"]).await;
+    assert!(same.status.success(), "{}", stderr(&same));
+}
