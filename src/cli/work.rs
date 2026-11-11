@@ -458,7 +458,7 @@ struct Target {
 
 /// `-R` names the repository, so, as in the other repo commands, the clone's
 /// host does not pick the destination then.
-fn clone_remote<'a>(explicit_repo: bool, remote: Option<&'a RemoteRepo>) -> Option<&'a RemoteRepo> {
+fn clone_remote(explicit_repo: bool, remote: Option<&RemoteRepo>) -> Option<&RemoteRepo> {
     remote.filter(|_| !explicit_repo)
 }
 
