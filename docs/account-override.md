@@ -76,10 +76,18 @@ publishing metadata. Failure leaves the old active descriptor intact; retry
 the same login. Old generations, legacy credential keys and legacy host
 fields remain for at least one release, with no automatic cleanup.
 
-Status reports configured counts and a redacted default marker, not a fresh
-authentication result. Legacy logout/refresh/token-export/session/setup-git maintenance
-on profiled hosts is refused so it cannot operate on a different credential.
-Scoped cookies and remaining maintenance are deferred to 2b-iii.
+Status reports configured counts, a redacted default marker and the number of
+imported web sessions, not a fresh authentication result.
+
+`fj auth token` needs `--account` (a bare token export on a profiled host stays
+refused). `refresh`, `session` and `logout` act on the `--account` profile, or
+the host's default profile, never on legacy credentials. A web
+session cookie is bound to its profile and destination instance; if the
+instance or URL changes the cookie is ignored until you import it again.
+`session --with-cookie` reads stdin only. Logout removes the profile and its
+secrets but keeps the default pointer, so a logged-out default fails instead of
+using legacy credentials; recover with `auth switch HOST --account` or login.
+`setup-git` stays refused on profiled hosts.
 
 Remove an existing fj Git helper with `git config --global --unset-all
 credential.https://HOST.helper` (replace HOST), then configure a standard Git
@@ -94,7 +102,6 @@ Named Fjord profiles support API, instance, status/web and mute
 commands. Mute lists are independent per host, account and instance; rotating
 credentials preserves the list. Retained legacy mute entries remain in their
 legacy scope and are not implicitly applied to named profiles.
-Profile-scoped cookies and remaining maintenance follow in 2b-iii.
 
 Work context/resume/continue remain legacy-host-based and are not yet profile-aware.
 Work-session account/instance identity will be handled separately in 2b-iv.

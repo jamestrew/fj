@@ -20,6 +20,9 @@ impl std::fmt::Debug for Profile {
 pub struct HostProfiles {
     pub default_account: Option<String>,
     pub profiles: BTreeMap<String, Profile>,
+    /// Web-session cookie references by account; see `profile_session`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sessions: BTreeMap<String, super::profile_session::WebSession>,
 }
 impl std::fmt::Debug for HostProfiles {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -53,7 +56,7 @@ pub fn selection(hosts: &Hosts, host: &str, account: Option<&str>) -> Result<Opt
     }
     Ok(profile)
 }
-fn hex(value: &str) -> String {
+pub(super) fn hex(value: &str) -> String {
     value.bytes().map(|b| format!("{b:02x}")).collect()
 }
 pub fn key(host: &str, profile: &Profile) -> String {
@@ -77,13 +80,19 @@ pub fn has_profiles(hosts: &Hosts, host: &str) -> bool {
 }
 pub fn status(hosts: &Hosts, host: &str) -> String {
     let set = hosts.accounts.get(host);
+    let sessions = super::profile_session::active(hosts, host);
     format!(
-        "{host}: {} profile(s); default: {}",
+        "{host}: {} profile(s); default: {}{}",
         set.map_or(0, |s| s.profiles.len()),
         if set.is_some_and(|s| s.default_account.is_some()) {
             "profile [redacted]"
         } else {
             "legacy"
+        },
+        if sessions > 0 {
+            format!("; web session(s): {sessions}")
+        } else {
+            String::new()
         }
     )
 }

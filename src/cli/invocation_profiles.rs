@@ -112,14 +112,17 @@ pub(super) async fn run(
             } else {
                 Some(hosts.resolve_host(explicit)?)
             };
-            if matches!(command, AuthSub::SetupGit(_))
-                && target.is_some_and(|h| profiles::has_profiles(&hosts, h))
-            {
+            let profiled = target.is_some_and(|h| profiles::has_profiles(&hosts, h));
+            if matches!(command, AuthSub::SetupGit(_)) && profiled {
                 return Err(anyhow!("profiled hosts cannot use the fj git helper; remove it with git config --global --unset-all credential.https://HOST.helper and configure a standard Git credential helper"));
             }
-            if selected.is_some()
-                || maintenance && target.is_some_and(|h| profiles::has_profiles(&hosts, h))
+            // Token export without --account stays refused: a stale Git credential helper runs exactly that.
+            if maintenance
+                && (selected.is_some() || profiled && !matches!(command, AuthSub::Token(_)))
             {
+                return maintenance::run(command, &hosts, selected, global).await;
+            }
+            if selected.is_some() || maintenance && profiled {
                 return Err(anyhow!("profiled credentials require named login; existing fj git helpers must be removed with git config --global --unset-all credential.https://HOST.helper and replaced with a standard Git credential helper"));
             }
             crate::cli::auth::run(AuthCmd { command }, global).await
@@ -189,6 +192,8 @@ async fn login(mut args: LoginArgs, account: &str) -> Result<()> {
     Ok(())
 }
 
+#[path = "profile_maintenance.rs"]
+mod maintenance;
 #[path = "profile_verify.rs"]
 mod verification;
 use verification::verify;
