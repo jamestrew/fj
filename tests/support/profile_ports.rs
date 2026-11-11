@@ -35,8 +35,20 @@ pub async fn check(dir: &Path, gateway: &MockServer) {
     // fall back to the default host, for mutations and browser shortcuts.
     repo_clone::remote("https://forge.example/base/o/r.git");
     repo_clone::wrong_instance(dir, gateway, "cannot infer the instance").await;
-    for command in ["issue", "pr", "release"] {
-        let args = ["--account", "a@test", command, "list", "--web"];
-        assert!(!call(dir, &args).await.status.success());
+    // A bad higher-priority remote must not hand the slug to a valid fallback.
+    let origin = "ssh://git@first-a.example:2222/o/r.git";
+    repo_clone::remote(origin);
+    for args in [[
+        "remote",
+        "add",
+        "upstream",
+        "https://forge.example/base/o/r.git",
+    ]] {
+        assert!(std::process::Command::new("git")
+            .args(args)
+            .status()
+            .unwrap()
+            .success());
     }
+    repo_clone::wrong_instance(dir, gateway, "cannot infer the instance").await;
 }

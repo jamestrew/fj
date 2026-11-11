@@ -65,7 +65,7 @@ pub fn discover(preferred_host: Option<&str>) -> Result<RemoteRepo> {
         .context("could not infer the repository from git remotes"))
 }
 
-fn list_remotes() -> Result<Vec<(String, String)>> {
+pub(super) fn list_remotes() -> Result<Vec<(String, String)>> {
     let out = super::command()
         .args(["remote", "-v"])
         .output()
