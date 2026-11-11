@@ -1,5 +1,3 @@
-#[path = "support/account_override.rs"]
-mod support;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -39,7 +37,10 @@ async fn legacy_mixed_case_host_key_resolves_and_login_updates_it() {
             .await;
     }
     let run = |args: Vec<&str>| {
-        support::command(dir.path())
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_fj"))
+            .env("XDG_CONFIG_HOME", dir.path())
+            .env("FJ_NO_KEYCHAIN", "1")
+            .current_dir(dir.path())
             .env("FJ_CONFIG_DIR", dir.path().join("fj"))
             .args(args)
             .output()

@@ -38,18 +38,17 @@ pub async fn check(dir: &Path, gateway: &MockServer) {
     // A bad higher-priority remote must not hand the slug to a valid fallback.
     let origin = "ssh://git@first-a.example:2222/o/r.git";
     repo_clone::remote(origin);
-    for args in [[
+    let add = [
         "remote",
         "add",
         "upstream",
         "https://forge.example/base/o/r.git",
-    ]] {
-        assert!(std::process::Command::new("git")
-            .args(args)
-            .status()
-            .unwrap()
-            .success());
-    }
+    ];
+    assert!(std::process::Command::new("git")
+        .args(add)
+        .status()
+        .unwrap()
+        .success());
     repo_clone::wrong_instance(dir, gateway, "cannot infer the instance").await;
     // An unparseable lower-priority backup remote is never consulted.
     for args in [
