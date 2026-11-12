@@ -148,13 +148,14 @@ pub fn active(hosts: &Hosts, host: &str) -> usize {
 pub fn logout(host: &str, seen: &Profile) -> Result<()> {
     let _guard = super::fjord_scope::lock(host, seen)?;
     fenced(&Hosts::load()?, host, seen)?;
-    let mut keys = vec![profiles::key(host, seen)];
-    if seen.fjord.is_some() {
-        let base = super::fjord_profiles::key(host, seen);
-        keys = ["bearer", "refresh"].map(|k| format!("{base}:{k}")).into();
-    }
-    keys.iter().try_for_each(|k| auth::delete_token(k))?;
+    super::profile_retired::secret_keys(host, seen)
+        .iter()
+        .try_for_each(|k| auth::delete_token(k))?;
     delete_slots(host, &seen.user)?;
+    // Earlier replaced generations that a failed delete left behind go before the
+    // profile is unpublished, so a failure here leaves it selectable and logging
+    // out again retries.
+    super::profile_retired::drain(host)?;
     profile_publish::edit(|hosts| {
         fenced(hosts, host, seen)?;
         let set = hosts

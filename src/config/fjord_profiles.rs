@@ -151,8 +151,11 @@ pub async fn login(
                 .and_then(|s| s.refresh)
         }),
     };
-    write(platform, &profile, &session)?;
-    super::profile_publish::edit(|latest| {
+    if let Err(error) = write(platform, &profile, &session) {
+        super::profile_retired::abandon(platform, &profile);
+        return Err(error);
+    }
+    let published = super::profile_publish::edit(|latest| {
         if serde_json::to_value(latest.hosts.get(platform))? != serde_json::to_value(&original)?
             || serde_json::to_value(profiles::selection(latest, platform, Some(account))?)?
                 != serde_json::to_value(&prior)?
@@ -175,9 +178,13 @@ pub async fn login(
         if set.default_account.is_none() && migrating {
             set.default_account = Some(account.into());
         }
-        set.profiles.insert(account.into(), profile);
+        if let Some(old) = set.profiles.insert(account.into(), profile.clone()) {
+            set.retired.push(old);
+        }
         Ok(())
-    })?;
+    });
+    published.inspect_err(|_| super::profile_retired::abandon(platform, &profile))?;
+    super::profile_retired::drain(platform)?;
     println!("Saved verified Fjord profile [redacted]; legacy credentials retained");
     Ok(())
 }

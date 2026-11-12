@@ -23,6 +23,10 @@ pub struct HostProfiles {
     /// Web-session cookie references by account; see `profile_session`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub sessions: BTreeMap<String, super::profile_session::WebSession>,
+    /// Replaced generations whose secrets are not yet confirmed deleted; see
+    /// `profile_retired`. Absent in older files.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retired: Vec<Profile>,
 }
 impl std::fmt::Debug for HostProfiles {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -157,7 +161,7 @@ fn store_checked(
     );
     // A write that landed but failed its read-back is unpublished too.
     if let Err(error) = staged {
-        let _ = crate::auth::delete_token(&key);
+        super::profile_retired::abandon(host, &profile);
         return Err(error);
     }
     let published = super::profile_publish::edit(|hosts| {
@@ -182,13 +186,15 @@ fn store_checked(
         if set.default_account.is_none() && legacy.is_some_and(|u| u.eq_ignore_ascii_case(user)) {
             set.default_account = Some(profile.user.clone());
         }
-        set.profiles.insert(profile.user.clone(), profile.clone());
+        if let Some(old) = set.profiles.insert(profile.user.clone(), profile.clone()) {
+            set.retired.push(old);
+        }
         Ok(())
     });
     // A refused or failed publication must not leave the staged secret behind.
-    published.inspect_err(|_| {
-        let _ = crate::auth::delete_token(&key);
-    })
+    published.inspect_err(|_| super::profile_retired::abandon(host, &profile))?;
+    // The replaced generation's secrets go now, or stay listed for a retry.
+    super::profile_retired::drain(host)
 }
 fn stage(
     key: &str,

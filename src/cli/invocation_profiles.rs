@@ -146,7 +146,16 @@ async fn login(mut args: LoginArgs, account: &str) -> Result<()> {
         }
         return auth_login::login_fjord_oidc(args, platform, Some(account))
             .await
-            .map_err(|_| anyhow!("named Fjord sign-in failed; retry login"));
+            .map_err(|e| {
+                if e.downcast_ref::<crate::config::profile_retired::CleanupPending>()
+                    .is_some()
+                {
+                    // The new profile is saved; only the replaced credentials remain.
+                    e
+                } else {
+                    anyhow!("named Fjord sign-in failed; retry login")
+                }
+            });
     }
     let input = args
         .host
