@@ -10,7 +10,7 @@ use clap::{Args, Subcommand};
 use crate::api;
 use crate::api::notification::{Notification, Unsubscribed};
 use crate::client::Client;
-use crate::config::muted::{account_scope, MutedRepos};
+use crate::config::muted::{account_scope, client_scope, MutedRepos};
 use crate::output;
 
 #[derive(Debug, Args)]
@@ -97,7 +97,7 @@ async fn inbox(args: StatusArgs, host: Option<&str>) -> Result<()> {
         let items = api::notification::list(&client, args.all, args.limit).await?;
         (items, 0, false)
     } else {
-        let scope = account_scope(host)?;
+        let scope = client_scope(&client)?;
         let mutes = MutedRepos::load()?;
         let inbox = api::notification::list_filtered(&client, args.all, args.limit, |n| {
             is_visible(&mutes, &scope, n)

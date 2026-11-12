@@ -375,6 +375,62 @@ generation = "g2"
     }
 
     #[test]
+    fn the_inbox_scope_follows_the_connected_client_not_the_disk() {
+        use crate::config::muted::{account_scope, client_scope};
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        write_accounts_config(dir.path(), "alice", "https");
+        let _config = EnvRestore::set("FJ_CONFIG_DIR", dir.path().join("fj"));
+        let _no_keychain = EnvRestore::set("FJ_NO_KEYCHAIN", "1");
+        let _token = EnvRestore::set(
+            crate::auth::host_env_token_var("forge.example"),
+            "env-token",
+        );
+
+        let alice_scope = account_scope(None).unwrap();
+        let client = crate::client::Client::connect(None).unwrap();
+        // Another terminal switches account after the client connected.
+        write_accounts_config(dir.path(), "bob", "https");
+
+        assert_eq!(
+            client_scope(&client).unwrap(),
+            alice_scope,
+            "the connected account's mute list"
+        );
+        assert_ne!(
+            account_scope(None).unwrap(),
+            alice_scope,
+            "reloading the files after the switch would name the other account"
+        );
+    }
+
+    #[test]
+    fn the_inbox_scope_follows_the_connected_fjord_instance() {
+        use crate::config::muted::{client_scope, scope_key};
+        let instance = |id: &str| Host {
+            auth_kind: AuthKind::FjordAccount,
+            fjord_account: Some(FjordAccount {
+                platform_url: "https://p.example".into(),
+                default_instance_id: Some(id.into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let client = |host: Host| {
+            crate::client::Client::for_base_url(
+                "http://h.example/api/v1/".parse().unwrap(),
+                "t".into(),
+            )
+            .unwrap()
+            .with_config(host)
+        };
+        let one = client_scope(&client(instance("i1"))).unwrap();
+        let two = client_scope(&client(instance("i2"))).unwrap();
+        assert_ne!(one, two, "each instance has its own mute list");
+        assert_eq!(one, scope_key("h.example", Some(&instance("i1"))).unwrap());
+    }
+
+    #[test]
     fn default_host_can_use_generic_env_token_without_reading_token_store() {
         let _guard = ENV_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
