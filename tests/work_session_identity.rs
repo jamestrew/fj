@@ -211,6 +211,13 @@ async fn an_explicit_repo_uses_the_default_host_not_the_clone_host() {
     );
 }
 
+async fn repo_reads(server: &MockServer) -> usize {
+    let seen = server.received_requests().await.unwrap_or_default();
+    seen.iter()
+        .filter(|r| r.url.path() == "/api/v1/repos/o/r")
+        .count()
+}
+
 #[tokio::test]
 async fn a_switch_while_gathering_is_not_saved_or_resumed() {
     use std::time::Duration;
@@ -227,7 +234,7 @@ async fn a_switch_while_gathering_is_not_saved_or_resumed() {
     login(d, "first.example", "qa-b", "tok-b").await;
     Mock::given(method("GET"))
         .and(path("/api/v1/repos/o/r"))
-        .respond_with(ResponseTemplate::new(404).set_delay(Duration::from_millis(1500)))
+        .respond_with(ResponseTemplate::new(404).set_delay(Duration::from_millis(4000)))
         .mount(&first)
         .await;
     let switch = |account: &'static str| async move {
@@ -238,8 +245,16 @@ async fn a_switch_while_gathering_is_not_saved_or_resumed() {
         .await;
         assert!(out.status.success(), "{}", stderr(&out));
     };
+    // Switch once the command's repository read has reached the server and is held there.
+    let first_ref = &first;
     let switch_during = |account: &'static str| async move {
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        let baseline = repo_reads(first_ref).await;
+        loop {
+            if repo_reads(first_ref).await > baseline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         switch(account).await;
     };
     switch("qa-a").await;
