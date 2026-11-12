@@ -6,6 +6,15 @@ All notable changes will be recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Repo-scoped commands now read `hosts.toml` once. Routing the clone's host, building
+  the API client and working out the browser URL used separate reads, so an
+  `auth switch` or `instances use` from another terminal in between could send a
+  request as one account and open a page for another. `repo clone`, `repo create` and
+  `repo fork` with `--clone` also take the git protocol from the host the command
+  connected to (a fork of a repo on a routed host used the default host's protocol).
+
 ## [0.8.2] - 2026-11-12
 
 ### Fixed
