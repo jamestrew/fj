@@ -506,17 +506,22 @@ fn current_identity(explicit_repo: bool, host_flag: Option<&str>) -> Result<Opti
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn context(args: ContextArgs, host: Option<&str>) -> Result<()> {
+    let explicit = args.r.repo.is_some();
+    let before = current_identity(explicit, host);
     let wc = gather(args.r.repo.as_deref(), host).await?;
+    let after = current_identity(explicit, host);
 
     // Persist the session as a convenience for `work resume` / `continue`.
-    // A failure to write the cache must never sink the inspect command.
-    match current_identity(args.r.repo.is_some(), host) {
-        Ok(identity) => {
-            let mut session = to_session(&wc, git::remote_url(), Utc::now().to_rfc3339(), identity);
-            session.explicit_repo = args.r.repo.is_some();
+    // A failure to write the cache must never sink the inspect command, but a
+    // switch of account or instance while gathering must not be saved.
+    match (before, after) {
+        (Ok(b), Ok(a)) => {
+            ensure_stable(&b, &a)?;
+            let mut session = to_session(&wc, git::remote_url(), Utc::now().to_rfc3339(), a);
+            session.explicit_repo = explicit;
             let _ = work_session::save(&session);
         }
-        Err(e) => eprintln!("warning: work session not saved: {e}"),
+        (Err(e), _) | (_, Err(e)) => eprintln!("warning: work session not saved: {e}"),
     }
 
     if args.json {
@@ -524,6 +529,19 @@ async fn context(args: ContextArgs, host: Option<&str>) -> Result<()> {
     }
     print!("{}", render_human(&wc));
     Ok(())
+}
+
+/// The identity must be the same before and after the API reads. This detects
+/// a switch that outlasts the window; a switch away and back inside it, or one
+/// between the check and `Client::connect`'s own config load, is not seen.
+fn ensure_stable(before: &Option<String>, after: &Option<String>) -> Result<()> {
+    if before == after {
+        return Ok(());
+    }
+    bail!(
+        "the selected account or instance changed while gathering; nothing was saved. \
+         Run it again."
+    )
 }
 
 /// Render the saved session: the snapshot fields plus the suggested next
@@ -614,10 +632,8 @@ async fn resume(args: ResumeArgs, host: Option<&str>) -> Result<()> {
     let Some(session) = work_session::load()? else {
         bail!("no saved work session for this repo. Run `fj work context` first.");
     };
-    work_session::check_identity(
-        &session,
-        current_identity(args.r.repo.is_some(), host)?.as_deref(),
-    )?;
+    let identity = current_identity(args.r.repo.is_some(), host)?;
+    work_session::check_identity(&session, identity.as_deref())?;
 
     if args.dry_run {
         println!("would: resume the session saved at {}", session.saved_at);
@@ -626,6 +642,7 @@ async fn resume(args: ResumeArgs, host: Option<&str>) -> Result<()> {
 
     // Recompute the live context so we can show what moved since the save.
     let fresh = gather(args.r.repo.as_deref(), host).await?;
+    ensure_stable(&identity, &current_identity(args.r.repo.is_some(), host)?)?;
     let changes = diff_session_vs_context(&session, &fresh);
 
     if args.json {
@@ -906,6 +923,20 @@ mod tests {
         assert_eq!(v["checks"]["total"], 3);
         assert_eq!(v["stack"]["name"], "feat");
         assert_eq!(v["api_reachable"], true);
+    }
+
+    #[test]
+    fn a_changed_identity_is_not_stable() {
+        let a = Some("a".to_string());
+        assert!(ensure_stable(&a, &a).is_ok());
+        assert!(ensure_stable(&None, &None).is_ok());
+        for (x, y) in [(&a, &None), (&None, &a), (&a, &Some("b".to_string()))] {
+            let e = ensure_stable(x, y).unwrap_err().to_string();
+            assert!(
+                e.contains("changed while gathering") && !e.contains('"'),
+                "{e}"
+            );
+        }
     }
 
     #[test]

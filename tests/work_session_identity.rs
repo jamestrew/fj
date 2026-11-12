@@ -210,3 +210,65 @@ async fn an_explicit_repo_uses_the_default_host_not_the_clone_host() {
         "the data host, not the clone host"
     );
 }
+
+#[tokio::test]
+async fn a_switch_while_gathering_is_not_saved_or_resumed() {
+    use std::time::Duration;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    let first = MockServer::start().await;
+    let second = MockServer::start().await;
+    let dir = support::config(&first, &second);
+    let d = dir.path();
+    git(d, &["init", "-q"]);
+    server(&first, "tok-a", "qa-a").await;
+    server(&first, "tok-b", "qa-b").await;
+    login(d, "first.example", "qa-a", "tok-a").await;
+    login(d, "first.example", "qa-b", "tok-b").await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r"))
+        .respond_with(ResponseTemplate::new(404).set_delay(Duration::from_millis(1500)))
+        .mount(&first)
+        .await;
+    let switch = |account: &'static str| async move {
+        let out = call(
+            d,
+            &["auth", "switch", "first.example", "--account", account],
+        )
+        .await;
+        assert!(out.status.success(), "{}", stderr(&out));
+    };
+    let switch_during = |account: &'static str| async move {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        switch(account).await;
+    };
+    switch("qa-a").await;
+
+    // A stable run saves.
+    let ok = call(d, &["work", "context", "-R", "o/r"]).await;
+    assert!(ok.status.success(), "{}", stderr(&ok));
+    let saved = session(d);
+
+    // The account changes while `work resume` reads the API: nothing is shown.
+    let (resume, ()) = tokio::join!(
+        call(d, &["work", "resume", "-R", "o/r"]),
+        switch_during("qa-b")
+    );
+    assert!(!resume.status.success());
+    assert!(
+        stderr(&resume).contains("changed while gathering"),
+        "{}",
+        stderr(&resume)
+    );
+    assert!(resume.stdout.is_empty(), "no snapshot is printed");
+
+    // The account changes while `work context` reads the API: the old session stays.
+    switch("qa-a").await;
+    let (context, ()) = tokio::join!(
+        call(d, &["work", "context", "-R", "o/r"]),
+        switch_during("qa-b")
+    );
+    assert!(!context.status.success());
+    assert!(stderr(&context).contains("changed while gathering"));
+    assert_eq!(session(d), saved, "the old session is not replaced");
+}
