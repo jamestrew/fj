@@ -25,10 +25,18 @@ pub(crate) fn note_fjord_host(host: &str) {
     let _ = FJORD_HOST.set(host.to_string());
 }
 
-/// Turn git's terminal prompts off (`GIT_TERMINAL_PROMPT=0`) when `fjord`.
+/// Turn every way git can ask a person for a credential off when `fjord`:
+/// the terminal prompt, any askpass program, and the credential manager's UI.
+/// Credential helpers still run, so a credential the user configured is used.
+///
+/// `GIT_ASKPASS` set to the empty string is what disables the askpass chain: git
+/// reads it with `getenv`, finds it non-null so it never falls through to
+/// `core.askPass` or `SSH_ASKPASS`, and skips an empty program.
 fn apply_prompt_policy(cmd: &mut Command, fjord: bool) {
     if fjord {
-        cmd.env("GIT_TERMINAL_PROMPT", "0");
+        cmd.env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_ASKPASS", "")
+            .env("GCM_INTERACTIVE", "never");
     }
 }
 
@@ -808,8 +816,19 @@ mod tests {
                 .find(|(k, _)| *k == "GIT_TERMINAL_PROMPT")
                 .and_then(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
         };
+        let env = |fjord, key: &str| {
+            let mut cmd = std::process::Command::new("git");
+            apply_prompt_policy(&mut cmd, fjord);
+            cmd.get_envs()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+        };
         assert_eq!(prompt(true).as_deref(), Some("0"));
         assert_eq!(prompt(false), None, "other hosts keep git's own prompting");
+        // Set but empty: git then skips GIT_ASKPASS, core.askPass and SSH_ASKPASS.
+        assert_eq!(env(true, "GIT_ASKPASS"), Some(Some(String::new())));
+        assert_eq!(env(true, "GCM_INTERACTIVE"), Some(Some("never".into())));
+        assert_eq!(env(false, "GIT_ASKPASS"), None);
     }
 
     #[test]

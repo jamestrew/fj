@@ -10,8 +10,8 @@ All notable changes will be recorded here. The format follows
 
 - On a Fjord Account host, the `git` that fj runs (clone, fetch, push, `pr checkout`,
   stacks) no longer waits on a username prompt. fj has no git credential for such a
-  host yet (the gateway has no git route, #222), so git now runs with terminal prompts
-  off and a failed fetch, push or clone says so and what to do: use an SSH remote, or
+  host yet (the gateway has no git route, #222), so git now runs with every credential
+  prompt off (terminal, askpass programs, the credential manager's UI) and a failed fetch, push or clone says so and what to do: use an SSH remote, or
   give git its own credential for the instance. Other hosts are unchanged.
 - `fj run rerun --failed` on Forgejo 17 no longer reruns a job twice. It skipped a
   selected job that an earlier rerun had restarted only while that job was still

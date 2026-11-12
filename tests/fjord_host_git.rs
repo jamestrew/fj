@@ -29,19 +29,51 @@ async fn forge_demanding_credentials() -> MockServer {
     forge
 }
 
-async fn clone_in(dir: &std::path::Path, args: &[&str]) -> (std::process::Output, Duration) {
+/// An askpass program that records that it ran, then waits like a GUI prompt.
+fn hanging_askpass(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let marker = dir.join("askpass-ran");
+    let script = dir.join("askpass.sh");
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\ntouch '{}'\nsleep 60\n", marker.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (script, marker)
+}
+
+async fn clone_in(
+    dir: &std::path::Path,
+    args: &[&str],
+    wire_askpass: bool,
+) -> (std::process::Output, Duration) {
+    let (askpass, _) = hanging_askpass(dir);
     let started = Instant::now();
-    let out = support::command(dir)
+    let mut command = support::command(dir);
+    command
         .env("FJ_CONFIG_DIR", dir.join("fj"))
-        // No helper, askpass or ambient config may supply a credential.
+        // No helper or ambient config may supply a credential; every askpass
+        // route is wired to a program that would hang if git ever ran it.
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env_remove("GIT_ASKPASS")
         .env_remove("SSH_ASKPASS")
         .env_remove("GIT_TERMINAL_PROMPT")
-        .args(args)
-        .output()
+        .kill_on_drop(true)
+        .args(args);
+    if wire_askpass {
+        command
+            .env("GIT_ASKPASS", &askpass)
+            .env("SSH_ASKPASS", &askpass)
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "core.askPass")
+            .env("GIT_CONFIG_VALUE_0", &askpass);
+    }
+    // Enforced: a child stuck in a prompt is killed at the deadline, not awaited.
+    let out = tokio::time::timeout(Duration::from_secs(30), command.output())
         .await
+        .expect("fj hung waiting for a credential prompt")
         .unwrap();
     (out, started.elapsed())
 }
@@ -77,7 +109,7 @@ async fn a_fjord_host_clone_without_a_credential_fails_fast_with_the_explanation
         .mount(&platform)
         .await;
 
-    let (out, took) = clone_in(dir.path(), &["repo", "clone", "o/r", "dest"]).await;
+    let (out, took) = clone_in(dir.path(), &["repo", "clone", "o/r", "dest"], true).await;
     let err = stderr(&out);
     assert!(!out.status.success(), "{err}");
     assert!(
@@ -95,6 +127,10 @@ async fn a_fjord_host_clone_without_a_credential_fails_fast_with_the_explanation
         "the bearer never reaches git or the output"
     );
     assert!(!dir.path().join("dest").exists(), "nothing was cloned");
+    assert!(
+        !dir.path().join("askpass-ran").exists(),
+        "no askpass program (GIT_ASKPASS, core.askPass, SSH_ASKPASS) was started"
+    );
 }
 
 #[tokio::test]
@@ -114,6 +150,7 @@ async fn a_pat_host_keeps_gits_own_prompting_and_gets_no_hint() {
     let (out, _) = clone_in(
         dir.path(),
         &["--host", "first.example", "repo", "clone", "o/r", "dest"],
+        false,
     )
     .await;
     let err = stderr(&out);
