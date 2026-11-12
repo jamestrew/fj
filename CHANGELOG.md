@@ -6,6 +6,8 @@ All notable changes will be recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-11-12
+
 ### Fixed
 
 - `fj workflow run` no longer fails with "could not find the triggered run" after a
