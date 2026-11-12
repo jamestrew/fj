@@ -446,14 +446,16 @@ pub fn run_web_url(client: &Client, owner: &str, name: &str, run_number: u64) ->
 }
 
 /// The client for an unversioned web route: the same host, with no forge
-/// token attached. Refused outright for a Fjord Account gateway, which does
-/// not forward web routes and must never see a request shaped like one.
+/// token attached. fj never sends an imported browser session cookie on any
+/// request, so a web route is only reachable when it is public. Refused
+/// outright for a Fjord Account gateway: it can forward web paths to the
+/// instance, but a web fallback would carry no credential there, and the
+/// Fjord bearer is never attached to a web route.
 pub(crate) fn web_client(client: &Client, what: &str, run_url: &str) -> Result<Client> {
     if matches!(client.auth_scheme(), AuthScheme::FjordBearer) {
         return Err(actions_limitation(
             &format!(
-                "{what} needs a web route on this server, which a Fjord Account gateway does \
-                 not forward"
+                "{what} needs a web route on this server, which a Fjord Account gateway cannot authenticate"
             ),
             run_url,
         ));

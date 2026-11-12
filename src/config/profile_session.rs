@@ -115,6 +115,8 @@ pub fn clear(host: &str, user: &str) -> Result<()> {
     })
 }
 /// The cookie for the selected profile, only while its destination is unchanged.
+/// Decision (CLS-1267): an imported cookie is stored and listed only. No request path
+/// may send it, because a browser session is broader authority than a token.
 pub fn cookie(hosts: &Hosts, host: &str, user: &str) -> Result<Option<String>> {
     let (profile, config) = current(hosts, host, user)?;
     match hosts

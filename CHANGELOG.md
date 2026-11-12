@@ -8,6 +8,9 @@ All notable changes will be recorded here. The format follows
 
 ### Fixed
 
+- The Fjord Account web-fallback refusal no longer says the gateway "does not forward"
+  web routes. fj never sends an imported browser session cookie on any request; the
+  cookie stays stored and listed only.
 - Replacing a profile (PAT login, `auth refresh --token`, Fjord login) now deletes
   the previous generation's stored credential. If the delete fails, the replaced
   generation is kept in a new optional `retired` list per account in `hosts.toml`
