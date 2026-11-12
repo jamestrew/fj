@@ -8,6 +8,10 @@ All notable changes will be recorded here. The format follows
 
 ### Fixed
 
+- `fj status` filters the inbox with the mute list of the account it connected as,
+  taken from the configuration the client connected with. It used to load
+  `hosts.toml` again after connecting, so a switch from another terminal in between
+  could filter one account's notifications with another account's mutes.
 - Repo-scoped commands now read `hosts.toml` once. Routing the clone's host, building
   the API client and working out the browser URL used separate reads, so an
   `auth switch` or `instances use` from another terminal in between could send a

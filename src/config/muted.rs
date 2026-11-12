@@ -113,9 +113,19 @@ pub fn scope_key(name: &str, host: Option<&Host>) -> Result<String> {
     super::metadata::mute_scope(name, Some(host), format!("{name}#{instance}"))
 }
 
+/// The scope of the account a connected client is acting as, from the
+/// configuration the client connected with. A command that talks to the server
+/// uses this, not [`account_scope`], so the mute list that filters its results
+/// is the connected account's even if `hosts.toml` changed since (CLS-1264).
+pub fn client_scope(client: &crate::client::Client) -> Result<String> {
+    scope_key(client.host(), Some(client.config()))
+}
+
 /// Resolve the account scope for the host a command targets, with the same
 /// precedence as the API client: an explicit `--host`, else the configured
-/// default. Reads only `hosts.toml` (no token, no network).
+/// default. Reads only `hosts.toml` (no token, no network). For commands that
+/// never connect (`mute`, `unmute`, `muted`); a command with a client uses
+/// [`client_scope`].
 pub fn account_scope(host_flag: Option<&str>) -> Result<String> {
     let hosts = Hosts::load()?;
     let name = host_flag.map_or_else(|| hosts.resolve_host(None), Ok)?;
@@ -140,6 +150,36 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_clients_scope_comes_from_the_config_it_connected_with() {
+        let account = |login: &str| Host {
+            selected_account: Some(login.parse().unwrap()),
+            ..Default::default()
+        };
+        let client = |host: Host| {
+            crate::client::Client::for_base_url(
+                "http://h.example/api/v1/".parse().unwrap(),
+                "t".into(),
+            )
+            .unwrap()
+            .with_config(host)
+        };
+        let alice = client_scope(&client(account("alice"))).unwrap();
+        let bob = client_scope(&client(account("bob"))).unwrap();
+        assert!(alice.starts_with("profile:"), "{alice}");
+        assert_ne!(alice, bob, "two accounts never share a mute list");
+        assert_eq!(
+            alice,
+            scope_key("h.example", Some(&account("alice"))).unwrap(),
+            "the client's scope is the profile scope for its host key and account"
+        );
+        assert_eq!(
+            client_scope(&client(Host::default())).unwrap(),
+            "h.example",
+            "a legacy host keeps its legacy scope"
+        );
     }
 
     #[test]
