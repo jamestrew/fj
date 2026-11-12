@@ -8,6 +8,9 @@ All notable changes will be recorded here. The format follows
 
 ### Fixed
 
+- `fj workflow run` no longer fails with "could not find the triggered run" after a
+  successful dispatch. Forgejo reports an empty event for dispatched runs, which the
+  run lookup did not accept (#321).
 - The Fjord Account web-fallback refusal no longer says the gateway "does not forward"
   web routes. fj never sends an imported browser session cookie on any request; the
   cookie stays stored and listed only.

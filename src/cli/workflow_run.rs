@@ -749,7 +749,15 @@ async fn dispatch_matching_runs(
 fn run_matches_dispatch(run: &api::workflow::WorkflowRun, workflow: &str, ref_: &str) -> bool {
     workflow_matches_dispatch(&run.workflow_id, workflow)
         && run.head_branch == normalize_dispatch_ref(ref_)
-        && run.event == "workflow_dispatch"
+        && dispatch_event(&run.event)
+}
+
+/// Forgejo reports an empty `event` for runs started by `workflow_dispatch`
+/// (the payload carries `inputs` and `ref`, but the field is `""`), while
+/// other triggers report their own name. Accept both spellings; runs that
+/// were already listed before the dispatch are excluded by the `seen` set.
+fn dispatch_event(event: &str) -> bool {
+    event.is_empty() || event == "workflow_dispatch"
 }
 
 fn workflow_matches_dispatch(actual: &str, wanted: &str) -> bool {
@@ -1166,6 +1174,48 @@ mod tests {
         let mut run = workflow_run(10, 20);
         run.event = "push".to_string();
         assert!(!run_matches_dispatch(&run, "ci.yml", "main"));
+    }
+
+    #[test]
+    fn run_matches_dispatch_accepts_the_empty_event_forgejo_reports_for_dispatch() {
+        let mut run = workflow_run(10, 20);
+        run.event = String::new();
+        assert!(run_matches_dispatch(&run, "ci.yml", "main"));
+    }
+
+    #[test]
+    fn run_matches_dispatch_rejects_every_other_named_event() {
+        for event in ["push", "pull_request", "schedule", "release"] {
+            let mut run = workflow_run(10, 20);
+            run.event = event.to_string();
+            assert!(!run_matches_dispatch(&run, "ci.yml", "main"), "{event}");
+        }
+    }
+
+    #[test]
+    fn run_matches_dispatch_still_requires_workflow_and_branch() {
+        let mut run = workflow_run(10, 20);
+        run.event = String::new();
+        assert!(!run_matches_dispatch(&run, "other.yml", "main"));
+        assert!(!run_matches_dispatch(&run, "ci.yml", "dev"));
+    }
+
+    #[test]
+    fn an_empty_event_dispatch_run_is_found_once_it_is_new() {
+        let mut old = workflow_run(10, 20);
+        old.event = String::new();
+        let mut new = workflow_run(11, 21);
+        new.event = String::new();
+        let seen: BTreeSet<RunKey> = [RunKey::from(&old)].into();
+        let runs = vec![old, new.clone()];
+        let matching: Vec<_> = runs
+            .into_iter()
+            .filter(|r| run_matches_dispatch(r, "ci.yml", "main"))
+            .collect();
+        assert_eq!(
+            find_new_dispatch_run(&matching, &seen).map(|r| r.id),
+            Some(new.id)
+        );
     }
 
     #[test]
