@@ -76,8 +76,11 @@ pub fn resolve_repo(
     explicit_repo: Option<&str>,
     explicit_host: Option<&str>,
 ) -> Result<RepoContext> {
-    // A pinned slug supplies the repo name; only explicit -R overrides clone routing.
+    // One configuration for the whole command: routing, the client, the browser
+    // base and the default host all read this value, so a second terminal's
+    // `auth switch` cannot make them disagree (CLS-1264).
     let configured = Hosts::load()?;
+    // A pinned slug supplies the repo name; only explicit -R overrides clone routing.
     let stored = explicit_host
         .map(|h| crate::config::metadata::existing_key(&configured, h))
         .transpose()?
@@ -106,27 +109,25 @@ pub fn resolve_repo(
         }
     };
 
-    let default_host = || {
-        Hosts::load()
-            .ok()
-            .and_then(|h| h.resolve_host(None).ok().map(|s| s.to_string()))
-    };
-    let client_host = resolve_client_host(explicit_host, detected_host.as_deref(), default_host());
+    let default_host = configured
+        .resolve_host(None)
+        .ok()
+        .map(std::string::ToString::to_string);
+    let client_host = resolve_client_host(explicit_host, detected_host.as_deref(), default_host);
 
     let client_host = client_host
         .map(|h| {
             if explicit_host.is_some() {
                 Ok(h)
             } else {
-                crate::config::metadata::route_selected(&Hosts::load()?, &h)
+                crate::config::metadata::route_selected(&configured, &h)
             }
         })
         .transpose()?;
-    let client = Client::connect(client_host.as_deref())?;
+    let client = Client::connect_with(&configured, client_host.as_deref())?;
     let host = client.host().to_string();
-    let hosts = Hosts::load()?;
-    let config = crate::config::metadata::resolve(&hosts, &host)?;
-    let web_base = web_base_url(&host, &config)?;
+    // The browser base comes from the configuration the client connected with.
+    let web_base = web_base_url(&host, client.config())?;
 
     Ok(RepoContext {
         client,

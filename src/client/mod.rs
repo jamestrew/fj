@@ -10,7 +10,7 @@ mod release_asset;
 mod resolve;
 
 use resolve::build_base_url;
-pub use resolve::{proxy_credential_for_host, resolve, web_base_url, ResolvedHost};
+pub use resolve::{proxy_credential_for_host, resolve, resolve_with, web_base_url, ResolvedHost};
 
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
@@ -90,6 +90,9 @@ pub struct Client {
     http: reqwest::Client,
     #[allow(dead_code)]
     host: String,
+    /// The resolved host configuration this client was built from (selected
+    /// account metadata applied). Shared by clones.
+    config: Arc<crate::config::hosts::Host>,
     base: Url,
     /// The outgoing bearer/PAT. Behind a lock (shared across clones) so the
     /// silent-refresh path can swap in a freshly minted Fjord access token on a
@@ -157,6 +160,23 @@ impl Client {
         Self::new(resolve(host_flag)?)
     }
 
+    /// [`Client::connect`] against a configuration the caller already loaded,
+    /// so the caller's own routing and rendering decisions and the client agree
+    /// on one account and instance (CLS-1264).
+    pub fn connect_with(
+        hosts: &crate::config::hosts::Hosts,
+        host_flag: Option<&str>,
+    ) -> Result<Self> {
+        Self::new(resolve_with(hosts, host_flag)?)
+    }
+
+    /// The host configuration this client connected with: the selected
+    /// account's destination as resolved when the client was built, not a
+    /// fresh read of `hosts.toml`.
+    pub fn config(&self) -> &crate::config::hosts::Host {
+        &self.config
+    }
+
     /// Construct a client pointing at an arbitrary base URL. Used for tests
     /// against a local mock server. `base_url` must end with `/`. Defaults to
     /// PAT-style auth; use `for_base_url_with_scheme` to override.
@@ -183,6 +203,7 @@ impl Client {
             account: None,
             http,
             host,
+            config: Arc::new(crate::config::hosts::Host::default()),
             base: base_url,
             token: Arc::new(RwLock::new(token)),
             auth_scheme,
@@ -204,6 +225,13 @@ impl Client {
         self.redirect_http = Some(build_http(false)?);
         self.proxy = Some(Arc::new(cred));
         Ok(self)
+    }
+
+    /// Give a test client the host configuration a real connect would carry.
+    #[cfg(test)]
+    pub fn with_config(mut self, config: crate::config::hosts::Host) -> Self {
+        self.config = Arc::new(config);
+        self
     }
 
     /// Pretend the flavor probe already ran, so a test can pin the server

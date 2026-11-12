@@ -55,9 +55,15 @@ pub fn proxy_credential_for_host(
 
 /// Look up the host config and token for the host the user is targeting.
 pub fn resolve(host_flag: Option<&str>) -> Result<ResolvedHost> {
-    let hosts = Hosts::load()?;
+    resolve_with(&Hosts::load()?, host_flag)
+}
+
+/// [`resolve`] against a configuration the caller already loaded. A command
+/// that routes, connects and renders from one `Hosts` value cannot see a
+/// second terminal's `auth switch` half way through (CLS-1264).
+pub fn resolve_with(hosts: &Hosts, host_flag: Option<&str>) -> Result<ResolvedHost> {
     let stored = host_flag
-        .map(|n| crate::config::metadata::existing_key(&hosts, n))
+        .map(|n| crate::config::metadata::existing_key(hosts, n))
         .transpose()?
         .flatten();
     let host_flag = stored.as_deref().or(host_flag);
@@ -76,8 +82,8 @@ pub fn resolve(host_flag: Option<&str>) -> Result<ResolvedHost> {
             .ok_or_else(|| anyhow!("host '{name}' not configured"))?;
         (name, host_cfg)
     };
-    let allow_generic_env = crate::config::profiles::generic_env(&hosts, &name, host_flag);
-    let token = super::account::resolve_token(&hosts, &name, &mut host_cfg, allow_generic_env)?;
+    let allow_generic_env = crate::config::profiles::generic_env(hosts, &name, host_flag);
+    let token = super::account::resolve_token(hosts, &name, &mut host_cfg, allow_generic_env)?;
     let proxy = proxy_credential_for_host(&name, &host_cfg, allow_generic_env)?;
     Ok(ResolvedHost {
         name,
@@ -154,7 +160,7 @@ fn web_base_path(path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_base_url, resolve, web_base_url};
+    use super::{build_base_url, resolve, resolve_with, web_base_url};
     use crate::config::hosts::{AuthKind, FjordAccount, Host};
     use std::sync::Mutex;
 
@@ -272,6 +278,100 @@ git_protocol = "https"
             ),
         )
         .unwrap();
+    }
+
+    /// A configuration with two accounts on one host and `default` selected.
+    fn write_accounts_config(config_home: &std::path::Path, default: &str, protocol: &str) {
+        let dir = config_home.join("fj");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("hosts.toml"),
+            format!(
+                r#"current = "forge.example"
+
+[hosts."forge.example"]
+git_protocol = "{protocol}"
+web_url = "https://forge.example"
+
+[accounts."forge.example"]
+default_account = "{default}"
+
+[accounts."forge.example".profiles.alice]
+user = "alice"
+generation = "g1"
+
+[accounts."forge.example".profiles.bob]
+user = "bob"
+generation = "g2"
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn resolve_with_uses_the_snapshot_not_the_files_on_disk() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        write_accounts_config(dir.path(), "alice", "ssh");
+        let _config = EnvRestore::set("FJ_CONFIG_DIR", dir.path().join("fj"));
+        let _no_keychain = EnvRestore::set("FJ_NO_KEYCHAIN", "1");
+        let _token = EnvRestore::set(
+            crate::auth::host_env_token_var("forge.example"),
+            "env-token",
+        );
+
+        let snapshot = crate::config::hosts::Hosts::load().unwrap();
+        // Another terminal switches account and protocol after the snapshot.
+        write_accounts_config(dir.path(), "bob", "https");
+
+        let seen = resolve_with(&snapshot, None).unwrap();
+        assert_eq!(seen.name, "forge.example");
+        assert_eq!(
+            seen.host.selected_account.as_ref().map(|a| a.as_str()),
+            Some("alice"),
+            "the snapshot's account, not the switched one"
+        );
+        assert_eq!(seen.host.git_protocol, "ssh");
+
+        let fresh = resolve(None).unwrap();
+        assert_eq!(
+            fresh.host.selected_account.as_ref().map(|a| a.as_str()),
+            Some("bob"),
+            "a new command sees the switch"
+        );
+    }
+
+    #[test]
+    fn a_connected_client_keeps_the_configuration_it_connected_with() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        write_accounts_config(dir.path(), "alice", "ssh");
+        let _config = EnvRestore::set("FJ_CONFIG_DIR", dir.path().join("fj"));
+        let _no_keychain = EnvRestore::set("FJ_NO_KEYCHAIN", "1");
+        let _token = EnvRestore::set(
+            crate::auth::host_env_token_var("forge.example"),
+            "env-token",
+        );
+
+        let snapshot = crate::config::hosts::Hosts::load().unwrap();
+        let client = crate::client::Client::connect_with(&snapshot, None).unwrap();
+        write_accounts_config(dir.path(), "bob", "https");
+
+        assert_eq!(client.host(), "forge.example");
+        assert_eq!(client.config().git_protocol, "ssh");
+        assert_eq!(
+            client
+                .config()
+                .selected_account
+                .as_ref()
+                .map(|a| a.as_str()),
+            Some("alice")
+        );
+        let web = web_base_url(client.host(), client.config())
+            .unwrap()
+            .unwrap();
+        assert_eq!(web.as_str(), "https://forge.example/");
     }
 
     #[test]

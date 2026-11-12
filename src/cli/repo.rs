@@ -12,7 +12,6 @@ use crate::cli::{
     repo_topics, repo_transfer,
 };
 use crate::client::Client;
-use crate::config::hosts::Hosts;
 use crate::git;
 use crate::output;
 
@@ -421,23 +420,23 @@ async fn view(args: ViewArgs, host: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// The clone URL in the protocol the connected account's host is configured
+/// for. It reads the configuration the client connected with, not a second
+/// load of `hosts.toml` that could name another host or account (CLS-1264).
+fn clone_url(client: &Client, ssh: String, https: String) -> String {
+    if client.config().git_protocol == "ssh" {
+        ssh
+    } else {
+        https
+    }
+}
+
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn clone(args: CloneArgs, host: Option<&str>) -> Result<()> {
     let (owner, name) = api::split_repo(&args.repo)?;
     let client = Client::connect(host)?;
     let repo = api::repo::get(&client, owner, name).await?;
-    let hosts = Hosts::load()?;
-    let hostname = hosts.resolve_host(host)?;
-    let proto = hosts
-        .hosts
-        .get(hostname)
-        .map(|h| h.git_protocol.clone())
-        .unwrap_or_else(|| "https".into());
-    let url = if proto == "ssh" {
-        repo.ssh_url
-    } else {
-        repo.clone_url
-    };
+    let url = clone_url(&client, repo.ssh_url, repo.clone_url);
     git::clone(&url, args.dir.as_deref())
 }
 
@@ -469,18 +468,7 @@ async fn create(args: CreateArgs, host: Option<&str>) -> Result<()> {
     println!("✓ Created {}", repo.full_name);
     println!("{}", repo.html_url);
     if args.clone {
-        let hosts = Hosts::load()?;
-        let hostname = hosts.resolve_host(host)?;
-        let proto = hosts
-            .hosts
-            .get(hostname)
-            .map(|h| h.git_protocol.clone())
-            .unwrap_or_else(|| "https".into());
-        let url = if proto == "ssh" {
-            repo.ssh_url.clone()
-        } else {
-            repo.clone_url.clone()
-        };
+        let url = clone_url(&client, repo.ssh_url.clone(), repo.clone_url.clone());
         git::clone(&url, None)?;
     }
     if args.web {
@@ -503,18 +491,7 @@ async fn fork(args: ForkArgs, host: Option<&str>) -> Result<()> {
     println!("✓ Forked to {}", r.full_name);
     println!("{}", r.html_url);
     if args.clone {
-        let hosts = Hosts::load()?;
-        let hostname = hosts.resolve_host(host)?;
-        let proto = hosts
-            .hosts
-            .get(hostname)
-            .map(|h| h.git_protocol.clone())
-            .unwrap_or_else(|| "https".into());
-        let url = if proto == "ssh" {
-            r.ssh_url
-        } else {
-            r.clone_url
-        };
+        let url = clone_url(&ctx.client, r.ssh_url, r.clone_url);
         git::clone(&url, None)?;
     }
     Ok(())
@@ -679,6 +656,27 @@ mod tests {
     use super::*;
     use crate::cli::{Cli, Command};
     use clap::Parser;
+
+    #[test]
+    fn the_clone_url_follows_the_connected_hosts_protocol() {
+        let client = |protocol: &str| {
+            Client::for_base_url("http://h.example/api/v1/".parse().unwrap(), "t".into())
+                .unwrap()
+                .with_config(crate::config::hosts::Host {
+                    git_protocol: protocol.into(),
+                    ..Default::default()
+                })
+        };
+        let pick =
+            |protocol: &str| clone_url(&client(protocol), "ssh://x".into(), "https://x".into());
+        assert_eq!(pick("ssh"), "ssh://x");
+        assert_eq!(pick("https"), "https://x");
+        assert_eq!(
+            pick(""),
+            "https://x",
+            "an unconfigured host clones over https"
+        );
+    }
 
     #[test]
     fn pick_repo_prefers_the_flag_over_positional() {

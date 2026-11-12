@@ -59,10 +59,12 @@ impl Client {
             account: resolved
                 .host
                 .selected_account
+                .clone()
                 .map(account::Guard::new)
                 .map(Arc::new),
             http,
             host: resolved.name,
+            config: Arc::new(resolved.host),
             base,
             token: Arc::new(RwLock::new(resolved.token)),
             auth_scheme,
