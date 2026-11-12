@@ -6,6 +6,8 @@ All notable changes will be recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.8.3] - 2026-11-12
+
 ### Fixed
 
 - On a Fjord Account host, the `git` that fj runs (clone, fetch, push, `pr checkout`,
