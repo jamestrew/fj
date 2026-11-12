@@ -29,6 +29,12 @@ pub(crate) fn note_fjord_host(host: &str) {
 /// the terminal prompt, any askpass program, and the credential manager's UI.
 /// Credential helpers still run, so a credential the user configured is used.
 ///
+/// This covers git's HTTP(S) credential prompts only. An SSH remote is left
+/// alone on purpose: ssh asks for its own key passphrase or password in the
+/// user's terminal (or agent), which is the user authenticating, not fj being
+/// unable to supply a credential, and forcing `BatchMode` would break working
+/// setups with a passphrase-protected key.
+///
 /// `GIT_ASKPASS` set to the empty string is what disables the askpass chain: git
 /// reads it with `getenv`, finds it non-null so it never falls through to
 /// `core.askPass` or `SSH_ASKPASS`, and skips an empty program.
