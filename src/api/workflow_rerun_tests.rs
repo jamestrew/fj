@@ -120,6 +120,63 @@ async fn forgejo_rerun_failed_skips_rescheduled_dependent() {
 }
 
 #[tokio::test]
+async fn forgejo_rerun_failed_skips_a_dependent_whose_new_attempt_already_finished() {
+    let (server, client) = setup().await;
+    let initial = json!([
+        {"id":11,"attempt":1,"status":"failure"}, {"id":12,"attempt":1,"status":"cancelled"},
+        {"id":13,"attempt":1,"status":"success"}
+    ]);
+    jobs(
+        &server,
+        vec![
+            initial.clone(),
+            initial,
+            // The server restarted 12 along with 11 and it has already finished
+            // again: terminal status, but a new attempt.
+            json!([
+                {"id":11,"attempt":2,"status":"running"}, {"id":12,"attempt":2,"status":"success"},
+                {"id":13,"attempt":1,"status":"success"}
+            ]),
+        ],
+    )
+    .await;
+    post(&server, "jobs/11/rerun", 204, "").await;
+    assert_eq!(
+        rerun(&client, "o", "r", 56, RerunTarget::Failed)
+            .await
+            .unwrap(),
+        RerunOutcome::Started
+    );
+    let posts: Vec<_> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.method == "POST")
+        .map(|r| r.url.path().to_string())
+        .collect();
+    assert_eq!(posts, ["/api/v1/repos/o/r/actions/jobs/11/rerun"]);
+}
+
+#[tokio::test]
+async fn forgejo_rerun_failed_still_reruns_a_job_whose_attempt_did_not_change() {
+    let (server, client) = setup().await;
+    let initial = json!([
+        {"id":11,"attempt":3,"status":"failure"}, {"id":12,"attempt":2,"status":"cancelled"},
+        {"id":13,"attempt":1,"status":"success"}
+    ]);
+    jobs(&server, vec![initial]).await;
+    post(&server, "jobs/11/rerun", 204, "").await;
+    post(&server, "jobs/12/rerun", 204, "").await;
+    assert_eq!(
+        rerun(&client, "o", "r", 56, RerunTarget::Failed)
+            .await
+            .unwrap(),
+        RerunOutcome::Started
+    );
+}
+
+#[tokio::test]
 async fn forgejo_rerun_failed_continues_after_rejection_and_reports_partial_progress() {
     let (server, client) = setup().await;
     jobs(&server, vec![json!([

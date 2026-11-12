@@ -8,6 +8,10 @@ All notable changes will be recorded here. The format follows
 
 ### Fixed
 
+- `fj run rerun --failed` on Forgejo 17 no longer reruns a job twice. It skipped a
+  selected job that an earlier rerun had restarted only while that job was still
+  running; a job that restarted and finished again before the next refresh was
+  posted again. It now skips any selected job whose attempt changed (#306).
 - `fj status` filters the inbox with the mute list of the account it connected as,
   taken from the configuration the client connected with. It used to load
   `hosts.toml` again after connecting, so a switch from another terminal in between

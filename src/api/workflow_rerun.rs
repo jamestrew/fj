@@ -78,7 +78,7 @@ async fn rerun_failed(
     let selected: Vec<_> = jobs
         .iter()
         .filter(|job| matches!(job.status.as_str(), "failure" | "cancelled"))
-        .map(|job| job.id)
+        .map(|job| (job.id, job.attempt))
         .collect();
     if selected.is_empty() {
         return Ok(RerunOutcome::NothingFailed);
@@ -96,7 +96,7 @@ async fn rerun_failed(
     }
     let mut errors = Vec::new();
     let mut started = 0;
-    for id in selected {
+    for (id, attempt) in selected {
         // A prior job rerun may already have rescheduled this dependent.
         let current = list_run_jobs_api(client, owner, name, run, run_id)
             .await
@@ -109,7 +109,9 @@ async fn rerun_failed(
         let job = current.iter().find(|job| job.id == id).ok_or_else(|| {
             anyhow!("selected job {id} disappeared; {started} rerun(s) already started")
         })?;
-        if !is_terminal_job_status(&job.status) {
+        // Still running, or already rerun and finished again: either way the
+        // attempt we selected is gone, and another POST would repeat the work.
+        if !is_terminal_job_status(&job.status) || job.attempt != attempt {
             continue;
         }
         let path = format!("{repo}/actions/jobs/{id}/rerun");
