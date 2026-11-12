@@ -11,8 +11,88 @@ pub use remote::discover;
 #[allow(unused_imports)]
 pub use remote::{parse_remote, RemoteRepo};
 
+/// The Fjord Account host this process connected to, once it has. Set by
+/// [`note_fjord_host`]; read by [`command`] and the error hints below.
+static FJORD_HOST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Record that this command talks to a Fjord Account host (fj#222). fj gives
+/// git no credential for such a host: the gateway has no git route yet, and a
+/// device never holds a forge token. Every `git` fj spawns afterwards runs with
+/// terminal prompts off, so a fetch, push or clone that needs a credential
+/// fails at once instead of waiting on a username prompt, and its failure
+/// carries [`fjord_git_hint`].
+pub(crate) fn note_fjord_host(host: &str) {
+    let _ = FJORD_HOST.set(host.to_string());
+}
+
+/// Turn every way git can ask a person for a credential off when `fjord`:
+/// the terminal prompt, any askpass program, and the credential manager's UI.
+/// Credential helpers still run, so a credential the user configured is used.
+///
+/// This covers git's HTTP(S) credential prompts only. An SSH remote is left
+/// alone on purpose: ssh asks for its own key passphrase or password in the
+/// user's terminal (or agent), which is the user authenticating, not fj being
+/// unable to supply a credential, and forcing `BatchMode` would break working
+/// setups with a passphrase-protected key.
+///
+/// `GIT_ASKPASS` set to the empty string is what disables the askpass chain: git
+/// reads it with `getenv`, finds it non-null so it never falls through to
+/// `core.askPass` or `SSH_ASKPASS`, and skips an empty program.
+fn apply_prompt_policy(cmd: &mut Command, fjord: bool) {
+    if fjord {
+        cmd.env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_ASKPASS", "")
+            .env("GCM_INTERACTIVE", "never");
+    }
+}
+
+/// What to tell someone whose network git call failed on a Fjord Account host.
+fn hint_text(host: &str) -> String {
+    format!(
+        "Fjord Account host {host}: fj has no git credential to give git yet (fj#222), and git \
+         prompts are off for this command. Use an SSH remote, or give git its own credential \
+         for the instance, then retry."
+    )
+}
+
+/// `git <args>` talks to a remote.
+fn is_network_op(args: &[&str]) -> bool {
+    matches!(
+        args.first().copied(),
+        Some("clone" | "fetch" | "push" | "pull" | "ls-remote")
+    )
+}
+
+/// git's own wording when it needed a credential and could not ask for one.
+fn is_credential_failure(stderr: &str) -> bool {
+    let s = stderr.to_lowercase();
+    s.contains("terminal prompts disabled")
+        || s.contains("could not read username")
+        || s.contains("could not read password")
+        || s.contains("authentication failed")
+}
+
+/// `\n<hint>` for a failure of `args` on `fjord_host`, else "". Only a network
+/// call qualifies, and when git's stderr is known it must say a credential was
+/// needed, so an unrelated failure (a rejected push, a dead network) is not
+/// blamed on the missing credential.
+fn hint_for(fjord_host: Option<&str>, args: &[&str], stderr: Option<&str>) -> String {
+    let Some(host) = fjord_host else {
+        return String::new();
+    };
+    if !is_network_op(args) || stderr.is_some_and(|e| !is_credential_failure(e)) {
+        return String::new();
+    }
+    format!("\n{}", hint_text(host))
+}
+
+fn hint_suffix(args: &[&str], stderr: Option<&str>) -> String {
+    hint_for(FJORD_HOST.get().map(String::as_str), args, stderr)
+}
+
 pub(crate) fn command() -> Command {
     let mut cmd = Command::new("git");
+    apply_prompt_policy(&mut cmd, FJORD_HOST.get().is_some());
     for key in [
         "GIT_DIR",
         "GIT_WORK_TREE",
@@ -35,7 +115,12 @@ pub fn run(args: &[&str]) -> Result<()> {
         .status()
         .with_context(|| "spawning git (is it installed and on PATH?)")?;
     if !status.success() {
-        bail!("git {} exited with status {}", args.join(" "), status);
+        bail!(
+            "git {} exited with status {}{}",
+            args.join(" "),
+            status,
+            hint_suffix(args, None)
+        );
     }
     Ok(())
 }
@@ -211,7 +296,11 @@ pub fn push(remote: &str, branch: &str) -> Result<()> {
              the remote changes (e.g. `git pull --rebase`), then re-run `fj stack sync`."
         );
     }
-    bail!("git push {remote} {branch} failed: {}", stderr.trim());
+    bail!(
+        "git push {remote} {branch} failed: {}{}",
+        stderr.trim(),
+        hint_suffix(&["push"], Some(&stderr))
+    );
 }
 
 /// Recognize git's non-fast-forward / rejected-push messages.
@@ -430,10 +519,12 @@ impl Repo {
             .output()
             .with_context(|| "spawning git (is it installed and on PATH?)")?;
         if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
             bail!(
-                "git {} failed: {}",
+                "git {} failed: {}{}",
                 args.join(" "),
-                String::from_utf8_lossy(&out.stderr).trim()
+                stderr.trim(),
+                hint_suffix(args, Some(&stderr))
             );
         }
         Ok(())
@@ -582,7 +673,11 @@ impl Repo {
                 expected: expect.to_string(),
             }));
         }
-        bail!("git push {remote} {branch} failed: {}", stderr.trim());
+        bail!(
+            "git push {remote} {branch} failed: {}{}",
+            stderr.trim(),
+            hint_suffix(&["push"], Some(&stderr))
+        );
     }
 }
 
@@ -717,8 +812,64 @@ fn reject_dash_lead(what: &str, value: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn prompts_are_off_only_for_a_fjord_host() {
+        let prompt = |fjord| {
+            let mut cmd = std::process::Command::new("git");
+            apply_prompt_policy(&mut cmd, fjord);
+            cmd.get_envs()
+                .find(|(k, _)| *k == "GIT_TERMINAL_PROMPT")
+                .and_then(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+        };
+        let env = |fjord, key: &str| {
+            let mut cmd = std::process::Command::new("git");
+            apply_prompt_policy(&mut cmd, fjord);
+            cmd.get_envs()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+        };
+        assert_eq!(prompt(true).as_deref(), Some("0"));
+        assert_eq!(prompt(false), None, "other hosts keep git's own prompting");
+        // Set but empty: git then skips GIT_ASKPASS, core.askPass and SSH_ASKPASS.
+        assert_eq!(env(true, "GIT_ASKPASS"), Some(Some(String::new())));
+        assert_eq!(env(true, "GCM_INTERACTIVE"), Some(Some("never".into())));
+        assert_eq!(env(false, "GIT_ASKPASS"), None);
+    }
+
+    #[test]
+    fn a_failed_credential_less_fetch_on_a_fjord_host_gets_the_hint() {
+        let denied =
+            "fatal: could not read Username for 'https://forge.example': terminal prompts disabled";
+        let hint = hint_for(Some("platform.example"), &["fetch", "origin"], Some(denied));
+        assert!(
+            hint.contains("Fjord Account host platform.example"),
+            "{hint}"
+        );
+        assert!(hint.contains("fj#222"), "{hint}");
+        // Without captured stderr (inherited), any failed network op gets it.
+        assert!(hint_for(Some("h"), &["clone", "--", "u"], None).contains("fj#222"));
+    }
+
+    #[test]
+    fn the_hint_is_not_added_where_it_would_mislead() {
+        let denied = "fatal: Authentication failed for 'https://forge.example/o/r.git/'";
+        // Not a Fjord host.
+        assert_eq!(hint_for(None, &["push", "origin", "b"], Some(denied)), "");
+        // Not a network call.
+        assert_eq!(hint_for(Some("h"), &["rebase", "main"], Some(denied)), "");
+        // A failure unrelated to credentials.
+        let rejected = "! [rejected] b -> b (non-fast-forward)";
+        assert_eq!(
+            hint_for(Some("h"), &["push", "origin", "b"], Some(rejected)),
+            ""
+        );
+        let dead = "fatal: unable to access 'https://x/': Could not resolve host";
+        assert_eq!(hint_for(Some("h"), &["fetch", "origin"], Some(dead)), "");
+    }
     use super::{
-        parse_left_right_count, parse_log_records, parse_porcelain, reject_dash_lead, Commit,
+        apply_prompt_policy, hint_for, parse_left_right_count, parse_log_records, parse_porcelain,
+        reject_dash_lead, Commit,
     };
 
     #[test]

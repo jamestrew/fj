@@ -2,6 +2,11 @@ use super::*;
 
 impl Client {
     pub fn new(resolved: ResolvedHost) -> Result<Self> {
+        if resolved.host.auth_kind == AuthKind::FjordAccount {
+            // fj has no git credential for a Fjord Account host (fj#222): any git
+            // this command runs must fail fast, not wait on a prompt.
+            crate::git::note_fjord_host(&resolved.name);
+        }
         let (base, auth_scheme, platform_url) = match resolved.host.auth_kind {
             AuthKind::Pat => (
                 build_base_url(&resolved.name, &resolved.host)?,
