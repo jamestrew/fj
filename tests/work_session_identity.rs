@@ -249,7 +249,8 @@ async fn a_switch_while_gathering_is_not_saved_or_resumed() {
     let first_ref = &first;
     let switch_during = |account: &'static str| async move {
         let baseline = repo_reads(first_ref).await;
-        loop {
+        // Bounded: if the command never reads, switch anyway so the assertions report it.
+        for _ in 0..500 {
             if repo_reads(first_ref).await > baseline {
                 break;
             }
