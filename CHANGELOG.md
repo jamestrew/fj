@@ -6,6 +6,17 @@ All notable changes will be recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- `fj workflow run` asks Forgejo for the run its dispatch created (`return_run_info`)
+  and reports that run, instead of searching the newest runs for one that looks new.
+  The search could miss the run on a busy repository, where other runs push it off
+  the first page before it is listed, and print "could not find the triggered run"
+  for a dispatch that succeeded; it also could not tell two dispatches of one
+  workflow apart. A server that does not return run info still gets the search.
+- The subprocess tests set `FJ_CONFIG_DIR`, so on macOS (which ignores
+  `XDG_CONFIG_HOME`) they no longer read the developer's real `hosts.toml`.
+
 ## [0.8.3] - 2026-11-12
 
 ### Fixed

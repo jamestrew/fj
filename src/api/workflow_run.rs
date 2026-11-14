@@ -345,6 +345,15 @@ struct DispatchBody<'a> {
     ref_: &'a str,
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     inputs: std::collections::BTreeMap<String, String>,
+    // Ask for the created run so the caller need not find it in the run list.
+    // Servers without this field ignore it and answer 204 as before.
+    return_run_info: bool,
+}
+
+/// The run Forgejo created for a dispatch, when it was asked to return it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DispatchedRun {
+    pub id: u64,
 }
 
 /// Trigger a `workflow_dispatch` for one workflow file on a given ref. This is
@@ -357,13 +366,17 @@ pub async fn dispatch(
     workflow: &str,
     ref_: &str,
     inputs: std::collections::BTreeMap<String, String>,
-) -> Result<()> {
+) -> Result<Option<DispatchedRun>> {
     let path = format!(
         "{}/actions/workflows/{}/dispatches",
         crate::api::repo_path(owner, name),
         crate::api::path_segment(workflow)
     );
-    let body = DispatchBody { ref_, inputs };
+    let body = DispatchBody {
+        ref_,
+        inputs,
+        return_run_info: true,
+    };
     let res = client
         .request(Method::POST, &path, &[], Some(&serde_json::to_value(body)?))
         .await?;
@@ -383,7 +396,21 @@ pub async fn dispatch(
             }
         ));
     }
-    Ok(())
+    if status == StatusCode::NO_CONTENT {
+        return Ok(None);
+    }
+    // A body that is not run info (an older server, a proxy) falls back to
+    // the run-list lookup rather than failing a dispatch that succeeded.
+    let body = res.text().await.unwrap_or_default();
+    Ok(serde_json::from_str::<DispatchedRun>(&body)
+        .ok()
+        .filter(|run| run.id != 0))
+}
+
+/// One run by its id (the `id` field, not the per-repo run number).
+pub async fn get_run(client: &Client, owner: &str, name: &str, id: u64) -> Result<WorkflowRun> {
+    let path = format!("{}/actions/runs/{id}", crate::api::repo_path(owner, name));
+    client.json(Method::GET, &path, &[], None::<&()>).await
 }
 
 // ── Capability-gated Actions surface ────────────────────────────────────────

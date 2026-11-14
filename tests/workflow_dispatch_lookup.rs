@@ -46,7 +46,7 @@ async fn dispatch(
         .and(path(
             "/api/v1/repos/o/r/actions/workflows/ci.yml/dispatches",
         ))
-        .and(body_json(json!({"ref": ref_})))
+        .and(body_json(json!({"ref": ref_, "return_run_info": true})))
         .respond_with(ResponseTemplate::new(204))
         .expect(1)
         .mount(&first)
@@ -106,4 +106,55 @@ async fn another_trigger_on_the_same_branch_is_not_taken_for_the_dispatch() {
         "{}",
         out(&o)
     );
+}
+
+#[tokio::test]
+async fn a_run_the_server_names_is_used_without_searching_the_run_list() {
+    // The run list never shows the new run (a busy repo pushed it off the
+    // page), but the dispatch response names it, so the command succeeds.
+    let first = MockServer::start().await;
+    let second = MockServer::start().await;
+    let dir = support::config(&first, &second);
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/runs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"workflow_runs": []})))
+        .mount(&first)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/api/v1/repos/o/r/actions/workflows/ci.yml/dispatches",
+        ))
+        .and(body_json(json!({"ref": "main", "return_run_info": true})))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .set_body_json(json!({"id": 900, "run_number": 41, "jobs": ["b"]})),
+        )
+        .expect(1)
+        .mount(&first)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/o/r/actions/runs/900"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(run(41, "", "main", "ci.yml")))
+        .expect(1)
+        .mount(&first)
+        .await;
+    let o = support::command(dir.path())
+        .args([
+            "--host",
+            "first.example",
+            "workflow",
+            "run",
+            "ci.yml",
+            "-R",
+            "o/r",
+            "--ref",
+            "main",
+            "--json",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(o.status.success(), "{}", out(&o));
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["run_number"], 41, "{v}");
 }
