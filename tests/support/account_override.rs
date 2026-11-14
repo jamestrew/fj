@@ -22,6 +22,8 @@ pub fn command(dir: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_fj"));
     command
         .env("XDG_CONFIG_HOME", dir)
+        // macOS ignores XDG_CONFIG_HOME; without this the binary reads the real config.
+        .env("FJ_CONFIG_DIR", dir.join("fj"))
         .env("FJ_NO_KEYCHAIN", "1")
         .env_remove("FJ_ACCOUNT")
         .env_remove("FJ_TOKEN")
