@@ -43,7 +43,7 @@ docs/                  architecture, jq, gh-to-fj, faq, troubleshooting
 - `cargo clippy --all-targets --all-features -- -D warnings` is the lint
   bar. Both the pre-push hook and `.forgejo/workflows/ci.yml` treat
   warnings as errors.
-- `cargo audit --ignore RUSTSEC-2024-0370 -D warnings` is the dependency
+- `scripts/audit.sh` is the dependency
   security gate. The ignored advisory is the known unmaintained
   `proc-macro-error` transitive dependency; new warnings fail locally and
   in CI.
