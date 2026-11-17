@@ -1,0 +1,16 @@
+# The one list of advisories waived for cargo audit. CI, hooks/pre-push, make audit
+# and scripts/audit.sh all read it (cargo-audit finds .cargo/audit.toml itself).
+# Anything not listed here fails `cargo audit -D warnings`.
+[advisories]
+ignore = [
+    # Unmaintained-only advisories on transitively pulled crates we don't depend
+    # on directly, tracked as known debt.
+    "RUSTSEC-2024-0370", # proc-macro-error (via clap/tabled deriveds)
+    "RUSTSEC-2025-0141", # bincode (via fjord-core -> uniffi_macros)
+    "RUSTSEC-2024-0436", # paste (via fjord-core -> uniffi_core)
+    "RUSTSEC-2026-0374", # basic-toml (via fjord-core -> uniffi_bindgen -> askama)
+    # Tracked in PLAT-906. Expires 2027-02-17 (scripts/audit.sh fails after that
+    # date). chrono is unmaintained with no fixed release and fj uses it directly,
+    # so it cannot be dropped yet. Remove this line when fj moves off chrono.
+    "RUSTSEC-2026-0543",
+]

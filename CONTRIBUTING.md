@@ -11,7 +11,7 @@ cargo build --release              # 4 MB binary at target/release/fj
 
 The pre-commit hook runs quick preflight and fmt checks. The pre-push hook
 gates every push on secret preflight, fmt, clippy (warnings as errors), the
-full test suite, `cargo audit`, and a release build. Set `FJ_E2E=1` to
+full test suite, `scripts/audit.sh` (cargo audit plus the waiver expiry check), and a release build. Set `FJ_E2E=1` to
 additionally run the live API smoke (requires `fj auth login` already done).
 CI runs the same read-only live smoke against `rasterstate/fj` with an
 ephemeral `FJ_TOKEN`, so the normal PR gate covers command handlers that

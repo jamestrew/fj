@@ -103,7 +103,7 @@ lint:
 	cargo fmt --all -- --check
 
 audit:
-	cargo audit --ignore RUSTSEC-2024-0370 -D warnings
+	scripts/audit.sh
 
 # Line/region coverage over the surface we intend to unit-test (see
 # COV_IGNORE above). Needs cargo-llvm-cov: `cargo install cargo-llvm-cov`.
