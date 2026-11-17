@@ -209,7 +209,7 @@ pub async fn dispatch(args: DispatchArgs, host: Option<&str>) -> Result<()> {
     };
     let inputs = parse_dispatch_fields(&args.fields)?;
     let seen = dispatch_run_keys(&ctx, &args.workflow, &ref_).await?;
-    api::workflow::dispatch(
+    let dispatched = api::workflow::dispatch(
         &ctx.client,
         &ctx.owner,
         &ctx.name,
@@ -218,7 +218,16 @@ pub async fn dispatch(args: DispatchArgs, host: Option<&str>) -> Result<()> {
         inputs,
     )
     .await?;
-    let run = wait_for_dispatched_run(&ctx, &args.workflow, &ref_, &seen).await?;
+    let run = match dispatched {
+        // The server named the run it created: no guessing from the run list,
+        // which a busy repo can push the new run out of, and which cannot tell
+        // two concurrent dispatches of one workflow apart.
+        Some(d) => match api::workflow::get_run(&ctx.client, &ctx.owner, &ctx.name, d.id).await {
+            Ok(run) => run,
+            Err(_) => wait_for_dispatched_run(&ctx, &args.workflow, &ref_, &seen).await?,
+        },
+        None => wait_for_dispatched_run(&ctx, &args.workflow, &ref_, &seen).await?,
+    };
     let handle = DispatchRunHandle::from_run(&ctx, &run);
 
     if args.json {

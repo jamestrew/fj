@@ -2229,7 +2229,7 @@ async fn workflow_dispatch_sends_ref_and_inputs() {
             "/api/v1/repos/o/r/actions/workflows/ci.yml/dispatches",
         ))
         .and(body_json(
-            json!({ "ref": "main", "inputs": { "env": "prod" } }),
+            json!({ "ref": "main", "inputs": { "env": "prod" }, "return_run_info": true }),
         ))
         .respond_with(ResponseTemplate::new(204))
         .expect(1)
@@ -2250,7 +2250,7 @@ async fn workflow_dispatch_omits_empty_inputs() {
         .and(path(
             "/api/v1/repos/o/r/actions/workflows/ci.yml/dispatches",
         ))
-        .and(body_json(json!({ "ref": "main" })))
+        .and(body_json(json!({ "ref": "main", "return_run_info": true })))
         .respond_with(ResponseTemplate::new(204))
         .expect(1)
         .mount(&server)
@@ -2266,6 +2266,59 @@ async fn workflow_dispatch_omits_empty_inputs() {
     )
     .await
     .expect("ok");
+}
+
+#[tokio::test]
+async fn workflow_dispatch_returns_the_created_run_when_the_server_names_it() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/api/v1/repos/o/r/actions/workflows/ci.yml/dispatches",
+        ))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .set_body_json(json!({ "id": 77, "run_number": 5, "jobs": ["build"] })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let run = crate::api::workflow::dispatch(
+        &c,
+        "o",
+        "r",
+        "ci.yml",
+        "main",
+        std::collections::BTreeMap::new(),
+    )
+    .await
+    .expect("ok");
+    assert_eq!(run.map(|r| r.id), Some(77));
+}
+
+#[tokio::test]
+async fn workflow_dispatch_without_run_info_returns_none() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/api/v1/repos/o/r/actions/workflows/ci.yml/dispatches",
+        ))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client_for(&server).await;
+    let run = crate::api::workflow::dispatch(
+        &c,
+        "o",
+        "r",
+        "ci.yml",
+        "main",
+        std::collections::BTreeMap::new(),
+    )
+    .await
+    .expect("ok");
+    assert!(run.is_none());
 }
 
 // ── Parity follow-ups: issue pin/unpin, repo deploy keys ──
