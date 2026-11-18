@@ -6,6 +6,8 @@ All notable changes will be recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.8.4] - 2026-11-18
+
 ### Fixed
 
 - `fj workflow run` asks Forgejo for the run its dispatch created (`return_run_info`)
@@ -15,7 +17,9 @@ All notable changes will be recorded here. The format follows
   for a dispatch that succeeded; it also could not tell two dispatches of one
   workflow apart. A server that does not return run info still gets the search.
 - The subprocess tests set `FJ_CONFIG_DIR`, so on macOS (which ignores
-  `XDG_CONFIG_HOME`) they no longer read the developer's real `hosts.toml`.
+  `XDG_CONFIG_HOME`) they no longer read the developer's real `hosts.toml`. Both
+  changes are from Peter Swimm (Toilville LLC).
+- Updated `quinn-udp` to 0.5.16 for RUSTSEC-2026-0538 (#329).
 
 ## [0.8.3] - 2026-11-12
 
