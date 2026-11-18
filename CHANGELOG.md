@@ -17,9 +17,11 @@ All notable changes will be recorded here. The format follows
   for a dispatch that succeeded; it also could not tell two dispatches of one
   workflow apart. A server that does not return run info still gets the search.
 - The subprocess tests set `FJ_CONFIG_DIR`, so on macOS (which ignores
-  `XDG_CONFIG_HOME`) they no longer read the developer's real `hosts.toml`. Both
-  changes are from Peter Swimm (Toilville LLC).
+  `XDG_CONFIG_HOME`) they no longer read the developer's real `hosts.toml`.
 - Updated `quinn-udp` to 0.5.16 for RUSTSEC-2026-0538 (#329).
+
+Thanks to Peter Swimm (Toilville LLC) for the workflow dispatch run lookup and the
+hermetic macOS test fix.
 
 ## [0.8.3] - 2026-11-12
 
