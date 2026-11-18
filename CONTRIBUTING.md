@@ -22,16 +22,61 @@ need a real Forgejo API.
 1. Branch off `main`.
 2. Make changes. Keep commits focused.
 3. `cargo fmt --all` before committing.
-4. The pre-commit hook catches quick issues before the commit is created.
-5. The pre-push hook runs the full bar; if it fails, fix the issue
+4. Sign off every commit (see below).
+5. The pre-commit hook catches quick issues before the commit is created.
+6. The pre-push hook runs the full bar; if it fails, fix the issue
    rather than passing `FJ_SKIP_PREPUSH=1` unless you genuinely need
    to bypass.
 
+### Sign-off (DCO)
+
+Every commit carries a `Signed-off-by:` line with your real name and an
+email you can be reached at, added with `git commit -s`:
+
+```
+Signed-off-by: Jane Doe <jane@example.com>
+```
+
+By signing off you certify the [Developer Certificate of Origin](https://developercertificate.org/):
+you wrote the change or have the right to submit it under this project's
+license. Commits without the line will be asked to add it. On a branch that
+only you have pushed (your own fork's PR branch), replay the commits with the
+line and update the branch:
+
+```sh
+git rebase --force-rebase --signoff main
+git push --force-with-lease
+```
+
+`--force-rebase` matters: without it git skips commits it does not need to
+move, and they stay unsigned. Signing a commit cryptographically (GPG or SSH)
+is a separate thing and optional for contributors.
+
 ## Testing
 
-- 60 tests live in the source tree (51 unit + 9 wiremock integration).
+- Before opening a PR, run what CI runs, with the Rust toolchain in
+  `rust-version` (1.95):
+
+  ```sh
+  cargo fmt --all -- --check
+  cargo clippy --all-targets --all-features -- -D warnings
+  cargo test --all --locked
+  ```
+
+  CI also runs `scripts/audit.sh` (`cargo install cargo-audit` first if you
+  want it locally) and a release build. A full `cargo test` takes a while on
+  a cold build; `cargo test <name>` runs one test.
 - Unit tests stay close to the code they cover, in inline `#[cfg(test)]`
   modules.
+- Tests under `tests/` run the real `fj` binary as a subprocess. Give each
+  one its own config directory so it never reads or writes your real
+  `hosts.toml`: set `FJ_CONFIG_DIR` on the `Command`, as
+  `tests/support/account_override.rs` does
+  (`.env("FJ_CONFIG_DIR", dir.join("fj"))`), and `FJ_NO_KEYCHAIN=1` so the
+  test never touches the OS keychain. Setting `XDG_CONFIG_HOME` alone is not
+  enough: macOS ignores it, so the binary would read your real config.
+  Linux honours either, so set `FJ_CONFIG_DIR` and the test behaves the same
+  on both.
 - HTTP integration tests live in `src/client/integration_tests.rs` and
   use a wiremock server. Construct test clients via
   `Client::for_base_url(base, token)`.
