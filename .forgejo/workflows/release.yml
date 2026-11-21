@@ -100,6 +100,35 @@ jobs:
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "releasing $RAW_TAG at $SHA"
 
+      - name: require successful CI for tag commit
+        env:
+          REPO: ${{ github.repository }}
+          API: ${{ github.server_url }}/api/v1
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ steps.resolve.outputs.sha }}
+        run: |
+          set -eu
+          status_json=$(curl -sf -H "Authorization: token $TOKEN" \
+            "$API/repos/$REPO/commits/$SHA/status") || {
+            echo "::error::could not read combined status for $SHA; refusing to release."
+            exit 1
+          }
+          # This release run adds pending statuses to the same commit while
+          # prepare executes. Exclude its own contexts, then require every
+          # remaining check to have succeeded. An empty set is not green.
+          if ! printf '%s' "$status_json" | jq -e --arg sha "$SHA" '
+            [.statuses[]? | select((.context // "" | startswith("release /")) | not)] as $checks
+            | .sha == $sha and ($checks | length > 0) and all($checks[]; .status == "success")
+          ' >/dev/null; then
+            echo "::error::CI for $SHA is not successful; refusing to release."
+            printf '%s' "$status_json" | jq -r '
+              .statuses[]? | select((.context // "" | startswith("release /")) | not)
+              | "\(.context): \(.status)"
+            '
+            exit 1
+          fi
+          echo "CI succeeded for $SHA"
+
   build:
     needs: prepare
     strategy:
