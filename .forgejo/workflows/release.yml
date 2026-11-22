@@ -119,37 +119,41 @@ jobs:
           SHA: ${{ needs.prepare.outputs.sha }}
         run: |
           set -eu
-          # The combined-status endpoint pages its statuses and reports no reliable total, so walk until an empty
-          # page (a short page proves nothing when the server caps the page size), as src/api/pull_status.rs does.
-          # A page that adds nothing new, or reaching the page cap before an empty page, means the set is not known
-          # to be complete, and an incomplete set must not release.
-          all='[]'
-          page=1
-          complete=no
-          while [ "$page" -le 50 ]; do
-            body=$(curl -sf -H "Authorization: token $TOKEN" \
-              "$API/repos/$REPO/commits/$SHA/status?page=$page&limit=50") || {
-              echo "::error::could not read combined status page $page for $SHA; refusing to release."
-              exit 1
-            }
-            printf '%s' "$body" | jq -e --arg sha "$SHA" '.sha == $sha and (.statuses | type == "array")' >/dev/null || {
-              echo "::error::status response is not a status list for $SHA; refusing to release."
-              exit 1
-            }
-            n=$(printf '%s' "$body" | jq '[.statuses[]?] | length')
-            if [ "$n" = "0" ]; then complete=yes; break; fi
-            before=$(printf '%s' "$all" | jq 'length')
-            all=$(jq -n --argjson a "$all" --argjson b "$(printf '%s' "$body" | jq '[.statuses[]?]')" \
-              '$a + [$b[] | . as $s | select(($a | map(.context) | index($s.context)) | not)]')
-            after=$(printf '%s' "$all" | jq 'length')
-            if [ "$after" = "$before" ]; then
-              echo "::error::status page $page repeated earlier contexts; the set is not known to be complete; refusing to release."
-              exit 1
+          # A short page does not prove completeness. Read through an empty page, then repeat the entire read so
+          # changing statuses cannot silently shift a context between pages during certification.
+          read_statuses() {
+            all='[]'
+            page=1
+            complete=no
+            while [ "$page" -le 50 ]; do
+              body=$(curl -sf -H "Authorization: token $TOKEN" \
+                "$API/repos/$REPO/commits/$SHA/status?page=$page&limit=50") || {
+                echo "::error::could not read combined status page $page for $SHA; refusing to release." >&2
+                return 1
+              }
+              printf '%s' "$body" | jq -e --arg sha "$SHA" '.sha == $sha and (.statuses | type == "array")' >/dev/null || {
+                echo "::error::status response is not a status list for $SHA; refusing to release." >&2
+                return 1
+              }
+              batch=$(printf '%s' "$body" | jq -c '.statuses')
+              if [ "$batch" = '[]' ]; then complete=yes; break; fi
+              all=$(printf '%s\n%s\n' "$all" "$batch" | jq -cs '.[0] + .[1]')
+              if ! printf '%s' "$all" | jq -e 'map(.context) | length == (unique | length)' >/dev/null; then
+                echo "::error::status page $page repeated a context; refusing to release." >&2
+                return 1
+              fi
+              page=$((page + 1))
+            done
+            if [ "$complete" != yes ]; then
+              echo "::error::more than 50 pages of statuses for $SHA; refusing to release." >&2
+              return 1
             fi
-            page=$((page + 1))
-          done
-          if [ "$complete" != yes ]; then
-            echo "::error::more than 50 pages of statuses for $SHA; refusing to release."
+            printf '%s' "$all" | jq -c 'sort_by(.context)'
+          }
+          all=$(read_statuses) || exit 1
+          again=$(read_statuses) || exit 1
+          if [ "$all" != "$again" ]; then
+            echo "::error::commit statuses changed between full reads for $SHA; refusing to release."
             exit 1
           fi
           # Every CI job must have reported its main-branch (push) run, not just those that happen to have a status
@@ -163,16 +167,19 @@ jobs:
               exit 1
             fi
           done
-          # This release run adds pending statuses to the same commit while prepare executes, and pull_request runs
-          # leave their own contexts. Judge only the push contexts, excluding this workflow's own, and require every
-          # one to have succeeded. An empty set is not green.
+          # This release run adds its own pending contexts, and PR runs leave contexts for a different event.
+          # Every other context, including external checks without a push suffix, must be successful.
           if ! printf '%s' "$all" | jq -e '
-            [.[] | select((.context // "") as $c | ($c | endswith("(push)")) and (($c | startswith("release /")) | not))] as $checks
+            def relevant: (.context // "") as $c
+              | ($c | startswith("release /") or endswith("(pull_request)") or endswith("(pull_request_target)")) | not;
+            [.[] | select(relevant)] as $checks
             | ($checks | length > 0) and all($checks[]; .status == "success")
           ' >/dev/null; then
             echo "::error::CI for $SHA is not successful; refusing to release."
             printf '%s' "$all" | jq -r '
-              .[] | select((.context // "") as $c | ($c | endswith("(push)")) and (($c | startswith("release /")) | not))
+              def relevant: (.context // "") as $c
+                | ($c | startswith("release /") or endswith("(pull_request)") or endswith("(pull_request_target)")) | not;
+              .[] | select(relevant)
               | "\(.context): \(.status)"
             '
             exit 1
