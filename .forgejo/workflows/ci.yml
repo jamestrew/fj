@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: [main]
 
+# A newer push to a PR supersedes its older run, so cancel it. A push to main keys on its commit and never cancels:
+# each merge commit's CI result is what the release gate reads.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   check:
     runs-on: docker
