@@ -100,29 +100,79 @@ jobs:
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "releasing $RAW_TAG at $SHA"
 
+  # Separate from `prepare` on purpose: a failed `prepare` skips `guard`, and a tag pushed while CI is pending or the
+  # API is down would then leave an empty release advertised with no issue filed. A failed `gate` leaves `prepare`
+  # green, so `guard` demotes the release and files the issue.
+  gate:
+    needs: prepare
+    runs-on: docker
+    container: alpine:3.20
+    steps:
+      - name: install tools
+        run: apk add --no-cache curl jq
+
       - name: require successful CI for tag commit
         env:
           REPO: ${{ github.repository }}
           API: ${{ github.server_url }}/api/v1
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SHA: ${{ steps.resolve.outputs.sha }}
+          SHA: ${{ needs.prepare.outputs.sha }}
         run: |
           set -eu
-          status_json=$(curl -sf -H "Authorization: token $TOKEN" \
-            "$API/repos/$REPO/commits/$SHA/status") || {
-            echo "::error::could not read combined status for $SHA; refusing to release."
+          # The combined-status endpoint pages its statuses and reports no reliable total, so walk until an empty
+          # page (a short page proves nothing when the server caps the page size), as src/api/pull_status.rs does.
+          # A page that adds nothing new, or reaching the page cap before an empty page, means the set is not known
+          # to be complete, and an incomplete set must not release.
+          all='[]'
+          page=1
+          complete=no
+          while [ "$page" -le 50 ]; do
+            body=$(curl -sf -H "Authorization: token $TOKEN" \
+              "$API/repos/$REPO/commits/$SHA/status?page=$page&limit=50") || {
+              echo "::error::could not read combined status page $page for $SHA; refusing to release."
+              exit 1
+            }
+            printf '%s' "$body" | jq -e --arg sha "$SHA" '.sha == $sha and (.statuses | type == "array")' >/dev/null || {
+              echo "::error::status response is not a status list for $SHA; refusing to release."
+              exit 1
+            }
+            n=$(printf '%s' "$body" | jq '[.statuses[]?] | length')
+            if [ "$n" = "0" ]; then complete=yes; break; fi
+            before=$(printf '%s' "$all" | jq 'length')
+            all=$(jq -n --argjson a "$all" --argjson b "$(printf '%s' "$body" | jq '[.statuses[]?]')" \
+              '$a + [$b[] | . as $s | select(($a | map(.context) | index($s.context)) | not)]')
+            after=$(printf '%s' "$all" | jq 'length')
+            if [ "$after" = "$before" ]; then
+              echo "::error::status page $page repeated earlier contexts; the set is not known to be complete; refusing to release."
+              exit 1
+            fi
+            page=$((page + 1))
+          done
+          if [ "$complete" != yes ]; then
+            echo "::error::more than 50 pages of statuses for $SHA; refusing to release."
             exit 1
-          }
-          # This release run adds pending statuses to the same commit while
-          # prepare executes. Exclude its own contexts, then require every
-          # remaining check to have succeeded. An empty set is not green.
-          if ! printf '%s' "$status_json" | jq -e --arg sha "$SHA" '
-            [.statuses[]? | select((.context // "" | startswith("release /")) | not)] as $checks
-            | .sha == $sha and ($checks | length > 0) and all($checks[]; .status == "success")
+          fi
+          # Every CI job must have reported its main-branch (push) run, not just those that happen to have a status
+          # yet: a tag pushed after `ci / check (push)` succeeds but before `ci / live-e2e (push)` reports would
+          # otherwise release without the smoke test. Exact push contexts on purpose: a pull_request context for the
+          # same job proves a different run (the PR's), and a stale failed PR context must not block a release whose
+          # main-branch run is green. Keep this list equal to the jobs in .forgejo/workflows/ci.yml.
+          for job in check coverage live-e2e; do
+            if ! printf '%s' "$all" | jq -e --arg c "ci / $job (push)" 'any(.[]; .context == $c)' >/dev/null; then
+              echo "::error::no main-branch CI status '$job (push)' on $SHA yet (pending or never ran); refusing to release."
+              exit 1
+            fi
+          done
+          # This release run adds pending statuses to the same commit while prepare executes, and pull_request runs
+          # leave their own contexts. Judge only the push contexts, excluding this workflow's own, and require every
+          # one to have succeeded. An empty set is not green.
+          if ! printf '%s' "$all" | jq -e '
+            [.[] | select((.context // "") as $c | ($c | endswith("(push)")) and (($c | startswith("release /")) | not))] as $checks
+            | ($checks | length > 0) and all($checks[]; .status == "success")
           ' >/dev/null; then
             echo "::error::CI for $SHA is not successful; refusing to release."
-            printf '%s' "$status_json" | jq -r '
-              .statuses[]? | select((.context // "" | startswith("release /")) | not)
+            printf '%s' "$all" | jq -r '
+              .[] | select((.context // "") as $c | ($c | endswith("(push)")) and (($c | startswith("release /")) | not))
               | "\(.context): \(.status)"
             '
             exit 1
@@ -130,7 +180,7 @@ jobs:
           echo "CI succeeded for $SHA"
 
   build:
-    needs: prepare
+    needs: [prepare, gate]
     strategy:
       fail-fast: false
       matrix:
@@ -491,13 +541,60 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  # `guard` marks an empty release draft and prerelease when a tag was pushed before its build could succeed. A re-run
+  # after that attaches assets but clears neither flag, so set the intended state once the assets are attached. A tag
+  # with a `-` suffix (v1.2.3-rc1, which `prepare` accepts) is a prerelease; anything else is stable. This is its own
+  # job so that a failure here is reported as "published but not visible", not as "no artifacts".
+  visible:
+    needs: [prepare, publish]
+    runs-on: docker
+    container: alpine:3.20
+    steps:
+      - name: install tools
+        run: apk add --no-cache curl jq
+
+      - name: make the release visible
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          REPO: ${{ github.repository }}
+          API: ${{ github.server_url }}/api/v1
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          case "$TAG" in *-*) pre=true ;; *) pre=false ;; esac
+          # The tag lookup may not return a draft (which is what `guard` leaves after a failed attempt), so fall back to
+          # the authenticated release list. Only a confirmed answer counts: any other failure fails the job.
+          rel_id=""
+          code=$(curl -s -o /tmp/rel.json -w '%{http_code}' -H "Authorization: token $TOKEN" "$API/repos/$REPO/releases/tags/$TAG") || code=000
+          if [ "$code" = "200" ]; then
+            rel_id=$(jq -r '.id // empty' /tmp/rel.json)
+          elif [ "$code" = "404" ]; then
+            page=1
+            while [ -z "$rel_id" ] && [ "$page" -le 20 ]; do
+              code=$(curl -s -o /tmp/list.json -w '%{http_code}' -H "Authorization: token $TOKEN" "$API/repos/$REPO/releases?limit=50&page=$page") || code=000
+              [ "$code" = "200" ] || { echo "::error::could not list releases (HTTP $code) while looking for $TAG"; exit 1; }
+              [ "$(jq 'length' /tmp/list.json)" != "0" ] || break
+              rel_id=$(jq -r --arg t "$TAG" '[.[] | select(.tag_name == $t)][0].id // empty' /tmp/list.json)
+              page=$((page + 1))
+            done
+          else
+            echo "::error::could not read the release for $TAG (HTTP $code) after publishing"
+            exit 1
+          fi
+          [ -n "$rel_id" ] || { echo "::error::no release found for $TAG after publishing"; exit 1; }
+          curl -sf -X PATCH -H "Authorization: token $TOKEN" -H 'Content-Type: application/json' \
+            -d "{\"draft\": false, \"prerelease\": $pre}" "$API/repos/$REPO/releases/$rel_id" > /dev/null
+
   # Forgejo surfaces a pushed tag as a published release immediately, so a build
   # that fails leaves a real-looking release with zero assets and nothing says
   # so. v0.4.1 sat like that from 2026-07-22 until fj#232 noticed. Demote it and
   # file an issue instead of failing silently.
   guard:
-    needs: [prepare, build, publish]
-    if: always() && needs.prepare.result == 'success' && (needs.build.result != 'success' || needs.publish.result != 'success')
+    needs: [prepare, gate, build, publish, visible]
+    # Also runs when `prepare` itself failed on a tag push (for example an API outage during the tag lookup), because
+    # Forgejo has already advertised the pushed tag as an empty release and nothing else would report it. In that case
+    # the tag comes from the push ref, not from prepare, and is re-validated below before it is used.
+    if: always() && ((needs.prepare.result == 'success' && (needs.gate.result != 'success' || needs.build.result != 'success' || needs.publish.result != 'success' || needs.visible.result != 'success')) || (needs.prepare.result == 'failure' && github.event_name == 'push'))
     runs-on: docker
     container: alpine:3.20
     steps:
@@ -506,36 +603,65 @@ jobs:
 
       - name: demote the release and open an issue
         env:
-          TAG: ${{ needs.prepare.outputs.tag }}
+          TAG: ${{ needs.prepare.outputs.tag || (github.event_name == 'push' && github.ref_name) || '' }}
           REPO: ${{ github.repository }}
           API: ${{ github.server_url }}/api/v1
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_number }}
+          PREPARE_RESULT: ${{ needs.prepare.result }}
+          GATE_RESULT: ${{ needs.gate.result }}
           BUILD_RESULT: ${{ needs.build.result }}
           PUBLISH_RESULT: ${{ needs.publish.result }}
+          VISIBLE_RESULT: ${{ needs.visible.result }}
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -euo pipefail
+          # No `set -e`: a failed lookup or demotion must not stop the issue from being filed, and each failure is
+          # reported at the end so the run itself fails visibly instead of hiding behind a green guard.
+          set -uo pipefail
+          # The tag may come from the push ref when `prepare` failed, so apply the same shape checks before using it.
+          case "$TAG" in
+            *[!0-9A-Za-z.+-]* | '') echo "::notice::not a release tag name; nothing to recover."; exit 0 ;;
+          esac
+          case "$TAG" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::notice::'$TAG' is not of the form v<major>.<minor>.<patch>; nothing to recover."; exit 0 ;;
+          esac
           auth="Authorization: token $TOKEN"
+          failed=""
 
-          rel=$(curl -sf -H "$auth" "$API/repos/$REPO/releases/tags/$TAG" || echo '{}')
+          if rel=$(curl -sf -H "$auth" "$API/repos/$REPO/releases/tags/$TAG"); then
+            :
+          else
+            echo "::warning::could not read the release for $TAG; cannot tell whether it is empty."
+            failed="$failed release-lookup"
+            rel='{}'
+          fi
           rel_id=$(echo "$rel" | jq -r '.id // empty')
           assets=$(echo "$rel" | jq -r '(.assets // []) | length')
 
           if [ -n "$rel_id" ] && [ "$assets" = "0" ]; then
             echo "Release $TAG has no assets; marking it draft so it stops advertising itself."
             body="The release job for \`$TAG\` failed and no artifacts were published. Do not install this version. See $RUN_URL."
-            curl -sf -X PATCH -H "$auth" -H 'Content-Type: application/json' \
+            if ! curl -sf -X PATCH -H "$auth" -H 'Content-Type: application/json' \
               -d "$(jq -n --arg b "$body" '{draft: true, prerelease: true, body: $b}')" \
-              "$API/repos/$REPO/releases/$rel_id" > /dev/null
+              "$API/repos/$REPO/releases/$rel_id" > /dev/null; then
+              echo "::error::could not mark release $TAG as a draft; it is still advertised."
+              failed="$failed release-demote"
+            fi
           else
             echo "Release $TAG has $assets asset(s); leaving its state alone."
           fi
 
           title="release $TAG failed: no installable artifacts"
-          existing=$(curl -sf -H "$auth" "$API/repos/$REPO/issues?state=open&type=issues&limit=50" \
-            | jq -r --arg t "$title" '[.[] | select(.title == $t)] | length')
+          if [ "$PUBLISH_RESULT" = "success" ]; then
+            title="release $TAG published but is not visible"
+          fi
+          # If the lookup fails, file anyway: a duplicate issue is cheaper than none.
+          existing=$(curl -sfG -H "$auth" --data-urlencode "q=$title" --data-urlencode state=open \
+            --data-urlencode type=issues --data-urlencode limit=50 "$API/repos/$REPO/issues" \
+            | jq -r --arg t "$title" '[.[] | select(.title == $t)] | length') || existing=0
           if [ "$existing" != "0" ]; then
             echo "Issue already open for $TAG; not filing a duplicate."
+            [ -z "$failed" ] || { echo "::error::release $TAG recovery incomplete:$failed"; exit 1; }
             exit 0
           fi
 
@@ -545,18 +671,31 @@ jobs:
           # would hang or swallow the rest of the script. A job that only ever
           # runs when the release has already failed is the worst place to
           # depend on either.
+          if [ "$PUBLISH_RESULT" = "success" ]; then
+            headline="The release workflow for \`$TAG\` attached its artifacts, but the release is still hidden (draft or prerelease)."
+            advice="The artifacts are attached. Re-run the release workflow from the default branch with \`tag: $TAG\` to retry the visibility step, or clear draft and prerelease on the release by hand."
+          else
+            headline="The release workflow for \`$TAG\` did not publish artifacts."
+            advice="Until this is resolved, \`brew install fj\` serves whatever the tap last pinned, which is the previous release. After fixing the cause, re-release without moving the tag: dispatch the release workflow from the default branch with \`tag: $TAG\`."
+          fi
           issue=$(printf '%s\n' \
-            "The release workflow for \`$TAG\` did not publish artifacts." \
+            "$headline" \
             "" \
+            "- prepare: $PREPARE_RESULT" \
+            "- ci gate: $GATE_RESULT" \
             "- build: $BUILD_RESULT" \
             "- publish: $PUBLISH_RESULT" \
+            "- visibility: $VISIBLE_RESULT" \
             "- run: $RUN_URL" \
             "" \
-            "Until this is resolved, \`brew install fj\` serves whatever the tap" \
-            "last pinned, which is the previous release. After fixing the cause," \
-            "re-release without moving the tag: dispatch the release workflow from" \
-            "the default branch with \`tag: $TAG\`.")
-          curl -sf -X POST -H "$auth" -H 'Content-Type: application/json' \
+            "$advice")
+          if curl -sf -X POST -H "$auth" -H 'Content-Type: application/json' \
             -d "$(jq -n --arg t "$title" --arg b "$issue" '{title: $t, body: $b}')" \
-            "$API/repos/$REPO/issues" > /dev/null
-          echo "::error::release $TAG published no artifacts; filed an issue."
+            "$API/repos/$REPO/issues" > /dev/null; then
+            echo "::error::release $TAG needs recovery; filed an issue."
+          else
+            failed="$failed issue"
+            echo "::error::release $TAG needs recovery and the issue could not be filed."
+          fi
+          [ -z "$failed" ] || { echo "::error::release $TAG recovery incomplete:$failed"; exit 1; }
+          exit 1
